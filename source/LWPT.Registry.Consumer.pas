@@ -60,10 +60,16 @@ type
 
   TLWPTRegistryContactOutcome = (rcoRequestFailure, rcoStale);
 
+  TLWPTRegistryConsumer = class;
+
   TLWPTRegistrySession = class
   private
+    FOwner: TLWPTRegistryConsumer;
     FDeclaration: TLWPTRegistryDeclaration;
-    FIdentity, FLockedIdentity: string;
+    FIdentity, FLockedIdentity, FLockAmbiguity: string;
+    { Identities a workspace member's same-alias declaration requires, as
+      Name=Value pairs of identity and declaring member. }
+    FConstraints: TStringList;
     FAttempted, FAcquired, FUnreachable: Boolean;
     FVerified: TLWPTVerifiedRegistry;
     FAPI, FContact, FFailures: string;
@@ -74,9 +80,21 @@ type
     function LockTableFor(const AIdentity: string;
       out ATable: TLWPTRegistryLockTable): Boolean;
     procedure AcquireFrom(const AContact, ANow: string);
+    procedure SetLockedIdentity(const AIdentity: string);
+    procedure RequireConstraints(const AIdentity: string);
+    function AcceptedChain(const AHashes: TStringArray;
+      out AChain: TLWPTRegistryRotationProofArray): Boolean;
   public
-    constructor Create(const ADeclaration: TLWPTRegistryDeclaration;
+    constructor Create(AOwner: TLWPTRegistryConsumer;
+      const ADeclaration: TLWPTRegistryDeclaration;
       const ALockTables: TLWPTRegistryLockTableArray);
+    destructor Destroy; override;
+    { Records that a workspace member declares this alias with AIdentity.
+      A declared, locked, or later established identity must equal it. }
+    procedure RequireIdentity(const AIdentity, AMember: string);
+    { Refuses acquisition when the lock could not bind this alias to one
+      recorded identity: an ambiguous binding is never new discovery. }
+    procedure MarkAmbiguous(const AMessage: string);
     { Tries each contact once per install. Afterwards Acquired, or
       Unreachable when every contact failed at the request layer. Any other
       outcome raises. }
@@ -92,7 +110,7 @@ type
     property Alias: string read FDeclaration.Alias;
     { Declared, locked, or (after acquisition) established identity. }
     property Identity: string read FIdentity;
-    property LockedIdentity: string read FLockedIdentity write FLockedIdentity;
+    property LockedIdentity: string read FLockedIdentity write SetLockedIdentity;
     property Attempted: Boolean read FAttempted;
     property Acquired: Boolean read FAcquired;
     property Unreachable: Boolean read FUnreachable;
@@ -114,11 +132,24 @@ type
     FRoot: TManifest;
     FSessions: TList;
     FLockTables: TLWPTRegistryLockTableArray;
+    FArchivesRoot: string;
     function SessionAt(AIndex: Integer): TLWPTRegistrySession;
   public
     constructor Create(const ARoot: TManifest;
-      const ALockTables: TLWPTRegistryLockTableArray);
+      const ALockTables: TLWPTRegistryLockTableArray;
+      const AArchivesRoot: string);
     destructor Destroy; override;
+    { One origin may be reached through only one alias: raises when another
+      declaration declares, locks, or established AIdentity. }
+    procedure RequireUniqueIdentity(ASession: TLWPTRegistrySession;
+      const AIdentity: string);
+    { Checkpoint freshness and the clock floor judged again at publication
+      time, as the mirror does at activation. }
+    procedure RecheckFreshness;
+    { Merges every acquisition into per-user state. Part of a successful
+      install: a failure raises. }
+    procedure PersistAcceptedState;
+    property ArchivesRoot: string read FArchivesRoot;
     function SessionForAlias(const AAlias: string): TLWPTRegistrySession;
     { The session for a record dependency's origin identity: a declared
       identity, or one established in this install or recorded in the lock.
@@ -132,14 +163,26 @@ type
 
 function RegistryStateRoot: string;
 function RegistryStatePath(const AIdentity, ATrustKeyId: string): string;
+function RegistryStatePathAt(const ARoot, AIdentity, ATrustKeyId: string): string;
 { False when no state exists. Corrupt state raises, naming the file; it is
   never reset, because a reset would lower the clock floor. }
 function LoadRegistryConsumerState(const AIdentity, ATrustKeyId: string;
   out AState: TLWPTRegistryConsumerState): Boolean;
+function LoadRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
+  out AState: TLWPTRegistryConsumerState): Boolean;
 { Merges AState into the per-user file under a producer lease. The sequence
-  and floor never go down. }
+  and floor never go down. The exact bytes of ARotations, the chain that
+  reaches the accepted key, join the per-user document store so a later
+  acquisition can authenticate an older contact against it. }
 procedure MergeRegistryConsumerState(const AIdentity, ATrustKeyId: string;
-  const AState: TLWPTRegistryConsumerState);
+  const AState: TLWPTRegistryConsumerState;
+  const ARotations: TLWPTRegistryRotationProofArray);
+procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
+  const AState: TLWPTRegistryConsumerState;
+  const ARotations: TLWPTRegistryRotationProofArray);
+{ One document of the per-user store, or nil when it is absent or its bytes
+  do not hash to AHash. }
+function LoadRegistryStateDocument(const ARoot, AHash: string): TBytes;
 { The newer of two accepted states; the floor is the later of both. }
 function MergeRegistryAcceptedStates(const ALeft,
   ARight: TLWPTRegistryConsumerState): TLWPTRegistryConsumerState;
@@ -220,10 +263,39 @@ begin
     IncludeTrailingPathDelimiter(GetAppConfigDir(False)) + 'registry'));
 end;
 
+function RegistryStatePathAt(const ARoot, AIdentity, ATrustKeyId: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(ARoot) + 'origins/'
+    + SHA256Hex(BytesOf(AIdentity + #10 + ATrustKeyId)) + '.toml';
+end;
+
 function RegistryStatePath(const AIdentity, ATrustKeyId: string): string;
 begin
-  Result := IncludeTrailingPathDelimiter(RegistryStateRoot) + 'origins/'
-    + SHA256Hex(BytesOf(AIdentity + #10 + ATrustKeyId)) + '.toml';
+  Result := RegistryStatePathAt(RegistryStateRoot, AIdentity, ATrustKeyId);
+end;
+
+function RegistryStateDocumentPath(const ARoot, AHash: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(ARoot) + 'documents/sha256/'
+    + RegistryDigestHex(AHash) + '.toml';
+end;
+
+function LoadRegistryStateDocument(const ARoot, AHash: string): TBytes;
+var Path: string; Stream: TFileStream;
+begin
+  Result := nil;
+  if not RegistryHashIsCanonical(AHash) then Exit;
+  Path := RegistryStateDocumentPath(ARoot, AHash);
+  if not FileExists(Path) then Exit;
+  Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+  try
+    if Stream.Size > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Exit;
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
+  finally
+    Stream.Free;
+  end;
+  if SHA256BytesPrefixed(Result) <> AHash then Result := nil;
 end;
 
 function QuoteList(const AValues: TStringArray): string;
@@ -286,6 +358,13 @@ end;
 
 function LoadRegistryConsumerState(const AIdentity, ATrustKeyId: string;
   out AState: TLWPTRegistryConsumerState): Boolean;
+begin
+  Result := LoadRegistryConsumerStateAt(RegistryStateRoot, AIdentity,
+    ATrustKeyId, AState);
+end;
+
+function LoadRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
+  out AState: TLWPTRegistryConsumerState): Boolean;
 var
   Path, Text: string;
   Stream: TFileStream;
@@ -294,7 +373,7 @@ var
   Sequence: Int64;
 begin
   AState := Default(TLWPTRegistryConsumerState);
-  Path := RegistryStatePath(AIdentity, ATrustKeyId);
+  Path := RegistryStatePathAt(ARoot, AIdentity, ATrustKeyId);
   if not FileExists(Path) then Exit(False);
   Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
   try
@@ -379,17 +458,46 @@ begin
 end;
 
 procedure MergeRegistryConsumerState(const AIdentity, ATrustKeyId: string;
-  const AState: TLWPTRegistryConsumerState);
+  const AState: TLWPTRegistryConsumerState;
+  const ARotations: TLWPTRegistryRotationProofArray);
+begin
+  MergeRegistryConsumerStateAt(RegistryStateRoot, AIdentity, ATrustKeyId,
+    AState, ARotations);
+end;
+
+function StateLeaseWaitMilliseconds: QWord;
+begin
+  Result := RegistryStateLeaseWaitMilliseconds;
+  {$IFDEF INSTALL_TESTING}
+  if TestSeamValue('REGISTRY_STATE_LEASE_MS') <> '' then
+    Result := StrToIntDef(TestSeamValue('REGISTRY_STATE_LEASE_MS'), 0);
+  {$ENDIF}
+end;
+
+procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
+  const AState: TLWPTRegistryConsumerState;
+  const ARotations: TLWPTRegistryRotationProofArray);
 var
   Root, Path: string;
   Coordinator: TLWPTProducerLeaseCoordinator;
   Lease: TLWPTProducerLease;
   Current, Merged: TLWPTRegistryConsumerState;
   StartedAt: QWord;
+  Index: Integer;
+
+  procedure StoreDocument(const ABytes: TBytes);
+  var DocumentPath: string;
+  begin
+    DocumentPath := RegistryStateDocumentPath(Root, SHA256BytesPrefixed(ABytes));
+    if FileExists(DocumentPath) then Exit;
+    ForceDirectories(ExtractFileDir(DocumentPath));
+    AtomicWriteBytes(DocumentPath, Root + '/tmp', ABytes);
+  end;
+
 begin
   if AState.State.Sequence < 1 then Exit;
-  Root := RegistryStateRoot;
-  Path := RegistryStatePath(AIdentity, ATrustKeyId);
+  Root := ExcludeTrailingPathDelimiter(ARoot);
+  Path := RegistryStatePathAt(Root, AIdentity, ATrustKeyId);
   ForceDirectories(Root + '/locks');
   ForceDirectories(Root + '/tmp');
   Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
@@ -400,14 +508,26 @@ begin
       Lease := Coordinator.TryAcquire('registry-state:' + ExtractFileName(Path),
         'registry consumer state for ' + AIdentity);
       if Assigned(Lease) then Break;
-      if GetTickCount64 - StartedAt > RegistryStateLeaseWaitMilliseconds then
+      if GetTickCount64 - StartedAt > StateLeaseWaitMilliseconds then
         raise ELWPTRegistryError.CreateStable('registry_state_locked',
           'another process holds the per-user registry state for ' + AIdentity);
       Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
     until False;
+    {$IFDEF INSTALL_TESTING}
+    if TestSeamValue('FAIL_REGISTRY_STATE_WRITE') = '1' then
+      raise ELWPTRegistryError.CreateStable('registry_state_write_failed',
+        'injected per-user registry state write failure');
+    {$ENDIF}
+    for Index := 0 to High(ARotations) do
+    begin
+      StoreDocument(ARotations[Index].Document);
+      StoreDocument(ARotations[Index].OldSignature);
+      StoreDocument(ARotations[Index].NewSignature);
+    end;
     Merged := AState;
     Merged.State.Origin := AIdentity;
-    if LoadRegistryConsumerState(AIdentity, ATrustKeyId, Current) then
+    Current := Default(TLWPTRegistryConsumerState);
+    if LoadRegistryConsumerStateAt(Root, AIdentity, ATrustKeyId, Current) then
       Merged := MergeRegistryAcceptedStates(Current, AState)
     else
       Merged.State.ClockFloor := RegistryLaterTimestamp(
@@ -614,14 +734,112 @@ begin
     and RegistryURIIsCanonical(AIdentity, True);
 end;
 
-constructor TLWPTRegistrySession.Create(
+constructor TLWPTRegistrySession.Create(AOwner: TLWPTRegistryConsumer;
   const ADeclaration: TLWPTRegistryDeclaration;
   const ALockTables: TLWPTRegistryLockTableArray);
 begin
   inherited Create;
+  FOwner := AOwner;
   FDeclaration := ADeclaration;
   FIdentity := ADeclaration.Identity;
   FLockTables := ALockTables;
+  FConstraints := TStringList.Create;
+end;
+
+destructor TLWPTRegistrySession.Destroy;
+begin
+  FConstraints.Free;
+  inherited Destroy;
+end;
+
+procedure TLWPTRegistrySession.MarkAmbiguous(const AMessage: string);
+begin
+  FLockAmbiguity := AMessage;
+end;
+
+procedure TLWPTRegistrySession.SetLockedIdentity(const AIdentity: string);
+begin
+  if AIdentity <> '' then
+  begin
+    FOwner.RequireUniqueIdentity(Self, AIdentity);
+    RequireConstraints(AIdentity);
+  end;
+  FLockedIdentity := AIdentity;
+end;
+
+procedure TLWPTRegistrySession.RequireConstraints(const AIdentity: string);
+var Index: Integer;
+begin
+  for Index := 0 to FConstraints.Count - 1 do
+    if FConstraints.Names[Index] <> AIdentity then
+      raise EManifestError.CreateFmt(
+        'workspace member "%s" declares [registries.%s] with identity %s, '
+        + 'but the root registry resolves to %s; an alias shared with the '
+        + 'root must name the same identity and pin',
+        [FConstraints.ValueFromIndex[Index], FDeclaration.Alias,
+         FConstraints.Names[Index], AIdentity]);
+end;
+
+procedure TLWPTRegistrySession.RequireIdentity(const AIdentity, AMember: string);
+var Known: string;
+begin
+  FConstraints.Add(AIdentity + '=' + AMember);
+  Known := FIdentity;
+  if Known = '' then Known := FLockedIdentity;
+  if Known <> '' then RequireConstraints(Known);
+end;
+
+{ The exact rotation chain of an accepted state, from the per-user document
+  store or the committed proofs. False when any document is unavailable. }
+function TLWPTRegistrySession.AcceptedChain(const AHashes: TStringArray;
+  out AChain: TLWPTRegistryRotationProofArray): Boolean;
+
+  function Load(const AHash: string): TBytes;
+  var Path: string; Stream: TFileStream;
+  begin
+    Result := LoadRegistryStateDocument(RegistryStateRoot, AHash);
+    if (Result <> nil) or (FOwner.ArchivesRoot = '') then Exit;
+    Path := RegistryProofPath(FOwner.ArchivesRoot, AHash);
+    if not FileExists(Path) then Exit;
+    Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+    try
+      if Stream.Size > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES then Exit;
+      SetLength(Result, Stream.Size);
+      if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
+    finally
+      Stream.Free;
+    end;
+    if SHA256BytesPrefixed(Result) <> AHash then Result := nil;
+  end;
+
+var Index: Integer;
+begin
+  AChain := nil;
+  Result := (Length(AHashes) mod 3) = 0;
+  if not Result then Exit;
+  SetLength(AChain, Length(AHashes) div 3);
+  for Index := 0 to High(AChain) do
+  begin
+    AChain[Index].Document := Load(AHashes[3 * Index]);
+    AChain[Index].OldSignature := Load(AHashes[3 * Index + 1]);
+    AChain[Index].NewSignature := Load(AHashes[3 * Index + 2]);
+    if (AChain[Index].Document = nil) or (AChain[Index].OldSignature = nil)
+       or (AChain[Index].NewSignature = nil) then
+    begin
+      AChain := nil;
+      Exit(False);
+    end;
+  end;
+end;
+
+{ True when ALeft's hashes are a prefix of ARight's. }
+function RotationPrefix(const ALeft, ARight: TStringArray): Boolean;
+var Index: Integer;
+begin
+  Result := Length(ALeft) <= Length(ARight);
+  if not Result then Exit;
+  for Index := 0 to High(ALeft) do
+    if ALeft[Index] <> ARight[Index] then Exit(False);
 end;
 
 function TLWPTRegistrySession.Trust: TLWPTRegistryTrust;
@@ -721,6 +939,8 @@ var
   Rotation: TLWPTUntrustedRegistryRotation;
   Index: Integer;
   Head: TLWPTVerifiedRegistry;
+  Chain: TLWPTRegistryRotationProofArray;
+  VerifyNow: string;
 begin
   Budget := TLWPTRegistryMetadataBudget.Create(DefaultRegistryVerificationLimits);
   Acquisition := TLWPTConsumerAcquisition.Create(Budget);
@@ -739,6 +959,8 @@ begin
     Candidate := Acquisition.Identity;
     if FDeclaration.Identity = '' then
     begin
+      FOwner.RequireUniqueIdentity(Self, Candidate);
+      RequireConstraints(Candidate);
       if not IdentityIsAcceptable(Candidate) then
         raise ELWPTRegistryError.CreateStable('registry_identity_invalid',
           '[registries.' + FDeclaration.Alias + '] contact ' + AContact
@@ -767,6 +989,13 @@ begin
       { A clock behind accepted state is local; no contact can satisfy it. }
       RequireRegistryClockAtFloor(ANow, RegistryLaterTimestamp(
         Prior.State.ClockFloor, Prior.State.PublishedAt));
+      { Supply the authenticated accepted chain, as the mirror does, so an
+        older checkpoint signed by an earlier key is judged stale against
+        it. A contact's own chain replaces it only when it extends it. }
+      if AcceptedChain(Prior.Rotations, Chain)
+         and RotationPrefix(RegistryRotationHashes(Acquisition.Proof.Rotations),
+           Prior.Rotations) then
+        Acquisition.Proof.Rotations := Chain;
       if Prior.State.KeyId = FDeclaration.KeyId then
         Prior.State.PublicKey := FDeclaration.PublicKey
       else if Prior.State.PublicKey = '' then
@@ -784,8 +1013,11 @@ begin
     Source.API := Acquisition.Discovery.API;
     Source.Policy := RegistryContactDestination(AContact);
     Source.Deadline := Acquisition.Deadline;
+    { Freshness is judged when the proof is verified, not when the install
+      started: requests to this and earlier contacts take time. }
+    VerifyNow := RegistryTimestampNow;
     Head := VerifyRegistryProof(Acquisition.Proof, TrustRoot, Prior.State,
-      ANow, rvmAcquire, Source, DefaultRegistryVerificationLimits);
+      VerifyNow, rvmAcquire, Source, DefaultRegistryVerificationLimits);
     { Every recorded state must lie on the verified history: the older of
       the two priors and the lock's selection proof. }
     RequireOnHistory(Head, UserState.State.Sequence, UserState.State.Snapshot,
@@ -827,6 +1059,8 @@ var
   Floor: string;
 begin
   if FAttempted then Exit;
+  if FLockAmbiguity <> '' then
+    raise EManifestError.Create(FLockAmbiguity);
   FAttempted := True;
   Now := RegistryTimestampNow;
   { With a known identity the floor is checked before any request. }
@@ -935,12 +1169,79 @@ end;
   --------------------------------------------------------------------------- }
 
 constructor TLWPTRegistryConsumer.Create(const ARoot: TManifest;
-  const ALockTables: TLWPTRegistryLockTableArray);
+  const ALockTables: TLWPTRegistryLockTableArray;
+  const AArchivesRoot: string);
 begin
   inherited Create;
   FRoot := ARoot;
   FLockTables := ALockTables;
+  FArchivesRoot := AArchivesRoot;
   FSessions := TList.Create;
+end;
+
+procedure TLWPTRegistryConsumer.RequireUniqueIdentity(
+  ASession: TLWPTRegistrySession; const AIdentity: string);
+var Index: Integer; Other: TLWPTRegistrySession; Alias: string;
+begin
+  Alias := '';
+  for Index := 0 to High(FRoot.Registries) do
+    if (FRoot.Registries[Index].Alias <> ASession.Alias)
+       and (FRoot.Registries[Index].Identity = AIdentity) then
+      Alias := FRoot.Registries[Index].Alias;
+  for Index := 0 to FSessions.Count - 1 do
+  begin
+    Other := SessionAt(Index);
+    if (Other <> ASession) and ((Other.Identity = AIdentity)
+       or (Other.LockedIdentity = AIdentity)) then
+      Alias := Other.Alias;
+  end;
+  if Alias <> '' then
+    raise EManifestError.CreateFmt(
+      'registries %s and %s both resolve to origin %s; one origin may be '
+      + 'declared under only one alias. Declare distinct identities or '
+      + 'remove one alias', [Alias, ASession.Alias, AIdentity]);
+end;
+
+procedure TLWPTRegistryConsumer.RecheckFreshness;
+var Index: Integer; Session: TLWPTRegistrySession; Now: string;
+begin
+  Now := RegistryTimestampNow;
+  for Index := 0 to FSessions.Count - 1 do
+  begin
+    Session := SessionAt(Index);
+    if not Session.Acquired then Continue;
+    RequireRegistryClockAtFloor(Now, RegistryLaterTimestamp(
+      Session.Accepted.State.ClockFloor, Session.Accepted.State.PublishedAt));
+    if Session.Verified.ExpiresAt <= Now then
+      raise ELWPTRegistryStaleContactError.CreateStable('checkpoint_expired',
+        'the checkpoint of ' + Session.Identity + ' verified through '
+        + Session.Contact + ' expired at ' + Session.Verified.ExpiresAt
+        + ' before the install could publish; nothing was published. Run '
+        + 'the install again');
+  end;
+end;
+
+procedure TLWPTRegistryConsumer.PersistAcceptedState;
+var Index: Integer; Session: TLWPTRegistrySession;
+begin
+  for Index := 0 to FSessions.Count - 1 do
+  begin
+    Session := SessionAt(Index);
+    if not Session.Acquired then Continue;
+    try
+      MergeRegistryConsumerState(Session.Identity, Session.Declaration.KeyId,
+        Session.UserAccepted, Session.ProofRotations);
+    except
+      on E: Exception do
+        raise ELWPTRegistryError.CreateStable('registry_state_not_persisted',
+          'per-user registry state for ' + Session.Identity + ' in '
+          + RegistryStateRoot + ' could not be updated (' + E.Message
+          + '); nothing was published, because this state is the only '
+          + 'record of the accepted high-water mark when ' + LWPT.Core.LOCKFILE
+          + ' does not change. Fix the state directory or set '
+          + REGISTRY_STATE_DIR_ENV + ', then run the install again');
+    end;
+  end;
 end;
 
 destructor TLWPTRegistryConsumer.Destroy;
@@ -974,7 +1275,7 @@ begin
     raise EManifestError.CreateFmt(
       'registry alias "%s" is not declared; add [registries.%s] with its '
       + 'identity and key to the root %s', [AAlias, AAlias, MANIFEST_FILE]);
-  Result := TLWPTRegistrySession.Create(Declaration, FLockTables);
+  Result := TLWPTRegistrySession.Create(Self, Declaration, FLockTables);
   FSessions.Add(Result);
 end;
 

@@ -3266,8 +3266,6 @@ var
   var
     k: Integer;
     RootDeclaration: TLWPTRegistryDeclaration;
-    Session: TLWPTRegistrySession;
-    Established: string;
 
     procedure Mismatch;
     begin
@@ -3289,16 +3287,12 @@ var
            and (RootDeclaration.Identity <> '')
            and (AMember.Registries[k].Identity <> RootDeclaration.Identity)) then
         Mismatch;
+      { The root omits identity: the member's identity constrains the one
+        the root declaration locks or establishes, now or later. }
       if (AMember.Registries[k].Identity <> '')
          and (RootDeclaration.Identity = '') then
-      begin
-        Session := AConsumer.SessionForAlias(RootDeclaration.Alias);
-        Established := Session.Identity;
-        if Established = '' then Established := Session.LockedIdentity;
-        if (Established <> '')
-           and (Established <> AMember.Registries[k].Identity) then
-          Mismatch;
-      end;
+        AConsumer.SessionForAlias(RootDeclaration.Alias).RequireIdentity(
+          AMember.Registries[k].Identity, AMemberName);
     end;
   end;
 
@@ -4425,6 +4419,9 @@ begin
     end;
 
     try
+      { Checkpoint freshness is judged again immediately before the first
+        committed move, after every archive transfer. }
+      if AConsumer <> nil then AConsumer.RecheckFreshness;
       PublishPlan;
     except
       on E: Exception do
@@ -5080,46 +5077,134 @@ begin
 end;
 
 { A declaration without identity keeps the identity its contacts advertised
-  when it was locked: taken from the lock entries of root dependencies that
-  use the alias, else from the only lock table pinned to its key. }
+  when it was locked. The binding is recovered from the lock entries of every
+  registry dependency the root or a workspace member declares through that
+  alias; failing that, from the only unclaimed lock table pinned to its key.
+  A binding that cannot be decided is marked ambiguous: acquiring it fails
+  rather than treating an advertisement as first discovery (decision 2). }
 procedure AssignLockedRegistryIdentities(AConsumer: TLWPTRegistryConsumer;
   const AMan: TManifest; const AOldLock: TResolvedArray);
 var
-  DeclarationIndex, DepIndex, LockIndex, Matches: Integer;
+  Deps: array of TDependency;
+  Bound: array of TStringList;
+  Claimed: TStringList;
+  DeclarationIndex, DepIndex, LockIndex, WorkspaceIndex, Matches: Integer;
   Declaration: TLWPTRegistryDeclaration;
-  Identity, Candidate: string;
-begin
-  for DeclarationIndex := 0 to High(AMan.Registries) do
+  Member: TManifest;
+  Alias, Candidate: string;
+
+  procedure AddDeps(const AFrom: array of TDependency);
+  var k: Integer;
   begin
-    Declaration := AMan.Registries[DeclarationIndex];
-    if Declaration.Identity <> '' then Continue;
-    Identity := '';
-    for DepIndex := 0 to High(AMan.Deps) do
+    for k := 0 to High(AFrom) do
+      if AFrom[k].SrcKind = skRegistry then
+      begin
+        SetLength(Deps, Length(Deps) + 1);
+        Deps[High(Deps)] := AFrom[k];
+      end;
+  end;
+
+  function Names(AList: TStringList): string;
+  var k: Integer;
+  begin
+    Result := '';
+    for k := 0 to AList.Count - 1 do
     begin
-      if (AMan.Deps[DepIndex].SrcKind <> skRegistry)
-         or (RegistryAliasFor(AMan, AMan.Deps[DepIndex]) <> Declaration.Alias) then
-        Continue;
-      for LockIndex := 0 to High(AOldLock) do
-        if SameText(AOldLock[LockIndex].Name, AMan.Deps[DepIndex].Name)
-           and (AOldLock[LockIndex].SrcKind = skRegistry)
-           and (AOldLock[LockIndex].RegistryOrigin <> '') then
-          Identity := AOldLock[LockIndex].RegistryOrigin;
-      if Identity <> '' then Break;
+      if Result <> '' then Result := Result + ', ';
+      Result := Result + AList[k];
     end;
-    if Identity = '' then
+  end;
+
+begin
+  Deps := nil;
+  AddDeps(AMan.Deps);
+  for WorkspaceIndex := 0 to High(AMan.Workspaces) do
+    try
+      Member := LoadManifest(IncludeTrailingPathDelimiter(
+        AMan.Workspaces[WorkspaceIndex].Path) + MANIFEST_FILE, False);
+      AddDeps(Member.Deps);
+    except
+      { A member that fails to load fails again, with its own diagnostic,
+        when the resolver stages it. }
+      on E: EManifestError do;
+    end;
+  SetLength(Bound, Length(AMan.Registries));
+  Claimed := TStringList.Create;
+  try
+    Claimed.Sorted := True;
+    Claimed.Duplicates := dupIgnore;
+    Claimed.CaseSensitive := True;
+    for DeclarationIndex := 0 to High(AMan.Registries) do
     begin
+      Bound[DeclarationIndex] := TStringList.Create;
+      Bound[DeclarationIndex].Sorted := True;
+      Bound[DeclarationIndex].Duplicates := dupIgnore;
+      Bound[DeclarationIndex].CaseSensitive := True;
+      if AMan.Registries[DeclarationIndex].Identity <> '' then
+        Claimed.Add(AMan.Registries[DeclarationIndex].Identity);
+    end;
+    for DepIndex := 0 to High(Deps) do
+    begin
+      try
+        Alias := RegistryAliasFor(AMan, Deps[DepIndex]);
+      except
+        on E: EManifestError do Continue;
+      end;
+      for DeclarationIndex := 0 to High(AMan.Registries) do
+        if AMan.Registries[DeclarationIndex].Alias = Alias then
+          for LockIndex := 0 to High(AOldLock) do
+            if SameText(AOldLock[LockIndex].Name, Deps[DepIndex].Name)
+               and (AOldLock[LockIndex].SrcKind = skRegistry)
+               and (AOldLock[LockIndex].RegistryOrigin <> '') then
+            begin
+              Bound[DeclarationIndex].Add(AOldLock[LockIndex].RegistryOrigin);
+              Claimed.Add(AOldLock[LockIndex].RegistryOrigin);
+            end;
+    end;
+    for DeclarationIndex := 0 to High(AMan.Registries) do
+    begin
+      Declaration := AMan.Registries[DeclarationIndex];
+      if Declaration.Identity <> '' then Continue;
+      if Bound[DeclarationIndex].Count > 1 then
+      begin
+        AConsumer.SessionForAlias(Declaration.Alias).MarkAmbiguous(Format(
+          '%s records several origins (%s) for [registries.%s], which '
+          + 'declares no identity. Declare identity = "<origin>" in '
+          + '[registries.%s]; an advertised identity is never chosen anew',
+          [LWPT.Core.LOCKFILE, Names(Bound[DeclarationIndex]),
+           Declaration.Alias, Declaration.Alias]));
+        Continue;
+      end;
+      if Bound[DeclarationIndex].Count = 1 then
+      begin
+        AConsumer.SessionForAlias(Declaration.Alias).LockedIdentity :=
+          Bound[DeclarationIndex][0];
+        Continue;
+      end;
       Matches := 0;
       Candidate := '';
       for LockIndex := 0 to High(AConsumer.LockTables) do
-        if AConsumer.LockTables[LockIndex].TrustKeyId = Declaration.KeyId then
+        if (AConsumer.LockTables[LockIndex].TrustKeyId = Declaration.KeyId)
+           and (Claimed.IndexOf(AConsumer.LockTables[LockIndex].Identity) < 0) then
         begin
           Inc(Matches);
-          Candidate := AConsumer.LockTables[LockIndex].Identity;
+          Candidate := Candidate + ' ' + AConsumer.LockTables[LockIndex].Identity;
         end;
-      if Matches = 1 then Identity := Candidate;
+      if Matches = 1 then
+        AConsumer.SessionForAlias(Declaration.Alias).LockedIdentity :=
+          Trim(Candidate)
+      else if Matches > 1 then
+        AConsumer.SessionForAlias(Declaration.Alias).MarkAmbiguous(Format(
+          '%s records several origins pinned to the key of [registries.%s] '
+          + '(%s), and none is bound to it by a locked dependency. Declare '
+          + 'identity = "<origin>" in [registries.%s]; an advertised '
+          + 'identity is never chosen anew',
+          [LWPT.Core.LOCKFILE, Declaration.Alias, Trim(Candidate),
+           Declaration.Alias]));
     end;
-    if Identity <> '' then
-      AConsumer.SessionForAlias(Declaration.Alias).LockedIdentity := Identity;
+  finally
+    for DeclarationIndex := 0 to High(Bound) do Bound[DeclarationIndex].Free;
+    Claimed.Free;
   end;
 end;
 
@@ -5162,7 +5247,6 @@ var
   RegistryMerged: TRegistryConsumerStateArray;
   RegistryDocuments: TRegistryProofDocumentArray;
   ProofsBackup, ProofsPublished: string;
-  RegistrySession: TLWPTRegistrySession;
   LockChanged: Boolean;
   {$IFDEF INSTALL_TESTING}
   TestCorruption: TStringList;
@@ -5236,7 +5320,7 @@ begin
     if not Frozen then
     begin
       Consumer := TLWPTRegistryConsumer.Create(Man,
-        LoadRegistryLockTables(LockfilePath));
+        LoadRegistryLockTables(LockfilePath), ArchivesRoot);
       AssignLockedRegistryIdentities(Consumer, Man, OldLock);
     end;
 
@@ -5460,6 +5544,11 @@ begin
     Result.LockfilePath := LockfilePath;
     Result.CfgPath := CfgPath;
     Result.Resolved := Resolved;
+    { Per-user accepted state advances on every successful acquisition,
+      whether or not the lock changed (decision 11). When the lock does not
+      change it is the only record of the new high-water mark, so failing to
+      persist it fails the install and rolls project state back. }
+    if Consumer <> nil then Consumer.PersistAcceptedState;
     MarkTransactionCommitted(RollbackRoot);
     FinalizeResolutionPublication(R);
     PublicationPending := False;
@@ -5467,22 +5556,6 @@ begin
     AtomicDiscardRetainedPath(LockfileBackup);
     AtomicDiscardRetainedPath(CfgBackup);
     if ProofsBackup <> '' then AtomicDiscardRetainedPath(ProofsBackup);
-    { Per-user accepted state advances on every successful acquisition,
-      whether or not the lock changed. }
-    if Consumer <> nil then
-      for i := 0 to Consumer.Count - 1 do
-      begin
-        RegistrySession := Consumer.Sessions[i];
-        if not RegistrySession.Acquired then Continue;
-        try
-          MergeRegistryConsumerState(RegistrySession.Identity,
-            RegistrySession.Declaration.KeyId, RegistrySession.UserAccepted);
-        except
-          on E: Exception do
-            WriteLn(ErrOutput, 'warning: per-user registry state for ',
-              RegistrySession.Identity, ' was not updated: ', E.Message);
-        end;
-      end;
     if ManifestBackup <> '' then
       AtomicDiscardRetainedPath(ManifestBackup);
     if DirectoryExists(RollbackRoot) then WipeDir(RollbackRoot);
