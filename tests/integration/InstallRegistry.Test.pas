@@ -96,6 +96,7 @@ type
     procedure TestTrustFailureAborts;
     procedure TestAllUnreachableReusesLock;
     procedure TestAllUnreachableWithoutLockFails;
+    procedure TestUnreachableReuseUnderAdvertisedIdentity;
     procedure TestClockBehindFloorAbortsBeforeRequests;
     procedure TestArchiveOnlyFromProofContact;
     procedure TestNoChurnAndEmptyStateRestoration;
@@ -924,6 +925,34 @@ begin
   end;
 end;
 
+procedure TInstallRegistry.TestUnreachableReuseUnderAdvertisedIdentity;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Before: string;
+  Run: TLwptResult;
+begin
+  CaseRoot := NewCase('unreachable-advertised');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, [], False),
+      'json = "registry:json"'#10);
+    ExpectSuccess('advertised baseline', Install(CaseRoot, ['install']));
+    Before := LockText(CaseRoot);
+    Origin.Mode := scmFail;
+    Run := Install(CaseRoot, ['install']);
+    ExpectSuccess('advertised reuse', Run);
+    Expect<Boolean>(Pos('reusing the locked selection json@1.0.0', Output(Run)) > 0)
+      .ToBe(True);
+    Expect<string>(LockText(CaseRoot)).ToBe(Before);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
 procedure TInstallRegistry.TestClockBehindFloorAbortsBeforeRequests;
 var
   Registry: TSyntheticRegistry;
@@ -1300,6 +1329,8 @@ begin
     TestAllUnreachableReusesLock);
   Test('#55: all request failures without a lock fail',
     TestAllUnreachableWithoutLockFails);
+  Test('#55: an advertised identity recorded in the lock verifies a reused '
+    + 'selection', TestUnreachableReuseUnderAdvertisedIdentity);
   Test('#55: a clock behind the recorded floor aborts before any request',
     TestClockBehindFloorAbortsBeforeRequests);
   Test('#55: archives come only from the contact that produced the proof',
