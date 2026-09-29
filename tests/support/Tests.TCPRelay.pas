@@ -216,6 +216,11 @@ var
   Received, Sent, Offset: Integer;
 begin
   repeat
+    { Polled, so teardown ends a copy through Terminate on every platform:
+      Windows does not wake a receive blocked on a socket that another
+      thread shuts down. }
+    if Terminated then Exit;
+    if not WaitRelaySocket(FFrom, False, POLL_MILLISECONDS) then Continue;
     {$IFDEF UNIX}
     Received := fpRecv(FFrom, @Buffer[0], SizeOf(Buffer), 0);
     {$ELSE}
@@ -401,10 +406,12 @@ begin
     LeaveCriticalSection(FLock);
   end;
   WaitFor;
-  { Sockets tracked after the first sweep, and the copies' own ends. }
+  { Sockets added after the first sweep; the copies, now that the relay
+    thread no longer adds any, end within one poll slice. }
   for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
   for Index := 0 to FPumps.Count - 1 do
   begin
+    TRelayPump(FPumps[Index]).Terminate;
     TRelayPump(FPumps[Index]).WaitFor;
     TRelayPump(FPumps[Index]).Free;
   end;
