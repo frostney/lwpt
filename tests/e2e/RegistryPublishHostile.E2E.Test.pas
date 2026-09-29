@@ -455,7 +455,7 @@ begin
     .ToBe(201);
   Expect<Integer>(AOrigin.Request('PUT', '/v1/packages/' + AName + '/1.0.0',
     [Authorization], RawHTTPBytes('schema = "' + RegistryProgramName
-      + '-registry-package-v1"' + #10 + 'origin = "' + AOrigin.Base + '"' + #10
+      + '-registry-package-v1"' + #10 + 'origin = "' + AOrigin.Identity + '"' + #10
       + 'name = "' + AName + '"' + #10 + 'version = "1.0.0"' + #10
       + 'archive = "' + RegistryArtifactHash(Archive) + '"' + #10
       + 'archive_size = ' + IntToStr(Length(Archive)) + #10

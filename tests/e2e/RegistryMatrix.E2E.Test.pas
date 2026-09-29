@@ -18,6 +18,8 @@ program RegistryMatrix.E2E.Test;
     fails closed without changing the data directory;
   - a pointer-first backup taken while publishing, its restore, and the
     rollback hazard an older restore creates for mirrors.
+  - an origin whose port is taken before it starts, which relocates while
+    publication and consumers keep its identity.
 
   Every child process is bound to this program, bounded, and stopped by the
   case's cleanup, including after a failure. A failing case prints its
@@ -45,6 +47,7 @@ uses
   Tests.RegistryOrigin,
   Tests.RegistryProcess,
   Tests.RegistryPublish,
+  Tests.RegistryServer,
   Tests.Scratch;
 
 const
@@ -119,6 +122,7 @@ type
     procedure ExpectSchemaRefused(const ARoot, AFile, AOld, ANew,
       ACode: string; const ACommands: array of string);
     procedure BodyBackupAndRestore;
+    procedure BodyPortCollision;
   protected
     procedure BeforeAll; override;
     procedure AfterAll; override;
@@ -131,6 +135,7 @@ type
     procedure TestHTTPSDeployments;
     procedure TestSchemaVersions;
     procedure TestBackupAndRestore;
+    procedure TestPortCollision;
   end;
 
 { --- small helpers ------------------------------------------------------- }
@@ -1159,6 +1164,56 @@ begin
   Expect<Integer>(DocumentSequence(Run.Stdout)).ToBe(3);
 end;
 
+procedure TRegistryMatrixE2E.TestPortCollision;
+begin
+  Guard('h', BodyPortCollision);
+end;
+
+{ Another process holds the origin's port before it starts, so the start
+  must recover onto a fresh port. The contact URL moves; the identity that
+  publication reports and consumers pin does not. }
+procedure TRegistryMatrixE2E.BodyPortCollision;
+var
+  Origin: TPublishOrigin;
+  Occupier: TRegistryTestServer;
+  Token, Identity, Collided, Discovery, Lock: string;
+begin
+  Origin := NewOrigin('o');
+  Identity := Origin.Identity;
+  Token := Origin.IssueToken(['--packages', PACKAGE_NAME]);
+  { The occupier binds a kernel-chosen port first and the origin is then
+    configured for it, so the collision is certain rather than raced. }
+  Occupier := TRegistryTestServer.Create(nil, True);
+  try
+    Origin.MoveToPort(Occupier.Port);
+    Collided := Origin.Base;
+    Origin.Start;
+    FLog.Add('origin relocated from ' + Collided + ' to ' + Origin.Base);
+    Expect<Boolean>(Origin.Base <> Collided).ToBe(True);
+    Expect<string>(Origin.Identity).ToBe(Identity);
+    Discovery := OriginText(Origin, '/.well-known/' + RegistryProgramName
+      + '-registry');
+    Expect<string>(DocumentField(Discovery, 'base_url')).ToBe(Origin.Base);
+    Expect<string>(DocumentField(Discovery, 'origin')).ToBe(Identity);
+    ExpectPublished(Publish('publish after relocation', Origin.Base,
+      Origin.KeyID, Origin.PublicKey, Token, '1.0.0', 'one'), Identity,
+      '1.0.0', 2);
+    Require('install from the relocated origin', Install('c1',
+      Registries(Identity, Origin.KeyID, Origin.PublicKey, Origin.Base, []),
+      '^1.0.0'));
+    ExpectInstalled('c1', 'one');
+    Lock := ReadBinaryFile(ConsumerRoot('c1') + '/p/lwpt.lock');
+    Expect<Boolean>(Contains(Lock, 'registryOrigin = "' + Identity + '"'))
+      .ToBe(True);
+    Expect<Boolean>(Contains(Lock, 'resolvedURL = "' + Origin.Base
+      + '/v1/objects/')).ToBe(True);
+    { Nothing ever talked to the process that held the port. }
+    Expect<Integer>(Occupier.RequestCount).ToBe(0);
+  finally
+    Occupier.Free;
+  end;
+end;
+
 procedure TRegistryMatrixE2E.SetupTests;
 begin
   Test('localhost HTTP development: init policy, live publish, reads, install, and restart',
@@ -1175,6 +1230,8 @@ begin
     TestSchemaVersions);
   Test('a pointer-first backup restores a verifiable origin and a rollback is refused',
     TestBackupAndRestore);
+  Test('an origin whose port is taken before it starts relocates and keeps its identity',
+    TestPortCollision);
 end;
 
 begin

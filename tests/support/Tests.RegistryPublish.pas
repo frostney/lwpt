@@ -48,6 +48,9 @@ type
     destructor Destroy; override;
     { Re-runs init to move the listener, keeping identity and keys. }
     procedure Listen(const APort: Word);
+    { Points the stopped origin's base URL and listener at APort, e.g. a
+      port a test already holds to force a start-time collision. }
+    procedure MoveToPort(const APort: Word);
     function IssueToken(const AExtra: array of string): string;
     procedure RevokeToken(const AToken: string);
     { Rewrites the token record so it expired long ago. }
@@ -397,6 +400,14 @@ begin
     '--port', IntToStr(APort)], FScratch, [], PUBLISH_RUN_TIMEOUT_MILLISECONDS);
   if Run.ExitCode <> 0 then
     raise Exception.Create('registry re-init failed: ' + Run.Stderr);
+  FListenPort := APort;
+end;
+
+procedure TPublishOrigin.MoveToPort(const APort: Word);
+begin
+  if Assigned(FServe) then
+    raise Exception.Create('registry origin must be stopped before moving');
+  FBase := RelocateRegistryPortTo(FData, FBase, APort);
   FListenPort := APort;
 end;
 
