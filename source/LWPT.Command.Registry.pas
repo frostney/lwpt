@@ -23,10 +23,15 @@ function CmdRegistryServe(const ADataDirectory: string): Integer;
 function CmdRegistrySync(const ADataDirectory: string): Integer;
 function CmdRegistryVerify(const ADataDirectory: string): Integer;
 function CmdRegistryRotateKey(const ADataDirectory, AExpectedKeyID: string): Integer;
+{ Issues a publication token; the token is the command's only stdout line. }
+function CmdRegistryIssueToken(const ADataDirectory, APackages, AActions,
+  AExpiresDays, ALabel: string): Integer;
+function CmdRegistryRevokeToken(const ADataDirectory, ATokenID: string): Integer;
 
 implementation
 
 uses
+  Classes,
   DateUtils,
   SysUtils,
   {$IFDEF UNIX}
@@ -36,9 +41,12 @@ uses
   Windows,
   {$ENDIF}
 
+  LWPT.Core,
+  LWPT.OutputRenderer,
   LWPT.Registry.Mirror,
   LWPT.Registry.Server,
-  LWPT.Registry.Store;
+  LWPT.Registry.Store,
+  LWPT.Registry.Tokens;
 
 var
   ActiveRegistryServer: TLWPTRegistryServer = nil;
@@ -176,6 +184,9 @@ end;
 function CmdRegistryVerify(const ADataDirectory: string): Integer;
 var
   Store: TLWPTRegistryStore;
+  Tokens: TLWPTRegistryTokenArray;
+  Line: string;
+  Index: Integer;
 begin
   Store := OpenRegistryStore(ADataDirectory);
   try
@@ -185,6 +196,14 @@ begin
       WriteLn('role = "origin"');
       WriteLn('origin = ', RegistryTOMLQuote(Store.Config.Identity));
       WriteLn('sequence = ', Store.LoadCurrentState.Sequence);
+      Tokens := ListRegistryTokens(ADataDirectory);
+      Line := 'tokens = [';
+      for Index := 0 to High(Tokens) do
+      begin
+        if Index > 0 then Line := Line + ', ';
+        Line := Line + RegistryTokenMetadata(Tokens[Index]);
+      end;
+      WriteLn(Line, ']');
     end;
   finally
     Store.Free;
@@ -192,11 +211,80 @@ begin
   Result := 0;
 end;
 
+function CmdRegistryIssueToken(const ADataDirectory, APackages, AActions,
+  AExpiresDays, ALabel: string): Integer;
+var
+  Actions: TLWPTRegistryTokenActions;
+  Days: Integer;
+  Parts: TStringList;
+  Patterns: array of string;
+  Index: Integer;
+  Token: string;
+  TokenRecord: TLWPTRegistryToken;
+begin
+  if APackages = '' then
+    raise ELWPTRegistryError.CreateStable('invalid_configuration',
+      'issue-token requires --packages');
+  Days := RegistryTokenDefaultExpiryDays;
+  if AExpiresDays <> '' then
+    if not TryStrToInt(AExpiresDays, Days) or (IntToStr(Days) <> AExpiresDays)
+      or (Days < RegistryTokenMinimumExpiryDays)
+      or (Days > RegistryTokenMaximumExpiryDays) then
+      raise ELWPTRegistryError.CreateStable('invalid_configuration',
+        '--expires-days must be a decimal integer from 1 to 365');
+  if AActions = '' then Actions := [rtaPublish]
+  else if not ParseRegistryTokenActions(AActions, Actions) then
+    raise ELWPTRegistryError.CreateStable('invalid_configuration',
+      '--actions must be publish, yank, or publish,yank');
+  Parts := TStringList.Create;
+  try
+    Parts.StrictDelimiter := True;
+    Parts.Delimiter := ',';
+    Parts.QuoteChar := #0;
+    Parts.DelimitedText := APackages;
+    SetLength(Patterns, Parts.Count);
+    for Index := 0 to Parts.Count - 1 do Patterns[Index] := Parts[Index];
+  finally
+    Parts.Free;
+  end;
+  Token := IssueRegistryToken(ADataDirectory, Patterns, Actions, Days, ALabel,
+    CurrentTimestamp, TokenRecord);
+  try
+    WriteCommandResultLine(Token);
+  finally
+    if Length(Token) > 0 then FillChar(Token[1], Length(Token), 0);
+  end;
+  Result := 0;
+end;
+
+function CmdRegistryRevokeToken(const ADataDirectory, ATokenID: string): Integer;
+begin
+  if ATokenID = '' then
+    raise ELWPTRegistryError.CreateStable('invalid_configuration',
+      'revoke-token requires --token-id');
+  if RevokeRegistryToken(ADataDirectory, ATokenID, CurrentTimestamp) then
+    WriteLn('revoked registry token ', ATokenID)
+  else WriteLn('registry token ', ATokenID, ' was already revoked');
+  Result := 0;
+end;
+
 function CmdRegistryServe(const ADataDirectory: string): Integer;
 var
   Server: TLWPTRegistryServer;
   Store: TLWPTRegistryStore;
+  {$IFDEF INSTALL_TESTING}
+  Barrier: string;
+  {$ENDIF}
 begin
+  {$IFDEF INSTALL_TESTING}
+  { <ready-path>|<release-path>: pause each publication between its durable
+    checkpoint and the pointer replacement, so a test can kill the server
+    there. }
+  Barrier := TestSeamValue('REGISTRY_PUBLICATION_BARRIER');
+  if Pos('|', Barrier) > 1 then
+    SetRegistryPublicationBarrierForTesting(Copy(Barrier, 1, Pos('|', Barrier) - 1),
+      Copy(Barrier, Pos('|', Barrier) + 1, MaxInt));
+  {$ENDIF}
   Store := OpenRegistryStore(ADataDirectory);
   try
     Server := TLWPTRegistryServer.Create(Store);

@@ -187,7 +187,8 @@ Discovery and capabilities advertise only the implemented read surface:
 checkpoint, key, package-record, snapshot, and object schemas with
 `snapshot-sync-v1`. [ADR-0045](0045-verified-registry-mirror.md) extends this
 with local signed key rotation and the `rotation-chain-v1` read endpoints.
-Package lists and remote publication remain issue #54 and are not advertised.
+Package lists and remote publication remained issue #54 and were not
+advertised here; [ADR-0049](0049-registry-remote-publication.md) adds them.
 
 ## Rejected alternatives
 

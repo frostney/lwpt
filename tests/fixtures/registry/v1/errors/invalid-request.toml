@@ -1,0 +1,5 @@
+schema = "lwpt-registry-error-v1"
+code = "invalid_request"
+message = "the publication request is invalid"
+request_id = "01j00000000000000000000005"
+retryable = false

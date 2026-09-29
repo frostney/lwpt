@@ -42,6 +42,9 @@ procedure WriteTextFile(const APath, AContent: string);
 procedure RecursiveDelete(const APath: string);
 function ReadBinaryFile(const APath: string): string;
 function TestCompilerExecutable: string;
+{ Creates APath with length ASize without writing its bytes. On Windows the
+  file is marked sparse first, so a large reservation costs no disk. }
+procedure CreateSparseFile(const APath: string; const ASize: Int64);
 
 implementation
 
@@ -372,6 +375,30 @@ begin
   try
     SetLength(Result, Stream.Size);
     if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure CreateSparseFile(const APath: string; const ASize: Int64);
+{$IFDEF MSWINDOWS}
+const
+  FSCTL_SET_SPARSE_LWPT = $000900C4;
+var
+  Returned: DWORD;
+{$ENDIF}
+var
+  Stream: TFileStream;
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    {$IFDEF MSWINDOWS}
+    Returned := 0;
+    Windows.DeviceIoControl(Stream.Handle, FSCTL_SET_SPARSE_LWPT, nil, 0, nil,
+      0, Returned, nil);
+    {$ENDIF}
+    Stream.Size := ASize;
   finally
     Stream.Free;
   end;

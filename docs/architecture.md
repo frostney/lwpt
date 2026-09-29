@@ -25,6 +25,11 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   five minutes of clock skew, and refuses to run while the local UTC clock is
   behind the highest accepted `published_at`, so mirror hosts need a
   synchronized clock that is never set back.
+  An origin with an active token accepts authenticated publication while it
+  serves: uploads stage in accounted `incoming/` reservations, commits use the
+  existing publication lease and checkpoint path with the server clock, and
+  `registry issue-token|revoke-token` manage hashed, scoped, expiring
+  credentials, per [ADR-0049](./adr/0049-registry-remote-publication.md).
   Publication and clients build on the wire contract in
   [`registry-spec.md`](./registry-spec.md).
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
@@ -399,7 +404,8 @@ tar.gz writer), `LWPT.Zip.pas` (the bounded in-tree zip container reader),
 `LWPT.ArchiveNormalize.pas` (publication input detection, the tar.gz scan, and
 zip normalization per [ADR-0049](./adr/0049-registry-remote-publication.md)),
 and the `LWPT.Registry.*` origin storage, signing,
-shared proof verification, mirror synchronization, HTTP routing, and native
+shared proof verification, mirror synchronization, HTTP routing, upload
+staging, publication tokens, audit records, publication handling, and native
 macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —

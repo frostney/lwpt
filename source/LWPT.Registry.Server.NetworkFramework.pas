@@ -11,10 +11,12 @@ unit LWPT.Registry.Server.NetworkFramework;
 interface
 
 uses
+  LWPT.Registry.Server,
   LWPT.Registry.Store;
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
+  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean;
+  AHandler: TLWPTRegistryMutationHandler);
 {$IFDEF REGISTRY_TESTING}
 function NetworkFrameworkTeardownOrderingIsSafeForTesting: Boolean;
 function NetworkFrameworkBlockABIIsCompleteForTesting: Boolean;
@@ -35,8 +37,7 @@ uses
   SysUtils,
 
   LWPT.Core,
-  LWPT.Registry.Filesystem,
-  LWPT.Registry.Server;
+  LWPT.Registry.Filesystem;
 
 {$linkframework Network}
 {$linkframework Security}
@@ -106,6 +107,9 @@ type
     FClosing: Boolean;
     FResponding: Boolean;
     FDeadline: QWord;
+    FPeer, FMethod: string;
+    FMutation: TLWPTRegistryMutation;
+    FRemaining: Int64;
     FResponseStream: TStream;
     FSendBuffer: TBytes;
     FSendData: Pointer;
@@ -119,7 +123,9 @@ type
     procedure SendCompleted(AError: Pointer);
     procedure SendCurrentBuffer;
     procedure SendNextResourceChunk;
-    procedure SendResponse;
+    procedure SendResponse(const AHeaderEnd: Integer);
+    procedure SendPrepared(AResponse: TLWPTRegistryHTTPResponse);
+    procedure FinishMutation;
   public
     destructor Destroy; override;
   end;
@@ -127,6 +133,7 @@ type
   TNetworkFrameworkRegistryServer = class
   private
     FStore: TLWPTRegistryStore;
+    FHandler: TLWPTRegistryMutationHandler;
     FListener: Pointer;
     FParameters: Pointer;
     FListenerQueue: Pointer;
@@ -153,7 +160,8 @@ type
     procedure LoadIdentity(const APath, APassphrase: string);
   public
     constructor Create(AStore: TLWPTRegistryStore;
-      const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
+      const APKCS12Path, APassphrase: string; AStopFlag: PBoolean;
+      AHandler: TLWPTRegistryMutationHandler);
     destructor Destroy; override;
     procedure Run;
   end;
@@ -336,6 +344,11 @@ procedure Nw_connection_set_queue(AConnection, AQueue: Pointer); cdecl;
 procedure Nw_connection_set_state_changed_handler(AConnection,
   ABlock: Pointer); cdecl;
   external name 'nw_connection_set_state_changed_handler';
+function Nw_connection_copy_endpoint(AConnection: Pointer): Pointer; cdecl;
+  external name 'nw_connection_copy_endpoint';
+function Nw_endpoint_copy_address_string(AEndpoint: Pointer): PAnsiChar; cdecl;
+  external name 'nw_endpoint_copy_address_string';
+procedure CFreeMemory(AValue: Pointer); cdecl; external name 'free';
 procedure Nw_connection_start(AConnection: Pointer); cdecl;
   external name 'nw_connection_start';
 procedure Nw_connection_cancel(AConnection: Pointer); cdecl;
@@ -571,6 +584,29 @@ begin
   end;
 end;
 
+{ The remote address as reported by Network.framework, or empty. It is
+  diagnostic and rate-limit metadata only. }
+function NetworkFrameworkPeerAddress(AConnection: Pointer): string;
+var
+  Endpoint: Pointer;
+  Address: PAnsiChar;
+begin
+  Result := '';
+  Endpoint := Nw_connection_copy_endpoint(AConnection);
+  if Endpoint = nil then Exit;
+  try
+    Address := Nw_endpoint_copy_address_string(Endpoint);
+    if Address <> nil then
+    try
+      Result := string(AnsiString(Address));
+    finally
+      CFreeMemory(Address);
+    end;
+  finally
+    Nw_release(Endpoint);
+  end;
+end;
+
 procedure NewConnectionInvoke(ABlock: PRegistryBlock;
   ANetworkConnection: Pointer); cdecl;
 var
@@ -589,6 +625,7 @@ begin
     end;
     Connection := TNetworkFrameworkRegistryConnection.Create;
     Connection.FServer := Server;
+    Connection.FPeer := NetworkFrameworkPeerAddress(ANetworkConnection);
     Connection.FDeadline := GetTickCount64
       + CONNECTION_DEADLINE_MILLISECONDS;
     Nw_retain(ANetworkConnection);
@@ -640,6 +677,16 @@ end;
 
 destructor TNetworkFrameworkRegistryConnection.Destroy;
 begin
+  { A head that began but never completed (peer EOF, a receive error, or
+    the connection deadline) is audited once by its method alone. }
+  if not FResponding and not Assigned(FMutation) and (FRequest <> '') then
+    RegistryAuditIncompleteRequest(FServer.FHandler,
+      Copy(string(FRequest), 1, 32), FPeer, GetTickCount64 >= FDeadline);
+  if Assigned(FMutation) then
+  begin
+    FMutation.Abort;
+    FreeAndNil(FMutation);
+  end;
   FResponseStream.Free;
   if FSendData <> nil then Dispatch_release(FSendData);
   inherited Destroy;
@@ -649,73 +696,148 @@ procedure TNetworkFrameworkRegistryConnection.Consume(const ABuffer: Pointer;
   const ALength: NativeUInt);
 var
   Chunk: AnsiString;
+  Count: NativeUInt;
+  HeaderEnd: Integer;
 begin
   if GetTickCount64 >= FDeadline then
   begin
     Cancel;
     Exit;
   end;
-  if Length(FRequest) + ALength > MAX_REQUEST_BYTES then
+  if Assigned(FMutation) then
   begin
-    Cancel;
+    Count := ALength;
+    if Int64(Count) > FRemaining then Count := NativeUInt(FRemaining);
+    try
+      if Count > 0 then FMutation.Feed(ABuffer^, Integer(Count));
+    except
+      Cancel;
+      Exit;
+    end;
+    Dec(FRemaining, Int64(Count));
+    if FRemaining = 0 then
+    begin
+      FResponding := True;
+      try
+        FinishMutation;
+      except
+        Cancel;
+      end;
+    end;
     Exit;
   end;
   SetString(Chunk, PAnsiChar(ABuffer), ALength);
   FRequest := FRequest + Chunk;
-  if Pos(#13#10#13#10, FRequest) > 0 then
+  HeaderEnd := Pos(#13#10#13#10, FRequest);
+  if ((HeaderEnd = 0) and (Length(FRequest) > MAX_REQUEST_BYTES))
+    or (HeaderEnd > MAX_REQUEST_BYTES) then
+  begin
+    FResponding := True;
+    FMethod := '';
+    try
+      SendPrepared(RegistryMalformedRequestResponse(FServer.FHandler,
+        string(FRequest), FPeer, 431, 'Request Header Fields Too Large',
+        'request_headers_too_large', 'request headers exceed 32 KiB'));
+    except
+      Cancel;
+    end;
+    FRequest := '';
+    Exit;
+  end;
+  if HeaderEnd > 0 then
   begin
     FResponding := True;
     try
-      SendResponse;
+      SendResponse(HeaderEnd);
     except
       Cancel;
     end;
   end;
 end;
 
-procedure TNetworkFrameworkRegistryConnection.SendResponse;
+procedure TNetworkFrameworkRegistryConnection.SendResponse(
+  const AHeaderEnd: Integer);
+var
+  Count: Integer;
+  Head: TLWPTRegistryRequestHead;
+  Leftover: AnsiString;
+  Mutation: TLWPTRegistryMutation;
+  Response: TLWPTRegistryHTTPResponse;
+begin
+  if not ParseRegistryRequestHead(Copy(string(FRequest), 1, AHeaderEnd - 1),
+    FPeer, Head) then
+  begin
+    FMethod := '';
+    Response := RegistryMalformedRequestResponse(FServer.FHandler,
+      string(FRequest), FPeer, 400, 'Bad Request', 'invalid_request',
+      'request line is invalid');
+    FRequest := '';
+    SendPrepared(Response);
+    Exit;
+  end;
+  FMethod := Head.Method;
+  { Admission and its refusal get their own processing deadline, so bounded
+    lease waits cannot outlast the header deadline and drop a retryable
+    answer. }
+  if not RegistryMethodIsRead(Head.Method) then
+    FDeadline := GetTickCount64 + RegistryMutationProcessingMilliseconds;
+  Response := RegistryDispatch(FServer.FStore, FServer.FHandler, Head,
+    CheckDeadline, Mutation);
+  if not Assigned(Mutation) then
+  begin
+    SendPrepared(Response);
+    Exit;
+  end;
+  FMutation := Mutation;
+  FRemaining := Mutation.BodyLength;
+  FDeadline := GetTickCount64 + RegistryBodyDeadlineMilliseconds(FRemaining);
+  Leftover := Copy(FRequest, AHeaderEnd + 4, MaxInt);
+  FRequest := '';
+  Count := Length(Leftover);
+  if Count > FRemaining then Count := Integer(FRemaining);
+  if Count > 0 then
+  begin
+    FMutation.Feed(Leftover[1], Count);
+    Dec(FRemaining, Count);
+  end;
+  if FRemaining = 0 then FinishMutation
+  { The receive callback re-arms while the body is incomplete. }
+  else FResponding := False;
+end;
+
+procedure TNetworkFrameworkRegistryConnection.FinishMutation;
+var
+  Response: TLWPTRegistryHTTPResponse;
+begin
+  FDeadline := GetTickCount64 + RegistryMutationProcessingMilliseconds;
+  Response := FMutation.Finish;
+  FreeAndNil(FMutation);
+  SendPrepared(Response);
+end;
+
+procedure TNetworkFrameworkRegistryConnection.SendPrepared(
+  AResponse: TLWPTRegistryHTTPResponse);
 var
   IncludeBody: Boolean;
-  Method, RequestLine, Target: string;
-  Response: TLWPTRegistryHTTPResponse;
-  Space: Integer;
 begin
-  RequestLine := Copy(string(FRequest), 1, Pos(#13#10, string(FRequest)) - 1);
-  Space := Pos(' ', RequestLine);
-  if Space = 0 then
-  begin
-    Cancel;
-    Exit;
-  end;
-  Method := Copy(RequestLine, 1, Space - 1);
-  Delete(RequestLine, 1, Space);
-  Space := Pos(' ', RequestLine);
-  if Space = 0 then
-  begin
-    Cancel;
-    Exit;
-  end;
-  Target := Copy(RequestLine, 1, Space - 1);
-  Response := RegistryHTTPResponse(FServer.FStore, Method, Target,
-    CheckDeadline);
-  IncludeBody := not SameText(Method, 'HEAD');
+  IncludeBody := not SameText(FMethod, 'HEAD');
   if GetTickCount64 >= FDeadline then
   begin
     Cancel;
     Exit;
   end;
-  if Response.ResourcePath <> '' then
+  if AResponse.ResourcePath <> '' then
   begin
     try
-      FResponseStream := OpenRegistryHTTPResource(Response, CheckDeadline);
+      FResponseStream := OpenRegistryHTTPResource(AResponse, CheckDeadline);
     except
       on E: Exception do
-        Response := RegistryResourceFailureResponse(E.Message);
+        AResponse := RegistryResourceFailureResponse(E.Message);
     end;
     if not IncludeBody then FreeAndNil(FResponseStream);
   end;
-  FSendBuffer := RegistryHTTPWireResponse(Response,
-    IncludeBody and (Response.ResourcePath = ''));
+  FSendBuffer := RegistryHTTPWireResponse(AResponse,
+    IncludeBody and (AResponse.ResourcePath = ''));
   SendCurrentBuffer;
 end;
 
@@ -1262,7 +1384,8 @@ begin
 end;
 
 constructor TNetworkFrameworkRegistryServer.Create(AStore: TLWPTRegistryStore;
-  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean);
+  const APKCS12Path, APassphrase: string; AStopFlag: PBoolean;
+  AHandler: TLWPTRegistryMutationHandler);
 var
   Endpoint: Pointer;
   Host, Port: AnsiString;
@@ -1270,6 +1393,7 @@ begin
   inherited Create;
   IsMultiThread := True;
   FStore := AStore;
+  FHandler := AHandler;
   FStopFlag := AStopFlag;
   FConnections := TList.Create;
   InitCriticalSection(FConnectionLock);
@@ -1444,14 +1568,15 @@ begin
 end;
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
+  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean;
+  AHandler: TLWPTRegistryMutationHandler);
 var
   Server: TNetworkFrameworkRegistryServer;
 begin
   Server := nil;
   try
     Server := TNetworkFrameworkRegistryServer.Create(AStore, APKCS12Path,
-      APassphrase, AStopFlag);
+      APassphrase, AStopFlag, AHandler);
   finally
     if Length(APassphrase) > 0 then
       FillChar(APassphrase[1], Length(APassphrase) * SizeOf(Char), 0);
@@ -1470,7 +1595,8 @@ initialization
 {$ELSE}
 
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
-  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean);
+  const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean;
+  AHandler: TLWPTRegistryMutationHandler);
 begin
   if Length(APassphrase) > 0 then
     FillChar(APassphrase[1], Length(APassphrase) * SizeOf(Char), 0);

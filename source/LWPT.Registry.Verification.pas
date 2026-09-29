@@ -187,6 +187,10 @@ function VerifyRegistryRotation(const ARotation: TLWPTRegistryRotationProof;
   const APreviousSequence, ACheckpointSequence: Int64): TLWPTUntrustedRegistryRotation;
 function ParseRegistryPackage(const AContent, AExpectedHash,
   AExpectedOrigin: string): TLWPTRegistryPackage;
+{ Content identity of two records for one package identity: archive,
+  archive size, and dependencies. published_at and yanked are excluded. }
+function RegistryPackageContentEqual(const ALeft,
+  ARight: TLWPTRegistryPackage): Boolean;
 
 { The caller must authenticate the captured head first. This verifies its
   complete hash-linked history and immutable package consistency, not trust. }
@@ -374,6 +378,11 @@ begin
     and (Valid(AValue, DefaultSemverOptions) = AValue);
 end;
 
+function RegistryVersionIsCanonical(const AValue: string): Boolean;
+begin
+  Result := IsCanonicalVersion(AValue);
+end;
+
 function RegistryPackageNameIsCanonical(const AValue: string): Boolean;
 var
   I: Integer;
@@ -384,11 +393,6 @@ begin
   for I := 2 to Length(AValue) do
     if not (AValue[I] in ['a'..'z', '0'..'9', '.', '_', '-']) then
       Exit(False);
-end;
-
-function RegistryVersionIsCanonical(const AValue: string): Boolean;
-begin
-  Result := IsCanonicalVersion(AValue);
 end;
 
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
@@ -1316,19 +1320,29 @@ begin
   Result := APackage.Origin + #0 + APackage.Name + #0 + APackage.Version;
 end;
 
-procedure VerifyImmutablePackage(const AOlder, ANewer: TLWPTRegistryPackage);
+function RegistryPackageContentEqual(const ALeft,
+  ARight: TLWPTRegistryPackage): Boolean;
 var
   Index: Integer;
 begin
+  Result := (ALeft.ArchiveHash = ARight.ArchiveHash)
+    and (ALeft.ArchiveSize = ARight.ArchiveSize)
+    and (Length(ALeft.Dependencies) = Length(ARight.Dependencies));
+  if not Result then Exit;
+  for Index := 0 to High(ALeft.Dependencies) do
+    if (ALeft.Dependencies[Index].Origin <> ARight.Dependencies[Index].Origin)
+      or (ALeft.Dependencies[Index].Name <> ARight.Dependencies[Index].Name)
+      or (ALeft.Dependencies[Index].Version <> ARight.Dependencies[Index].Version) then
+      Exit(False);
+end;
+
+procedure VerifyImmutablePackage(const AOlder, ANewer: TLWPTRegistryPackage);
+begin
   if (AOlder.ArchiveHash <> ANewer.ArchiveHash)
-    or (AOlder.ArchiveSize <> ANewer.ArchiveSize)
-    or (Length(AOlder.Dependencies) <> Length(ANewer.Dependencies)) then
+    or (AOlder.ArchiveSize <> ANewer.ArchiveSize) then
     raise ELWPTRegistryError.Create('identity_conflict: changed immutable content');
-  for Index := 0 to High(AOlder.Dependencies) do
-    if (AOlder.Dependencies[Index].Origin <> ANewer.Dependencies[Index].Origin)
-      or (AOlder.Dependencies[Index].Name <> ANewer.Dependencies[Index].Name)
-      or (AOlder.Dependencies[Index].Version <> ANewer.Dependencies[Index].Version) then
-      raise ELWPTRegistryError.Create('identity_conflict: changed dependencies');
+  if not RegistryPackageContentEqual(AOlder, ANewer) then
+    raise ELWPTRegistryError.Create('identity_conflict: changed dependencies');
   if (AOlder.RecordHash <> ANewer.RecordHash)
     and (AOlder.Yanked = ANewer.Yanked) then
     raise ELWPTRegistryError.Create('identity_conflict: invalid lifecycle change');

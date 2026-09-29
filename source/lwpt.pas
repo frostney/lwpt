@@ -17,7 +17,7 @@
     health    report Pascal complexity and optional Git hotspots
     agents    write/verify the agent-facing command reference in
               AGENTS.md (ADR-0027)
-    registry  initialize or serve a self-hosted origin (ADR-0043)
+    registry  initialize, serve, or accept publication on a self-hosted origin (ADR-0043, ADR-0049)
 
   earlier (ADR-0015) there was an eighth subcommand, `export`, which
   extruded the embedded TestingPascalLibrary blob into the consumer's
@@ -468,90 +468,145 @@ end;
 { --- registry ---------------------------------------------------------- }
 function HandleRegistry(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
+const
+  OPERATIONS = 'init, sync, verify, rotate-key, issue-token, revoke-token or serve';
 var
   Init: TLWPTRegistryInitOptions;
-  FromKey: string;
+  FromKey, Packages, Actions, ExpiresDays, TokenLabel, TokenID, Operation,
+    OptionName: string;
   Index: Integer;
   ServeConfigurationPresent, FromKeyPresent: Boolean;
+
+  function TokenOption(const AName: string): Boolean;
+  begin
+    Result := SameText(AName, 'packages') or SameText(AName, 'actions')
+      or SameText(AName, 'expires-days') or SameText(AName, 'label')
+      or SameText(AName, 'token-id');
+  end;
+
+  function OwnOption(const AName: string): Boolean;
+  begin
+    if SameText(AName, 'data-dir') or SameText(AName, 'silent') then Exit(True);
+    if SameText(Operation, 'issue-token') then
+      Exit(SameText(AName, 'packages') or SameText(AName, 'actions')
+        or SameText(AName, 'expires-days') or SameText(AName, 'label'));
+    if SameText(Operation, 'revoke-token') then
+      Exit(SameText(AName, 'token-id'));
+    Result := False;
+  end;
 begin
   if APositionals.Count <> 1 then
   begin
     WriteLn(ErrOutput, ErrPrefix('registry'),
-      'expected exactly one operation: init, sync, verify, rotate-key or serve');
+      'expected exactly one operation: ', OPERATIONS);
     Exit(1);
   end;
+  Operation := APositionals[0];
   Init := RegistryInitDefaults;
   FromKey := '';
+  Packages := '';
+  Actions := '';
+  ExpiresDays := '';
+  TokenLabel := '';
+  TokenID := '';
   FromKeyPresent := False;
   ServeConfigurationPresent := False;
-  for Index := 0 to High(AOptions) do
-  begin
-    if AOptions[Index].Present
-      and not SameText(AOptions[Index].LongName, 'data-dir')
-      and not SameText(AOptions[Index].LongName, 'silent') then
-      if not (SameText(APositionals[0], 'rotate-key')
-        and SameText(AOptions[Index].LongName, 'from-key')) then ServeConfigurationPresent := True;
-    if AOptions[Index] is TStringOption then
-    begin
-      if SameText(AOptions[Index].LongName, 'data-dir') then
-        Init.DataDirectory := TStringOption(AOptions[Index]).ValueOr(Init.DataDirectory)
-      else if SameText(AOptions[Index].LongName, 'identity') then
-        Init.Identity := TStringOption(AOptions[Index]).ValueOr(Init.Identity)
-      else if SameText(AOptions[Index].LongName, 'base-url') then
-        Init.BaseURL := TStringOption(AOptions[Index]).ValueOr(Init.BaseURL)
-      else if SameText(AOptions[Index].LongName, 'listen') then
-        Init.ListenAddress := TStringOption(AOptions[Index]).ValueOr(Init.ListenAddress)
-      else if SameText(AOptions[Index].LongName, 'tls-pkcs12') then
-        Init.TLSPKCS12Path := TStringOption(AOptions[Index]).ValueOr(Init.TLSPKCS12Path)
-      else if SameText(AOptions[Index].LongName, 'tls-password-env') then
-        Init.TLSPasswordEnvironment := TStringOption(AOptions[Index]).ValueOr(
-          Init.TLSPasswordEnvironment)
-      else if SameText(AOptions[Index].LongName, 'role') then
-        Init.Role := TStringOption(AOptions[Index]).ValueOr(Init.Role)
-      else if SameText(AOptions[Index].LongName, 'upstream') then
-        Init.Upstream := TStringOption(AOptions[Index]).ValueOr(Init.Upstream)
-      else if SameText(AOptions[Index].LongName, 'key-id') then
-        Init.KeyID := TStringOption(AOptions[Index]).ValueOr(Init.KeyID)
-      else if SameText(AOptions[Index].LongName, 'public-key') then
-        Init.PublicKey := TStringOption(AOptions[Index]).ValueOr(Init.PublicKey)
-      else if SameText(AOptions[Index].LongName, 'max-store-bytes') then
-        Init.MaximumStoreBytes := TStringOption(AOptions[Index]).ValueOr(Init.MaximumStoreBytes)
-      else if SameText(AOptions[Index].LongName, 'max-sync-bytes') then
-        Init.MaximumSyncBytes := TStringOption(AOptions[Index]).ValueOr(Init.MaximumSyncBytes)
-      else if SameText(AOptions[Index].LongName, 'from-key') then
-      begin
-        FromKey := TStringOption(AOptions[Index]).ValueOr(FromKey);
-        FromKeyPresent := AOptions[Index].Present;
-      end;
-    end
-    else if SameText(AOptions[Index].LongName, 'port') then
-      Init.Port := TIntegerOption(AOptions[Index]).ValueOr(Init.Port);
-  end;
   try
-    if SameText(APositionals[0], 'init') and FromKeyPresent then
+    for Index := 0 to High(AOptions) do
+    begin
+      OptionName := AOptions[Index].LongName;
+      if AOptions[Index].Present then
+      begin
+        if (SameText(Operation, 'issue-token')
+          or SameText(Operation, 'revoke-token'))
+          and not OwnOption(OptionName) then
+          raise ELWPTRegistryError.CreateStable('invalid_configuration',
+            Operation + ' does not accept --' + OptionName);
+        if TokenOption(OptionName) and not SameText(Operation, 'issue-token')
+          and not SameText(Operation, 'revoke-token') then
+          raise ELWPTRegistryError.CreateStable('invalid_configuration',
+            '--' + OptionName + ' is accepted only by issue-token or revoke-token');
+        if not SameText(OptionName, 'data-dir')
+          and not SameText(OptionName, 'silent')
+          and not (SameText(Operation, 'rotate-key')
+            and SameText(OptionName, 'from-key')) then
+          ServeConfigurationPresent := True;
+      end;
+      if AOptions[Index] is TStringOption then
+      begin
+        if SameText(OptionName, 'data-dir') then
+          Init.DataDirectory := TStringOption(AOptions[Index]).ValueOr(Init.DataDirectory)
+        else if SameText(OptionName, 'identity') then
+          Init.Identity := TStringOption(AOptions[Index]).ValueOr(Init.Identity)
+        else if SameText(OptionName, 'base-url') then
+          Init.BaseURL := TStringOption(AOptions[Index]).ValueOr(Init.BaseURL)
+        else if SameText(OptionName, 'listen') then
+          Init.ListenAddress := TStringOption(AOptions[Index]).ValueOr(Init.ListenAddress)
+        else if SameText(OptionName, 'tls-pkcs12') then
+          Init.TLSPKCS12Path := TStringOption(AOptions[Index]).ValueOr(Init.TLSPKCS12Path)
+        else if SameText(OptionName, 'tls-password-env') then
+          Init.TLSPasswordEnvironment := TStringOption(AOptions[Index]).ValueOr(
+            Init.TLSPasswordEnvironment)
+        else if SameText(OptionName, 'role') then
+          Init.Role := TStringOption(AOptions[Index]).ValueOr(Init.Role)
+        else if SameText(OptionName, 'upstream') then
+          Init.Upstream := TStringOption(AOptions[Index]).ValueOr(Init.Upstream)
+        else if SameText(OptionName, 'key-id') then
+          Init.KeyID := TStringOption(AOptions[Index]).ValueOr(Init.KeyID)
+        else if SameText(OptionName, 'public-key') then
+          Init.PublicKey := TStringOption(AOptions[Index]).ValueOr(Init.PublicKey)
+        else if SameText(OptionName, 'max-store-bytes') then
+          Init.MaximumStoreBytes := TStringOption(AOptions[Index]).ValueOr(Init.MaximumStoreBytes)
+        else if SameText(OptionName, 'max-sync-bytes') then
+          Init.MaximumSyncBytes := TStringOption(AOptions[Index]).ValueOr(Init.MaximumSyncBytes)
+        else if SameText(OptionName, 'packages') then
+          Packages := TStringOption(AOptions[Index]).ValueOr(Packages)
+        else if SameText(OptionName, 'actions') then
+          Actions := TStringOption(AOptions[Index]).ValueOr(Actions)
+        else if SameText(OptionName, 'expires-days') then
+          ExpiresDays := TStringOption(AOptions[Index]).ValueOr(ExpiresDays)
+        else if SameText(OptionName, 'label') then
+          TokenLabel := TStringOption(AOptions[Index]).ValueOr(TokenLabel)
+        else if SameText(OptionName, 'token-id') then
+          TokenID := TStringOption(AOptions[Index]).ValueOr(TokenID)
+        else if SameText(OptionName, 'from-key') then
+        begin
+          FromKey := TStringOption(AOptions[Index]).ValueOr(FromKey);
+          FromKeyPresent := AOptions[Index].Present;
+        end;
+      end
+      else if SameText(OptionName, 'port') then
+        Init.Port := TIntegerOption(AOptions[Index]).ValueOr(Init.Port);
+    end;
+    if SameText(Operation, 'init') and FromKeyPresent then
       raise ELWPTRegistryError.CreateStable('invalid_configuration', '--from-key is rotate-key only')
-    else if SameText(APositionals[0], 'init') then
+    else if SameText(Operation, 'init') then
       Result := CmdRegistryInit(Init)
-    else if SameText(APositionals[0], 'serve') or SameText(APositionals[0], 'sync')
-      or SameText(APositionals[0], 'verify') or SameText(APositionals[0], 'rotate-key') then
+    else if SameText(Operation, 'issue-token') then
+      Result := CmdRegistryIssueToken(Init.DataDirectory, Packages, Actions,
+        ExpiresDays, TokenLabel)
+    else if SameText(Operation, 'revoke-token') then
+      Result := CmdRegistryRevokeToken(Init.DataDirectory, TokenID)
+    else if SameText(Operation, 'serve') or SameText(Operation, 'sync')
+      or SameText(Operation, 'verify') or SameText(Operation, 'rotate-key') then
     begin
       if ServeConfigurationPresent then
       begin
-        if SameText(APositionals[0], 'rotate-key') then
+        if SameText(Operation, 'rotate-key') then
           WriteLn(ErrOutput, ErrPrefix('registry'), 'rotate-key accepts only --data-dir and --from-key')
         else WriteLn(ErrOutput, ErrPrefix('registry'),
-          APositionals[0], ' accepts only --data-dir; change persisted configuration with init');
+          Operation, ' accepts only --data-dir; change persisted configuration with init');
         Exit(1);
       end;
-      if SameText(APositionals[0], 'sync') then Result := CmdRegistrySync(Init.DataDirectory)
-      else if SameText(APositionals[0], 'verify') then Result := CmdRegistryVerify(Init.DataDirectory)
-      else if SameText(APositionals[0], 'rotate-key') then Result := CmdRegistryRotateKey(Init.DataDirectory, FromKey)
+      if SameText(Operation, 'sync') then Result := CmdRegistrySync(Init.DataDirectory)
+      else if SameText(Operation, 'verify') then Result := CmdRegistryVerify(Init.DataDirectory)
+      else if SameText(Operation, 'rotate-key') then Result := CmdRegistryRotateKey(Init.DataDirectory, FromKey)
       else Result := CmdRegistryServe(Init.DataDirectory);
     end
     else
     begin
       WriteLn(ErrOutput, ErrPrefix('registry'), 'unknown operation "',
-        APositionals[0], '"; expected init, sync, verify, rotate-key or serve');
+        Operation, '"; expected ', OPERATIONS);
       Result := 1;
     end;
   except
@@ -884,7 +939,7 @@ begin
       'Recover project and shared-cache residue', '',
       @HandleRepair, RepairOpts));
 
-    SetLength(RegistryOpts, 14);
+    SetLength(RegistryOpts, 19);
     RegistryOpts[0] := TStringOption.Create('data-dir',
       'Registry data directory (default: ' + REGISTRY_DEFAULT_DATA_DIR + ')');
     RegistryOpts[1] := TStringOption.Create('identity',
@@ -913,9 +968,19 @@ begin
       'Mirror data-directory byte budget (mirror init only; default: 34359738368)');
     RegistryOpts[13] := TStringOption.Create('max-sync-bytes',
       'Bytes one mirror synchronization may add (mirror init only; default: 8589934592)');
+    RegistryOpts[14] := TStringOption.Create('packages',
+      'Comma-separated package names, `name*` prefixes, or `*` the token may use (issue-token only)');
+    RegistryOpts[15] := TStringOption.Create('actions',
+      'Token actions: publish, yank, or publish,yank (issue-token only; default: publish)');
+    RegistryOpts[16] := TStringOption.Create('expires-days',
+      'Token lifetime in days, 1 to 365 (issue-token only; default: 90)');
+    RegistryOpts[17] := TStringOption.Create('label',
+      'Printable token label shown by verify (issue-token only)');
+    RegistryOpts[18] := TStringOption.Create('token-id',
+      'ID of the token to revoke (revoke-token only)');
     Registry.Add(TSubcommand.Create('registry',
-      'Initialize, synchronize, verify, rotate keys or serve a self-hosted registry',
-      '<init|sync|verify|rotate-key|serve> [--data-dir <path>] [configuration options]',
+      'Initialize, synchronize, verify, rotate keys, manage publication tokens or serve a self-hosted registry',
+      '<init|sync|verify|rotate-key|issue-token|revoke-token|serve> [--data-dir <path>] [configuration options]',
       @HandleRegistry, RegistryOpts));
 
     SetLength(InitOpts, 3);
