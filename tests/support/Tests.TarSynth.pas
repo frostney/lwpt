@@ -381,6 +381,9 @@ begin
   Result := ConcatBytes(Combined);
 end;
 
+var
+  TempFileCounter: LongInt = 0;
+
 function Gzip(const APlain: TBytes): TBytes;
 var
   Compressor: TGZFileStream;
@@ -390,7 +393,12 @@ begin
   { TGZFileStream wraps a file; the simplest path is to write to a temp
     file and slurp it back. This is a test-only helper; the cost is
     one extra disk round-trip per fixture. }
-  TempPath := GetTempFileName('', 'lwpt-tarsynth') + '.gz';
+  { GetTempFileName returns the first unused name without creating it, so
+    test programs running in parallel could pick the same path. Make the
+    name unique per process and per call instead. }
+  TempPath := IncludeTrailingPathDelimiter(GetTempDir(False)) + 'lwpt-tarsynth-'
+    + IntToStr(GetProcessID) + '-'
+    + IntToStr(InterLockedIncrement(TempFileCounter)) + '.gz';
   try
     Compressor := TGZFileStream.Create(TempPath, gzopenwrite);
     try
