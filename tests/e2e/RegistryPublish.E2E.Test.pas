@@ -24,7 +24,8 @@ uses
   Tests.RegistryOrigin,
   Tests.RegistryPublish,
   Tests.RegistryServer,
-  Tests.Scratch;
+  Tests.Scratch,
+  Tests.TCPRelay;
 
 type
   TRegistryPublishE2E = class(TTestSuite)
@@ -51,6 +52,7 @@ type
     procedure TestAuthenticationAndScopeFailures;
     procedure TestLocalRefusalsMakeNoConnectionAndReadNoToken;
     procedure TestPublishesOverHTTPSWithTheTestRoot;
+    procedure TestPublishesAcrossKeyRotations;
   end;
 
 procedure TRegistryPublishE2E.BeforeEach;
@@ -364,33 +366,99 @@ var
   Token, Seam, Path: string;
   Bytes: TBytes;
   Run: TLwptResult;
+  Relay: TTCPRelay;
+  Backend: Word;
+  Before: Integer;
 begin
-  FOrigin := NewOrigin('tls-origin', True);
-  Token := FOrigin.IssueToken(['--packages', 'tls-*']);
+  { The origin advertises a relay's port, so the test counts every
+    connection the client makes. }
+  Relay := TTCPRelay.Create(0);
+  try
+    Backend := FindAvailableRegistryTestPort;
+    Relay.Backend := Backend;
+    FOrigin := TPublishOrigin.Create(FScratch, 'tls-origin', Relay.Port, Backend, True);
+    Token := FOrigin.IssueToken(['--packages', 'tls-*']);
+    FOrigin.Start;
+    Seam := UpperCase(RegistryProgramName) + '_TEST_REGISTRY_TRUST_ANCHORS='
+      + TestRootCertificatePath;
+    Bytes := PublishTarGz('tls-lib', '1.0.0', 'over tls');
+    Path := Archive('tls-lib.tar.gz', Bytes);
+    { Decision 7: only the test build trusts the committed test root. }
+    Run := RunPublish(Path, FOrigin.Base, FOrigin.KeyID, FOrigin.PublicKey, '', Token,
+      FProject, [], [Seam], True);
+    FOutputs := FOutputs + Run.Stdout + Run.Stderr;
+    if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('published tls-lib@1.0.0 to ' + FOrigin.Base
+      + ' at sequence 2 (archive ' + RegistryArtifactHash(Bytes),
+      PublishLine(Run)) = 1).ToBe(True);
+    Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
+    { A release-flavoured binary ignores the seam and verifies against the
+      system store, which does not hold the test root. A refused
+      certificate is not retried: exactly one connection. }
+    Before := Relay.Accepted;
+    Path := Archive('tls-lib-2.tar.gz', PublishTarGz('tls-lib', '1.0.1', 'refused'));
+    Run := RunPublish(Path, FOrigin.Base, FOrigin.KeyID, FOrigin.PublicKey, '', Token,
+      FProject, [], [Seam], False);
+    FOutputs := FOutputs + Run.Stdout + Run.Stderr;
+    ExpectFailure(Run, 'registry: registry_tls_verification_failed: ');
+    Sleep(200);
+    Expect<Integer>(Relay.Accepted - Before).ToBe(1);
+    Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
+    ExpectProjectUntouched;
+    ExpectSecretAbsent(Token);
+  finally
+    FreeAndNil(FOrigin);
+    Relay.Free;
+  end;
+end;
+
+procedure TRegistryPublishE2E.TestPublishesAcrossKeyRotations;
+var
+  Token, Line: string;
+  Run: TLwptResult;
+
+  procedure Rotate(const AFromKey: string);
+  var
+    Rotation: TLwptResult;
+  begin
+    Rotation := RunLwpt(['registry', 'rotate-key', '--data-dir', FOrigin.DataDirectory,
+      '--from-key', AFromKey], FScratch);
+    FOutputs := FOutputs + Rotation.Stdout + Rotation.Stderr;
+    if Rotation.ExitCode <> 0 then WriteLn(StdErr, Rotation.Stderr);
+    Expect<Integer>(Rotation.ExitCode).ToBe(0);
+  end;
+
+  function SigningKey: string;
+  var
+    Text: string;
+  begin
+    Text := RawHTTPBodyText(FOrigin.Request('GET', '/v1/checkpoints/latest.toml', [], nil));
+    Result := Copy(Text, Pos('key_id = "', Text) + Length('key_id = "'), 72);
+  end;
+begin
+  { The client holds only the root pin: every publish walks the dual-signed
+    rotation chain, before and after its commit. }
+  FOrigin := NewOrigin('origin');
+  Token := FOrigin.IssueToken(['--packages', 'rotated-*']);
+  Rotate(FOrigin.KeyID);
   FOrigin.Start;
-  Seam := UpperCase(RegistryProgramName) + '_TEST_REGISTRY_TRUST_ANCHORS='
-    + TestRootCertificatePath;
-  Bytes := PublishTarGz('tls-lib', '1.0.0', 'over tls');
-  Path := Archive('tls-lib.tar.gz', Bytes);
-  { Decision 7: only the test build trusts the committed test root. }
-  Run := RunPublish(Path, FOrigin.Base, FOrigin.KeyID, FOrigin.PublicKey, '', Token,
-    FProject, [], [Seam], True);
-  FOutputs := FOutputs + Run.Stdout + Run.Stderr;
+  Expect<Boolean>(SigningKey <> FOrigin.KeyID).ToBe(True);
+  Run := Publish(Archive('rotated-a.tar.gz', PublishTarGz('rotated-a', '1.0.0', 'a')),
+    Token, []);
   if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
   Expect<Integer>(Run.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('published tls-lib@1.0.0 to ' + FOrigin.Base
-    + ' at sequence 2 (archive ' + RegistryArtifactHash(Bytes),
+  Line := PublishLine(Run);
+  Expect<Boolean>(Pos('published rotated-a@1.0.0 to ' + FOrigin.Base, Line) = 1)
+    .ToBe(True);
+  { A second rotation while the origin serves. }
+  Rotate(SigningKey);
+  Run := Publish(Archive('rotated-b.tar.gz', PublishTarGz('rotated-b', '1.0.0', 'b')),
+    Token, []);
+  if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('published rotated-b@1.0.0 to ' + FOrigin.Base,
     PublishLine(Run)) = 1).ToBe(True);
-  Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
-  { A release-flavoured binary ignores the seam and verifies against the
-    system store, which does not hold the test root. }
-  Path := Archive('tls-lib-2.tar.gz', PublishTarGz('tls-lib', '1.0.1', 'refused'));
-  Run := RunPublish(Path, FOrigin.Base, FOrigin.KeyID, FOrigin.PublicKey, '', Token,
-    FProject, [], [Seam], False);
-  FOutputs := FOutputs + Run.Stdout + Run.Stderr;
-  ExpectFailure(Run, 'registry: registry_transport_failed: ');
-  Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
-  ExpectProjectUntouched;
   ExpectSecretAbsent(Token);
 end;
 
@@ -406,8 +474,10 @@ begin
     TestAuthenticationAndScopeFailures);
   Test('local refusals make no connection and never read the token first; a read-only origin is refused',
     TestLocalRefusalsMakeNoConnectionAndReadNoToken);
-  Test('HTTPS publication trusts the test root only in the test build',
+  Test('HTTPS publication trusts the test root only in the test build; a refused certificate is not retried',
     TestPublishesOverHTTPSWithTheTestRoot);
+  Test('a root-pinned publish walks the rotation chain before and after its commit',
+    TestPublishesAcrossKeyRotations);
 end;
 
 begin

@@ -437,7 +437,11 @@ no state, so consistency holds within one invocation. Cross-invocation
 history belongs to the consumer trust store in
 [#62](https://github.com/frostney/lwpt/issues/62). The client retries only
 `429`, `503`, and transport failures on idempotent requests: at most five
-attempts, with exponential backoff capped by `Retry-After` and 60 seconds.
+attempts. The wait before attempt n + 1 is
+min(max(2^(n−1) seconds, `Retry-After`), 60 seconds): exponential backoff
+that honours `Retry-After` as the least the server asks for, capped at 60
+seconds. A peer certificate that TLS verification refused is not a
+transient failure and fails at once.
 
 ### Archive contract
 

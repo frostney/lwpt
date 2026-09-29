@@ -439,7 +439,10 @@ begin
     Stream.Free;
   end;
   Options.TLS.TrustMode := tstmAnchorsOnly;
-  Response := HTTPGet(FBase + ATarget, nil, Options);
+  { The listener directly, so a relay on the advertised port counts only
+    the client's connections. }
+  Response := HTTPGet('https://localhost:' + IntToStr(FListenPort) + ATarget,
+    nil, Options);
   Result := Default(TRawHTTPResponse);
   Result.Status := Response.StatusCode;
   Result.Head := 'HTTP/1.1 ' + IntToStr(Response.StatusCode);

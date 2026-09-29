@@ -82,8 +82,9 @@ function RegistryRequestIDIsValid(const AValue: string): Boolean;
 { Whole seconds from a delta-seconds Retry-After value, or -1 when absent
   or not plain decimal. Values above the backoff cap are capped. }
 function ParseRegistryRetryAfter(const AValue: string): Integer;
-{ Delay before retry AAttempt + 1: 2^(AAttempt - 1) seconds, capped by a
-  valid Retry-After (ARetryAfter >= 0) and by 60 seconds. }
+{ Delay before retry AAttempt + 1: 2^(AAttempt - 1) seconds, or longer
+  when a valid Retry-After (ARetryAfter >= 0) asks for more, and never more
+  than 60 seconds. }
 function RegistryPublishBackoffSeconds(const AAttempt,
   ARetryAfter: Integer): Integer;
 { The canonical origin URL; raises insecure_transport for plain http to any
@@ -248,7 +249,8 @@ begin
     Result := Result * 2;
     if Result >= RegistryPublishMaximumBackoffSeconds then Break;
   end;
-  if (ARetryAfter >= 0) and (ARetryAfter < Result) then Result := ARetryAfter;
+  { Retry-After is the least the server asks the client to wait. }
+  if ARetryAfter > Result then Result := ARetryAfter;
   if Result > RegistryPublishMaximumBackoffSeconds then
     Result := RegistryPublishMaximumBackoffSeconds;
 end;
@@ -504,17 +506,19 @@ begin
         else
           Result := HTTPGet(AURL, Headers, Options);
       except
+        { Neither an oversized response nor a peer the TLS client refused
+          can change on retry; every other transport failure is retried. }
         on E: EHTTPResponseTooLarge do
           Fail('registry_transport_failed', RedactRegistryCredential(
             'request for ' + AWhat + ' failed: ' + E.Message, FToken));
+        on E: EHTTPTLSVerificationError do
+          Fail('registry_tls_verification_failed', RedactRegistryCredential(
+            'the origin''s certificate was refused for ' + AWhat + ': '
+            + E.Message, FToken));
         on E: EHTTPError do
         begin
           Failure := RedactRegistryCredential(E.Message, FToken);
-          { A refused peer certificate is not transient. HTTPClient names
-            it "TLS certificate verification failed" (ADR-0050), or
-            "OpenSSL certificate verification failed" without options;
-            every other transport failure is retried. }
-          Retryable := Pos('certificate verification failed', E.Message) = 0;
+          Retryable := True;
         end;
       end;
       if Failure = '' then

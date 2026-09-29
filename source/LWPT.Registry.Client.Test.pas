@@ -174,15 +174,19 @@ begin
   Expect<Integer>(ParseRegistryRetryAfter('Wed, 21 Oct 2026 07:28:00 GMT')).ToBe(-1);
   Expect<Integer>(ParseRegistryRetryAfter(SAMPLE_TOKEN)).ToBe(-1);
   Expect<Integer>(ParseRegistryRetryAfter('99999999999999')).ToBe(-1);
-  { Exponential from one second, capped by Retry-After and 60 seconds. }
+  { Exponential from one second, never shorter than Retry-After, and at
+    most 60 seconds. }
   Expect<Integer>(RegistryPublishBackoffSeconds(1, -1)).ToBe(1);
   Expect<Integer>(RegistryPublishBackoffSeconds(2, -1)).ToBe(2);
   Expect<Integer>(RegistryPublishBackoffSeconds(4, -1)).ToBe(8);
   Expect<Integer>(RegistryPublishBackoffSeconds(7, -1)).ToBe(60);
   Expect<Integer>(RegistryPublishBackoffSeconds(40, -1)).ToBe(60);
-  Expect<Integer>(RegistryPublishBackoffSeconds(4, 0)).ToBe(0);
-  Expect<Integer>(RegistryPublishBackoffSeconds(4, 3)).ToBe(3);
-  Expect<Integer>(RegistryPublishBackoffSeconds(1, 30)).ToBe(1);
+  Expect<Integer>(RegistryPublishBackoffSeconds(4, 0)).ToBe(8);
+  Expect<Integer>(RegistryPublishBackoffSeconds(4, 3)).ToBe(8);
+  Expect<Integer>(RegistryPublishBackoffSeconds(1, 0)).ToBe(1);
+  Expect<Integer>(RegistryPublishBackoffSeconds(1, 30)).ToBe(30);
+  Expect<Integer>(RegistryPublishBackoffSeconds(2, 60)).ToBe(60);
+  Expect<Integer>(RegistryPublishBackoffSeconds(40, 60)).ToBe(60);
   Expect<Integer>(RegistryPublishMaximumAttempts).ToBe(5);
 end;
 
