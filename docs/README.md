@@ -21,6 +21,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [`health.md`](./health.md) | `lwpt health` scope, Pascal complexity scoring, thresholds, Git hotspot formula, and JSON schema |
 | [`packages.md`](./packages.md) | The package set, divergence vs GocciaScript-older-copies, bootstrap chicken-and-egg, graduation roadmap (per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)) |
 | [`registry-spec.md`](./registry-spec.md) | Open origin-and-mirror HTTP registry protocol: stable identity, immutable records/objects, signed snapshots, publication, synchronization, and conformance fixtures |
+| [`registry-deployment.md`](./registry-deployment.md) | Running a registry origin or mirror: the example container image in [`examples/registry/`](./examples/registry/), TLS and reverse-proxy shapes, secrets and tokens, graceful shutdown, backup and restore, upgrades, operational limits, portability assumptions, and the CI evidence |
 
 ## Decision records
 
