@@ -22,6 +22,7 @@ uses
   LWPT.Core,
   LWPT.ProcessTree,
   TestingPascalLibrary,
+  Tests.PayloadHandoff,
   Tests.ProcessSupport,
   Tests.Scratch;
 
@@ -152,8 +153,8 @@ begin
       Sleep(ProcessPollMilliseconds);
     end;
     Expect<Boolean>(FileExists(Marker)).ToBe(True);
-    Expect<Boolean>(FileExists(GrandchildPIDPath)).ToBe(True);
-    GrandchildPID := StrToInt(Trim(ReadBinaryFile(GrandchildPIDPath)));
+    Expect<Boolean>(PayloadIsReadable(GrandchildPIDPath)).ToBe(True);
+    GrandchildPID := StrToInt(Trim(ReadPayloadText(GrandchildPIDPath)));
     Runner.Cancel;
     Worker.WaitFor;
     Expect<string>(Worker.ErrorMessage).ToBe('');
@@ -224,8 +225,8 @@ begin
     ProcessTree.Execute;
     Child.WaitOnExit;
     Expect<Integer>(Child.ExitStatus).ToBe(0);
-    Expect<Boolean>(FileExists(DescendantPIDPath)).ToBe(True);
-    DescendantPID := StrToInt(Trim(ReadBinaryFile(DescendantPIDPath)));
+    Expect<Boolean>(PayloadIsReadable(DescendantPIDPath)).ToBe(True);
+    DescendantPID := StrToInt(Trim(ReadPayloadText(DescendantPIDPath)));
     FreeAndNil(ProcessTree);
     { Closing a successful tree's Windows Job handle must not act like
       cancellation; Unix process-group ownership has the same contract. }
@@ -300,7 +301,7 @@ begin
   Child.Parameters.Add(CompilerGrandchildProxyOption);
   Child.Parameters.Add(GrandchildPIDPath);
   Child.Execute;
-  while not FileExists(GrandchildPIDPath) do
+  while not PayloadIsReadable(GrandchildPIDPath) do
     Sleep(ProcessPollMilliseconds);
   WriteTextFile(ParamStr(2), 'ready');
   Sleep(CompilerProxySleepMilliseconds);
@@ -309,7 +310,7 @@ end;
 
 function RunCompilerGrandchildProxy: Integer;
 begin
-  WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
+  PublishReadablePayload(ParamStr(2), IntToStr(GetProcessID));
   Sleep(CompilerProxySleepMilliseconds);
   Result := 0;
 end;
@@ -327,11 +328,11 @@ begin
     Descendant.Parameters.Add(ParamStr(2));
     Descendant.Execute;
     Started := Now;
-    while (not FileExists(ParamStr(2))) and Descendant.Running
+    while (not PayloadIsReadable(ParamStr(2))) and Descendant.Running
       and ((Now - Started) * SecondsPerDay
         < ProcessStartupTimeoutSeconds) do
       Sleep(ProcessPollMilliseconds);
-    if not FileExists(ParamStr(2)) then
+    if not PayloadIsReadable(ParamStr(2)) then
     begin
       if Descendant.Running then Descendant.Terminate(1);
       Exit;
@@ -344,7 +345,7 @@ end;
 
 function RunCompilerSurvivingDescendantProxy: Integer;
 begin
-  WriteTextFile(ParamStr(2), IntToStr(GetProcessID));
+  PublishReadablePayload(ParamStr(2), IntToStr(GetProcessID));
   Sleep(CompilerProxySleepMilliseconds);
   Result := 0;
 end;
