@@ -349,7 +349,7 @@ begin
   Tables[0].Accepted.State.ExpiresAt := '2026-10-27T00:00:00Z';
   Lines := TStringList.Create;
   try
-    Lines.Add('version = 3');
+    Lines.Add('version = 4');
     RenderRegistryLockTables(Tables, Lines);
     Lines.SaveToFile(FScratch + '/tables.lock');
   finally

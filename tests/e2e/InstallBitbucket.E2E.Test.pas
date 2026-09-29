@@ -154,7 +154,7 @@ begin
     bitbucket: prefix encodes the host. }
   Expect<Boolean>(Pos('source = "bitbucket:' + REPO_SLUG + '"', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('resolvedURL = "https://bitbucket.org/', Lock) > 0).ToBe(True);
-  Expect<Boolean>(Pos('computedHash = "sha256:', Lock) > 0).ToBe(True);
+  Expect<Boolean>(Pos('computedHash = "sha256-tree2:', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('archiveHash = "sha256:',  Lock) > 0).ToBe(True);
 end;
 

@@ -225,7 +225,82 @@ function  SHA256File(const APath: string): string;
 function  CanonicalTreeHashPath(const APath: string;
   const ASourceDelimiter: Char): string;
 function  NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
-function  HashTree(const APathOrArchive: string): string;
+
+const
+  { The framed tree digest (ADR-0052). The algorithm name is both the lock
+    value's prefix and, with one trailing NUL, the stream's magic. It is a
+    wire constant, not a program-name literal (ADR-0001). }
+  TREE_DIGEST_ALGORITHM = 'sha256-tree2';
+  TREE_DIGEST_PREFIX = TREE_DIGEST_ALGORITHM + ':';
+  { The flawed v3 digest, kept only to recover rollback files that a
+    pre-v4 binary wrote and to pin its own tests. }
+  LEGACY_TREE_DIGEST_PREFIX = 'sha256:';
+  { Files are read in chunks of this size. The digest does not depend on
+    it. }
+  TREE_DIGEST_CHUNK_BYTES = 64 * 1024;
+  TREE_DIGEST_FILE_RECORD = $01;
+
+type
+  { What a tree walk found below a module root. Directories are walked, not
+    listed. }
+  TTreeEntryKind = (tekFile, tekFileLink, tekDirectoryLink, tekDanglingLink);
+
+{ Fold-order comparator shared by both tree digests: ASCII case-insensitive,
+  byte-wise, shorter first, ordinal tiebreak. }
+function  TreeHashPathCompare(AList: TStringList;
+  AIndex1, AIndex2: Integer): Integer;
+{ SHA-256 of NormalizeTreeHashContent(the stream's remaining bytes), computed
+  in one pass of TREE_DIGEST_CHUNK_BYTES reads with a raw and a normalized
+  context; ASize is the normalized length. Nothing is buffered beyond one
+  chunk. }
+function  TreeContentDigest(AStream: TStream; out ASize: Int64): TSHA256Digest;
+{ `sha256-tree2:<hex>` of the directory ADirectory (ADR-0052). Raises
+  EVerifyError for a missing directory, and for a path that is not
+  well-formed UTF-8 (or, on Windows, well-formed UTF-16). }
+function  HashTree(const ADirectory: string): string;
+{ The v3 `sha256:` digest. Used only to validate rollback files written by a
+  pre-v4 binary, never for lock verification. }
+function  LegacyHashTree(const APathOrArchive: string): string;
+{ True for `sha256-tree2:` followed by 64 lowercase hex digits. }
+function  IsTreeDigest(const AValue: string): Boolean;
+{ Strict UTF-8: no overlong forms, no surrogates, nothing above U+10FFFF, no
+  NUL. }
+function  IsWellFormedTreePath(const APath: RawByteString): Boolean;
+{ Printable ASCII kept, every other byte as \xHH. }
+function  EscapeTreePath(const APath: RawByteString): string;
+{ Strict UTF-16 to UTF-8: an unpaired surrogate fails, it is never replaced
+  with U+FFFD. Pure Pascal, so it is tested on every platform. }
+function  StrictUTF16ToUTF8(const AName: UnicodeString;
+  out AUTF8: RawByteString): Boolean;
+{ Code units outside printable ASCII as \uXXXX. }
+function  EscapeUTF16Name(const AName: UnicodeString): string;
+{ Every entry below ADirectory as its canonical UTF-8 relative path, with
+  Ord(TTreeEntryKind) in Objects. Directory links are listed, never
+  followed. Raises like HashTree for a malformed name. }
+procedure CollectTreeEntries(const ADirectory: string; AEntries: TStringList);
+{ The escaped relative path of the first link (file link, directory link,
+  junction, or dangling link) below ADirectory in digest order, '.' when
+  ADirectory itself is one, or ''. }
+function  FindTreeLink(const ADirectory: string): string;
+
+const
+  { Lockfile schema (ADR-0052). v3 is read only by `lwpt repair` to upgrade
+    it. }
+  LOCKFILE_SCHEMA_VERSION = 4;
+  LOCKFILE_SCHEMA_V3 = 3;
+
+{ The one message every lock reader raises for a schema-v3 lock. }
+function  LockfileSchemaV3Message: string;
+{ The shared lock version gate. Returns the schema version; raises
+  ELockfileError for anything but v4, except v3 when AAcceptSchemaV3. }
+function  CheckLockfileSchema(ARoot: TTOMLNode; const APath: string;
+  const AAcceptSchemaV3: Boolean): Integer;
+{ The gate for a lock on disk, run before a command changes anything. A
+  missing lock passes. }
+procedure RequireCurrentLockfileSchema(const APath: string);
+{ The schema version of the lock at APath: 0 when it is missing, -1 when it
+  cannot be parsed or has no integer version. Never raises for content. }
+function  ReadLockfileSchemaVersion(const APath: string): Integer;
 
 { Appends every entry of the process environment to ATarget, safe to call
   from concurrent threads. The RTL's GetEnvironmentVariableCount lazily
@@ -459,6 +534,104 @@ begin
   N := TomlGet(ANode, AKey);
   if TomlIsInt(N) then Result := StrToInt64Def(N.ScalarText, ADefault)
   else Result := ADefault;
+end;
+
+{ ===========================================================================
+  Lockfile schema gate (ADR-0052). Every reader of lwpt.lock goes through
+  CheckLockfileSchema, so v3 is refused with one message everywhere and only
+  `lwpt repair` accepts it, to upgrade it.
+  =========================================================================== }
+function LockfileSchemaV3Message: string;
+begin
+  Result := '`' + LOCKFILE + '` is schema v3, whose tree hash cannot detect '
+    + 'a rearranged module tree (ADR-0052). Run `' + PROGRAM_NAME
+    + ' repair` to upgrade it to v4 without network access and without '
+    + 'changing dependency versions, then commit `' + LOCKFILE + '`. '
+    + 'Deleting `' + LOCKFILE + '` and running `' + PROGRAM_NAME
+    + ' install` also works, but needs network access and moves range '
+    + 'dependencies to their newest matching versions.';
+end;
+
+function CheckLockfileSchema(ARoot: TTOMLNode; const APath: string;
+  const AAcceptSchemaV3: Boolean): Integer;
+var VersionNode: TTOMLNode;
+begin
+  VersionNode := TomlGet(ARoot, 'version');
+  if not TomlIsInt(VersionNode) then
+    raise ELockfileError.CreateFmt(
+      'lockfile %s has no schema version. Delete and re-run `%s install`.',
+      [APath, PROGRAM_NAME]);
+  Result := StrToIntDef(VersionNode.ScalarText, -1);
+  if Result = LOCKFILE_SCHEMA_VERSION then Exit;
+  if Result = LOCKFILE_SCHEMA_V3 then
+  begin
+    if AAcceptSchemaV3 then Exit;
+    raise ELockfileError.Create(LockfileSchemaV3Message);
+  end;
+  if Result > LOCKFILE_SCHEMA_VERSION then
+    raise ELockfileError.CreateFmt(
+      'lockfile %s is schema v%d; this %s reads up to v%d. Use a %s release '
+      + 'that reads schema v%d.', [APath, Result, PROGRAM_NAME,
+      LOCKFILE_SCHEMA_VERSION, PROGRAM_NAME, Result]);
+  raise ELockfileError.CreateFmt(
+    'lockfile %s is schema v%d; this %s expects v%d. '
+    + 'Delete %s and run `%s install` to regenerate.',
+    [APath, Result, PROGRAM_NAME, LOCKFILE_SCHEMA_VERSION, APath,
+     PROGRAM_NAME]);
+end;
+
+function ParseLockfileDocument(const APath: string): TTOMLNode;
+var Lines: TStringList; Parser: TTOMLParser;
+begin
+  Lines := TStringList.Create;
+  Parser := TTOMLParser.Create;
+  try
+    Lines.LoadFromFile(APath);
+    try
+      Result := Parser.ParseDocument(Lines.Text);
+    except
+      on E: ETOMLParseError do
+        raise ELockfileError.CreateFmt(
+          'lockfile %s is corrupt: %s. Delete it and run `%s install` '
+          + 'to regenerate from the manifest.', [APath, E.Message,
+          PROGRAM_NAME]);
+    end;
+  finally
+    Parser.Free;
+    Lines.Free;
+  end;
+end;
+
+procedure RequireCurrentLockfileSchema(const APath: string);
+var Root: TTOMLNode;
+begin
+  if not FileExists(APath) then Exit;
+  Root := ParseLockfileDocument(APath);
+  try
+    CheckLockfileSchema(Root, APath, False);
+  finally
+    Root.Free;
+  end;
+end;
+
+function ReadLockfileSchemaVersion(const APath: string): Integer;
+var Root, VersionNode: TTOMLNode;
+begin
+  if not FileExists(APath) then Exit(0);
+  try
+    Root := ParseLockfileDocument(APath);
+  except
+    on E: ELockfileError do Exit(-1);
+  end;
+  try
+    VersionNode := TomlGet(Root, 'version');
+    if TomlIsInt(VersionNode) then
+      Result := StrToIntDef(VersionNode.ScalarText, -1)
+    else
+      Result := -1;
+  finally
+    Root.Free;
+  end;
 end;
 
 function MatchSegment(const APattern, AName: string): Boolean;
@@ -1352,6 +1525,21 @@ begin
     Result := 'absent';
 end;
 
+{ True when APath still holds the snapshot AExpected describes. A sidecar
+  that a pre-v4 binary wrote records `tree:sha256:<hex>`; it is validated
+  with the legacy digest, so a transaction interrupted before an upgrade can
+  still be recovered after it (ADR-0052). This is the legacy digest's only
+  use outside its pinned tests. }
+function SnapshotMatches(const APath, AExpected: string): Boolean;
+const LEGACY_TREE_SNAPSHOT = 'tree:' + LEGACY_TREE_DIGEST_PREFIX;
+begin
+  if Copy(AExpected, 1, Length(LEGACY_TREE_SNAPSHOT)) = LEGACY_TREE_SNAPSHOT then
+    Result := (not IsDirSymlinkOrJunction(APath)) and DirectoryExists(APath)
+      and ('tree:' + LegacyHashTree(APath) = AExpected)
+  else
+    Result := SnapshotPathHash(APath) = AExpected;
+end;
+
 { Copy the current transaction target below the caller-owned rollback root.
   The live destination remains readable until publication's final swap. A
   sidecar records both the destination and validated content identity, so an
@@ -1442,7 +1630,7 @@ begin
   { Validate before touching the published destination. A corrupt or missing
     backup remains available for diagnosis and never destroys the current
     readable tree while rollback is already degraded. }
-  if SnapshotPathHash(ABackupPath) <> Expected then Exit;
+  if not SnapshotMatches(ABackupPath, Expected) then Exit;
   if not AtomicRemovePath(ADestination) then Exit(False);
   if FileExists(ABackupPath) and not IsDirSymlinkOrJunction(ABackupPath) then
     Result := AtomicMoveFile(ABackupPath, ADestination)
@@ -2185,19 +2373,25 @@ begin
   SetLength(Result, Write);
 end;
 
-{ Hash of an installed package: SHA-256 over every extracted file's bytes,
-  visited in sorted relative-path order so the digest is stable regardless
-  of filesystem enumeration order or which mirror served the archive.
-  This is the value that goes in lwpt.lock's computedHash.
+{ ===========================================================================
+  Tree digests.
 
-  Directory symlinks are never descended into: a link cycle would recurse
-  forever, and the linked bytes are hashed where they really live. File
-  symlinks still contribute (their target's bytes are read through the
-  link, as before) — but only when the target resolves: a dangling link
-  was invisible to the old faAnyFile-only enumeration, so it must stay
-  excluded or HashTree fails opening it. faSymLink must be in the
-  FindFirst mask or the attribute is not reported and links look like
-  plain directories (or, dangling, vanish entirely). }
+  HashTree is the framed `sha256-tree2` digest of ADR-0052, the value of
+  every schema-v4 computedHash. LegacyHashTree is the v3 digest, whose
+  unframed "path LF contents" stream lets a rearranged tree hash like the
+  original (#352); it survives only to validate rollback files that a
+  pre-v4 binary wrote.
+
+  Both cover the same files: regular files, and file links whose target
+  resolves, read through the link. Directory links are never descended into
+  (a link cycle would recurse forever, and the linked bytes are hashed where
+  they really live) and dangling links are skipped, so a CopyDirTree copy
+  hashes like its source. faSymLink must be in the FindFirst mask or the
+  attribute is not reported and links look like plain directories (or,
+  dangling, vanish entirely).
+  =========================================================================== }
+
+{ The v3 inventory, unchanged: native-name relative paths. }
 procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
 var SR: TSearchRec; Path, RelPath: string;
 begin
@@ -2223,19 +2417,19 @@ begin
     end;
 end;
 
-{ Fold-order comparator for HashTree: ASCII case-insensitive, byte-wise,
-  ordinal tiebreak — a platform-independent pin of the order every
-  existing lockfile was written with. TStringList.Sort compares with
-  AnsiCompareText, which is ASCII-uppercase byte compare on POSIX but
-  CompareStringW WORD-SORT on Windows, where '-' is primary-ignorable:
-  the same tree of hyphenated filenames folds in a different order and
-  the digest diverges with byte-identical content ("tree hash mismatch"
-  on a Windows checkout — the third guise of the #78 family, after path
-  separators (#116) and the fingerprint join). Verified byte-for-byte
-  against a real divergence: ASCII-CI order reproduces the POSIX-written
-  lockfile digest exactly; the hyphen-ignoring order reproduces the
-  Windows disk digest exactly. Do not "simplify" this to a plain ordinal
-  compare — that is a THIRD order and would invalidate every lockfile. }
+{ Fold-order comparator for both tree digests: ASCII case-insensitive,
+  byte-wise, ordinal tiebreak — a platform-independent pin of the order every
+  lockfile was written with. TStringList.Sort compares with AnsiCompareText,
+  which is ASCII-uppercase byte compare on POSIX but CompareStringW
+  WORD-SORT on Windows, where '-' is primary-ignorable: the same tree of
+  hyphenated filenames folds in a different order and the digest diverges
+  with byte-identical content ("tree hash mismatch" on a Windows checkout —
+  the third guise of the #78 family, after path separators (#116) and the
+  fingerprint join). Verified byte-for-byte against a real divergence:
+  ASCII-CI order reproduces the POSIX-written lockfile digest exactly; the
+  hyphen-ignoring order reproduces the Windows disk digest exactly. Framing
+  (ADR-0052) would make any deterministic order sound, but a third order
+  adds risk for nothing, so `sha256-tree2` keeps this one. }
 function TreeHashPathCompare(AList: TStringList;
   AIndex1, AIndex2: Integer): Integer;
 var
@@ -2260,18 +2454,12 @@ begin
   Result := LA - LB;
   { Case-insensitively equal but distinct paths (a case collision the
     default Windows/macOS filesystems cannot even host): break the tie
-    ordinally so the order is still deterministic everywhere. This does
-    NOT change any existing digest — the prior TStringList.Sort
-    (AnsiCompareText) already ordered such a pair uppercase-first and
-    input-order-stably ('A.pas' before 'a.pas'), which CompareStr
-    reproduces byte-for-byte (verified against FPC's Sort). Where the
-    old order could still differ was ACROSS platforms — the exact
-    non-portability this comparator exists to remove — so no lockfile
-    that was portable is invalidated. }
+    ordinally so the order is still deterministic everywhere ('A.pas'
+    before 'a.pas'). }
   if Result = 0 then Result := CompareStr(A, B);
 end;
 
-function HashTree(const APathOrArchive: string): string;
+function LegacyHashTree(const APathOrArchive: string): string;
 var
   Files : TStringList;
   Acc   : TBytes;
@@ -2291,7 +2479,6 @@ begin
       SetLength(Acc, 0);
       for i := 0 to Files.Count - 1 do
       begin
-        { fold the relative path in too, so renames change the hash }
         Chunk := BytesOf(Files[i] + #10);
         n := Length(Acc);
         SetLength(Acc, n + Length(Chunk));
@@ -2306,26 +2493,583 @@ begin
         finally
           FS.Free;
         end;
-        { Fold NORMALIZED content: a CRLF checkout hashes as its LF tree
-          (NormalizeTreeHashContent), so a Windows working tree verifies
-          against a POSIX-written lockfile. Binary files pass through
-          verbatim via that helper's NUL guard. }
         FileBytes := NormalizeTreeHashContent(FileBytes);
         n := Length(Acc);
         SetLength(Acc, n + Length(FileBytes));
         if Length(FileBytes) > 0 then
           Move(FileBytes[0], Acc[n], Length(FileBytes));
       end;
-      Result := 'sha256:' + SHA256Hex(Acc);
+      Result := LEGACY_TREE_DIGEST_PREFIX + SHA256Hex(Acc);
     finally
       Files.Free;
     end;
   end
   { file (e.g. the archive itself): hash its bytes }
   else if FileExists(APathOrArchive) then
-    Result := 'sha256:' + SHA256File(APathOrArchive)
+    Result := LEGACY_TREE_DIGEST_PREFIX + SHA256File(APathOrArchive)
   else
-    Result := 'sha256:' + SHA256Hex(BytesOf(APathOrArchive));
+    Result := LEGACY_TREE_DIGEST_PREFIX + SHA256Hex(BytesOf(APathOrArchive));
+end;
+
+function IsTreeDigest(const AValue: string): Boolean;
+var i: Integer;
+begin
+  Result := (Length(AValue) = Length(TREE_DIGEST_PREFIX) + 64)
+    and (Copy(AValue, 1, Length(TREE_DIGEST_PREFIX)) = TREE_DIGEST_PREFIX);
+  if not Result then Exit;
+  for i := Length(TREE_DIGEST_PREFIX) + 1 to Length(AValue) do
+    if not (AValue[i] in ['0'..'9', 'a'..'f']) then Exit(False);
+end;
+
+function IsWellFormedTreePath(const APath: RawByteString): Boolean;
+var
+  i, Len, Extra: Integer;
+  B, Second: Byte;
+  CodePoint: LongWord;
+  k: Integer;
+begin
+  Len := Length(APath);
+  if Len = 0 then Exit(False);
+  i := 1;
+  while i <= Len do
+  begin
+    B := Ord(APath[i]);
+    if B = 0 then Exit(False);
+    if B < $80 then
+    begin
+      Inc(i);
+      Continue;
+    end;
+    if (B and $E0) = $C0 then
+    begin
+      Extra := 1;
+      CodePoint := B and $1F;
+    end
+    else if (B and $F0) = $E0 then
+    begin
+      Extra := 2;
+      CodePoint := B and $0F;
+    end
+    else if (B and $F8) = $F0 then
+    begin
+      Extra := 3;
+      CodePoint := B and $07;
+    end
+    else
+      Exit(False);
+    if i + Extra > Len then Exit(False);
+    for k := 1 to Extra do
+    begin
+      Second := Ord(APath[i + k]);
+      if (Second and $C0) <> $80 then Exit(False);
+      CodePoint := (CodePoint shl 6) or (Second and $3F);
+    end;
+    { Shortest form only, no surrogate code points, nothing above
+      U+10FFFF. }
+    case Extra of
+      1: if CodePoint < $80 then Exit(False);
+      2: if (CodePoint < $800)
+            or ((CodePoint >= $D800) and (CodePoint <= $DFFF)) then
+           Exit(False);
+      3: if (CodePoint < $10000) or (CodePoint > $10FFFF) then Exit(False);
+    end;
+    Inc(i, Extra + 1);
+  end;
+  Result := True;
+end;
+
+function EscapeTreePath(const APath: RawByteString): string;
+var i: Integer; B: Byte;
+begin
+  Result := '';
+  for i := 1 to Length(APath) do
+  begin
+    B := Ord(APath[i]);
+    if (B >= $20) and (B < $7F) and (B <> Ord('\')) then
+      Result := Result + Chr(B)
+    else
+      Result := Result + '\x' + LowerCase(IntToHex(B, 2));
+  end;
+end;
+
+function StrictUTF16ToUTF8(const AName: UnicodeString;
+  out AUTF8: RawByteString): Boolean;
+var
+  i, Len, Written: Integer;
+  Unit1, Unit2: Word;
+  CodePoint: LongWord;
+  Buffer: string;
+
+  procedure Emit(AByte: LongWord);
+  begin
+    Inc(Written);
+    Buffer[Written] := Chr(Byte(AByte));
+  end;
+
+begin
+  AUTF8 := '';
+  Len := Length(AName);
+  { Four UTF-8 bytes at most per code unit pair; three per single unit. }
+  SetLength(Buffer, 3 * Len);
+  Written := 0;
+  i := 1;
+  while i <= Len do
+  begin
+    Unit1 := Ord(AName[i]);
+    if (Unit1 >= $D800) and (Unit1 <= $DBFF) then
+    begin
+      if i = Len then Exit(False);
+      Unit2 := Ord(AName[i + 1]);
+      if (Unit2 < $DC00) or (Unit2 > $DFFF) then Exit(False);
+      CodePoint := $10000 + ((LongWord(Unit1) - $D800) shl 10)
+        + (LongWord(Unit2) - $DC00);
+      Inc(i, 2);
+    end
+    else if (Unit1 >= $DC00) and (Unit1 <= $DFFF) then
+      Exit(False)
+    else
+    begin
+      CodePoint := Unit1;
+      Inc(i);
+    end;
+    if CodePoint < $80 then
+      Emit(CodePoint)
+    else if CodePoint < $800 then
+    begin
+      Emit($C0 or (CodePoint shr 6));
+      Emit($80 or (CodePoint and $3F));
+    end
+    else if CodePoint < $10000 then
+    begin
+      Emit($E0 or (CodePoint shr 12));
+      Emit($80 or ((CodePoint shr 6) and $3F));
+      Emit($80 or (CodePoint and $3F));
+    end
+    else
+    begin
+      Emit($F0 or (CodePoint shr 18));
+      Emit($80 or ((CodePoint shr 12) and $3F));
+      Emit($80 or ((CodePoint shr 6) and $3F));
+      Emit($80 or (CodePoint and $3F));
+    end;
+  end;
+  SetLength(Buffer, Written);
+  AUTF8 := Buffer;
+  Result := True;
+end;
+
+function EscapeUTF16Name(const AName: UnicodeString): string;
+var i: Integer; CodeUnit: Word;
+begin
+  Result := '';
+  for i := 1 to Length(AName) do
+  begin
+    CodeUnit := Ord(AName[i]);
+    if (CodeUnit >= $20) and (CodeUnit < $7F) and (CodeUnit <> Ord('\')) then
+      Result := Result + Chr(CodeUnit)
+    else
+      Result := Result + '\u' + LowerCase(IntToHex(CodeUnit, 4));
+  end;
+end;
+
+procedure RaiseMalformedTreePath(const ARoot, AEscaped, AEncoding: string);
+begin
+  raise EVerifyError.CreateFmt(
+    'cannot hash the tree at %s: the name "%s" is not well-formed %s. A '
+    + 'tree digest (ADR-0052) covers only paths that hash the same on every '
+    + 'platform; rename the file.', [ARoot, AEscaped, AEncoding]);
+end;
+
+{$IFDEF MSWINDOWS}
+const
+  WC_ERR_INVALID_CHARS_LWPT = $00000080;
+
+{ UTF-16 names from the filesystem, converted strictly: pairing is checked
+  here, and WideCharToMultiByte with WC_ERR_INVALID_CHARS must agree. It
+  never goes through the ANSI code page and never substitutes U+FFFD. }
+function WindowsNameToUTF8(const AName: UnicodeString;
+  out AUTF8: string): Boolean;
+var
+  Checked: RawByteString;
+  Size: LongInt;
+  Converted: string;
+begin
+  AUTF8 := '';
+  if not StrictUTF16ToUTF8(AName, Checked) then Exit(False);
+  if AName = '' then Exit(False);
+  Size := WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS_LWPT,
+    PWideChar(AName), Length(AName), nil, 0, nil, nil);
+  if Size <= 0 then Exit(False);
+  SetLength(Converted, Size);
+  if WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS_LWPT, PWideChar(AName),
+       Length(AName), PAnsiChar(Converted), Size, nil, nil) <> Size then
+    Exit(False);
+  { Byte comparison of the two independent conversions. }
+  if (Length(Converted) <> Length(Checked))
+     or ((Length(Checked) > 0)
+       and not CompareMem(@Converted[1], @Checked[1], Length(Checked))) then
+    Exit(False);
+  AUTF8 := Converted;
+  Result := True;
+end;
+
+{ The exact inverse for a validated UTF-8 path; '/' becomes '\'. }
+function TreePathToWide(const APath: string): UnicodeString;
+var
+  i, Len, Written: Integer;
+  B: Byte;
+  CodePoint: LongWord;
+begin
+  Len := Length(APath);
+  SetLength(Result, Len);
+  Written := 0;
+  i := 1;
+  while i <= Len do
+  begin
+    B := Ord(APath[i]);
+    if B < $80 then
+    begin
+      CodePoint := B;
+      Inc(i);
+    end
+    else if (B and $E0) = $C0 then
+    begin
+      CodePoint := ((B and $1F) shl 6) or (Ord(APath[i + 1]) and $3F);
+      Inc(i, 2);
+    end
+    else if (B and $F0) = $E0 then
+    begin
+      CodePoint := ((B and $0F) shl 12) or ((Ord(APath[i + 1]) and $3F) shl 6)
+        or (Ord(APath[i + 2]) and $3F);
+      Inc(i, 3);
+    end
+    else
+    begin
+      CodePoint := ((B and $07) shl 18) or ((Ord(APath[i + 1]) and $3F) shl 12)
+        or ((Ord(APath[i + 2]) and $3F) shl 6) or (Ord(APath[i + 3]) and $3F);
+      Inc(i, 4);
+    end;
+    if CodePoint = Ord('/') then CodePoint := Ord('\');
+    if CodePoint >= $10000 then
+    begin
+      Dec(CodePoint, $10000);
+      Inc(Written);
+      Result[Written] := WideChar($D800 + (CodePoint shr 10));
+      Inc(Written);
+      Result[Written] := WideChar($DC00 + (CodePoint and $3FF));
+    end
+    else
+    begin
+      Inc(Written);
+      Result[Written] := WideChar(CodePoint);
+    end;
+  end;
+  SetLength(Result, Written);
+end;
+
+function WideTargetIsFile(const APath: UnicodeString): Boolean;
+var Handle: THandle; Info: TByHandleFileInformation;
+begin
+  { Opening follows the link; without backup semantics a directory target
+    fails, which is exactly "not a file". }
+  Handle := CreateFileW(PWideChar(APath), 0,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  if Handle = INVALID_HANDLE_VALUE then Exit(False);
+  try
+    Result := GetFileInformationByHandle(Handle, Info)
+      and ((Info.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) = 0);
+  finally
+    CloseHandle(Handle);
+  end;
+end;
+
+procedure CollectTreeEntriesRec(const ARootLabel: string;
+  const AWideDir: UnicodeString; const ARel: string; AEntries: TStringList);
+var
+  Find: THandle;
+  Data: TWin32FindDataW;
+  Name: UnicodeString;
+  NameUTF8, RelPath: string;
+  Kind: TTreeEntryKind;
+begin
+  Find := FindFirstFileW(PWideChar(AWideDir + '\*'), Data);
+  if Find = INVALID_HANDLE_VALUE then Exit;
+  try
+    repeat
+      Name := PWideChar(@Data.cFileName[0]);
+      if (Name = '.') or (Name = '..') then Continue;
+      if not WindowsNameToUTF8(Name, NameUTF8) then
+        RaiseMalformedTreePath(ARootLabel,
+          EscapeTreePath(ARel) + EscapeUTF16Name(Name), 'UTF-16');
+      RelPath := ARel + NameUTF8;
+      if (Data.dwFileAttributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+      begin
+        if (Data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          Kind := tekDirectoryLink
+        else if WideTargetIsFile(AWideDir + '\' + Name) then
+          Kind := tekFileLink
+        else
+          Kind := tekDanglingLink;
+        AEntries.AddObject(RelPath, TObject(PtrInt(Ord(Kind))));
+      end
+      else if (Data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+        CollectTreeEntriesRec(ARootLabel, AWideDir + '\' + Name,
+          RelPath + TREE_HASH_PATH_SEPARATOR, AEntries)
+      else
+        AEntries.AddObject(RelPath, TObject(PtrInt(Ord(tekFile))));
+    until not FindNextFileW(Find, Data);
+  finally
+    Windows.FindClose(Find);
+  end;
+end;
+
+function OpenTreeFile(const ADirectory, ARelPath: string): TStream;
+var Handle: THandle; WidePath: UnicodeString;
+begin
+  WidePath := UnicodeString(ExcludeTrailingPathDelimiter(ADirectory)) + '\'
+    + TreePathToWide(ARelPath);
+  { Non-inheritable (no security attributes), as every toolkit handle. }
+  Handle := CreateFileW(PWideChar(WidePath), GENERIC_READ,
+    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
+    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  if Handle = INVALID_HANDLE_VALUE then
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [EscapeTreePath(ARelPath), SysErrorMessage(GetLastOSError)]);
+  Result := TLWPTProtectedFileStream.Create(Handle);
+end;
+{$ELSE}
+procedure CollectTreeEntriesRec(const ARootLabel, ARoot, ARel: string;
+  AEntries: TStringList);
+var SR: TSearchRec; Path, RelPath: string; Kind: TTreeEntryKind;
+begin
+  Path := IncludeTrailingPathDelimiter(ARoot + ARel);
+  if SysUtils.FindFirst(Path + '*', faAnyFile or faSymLink, SR) = 0 then
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        RelPath := ARel + SR.Name;
+        { POSIX names are hashed as the bytes the filesystem reports. }
+        if not IsWellFormedTreePath(RelPath) then
+          RaiseMalformedTreePath(ARootLabel, EscapeTreePath(RelPath),
+            'UTF-8');
+        if (SR.Attr and faSymLink) <> 0 then
+        begin
+          if (SR.Attr and faDirectory) <> 0 then
+            Kind := tekDirectoryLink
+          else if FileExists(Path + SR.Name) then
+            Kind := tekFileLink
+          else if DirectoryExists(Path + SR.Name) then
+            Kind := tekDirectoryLink
+          else
+            Kind := tekDanglingLink;
+          AEntries.AddObject(RelPath, TObject(PtrInt(Ord(Kind))));
+        end
+        else if (SR.Attr and faDirectory) <> 0 then
+          CollectTreeEntriesRec(ARootLabel, ARoot, RelPath + PathDelim,
+            AEntries)
+        else
+          AEntries.AddObject(RelPath, TObject(PtrInt(Ord(tekFile))));
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
+end;
+
+function OpenTreeFile(const ADirectory, ARelPath: string): TStream;
+begin
+  Result := OpenProtectedFileStream(IncludeTrailingPathDelimiter(ADirectory)
+    + ARelPath, fmOpenRead or fmShareDenyNone);
+end;
+{$ENDIF}
+
+procedure CollectTreeEntries(const ADirectory: string; AEntries: TStringList);
+begin
+  if not DirectoryExists(ADirectory) then
+    raise EVerifyError.CreateFmt(
+      'cannot hash the tree at %s: it is not a directory', [ADirectory]);
+  {$IFDEF MSWINDOWS}
+  CollectTreeEntriesRec(ADirectory,
+    UnicodeString(ExcludeTrailingPathDelimiter(ADirectory)), '', AEntries);
+  {$ELSE}
+  CollectTreeEntriesRec(ADirectory, IncludeTrailingPathDelimiter(ADirectory),
+    '', AEntries);
+  {$ENDIF}
+end;
+
+function TreeContentDigestWith(AStream: TStream; var ARaw, ANormalized: TBytes;
+  out ASize: Int64): TSHA256Digest;
+var
+  RawContext, NormalizedContext: TSHA256Context;
+  RawSize, NormalizedSize: Int64;
+  Binary, HeldCR: Boolean;
+  Count, i, Written: Integer;
+  Value: Byte;
+  NormalizedDigest: TSHA256Digest;
+begin
+  SHA256Init(RawContext);
+  SHA256Init(NormalizedContext);
+  RawSize := 0;
+  NormalizedSize := 0;
+  Binary := False;
+  HeldCR := False;
+  repeat
+    Count := AStream.Read(ARaw[0], TREE_DIGEST_CHUNK_BYTES);
+    if Count <= 0 then Break;
+    { FS.Size is never trusted: the length is what was read. }
+    SHA256Update(RawContext, ARaw[0], Count);
+    Inc(RawSize, Count);
+    if Binary then Continue;
+    Written := 0;
+    for i := 0 to Count - 1 do
+    begin
+      Value := ARaw[i];
+      if Value = TREE_HASH_BYTE_NUL then
+      begin
+        { Binary: hashed verbatim; the normalized context is abandoned. }
+        Binary := True;
+        Break;
+      end;
+      if HeldCR then
+      begin
+        HeldCR := False;
+        { CRLF drops the CR; a lone CR is kept. }
+        if Value <> TREE_HASH_BYTE_LF then
+        begin
+          ANormalized[Written] := TREE_HASH_BYTE_CR;
+          Inc(Written);
+        end;
+      end;
+      if Value = TREE_HASH_BYTE_CR then
+        { Held until the next byte, possibly in the next chunk. }
+        HeldCR := True
+      else
+      begin
+        ANormalized[Written] := Value;
+        Inc(Written);
+      end;
+    end;
+    if (not Binary) and (Written > 0) then
+    begin
+      SHA256Update(NormalizedContext, ANormalized[0], Written);
+      Inc(NormalizedSize, Written);
+    end;
+  until False;
+  if Binary then
+  begin
+    SHA256Final(RawContext, Result);
+    SHA256Final(NormalizedContext, NormalizedDigest);
+    ASize := RawSize;
+    Exit;
+  end;
+  if HeldCR then
+  begin
+    ANormalized[0] := TREE_HASH_BYTE_CR;
+    SHA256Update(NormalizedContext, ANormalized[0], 1);
+    Inc(NormalizedSize);
+  end;
+  SHA256Final(NormalizedContext, Result);
+  SHA256Final(RawContext, NormalizedDigest);
+  ASize := NormalizedSize;
+end;
+
+function TreeContentDigest(AStream: TStream; out ASize: Int64): TSHA256Digest;
+var Raw, Normalized: TBytes;
+begin
+  SetLength(Raw, TREE_DIGEST_CHUNK_BYTES);
+  { A held CR from the previous chunk can precede a whole chunk. }
+  SetLength(Normalized, TREE_DIGEST_CHUNK_BYTES + 1);
+  Result := TreeContentDigestWith(AStream, Raw, Normalized, ASize);
+end;
+
+procedure SHA256UpdateBigEndian(var AContext: TSHA256Context;
+  const AValue: QWord; const ABytes: Integer);
+var Encoded: array[0..7] of Byte; i: Integer;
+begin
+  for i := 0 to ABytes - 1 do
+    Encoded[i] := Byte((AValue shr (8 * (ABytes - 1 - i))) and $FF);
+  SHA256Update(AContext, Encoded[0], ABytes);
+end;
+
+{ `sha256-tree2` (ADR-0052): SHA-256 over magic || record*, records in
+  TreeHashPathCompare order. magic is the algorithm name and one NUL; a
+  record is type (1 byte, 0x01), path length (4 bytes), the UTF-8 path, the
+  normalized content length (8 bytes), and the normalized content's SHA-256
+  (32 bytes); integers are unsigned big-endian. Every record is
+  self-delimiting, so no arrangement of contents can be read as a path or a
+  file boundary. Only the sorted path list is held in memory; each file is
+  read once in fixed chunks. }
+function HashTree(const ADirectory: string): string;
+var
+  Entries, Files: TStringList;
+  Outer: TSHA256Context;
+  Raw, Normalized: TBytes;
+  Magic: string;
+  Kind: TTreeEntryKind;
+  i: Integer;
+  Size: Int64;
+  Digest, TreeDigest: TSHA256Digest;
+  RecordType: Byte;
+  Stream: TStream;
+begin
+  Entries := TStringList.Create;
+  Files := TStringList.Create;
+  try
+    CollectTreeEntries(ADirectory, Entries);
+    for i := 0 to Entries.Count - 1 do
+    begin
+      Kind := TTreeEntryKind(PtrInt(Entries.Objects[i]));
+      if Kind in [tekFile, tekFileLink] then Files.Add(Entries[i]);
+    end;
+    Files.CustomSort(@TreeHashPathCompare);
+    SetLength(Raw, TREE_DIGEST_CHUNK_BYTES);
+    SetLength(Normalized, TREE_DIGEST_CHUNK_BYTES + 1);
+    SHA256Init(Outer);
+    Magic := TREE_DIGEST_ALGORITHM + #0;
+    SHA256Update(Outer, Magic[1], Length(Magic));
+    RecordType := TREE_DIGEST_FILE_RECORD;
+    for i := 0 to Files.Count - 1 do
+    begin
+      Stream := OpenTreeFile(ADirectory, Files[i]);
+      try
+        Digest := TreeContentDigestWith(Stream, Raw, Normalized, Size);
+      finally
+        Stream.Free;
+      end;
+      SHA256Update(Outer, RecordType, 1);
+      SHA256UpdateBigEndian(Outer, QWord(Length(Files[i])), 4);
+      SHA256Update(Outer, Files[i][1], Length(Files[i]));
+      SHA256UpdateBigEndian(Outer, QWord(Size), 8);
+      SHA256Update(Outer, Digest[0], SizeOf(Digest));
+    end;
+    SHA256Final(Outer, TreeDigest);
+    Result := TREE_DIGEST_PREFIX + SHA256DigestHex(TreeDigest);
+  finally
+    Files.Free;
+    Entries.Free;
+  end;
+end;
+
+function FindTreeLink(const ADirectory: string): string;
+var Entries, Links: TStringList; i: Integer;
+begin
+  Result := '';
+  if IsDirSymlinkOrJunction(ExcludeTrailingPathDelimiter(ADirectory)) then
+    Exit('.');
+  Entries := TStringList.Create;
+  Links := TStringList.Create;
+  try
+    CollectTreeEntries(ADirectory, Entries);
+    for i := 0 to Entries.Count - 1 do
+      if TTreeEntryKind(PtrInt(Entries.Objects[i])) <> tekFile then
+        Links.Add(Entries[i]);
+    if Links.Count = 0 then Exit;
+    Links.CustomSort(@TreeHashPathCompare);
+    Result := EscapeTreePath(Links[0]);
+  finally
+    Links.Free;
+    Entries.Free;
+  end;
 end;
 
 initialization

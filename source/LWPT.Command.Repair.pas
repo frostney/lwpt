@@ -86,10 +86,40 @@ begin
   end;
 end;
 
+{ The only reader that accepts a schema-v3 lock (ADR-0052): after every
+  other recovery step, it upgrades the lock to v4 without network access and
+  without moving versions, re-deriving each module from its archive, proof,
+  or source through the install transaction. A v4 lock, or none, is left
+  alone. Returns True when it upgraded. }
+function UpgradeLegacyLockfile(const ACtx: TManifestContext): Boolean;
+var LockfilePath: string; SchemaVersion: Integer;
+begin
+  Result := False;
+  LockfilePath := ResolveRepairPath(ACtx.ProjectRoot, LOCKFILE);
+  SchemaVersion := ReadLockfileSchemaVersion(LockfilePath);
+  if SchemaVersion = 0 then
+    WriteLn('repair: no ', LOCKFILE, ' to upgrade')
+  else if SchemaVersion = LOCKFILE_SCHEMA_VERSION then
+    WriteLn('repair: ', LOCKFILE, ' is schema v', LOCKFILE_SCHEMA_VERSION,
+      '; no upgrade needed')
+  else if SchemaVersion = LOCKFILE_SCHEMA_V3 then
+  begin
+    WriteLn('repair: upgrading ', LOCKFILE, ' from schema v',
+      LOCKFILE_SCHEMA_V3, ' to v', LOCKFILE_SCHEMA_VERSION,
+      ' without network access or version changes');
+    RunInstallTransaction(ACtx, itmSchemaUpgrade);
+    Result := True;
+  end
+  else
+    WriteLn('repair: ', LOCKFILE, ' is not a schema-v', LOCKFILE_SCHEMA_V3,
+      ' lockfile; left unchanged');
+end;
+
 procedure CmdRepair(const AManifestPath: string);
 var
   Ctx : TManifestContext;
   TmpRoot, LockPath : string;
+  Upgraded: Boolean;
   SessionsRemoved, SessionsRetained: Integer;
   TmpRootCleaned: Boolean;
   WorkerLines : TStringList;
@@ -163,8 +193,16 @@ begin
   else
     WriteLn('repair: verified the shared-cache LRU index');
 
-  WriteLn('repair complete. Project install recovery and per-user shared-cache '
-    + 'recovery completed without touching committed project archives.');
+  Upgraded := UpgradeLegacyLockfile(Ctx);
+
+  if Upgraded then
+    WriteLn('repair complete. Project install recovery, per-user shared-cache '
+      + 'recovery, and the ', LOCKFILE, ' schema upgrade completed; commit ',
+      LOCKFILE, '.')
+  else
+    WriteLn('repair complete. Project install recovery and per-user '
+      + 'shared-cache recovery completed without touching committed project '
+      + 'archives.');
 end;
 
 end.

@@ -49,6 +49,8 @@ begin
       'remove needs at least one dependency name');
 
   Ctx := LoadManifestContext(AManifestPath);
+  { A v3 lock is refused before hooks or any other change (ADR-0052). }
+  RequireProjectLockfileSchema(Ctx);
 
   Lines := TStringList.Create;
   try
