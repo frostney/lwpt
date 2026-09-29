@@ -165,7 +165,7 @@ begin
   if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
   Lock := ReadFileText(FRoot + '/lwpt.lock');
   Expect<Boolean>(Pos('[package.' + DEP_NAME + ']', Lock) > 0).ToBe(True);
-  Expect<Boolean>(Pos('computedHash = "sha256:', Lock) > 0).ToBe(True);
+  Expect<Boolean>(Pos('computedHash = "sha256-tree2:', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('archiveHash = "sha256:',  Lock) > 0).ToBe(True);
 end;
 

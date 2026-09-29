@@ -1,5 +1,7 @@
 # Registry dependency sources
 
+> **Amended by [ADR-0052](./0052-lockfile-schema-v4-framed-tree-digest.md):** `computedHash` is the framed `sha256-tree2` digest of lockfile schema v4, and `--frozen` step 4 relies on digest equality between the re-derived tree, the installed tree, and `computedHash`; the file-for-file comparison only names the first difference. The registry fields and decision 11 are unchanged. The considered option "Lockfile schema v4. Rejected" stays as history: its rejection concerned the registry fields, which remain additive, and only this record's closing claim that v3 stays the last schema break is superseded.
+
 ## Status
 
 Accepted on 2026-09-29 by the maintainer, who settled the ten decisions at

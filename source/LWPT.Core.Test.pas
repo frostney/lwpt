@@ -29,6 +29,7 @@ uses
   LWPT.GitProtocol,
   LWPT.Install,
   LWPT.Manifest,
+  LWPT.Registry.Consumer,
   TestingPascalLibrary,
   TOML;
 
@@ -59,6 +60,43 @@ type
     procedure TestNormalizeEmptyInput;
     procedure TestCrlfTreeHashesEqualLf;
     procedure TestFoldOrderIsAsciiCaseInsensitive;
+  end;
+
+  { The framed sha256-tree2 digest of ADR-0052: every vector of its section
+    2, streaming, path validation, links, and rollback snapshots. }
+  TTreeDigestV2 = class(TTestSuite)
+  private
+    FScratch: string;
+    procedure ResetScratch;
+    procedure Put(const ARelative: string; const AContent: string);
+    procedure ExpectDigests(const ALegacy, ATree2: string);
+    procedure ExpectDigestFailure(const AContains: string);
+  protected
+    procedure AfterAll; override;
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestEmptyDirectoryVector;
+    procedure TestNestedVector;
+    procedure TestFoldOrderVector;
+    procedure TestIssue352Vectors;
+    procedure TestContentVectors;
+    procedure TestNonAsciiVectors;
+    procedure TestCaseCollisionVector;
+    procedure TestComparatorTiebreak;
+    procedure TestRecordEncoding;
+    procedure TestStreamingEqualsBuffered;
+    procedure TestTreeIsNotBuffered;
+    procedure TestStrictUTF16Conversion;
+    procedure TestWellFormedPaths;
+    procedure TestMalformedPosixNameFails;
+    procedure TestMalformedWindowsNamesFail;
+    procedure TestCopyDirTreeLinkParity;
+    procedure TestFindTreeLinkNamesEveryLinkKind;
+    procedure TestMissingDirectoryFails;
+    procedure TestIsTreeDigest;
+    procedure TestRetentionRecordsTree2Snapshot;
+    procedure TestLegacySidecarIsRecovered;
   end;
 
   TLoadManifestHappy = class(TTestSuite)
@@ -112,6 +150,11 @@ type
     procedure TestCorruptTOMLRaisesELockfileError;
     procedure TestMissingSchemaVersionRaisesELockfileError;
     procedure TestSchemaV1RaisesWithMigrationHint;
+    procedure TestSchemaV3RaisesWithRepairHint;
+    procedure TestSchemaV3LoadsOnlyForTheUpgrade;
+    procedure TestNewerSchemaNamesTheReader;
+    procedure TestLegacyDigestInV4Fails;
+    procedure TestRegistryTablesShareTheGate;
     procedure TestEmptyPackageTableReturnsEmptyArray;
     procedure TestPackageEntriesRoundTripFields;
   end;
@@ -613,7 +656,9 @@ begin
   WriteFixtureBytes(FScratch + PathDelim + 'nested' + PathDelim + 'deeper'
     + PathDelim + 'gamma.txt', StringAsBytes('gamma'));
 
-  Expect<string>(HashTree(FScratch)).ToBe(EXPECTED);
+  { The legacy v3 digest stays pinned: rollback recovery still validates
+    sidecars that a pre-v4 binary wrote with it. }
+  Expect<string>(LegacyHashTree(FScratch)).ToBe(EXPECTED);
 end;
 
 procedure THashTreePaths.TestCanonicalPathReplacesSourceDelimiter;
@@ -697,7 +742,7 @@ begin
   WriteFixtureBytes(FScratch + PathDelim + 'sub' + PathDelim + 'ab.pas',
     StringAsBytes('unit ab2;'#10));
 
-  Expect<string>(HashTree(FScratch)).ToBe(EXPECTED);
+  Expect<string>(LegacyHashTree(FScratch)).ToBe(EXPECTED);
 end;
 
 procedure THashTreePaths.SetupTests;
@@ -718,6 +763,808 @@ begin
     TestCrlfTreeHashesEqualLf);
   Test('fold order is ASCII case-insensitive on every platform',
     TestFoldOrderIsAsciiCaseInsensitive);
+end;
+
+function ReadFixtureText(const APath: string): RawByteString;
+var Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then Stream.ReadBuffer(Result[1], Length(Result));
+  finally
+    Stream.Free;
+  end;
+end;
+
+{ ── TTreeDigestV2 ──────────────────────────────────────────────── }
+
+{ Heap tracking for the streaming bound: a wrapper memory manager counts the
+  bytes live between Begin and End and records their peak. The test runs
+  single-threaded while it is installed. }
+var
+  TrackedPrevious: TMemoryManager;
+  TrackedCurrent, TrackedPeak: PtrInt;
+
+function TrackedGetMem(ASize: PtrUInt): Pointer;
+begin
+  Result := TrackedPrevious.GetMem(ASize);
+  if Result <> nil then
+  begin
+    Inc(TrackedCurrent, PtrInt(TrackedPrevious.MemSize(Result)));
+    if TrackedCurrent > TrackedPeak then TrackedPeak := TrackedCurrent;
+  end;
+end;
+
+function TrackedFreeMem(APointer: Pointer): PtrUInt;
+begin
+  if APointer <> nil then
+    Dec(TrackedCurrent, PtrInt(TrackedPrevious.MemSize(APointer)));
+  Result := TrackedPrevious.FreeMem(APointer);
+end;
+
+function TrackedFreeMemSize(APointer: Pointer; ASize: PtrUInt): PtrUInt;
+begin
+  if APointer <> nil then
+    Dec(TrackedCurrent, PtrInt(TrackedPrevious.MemSize(APointer)));
+  Result := TrackedPrevious.FreeMemSize(APointer, ASize);
+end;
+
+function TrackedAllocMem(ASize: PtrUInt): Pointer;
+begin
+  Result := TrackedPrevious.AllocMem(ASize);
+  if Result <> nil then
+  begin
+    Inc(TrackedCurrent, PtrInt(TrackedPrevious.MemSize(Result)));
+    if TrackedCurrent > TrackedPeak then TrackedPeak := TrackedCurrent;
+  end;
+end;
+
+function TrackedReAllocMem(var APointer: Pointer; ASize: PtrUInt): Pointer;
+var Before: PtrInt;
+begin
+  Before := 0;
+  if APointer <> nil then Before := PtrInt(TrackedPrevious.MemSize(APointer));
+  Result := TrackedPrevious.ReAllocMem(APointer, ASize);
+  Dec(TrackedCurrent, Before);
+  if APointer <> nil then
+    Inc(TrackedCurrent, PtrInt(TrackedPrevious.MemSize(APointer)));
+  if TrackedCurrent > TrackedPeak then TrackedPeak := TrackedCurrent;
+end;
+
+procedure BeginHeapTracking;
+var Tracking: TMemoryManager;
+begin
+  GetMemoryManager(TrackedPrevious);
+  Tracking := TrackedPrevious;
+  Tracking.GetMem := TrackedGetMem;
+  Tracking.FreeMem := TrackedFreeMem;
+  Tracking.FreeMemSize := TrackedFreeMemSize;
+  Tracking.AllocMem := TrackedAllocMem;
+  Tracking.ReAllocMem := TrackedReAllocMem;
+  TrackedCurrent := 0;
+  TrackedPeak := 0;
+  SetMemoryManager(Tracking);
+end;
+
+procedure EndHeapTracking;
+begin
+  SetMemoryManager(TrackedPrevious);
+end;
+
+{ A fixture file whose name is given as UTF-16. Windows creates it through
+  CreateFileW, so no ANSI code page is involved; POSIX creates the strictly
+  converted UTF-8 bytes. }
+procedure WriteNamedFixture(const ADirectory: string;
+  const AName: UnicodeString; const ABytes: TBytes);
+{$IFDEF MSWINDOWS}
+var Handle: THandle; Written: DWORD;
+begin
+  ForceDirectories(ADirectory);
+  Handle := CreateFileW(PWideChar(UnicodeString(ADirectory) + '\' + AName),
+    GENERIC_WRITE, 0, nil, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
+  if Handle = INVALID_HANDLE_VALUE then
+    raise Exception.Create('fixture: CreateFileW failed for '
+      + EscapeUTF16Name(AName));
+  try
+    Written := 0;
+    if (Length(ABytes) > 0)
+       and not WriteFile(Handle, ABytes[0], Length(ABytes), Written, nil) then
+      raise Exception.Create('fixture: WriteFile failed');
+  finally
+    CloseHandle(Handle);
+  end;
+end;
+{$ELSE}
+var Name: RawByteString;
+begin
+  if not StrictUTF16ToUTF8(AName, Name) then
+    raise Exception.Create('fixture: malformed UTF-16 name');
+  WriteFixtureBytes(ADirectory + '/' + Name, ABytes);
+end;
+{$ENDIF}
+
+{ Removes the flat fixture files of ADirectory by their UTF-16 names: the
+  ANSI-path WipeDir cannot name a file outside the code page on Windows. }
+procedure RemoveNamedFixtures(const ADirectory: string);
+{$IFDEF MSWINDOWS}
+var Find: THandle; Data: TWin32FindDataW; Name: UnicodeString;
+begin
+  Find := FindFirstFileW(PWideChar(UnicodeString(ADirectory) + '\*'), Data);
+  if Find = INVALID_HANDLE_VALUE then Exit;
+  try
+    repeat
+      Name := PWideChar(@Data.cFileName[0]);
+      if (Name = '.') or (Name = '..') then Continue;
+      if (Data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+        DeleteFileW(PWideChar(UnicodeString(ADirectory) + '\' + Name));
+    until not FindNextFileW(Find, Data);
+  finally
+    Windows.FindClose(Find);
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+function Utf16(const ACodeUnits: array of Word): UnicodeString;
+var i: Integer;
+begin
+  SetLength(Result, Length(ACodeUnits));
+  for i := 0 to High(ACodeUnits) do Result[i + 1] := WideChar(ACodeUnits[i]);
+end;
+
+function BytesToHex(const ABytes: RawByteString): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(ABytes) do
+    Result := Result + LowerCase(IntToHex(Ord(ABytes[i]), 2));
+end;
+
+procedure TTreeDigestV2.ResetScratch;
+begin
+  WipeDir(FScratch);
+  ForceDirectories(FScratch);
+end;
+
+procedure TTreeDigestV2.BeforeAll;
+begin
+  FScratch := ExpandFileName('build/tests/tmp/tree2-'
+    + IntToStr(GetProcessID));
+  ResetScratch;
+end;
+
+procedure TTreeDigestV2.AfterAll;
+begin
+  WipeDir(FScratch);
+end;
+
+procedure TTreeDigestV2.Put(const ARelative: string; const AContent: string);
+begin
+  WriteFixtureBytes(FScratch + PathDelim + StringReplace(ARelative, '/',
+    PathDelim, [rfReplaceAll]), StringAsBytes(AContent));
+end;
+
+procedure TTreeDigestV2.ExpectDigests(const ALegacy, ATree2: string);
+begin
+  if ALegacy <> '' then
+    Expect<string>(LegacyHashTree(FScratch)).ToBe('sha256:' + ALegacy);
+  Expect<string>(HashTree(FScratch)).ToBe(TREE_DIGEST_PREFIX + ATree2);
+end;
+
+procedure TTreeDigestV2.TestEmptyDirectoryVector;
+begin
+  ResetScratch;
+  ExpectDigests(
+    'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+    '27822f587b72b705a08f0c9865fe020a44bbd681b87df7462f2cc46af0e33ab7');
+end;
+
+procedure TTreeDigestV2.TestNestedVector;
+begin
+  ResetScratch;
+  Put('alpha.txt', 'alpha');
+  Put('nested/beta.bin', 'beta');
+  Put('nested/deeper/gamma.txt', 'gamma');
+  ExpectDigests(
+    '5c970f737e82874a0c3c6bde83813385951ef2a78125d709ac4b46f5812ba4d4',
+    '24a5a83e163c4c78a47b5c93c5f7061ed40cff21bf794d2237e88d40114947ae');
+end;
+
+procedure TTreeDigestV2.TestFoldOrderVector;
+begin
+  ResetScratch;
+  Put('leaf-ca-true.cnf', 'ca=true'#10);
+  Put('leaf.cnf', 'leaf'#10);
+  Put('README.md', '# fixture'#10);
+  Put('sub/a-b.pas', 'unit ab;'#10);
+  Put('sub/ab.pas', 'unit ab2;'#10);
+  ExpectDigests(
+    '77386de0b4e46c60b337ea3255b2f68ddb48a46a1a216a828dce604a2f84ad85',
+    'c832919ae78620edac02c29d991b78b2895023c181110c3095d4b1759ed666b1');
+end;
+
+const
+  JSON_MANIFEST = '[package]'#10'name = "json"'#10'version = "1.3.0"'#10
+    + 'units = ["source"]'#10;
+  JSON_UNIT_TAIL = '{ 1.3.0 }'#10'interface'#10'implementation'#10'end.'#10;
+
+procedure TTreeDigestV2.TestIssue352Vectors;
+var LegacyOriginal, Tree2Original: string;
+begin
+  { The #352 layout substitution: equal legacy digests, different tree2
+    digests. }
+  ResetScratch;
+  Put('lwpt.toml', JSON_MANIFEST);
+  Put('source/json.pas', 'unit json;'#10 + JSON_UNIT_TAIL);
+  ExpectDigests(
+    '68f88ceb5c7c6ff44ff90c66861ad33fba687776194988f2aee59078b8c4508f',
+    '10e083e1804357e2376467dedbb598b3059e7a69bd18f125498e5e92efca1c1a');
+  LegacyOriginal := LegacyHashTree(FScratch);
+  Tree2Original := HashTree(FScratch);
+  ResetScratch;
+  Put('lwpt.toml', JSON_MANIFEST);
+  Put('source/json.pas', '');
+  Put('unit json;', JSON_UNIT_TAIL);
+  ExpectDigests(
+    '68f88ceb5c7c6ff44ff90c66861ad33fba687776194988f2aee59078b8c4508f',
+    '67817df420cfac5318569f13b72d82082cc28f3e889aacaf392e37bfaf14943d');
+  Expect<string>(LegacyHashTree(FScratch)).ToBe(LegacyOriginal);
+  Expect<Boolean>(HashTree(FScratch) <> Tree2Original).ToBe(True);
+end;
+
+procedure TTreeDigestV2.TestContentVectors;
+begin
+  ResetScratch;
+  Put('unit.pas', 'unit A;'#13#10'begin'#13#10'end.'#13#10);
+  ExpectDigests(
+    '2bb80f3322fc70ef3ab7bda3fc07e71bbbbc153c0618e655bf4139af6bedbb05',
+    '7c177c9e38d6e6f87d4fcbc81e5af3e89d41ab13806c2ecc13cedcd74681bd8c');
+  ResetScratch;
+  Put('unit.pas', 'unit A;'#10'begin'#10'end.'#10);
+  ExpectDigests(
+    '2bb80f3322fc70ef3ab7bda3fc07e71bbbbc153c0618e655bf4139af6bedbb05',
+    '7c177c9e38d6e6f87d4fcbc81e5af3e89d41ab13806c2ecc13cedcd74681bd8c');
+  ResetScratch;
+  Put('blob.bin', 'a'#13#10#0'b'#13#10);
+  ExpectDigests(
+    '69934cb6a9d50a2d61ebb273ddbbcd6f8f29806a652a57e8e6bef1305d2d2782',
+    'cf31319e6c1d6b3e75f2fbece1f5f6d4d97f9105a455a7ca4511a123808c3836');
+  ResetScratch;
+  Put('blob.bin', 'a'#10#0'b'#10);
+  ExpectDigests(
+    '4c3f6771f755d55099b1a72e54e0665187931cfb0ce5d2852d8d37569d1e12d6',
+    'e51425a5ce78cb9d69d51f068373e691b794c9b31c8b65ec522c5761a6650d7e');
+  ResetScratch;
+  Put('cr.txt', 'a'#13'b'#13);
+  ExpectDigests(
+    '62f79a9f6fe3a6805be13d8d9a6040422b06f6bf9c39e172693c0d52f4831f8c',
+    '6767b67a1459191651578f01c861b4e6b7681825da5449dbdb7087c74bb1b5eb');
+  ResetScratch;
+  Put('empty.pas', '');
+  ExpectDigests(
+    '7de1b0d19b3467c2191240d86d4479c6635e73c0c30cb99f005e3213c45a17bb',
+    '86d302c47f0b9d1c94fd0385467be28c3d31fef8f03df93345c0203295b9df32');
+end;
+
+procedure TTreeDigestV2.TestNonAsciiVectors;
+const
+  { The legacy digest read names through the ANSI code page on Windows, so
+    it is pinned for these names on POSIX only. }
+  {$IFDEF MSWINDOWS}
+  LEGACY_SUSS = '';
+  LEGACY_SUPPLEMENTARY = '';
+  {$ELSE}
+  LEGACY_SUSS =
+    '2ac8aeee577349918473caaebe1f3cd79a1cd83c749c1c2a0c80969a206b9616';
+  LEGACY_SUPPLEMENTARY =
+    'd4beb95e5f9d918a1a7beddc50331157c88d431063f5e3d3483520594ffa10bb';
+  {$ENDIF}
+begin
+  ResetScratch;
+  try
+    WriteNamedFixture(FScratch, Utf16([Ord('s'), $00FC, $00DF, Ord('.'),
+      Ord('p'), Ord('a'), Ord('s')]), StringAsBytes('unit s;'#10));
+    ExpectDigests(LEGACY_SUSS,
+      '8398b468076302b8f9cf0a930f6e7d129f7201c6896bafabe2674385c7a25069');
+  finally
+    RemoveNamedFixtures(FScratch);
+  end;
+  { U+1D518 is the surrogate pair D835 DD18: on Windows this exercises the
+    pair's conversion to its four-byte UTF-8 form. }
+  ResetScratch;
+  try
+    WriteNamedFixture(FScratch, Utf16([$D835, $DD18, Ord('.'), Ord('p'),
+      Ord('a'), Ord('s')]), StringAsBytes('unit u;'#10));
+    ExpectDigests(LEGACY_SUPPLEMENTARY,
+      '07c9aecdbc478349c8f2c275ff6e01717a166118cd2e2e8f1089b9be5486fe8a');
+  finally
+    RemoveNamedFixtures(FScratch);
+  end;
+end;
+
+procedure TTreeDigestV2.TestCaseCollisionVector;
+begin
+  { Only case-sensitive filesystems can hold both names; each creation
+    order must give the tiebreak's digest. }
+  ResetScratch;
+  Put('a.pas', 'unit a;'#10);
+  Put('A.pas', 'unit A;'#10);
+  ExpectDigests(
+    'c179b461d81015e4bfdcaa89a916b3b84f473b00f4466ee5412f8cda08b39d37',
+    'ce003a228b9696df3a9f38e525a88fc8e295feb855f7850e9ac49a6615c4256a');
+  ResetScratch;
+  Put('A.pas', 'unit A;'#10);
+  Put('a.pas', 'unit a;'#10);
+  ExpectDigests(
+    'c179b461d81015e4bfdcaa89a916b3b84f473b00f4466ee5412f8cda08b39d37',
+    'ce003a228b9696df3a9f38e525a88fc8e295feb855f7850e9ac49a6615c4256a');
+end;
+
+procedure TTreeDigestV2.TestComparatorTiebreak;
+var Paths: TStringList;
+begin
+  Paths := TStringList.Create;
+  try
+    Paths.Add('a.pas');
+    Paths.Add('A.pas');
+    Paths.CustomSort(@TreeHashPathCompare);
+    Expect<string>(Paths[0] + '|' + Paths[1]).ToBe('A.pas|a.pas');
+    Paths.Clear;
+    Paths.Add('A.pas');
+    Paths.Add('a.pas');
+    Paths.CustomSort(@TreeHashPathCompare);
+    Expect<string>(Paths[0] + '|' + Paths[1]).ToBe('A.pas|a.pas');
+  finally
+    Paths.Free;
+  end;
+end;
+
+procedure TTreeDigestV2.TestRecordEncoding;
+var Expected: TBytes; Stream: string; Size: Int64; Digest: TSHA256Digest;
+  Bytes: TBytesStream;
+begin
+  { One file `alpha.txt` holding `alpha`: magic, then 01, 00000009, the
+    path, 0000000000000005, and SHA-256("alpha"). }
+  Bytes := TBytesStream.Create(StringAsBytes('alpha'));
+  try
+    Digest := TreeContentDigest(Bytes, Size);
+  finally
+    Bytes.Free;
+  end;
+  Expect<Int64>(Size).ToBe(5);
+  Expect<string>(SHA256DigestHex(Digest))
+    .ToBe(SHA256Hex(StringAsBytes('alpha')));
+  Stream := 'sha256-tree2'#0 + #1 + #0#0#0#9 + 'alpha.txt'
+    + #0#0#0#0#0#0#0#5;
+  Expected := StringAsBytes(Stream);
+  SetLength(Expected, Length(Expected) + 32);
+  Move(Digest[0], Expected[Length(Stream)], 32);
+  ResetScratch;
+  Put('alpha.txt', 'alpha');
+  Expect<string>(HashTree(FScratch))
+    .ToBe(TREE_DIGEST_PREFIX + SHA256Hex(Expected));
+end;
+
+procedure TTreeDigestV2.TestStreamingEqualsBuffered;
+
+  procedure Check(const ALabel: string; const AData: TBytes);
+  var Stream: TBytesStream; Size: Int64; Digest: TSHA256Digest;
+    Normalized: TBytes;
+  begin
+    Normalized := NormalizeTreeHashContent(AData);
+    Stream := TBytesStream.Create(AData);
+    try
+      Digest := TreeContentDigest(Stream, Size);
+    finally
+      Stream.Free;
+    end;
+    if SHA256DigestHex(Digest) <> SHA256Hex(Normalized) then
+      Fail('streamed digest differs for ' + ALabel);
+    Expect<string>(SHA256DigestHex(Digest)).ToBe(SHA256Hex(Normalized));
+    Expect<Int64>(Size).ToBe(Length(Normalized));
+  end;
+
+  function Text(const ACount: Integer): TBytes;
+  var i: Integer;
+  begin
+    SetLength(Result, ACount);
+    for i := 0 to ACount - 1 do Result[i] := Ord('a') + i mod 23;
+  end;
+
+var
+  Chunk, i: Integer;
+  Data: TBytes;
+begin
+  Chunk := TREE_DIGEST_CHUNK_BYTES;
+  Check('empty', nil);
+  for i := -1 to 1 do
+  begin
+    Data := Text(Chunk + i);
+    Data[10] := TREE_HASH_BYTE_CR;
+    Data[11] := TREE_HASH_BYTE_LF;
+    Check('size chunk' + IntToStr(i), Data);
+  end;
+  { A CR as the last byte of a chunk followed by an LF in the next. }
+  Data := Text(Chunk + 5);
+  Data[Chunk - 1] := TREE_HASH_BYTE_CR;
+  Data[Chunk] := TREE_HASH_BYTE_LF;
+  Check('CR at chunk end before LF', Data);
+  { A CR as the last byte of a chunk followed by another byte, or a CR. }
+  Data := Text(Chunk + 5);
+  Data[Chunk - 1] := TREE_HASH_BYTE_CR;
+  Check('lone CR at chunk end', Data);
+  Data := Text(Chunk + 5);
+  Data[Chunk - 1] := TREE_HASH_BYTE_CR;
+  Data[Chunk] := TREE_HASH_BYTE_CR;
+  Data[Chunk + 1] := TREE_HASH_BYTE_LF;
+  Check('CR CR LF across the chunk end', Data);
+  { A CR at end of file, at a chunk boundary and inside a chunk. }
+  Data := Text(Chunk);
+  Data[Chunk - 1] := TREE_HASH_BYTE_CR;
+  Check('CR at end of file on the chunk boundary', Data);
+  Data := Text(7);
+  Data[6] := TREE_HASH_BYTE_CR;
+  Check('CR at end of a short file', Data);
+  { A NUL only in the last chunk, after CRLFs in the first: binary. }
+  Data := Text(Chunk + 100);
+  for i := 0 to 20 do
+  begin
+    Data[i * 3] := TREE_HASH_BYTE_CR;
+    Data[i * 3 + 1] := TREE_HASH_BYTE_LF;
+  end;
+  Data[Chunk + 50] := TREE_HASH_BYTE_NUL;
+  Check('NUL in the last chunk after CRLFs', Data);
+end;
+
+procedure TTreeDigestV2.TestTreeIsNotBuffered;
+const
+  FILE_MEBIBYTES = 64;
+  LIMIT_BYTES = 1024 * 1024;
+var
+  Stream: TFileStream;
+  Block: TBytes;
+  i: Integer;
+  Digest: string;
+  Peak: PtrInt;
+begin
+  { One 64 MiB file of NUL bytes: binary, so the normalized context stops at
+    the first byte and only the raw context runs. }
+  ResetScratch;
+  SetLength(Block, 1024 * 1024);
+  FillChar(Block[0], Length(Block), 0);
+  Stream := TFileStream.Create(FScratch + PathDelim + 'large.bin', fmCreate);
+  try
+    for i := 1 to FILE_MEBIBYTES do Stream.WriteBuffer(Block[0], Length(Block));
+  finally
+    Stream.Free;
+  end;
+  SetLength(Block, 0);
+  { The tracker is live: a 2 MiB allocation shows in its peak. }
+  BeginHeapTracking;
+  try
+    SetLength(Block, 2 * LIMIT_BYTES);
+    Peak := TrackedPeak;
+    SetLength(Block, 0);
+  finally
+    EndHeapTracking;
+  end;
+  Expect<Boolean>(Peak >= 2 * LIMIT_BYTES).ToBe(True);
+  BeginHeapTracking;
+  try
+    Digest := HashTree(FScratch);
+  finally
+    EndHeapTracking;
+  end;
+  Peak := TrackedPeak;
+  Expect<Boolean>(IsTreeDigest(Digest)).ToBe(True);
+  if Peak >= LIMIT_BYTES then
+    Fail('hashing a 64 MiB file raised peak heap use by '
+      + IntToStr(Peak) + ' bytes');
+  Expect<Boolean>(Peak < LIMIT_BYTES).ToBe(True);
+end;
+
+procedure TTreeDigestV2.TestStrictUTF16Conversion;
+var UTF8: RawByteString;
+begin
+  { A correctly paired surrogate converts to its four-byte form. }
+  Expect<Boolean>(StrictUTF16ToUTF8(Utf16([$D835, $DD18]), UTF8)).ToBe(True);
+  Expect<string>(BytesToHex(UTF8)).ToBe('f09d9498');
+  Expect<Boolean>(StrictUTF16ToUTF8(Utf16([Ord('s'), $00FC, $00DF]), UTF8))
+    .ToBe(True);
+  Expect<string>(BytesToHex(UTF8)).ToBe('73c3bcc39f');
+  { Unpaired or reversed surrogates fail; they are never replaced with
+    U+FFFD, which would merge distinct names. }
+  Expect<Boolean>(StrictUTF16ToUTF8(Utf16([Ord('a'), $D800]), UTF8))
+    .ToBe(False);
+  Expect<Boolean>(StrictUTF16ToUTF8(Utf16([$DC00, Ord('a')]), UTF8))
+    .ToBe(False);
+  Expect<Boolean>(StrictUTF16ToUTF8(Utf16([$DC00, $D800]), UTF8)).ToBe(False);
+  Expect<Boolean>(StrictUTF16ToUTF8(Utf16([$D800, Ord('b')]), UTF8))
+    .ToBe(False);
+  Expect<string>(EscapeUTF16Name(Utf16([Ord('a'), $D800])))
+    .ToBe('a\ud800');
+end;
+
+procedure TTreeDigestV2.TestWellFormedPaths;
+begin
+  Expect<Boolean>(IsWellFormedTreePath('source/json.pas')).ToBe(True);
+  Expect<Boolean>(IsWellFormedTreePath('s'#$C3#$BC#$C3#$9F'.pas')).ToBe(True);
+  Expect<Boolean>(IsWellFormedTreePath(#$F0#$9D#$94#$98'.pas')).ToBe(True);
+  Expect<Boolean>(IsWellFormedTreePath('')).ToBe(False);
+  Expect<Boolean>(IsWellFormedTreePath('bad'#$FF'.pas')).ToBe(False);
+  { Overlong '/', a UTF-8-encoded surrogate, beyond U+10FFFF, truncated. }
+  Expect<Boolean>(IsWellFormedTreePath(#$C0#$AF)).ToBe(False);
+  Expect<Boolean>(IsWellFormedTreePath(#$ED#$A0#$80)).ToBe(False);
+  Expect<Boolean>(IsWellFormedTreePath(#$F4#$90#$80#$80)).ToBe(False);
+  Expect<Boolean>(IsWellFormedTreePath('a'#$C3)).ToBe(False);
+  Expect<Boolean>(IsWellFormedTreePath('a'#0'b')).ToBe(False);
+  Expect<string>(EscapeTreePath('bad'#$FF'.pas')).ToBe('bad\xff.pas');
+end;
+
+procedure TTreeDigestV2.ExpectDigestFailure(const AContains: string);
+var Raised: Boolean;
+begin
+  Raised := False;
+  try
+    HashTree(FScratch);
+  except
+    on E: EVerifyError do
+    begin
+      Raised := True;
+      if Pos(AContains, E.Message) = 0 then
+        Fail('expected the digest error to name ' + AContains + '; got: '
+          + E.Message);
+    end;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TTreeDigestV2.TestMalformedPosixNameFails;
+begin
+  { Linux stores any byte string; the digest fails closed and names it. }
+  ResetScratch;
+  Put('ok.pas', 'unit ok;'#10);
+  WriteFixtureBytes(FScratch + '/bad'#$FF'.pas', StringAsBytes('x'));
+  ExpectDigestFailure('bad\xff.pas');
+end;
+
+procedure TTreeDigestV2.TestMalformedWindowsNamesFail;
+
+  { NTFS stores unpaired surrogates. Wine maps names onto a host
+    filesystem that cannot, so there only the conversion is checked. }
+  function RunningUnderWine: Boolean;
+  {$IFDEF MSWINDOWS}
+  var Module: HMODULE;
+  begin
+    Module := GetModuleHandle('ntdll.dll');
+    Result := (Module <> 0)
+      and (GetProcAddress(Module, 'wine_get_version') <> nil);
+  end;
+  {$ELSE}
+  begin
+    Result := False;
+  end;
+  {$ENDIF}
+
+  procedure Check(const ANames: array of UnicodeString; const AContains: string);
+  var k: Integer; UTF8: RawByteString;
+  begin
+    ResetScratch;
+    try
+      if RunningUnderWine then
+      begin
+        for k := 0 to High(ANames) do
+          Expect<Boolean>(StrictUTF16ToUTF8(ANames[k], UTF8)).ToBe(False);
+        Exit;
+      end;
+      for k := 0 to High(ANames) do
+        WriteNamedFixture(FScratch, ANames[k], StringAsBytes('x'));
+      ExpectDigestFailure(AContains);
+    finally
+      RemoveNamedFixtures(FScratch);
+    end;
+  end;
+
+begin
+  Check([Utf16([Ord('a'), $D800, Ord('.'), Ord('p')])], 'a\ud800.p');
+  Check([Utf16([Ord('a'), $DC00, Ord('.'), Ord('p')])], 'a\udc00.p');
+  Check([Utf16([Ord('a'), $DC00, $D800, Ord('.'), Ord('p')])],
+    'a\udc00\ud800.p');
+  { Two names that U+FFFD replacement would merge never yield a digest. }
+  Check([Utf16([Ord('m'), $D800]), Utf16([Ord('m'), $DC00])], 'm\ud');
+end;
+
+{$IFDEF UNIX}
+procedure TTreeDigestV2.TestCopyDirTreeLinkParity;
+var Source, Copied: string;
+begin
+  { A file link is read through and a directory link is omitted, exactly as
+    CopyDirTree copies them, so rollback retention validates. }
+  ResetScratch;
+  Source := FScratch + '/src';
+  Copied := FScratch + '/copy';
+  WriteFixtureBytes(Source + '/real.pas', StringAsBytes('unit real;'#10));
+  WriteFixtureBytes(Source + '/dir/inner.pas', StringAsBytes('unit inner;'#10));
+  if FpSymlink('real.pas', PAnsiChar(Source + '/link.pas')) <> 0 then
+    raise Exception.Create('fixture: file link failed');
+  if FpSymlink('dir', PAnsiChar(Source + '/dirlink')) <> 0 then
+    raise Exception.Create('fixture: directory link failed');
+  ForceDirectories(Copied);
+  CopyDirTree(Source, Copied);
+  Expect<string>(HashTree(Copied)).ToBe(HashTree(Source));
+  Expect<Boolean>(FileExists(Copied + '/link.pas')).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Copied + '/dirlink')).ToBe(False);
+end;
+
+procedure TTreeDigestV2.TestFindTreeLinkNamesEveryLinkKind;
+begin
+  ResetScratch;
+  Put('source/a.pas', 'unit a;'#10);
+  Expect<string>(FindTreeLink(FScratch)).ToBe('');
+  if FpSymlink('a.pas', PAnsiChar(FScratch + '/source/f.pas')) <> 0 then
+    raise Exception.Create('fixture: file link failed');
+  Expect<string>(FindTreeLink(FScratch)).ToBe('source/f.pas');
+  ResetScratch;
+  Put('source/a.pas', 'unit a;'#10);
+  if FpSymlink('source', PAnsiChar(FScratch + '/d')) <> 0 then
+    raise Exception.Create('fixture: directory link failed');
+  Expect<string>(FindTreeLink(FScratch)).ToBe('d');
+  ResetScratch;
+  Put('source/a.pas', 'unit a;'#10);
+  if FpSymlink('missing', PAnsiChar(FScratch + '/source/gone')) <> 0 then
+    raise Exception.Create('fixture: dangling link failed');
+  Expect<string>(FindTreeLink(FScratch)).ToBe('source/gone');
+end;
+{$ELSE}
+procedure TTreeDigestV2.TestCopyDirTreeLinkParity;
+begin
+end;
+
+procedure TTreeDigestV2.TestFindTreeLinkNamesEveryLinkKind;
+begin
+end;
+{$ENDIF}
+
+procedure TTreeDigestV2.TestMissingDirectoryFails;
+var Raised: Boolean;
+begin
+  Raised := False;
+  try
+    HashTree(FScratch + PathDelim + 'absent');
+  except
+    on E: EVerifyError do Raised := True;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TTreeDigestV2.TestIsTreeDigest;
+begin
+  Expect<Boolean>(IsTreeDigest(TREE_DIGEST_PREFIX + StringOfChar('a', 64)))
+    .ToBe(True);
+  Expect<Boolean>(IsTreeDigest('sha256:' + StringOfChar('a', 64))).ToBe(False);
+  Expect<Boolean>(IsTreeDigest(TREE_DIGEST_PREFIX + StringOfChar('A', 64)))
+    .ToBe(False);
+  Expect<Boolean>(IsTreeDigest(TREE_DIGEST_PREFIX + StringOfChar('a', 63)))
+    .ToBe(False);
+  Expect<Boolean>(IsTreeDigest('sha256:(unfetched)')).ToBe(False);
+end;
+
+procedure TTreeDigestV2.TestRetentionRecordsTree2Snapshot;
+var Live, Backup: string; Meta: TStringList;
+begin
+  ResetScratch;
+  Live := FScratch + PathDelim + 'module';
+  WriteFixtureBytes(Live + PathDelim + 'a.pas', StringAsBytes('unit a;'#10));
+  Expect<Boolean>(AtomicRetainPath(Live, FScratch, 'm', Backup)).ToBe(True);
+  Meta := TStringList.Create;
+  try
+    Meta.LoadFromFile(Backup + '.rollback');
+    Expect<string>(Meta[1]).ToBe('tree:' + HashTree(Live));
+  finally
+    Meta.Free;
+  end;
+  AtomicDiscardRetainedPath(Backup);
+end;
+
+procedure TTreeDigestV2.TestLegacySidecarIsRecovered;
+var Live, Backup: string; Meta: TStringList;
+begin
+  { A rollback file that a pre-v4 binary wrote records the legacy digest;
+    recovery still validates and restores it. }
+  ResetScratch;
+  Live := FScratch + PathDelim + 'module';
+  Backup := FScratch + PathDelim + 'rollback-module';
+  WriteFixtureBytes(Backup + PathDelim + 'a.pas', StringAsBytes('unit a;'#10));
+  WriteFixtureBytes(Live + PathDelim + 'a.pas', StringAsBytes('changed'#10));
+  Meta := TStringList.Create;
+  try
+    Meta.Add(Live);
+    Meta.Add('tree:' + LegacyHashTree(Backup));
+    Meta.SaveToFile(Backup + '.rollback');
+  finally
+    Meta.Free;
+  end;
+  Expect<Boolean>(AtomicRestorePath(Backup, Live)).ToBe(True);
+  Expect<string>(BytesToHex(ReadFixtureText(Live + PathDelim + 'a.pas')))
+    .ToBe(BytesToHex('unit a;'#10));
+  { A legacy sidecar that does not match its copy is refused. }
+  WriteFixtureBytes(Backup + PathDelim + 'a.pas', StringAsBytes('unit b;'#10));
+  Meta := TStringList.Create;
+  try
+    Meta.Add(Live);
+    Meta.Add('tree:sha256:' + StringOfChar('0', 64));
+    Meta.SaveToFile(Backup + '.rollback');
+  finally
+    Meta.Free;
+  end;
+  Expect<Boolean>(AtomicRestorePath(Backup, Live)).ToBe(False);
+end;
+
+procedure TTreeDigestV2.SetupTests;
+begin
+  Test('ADR-0052 vector: empty directory', TestEmptyDirectoryVector);
+  Test('ADR-0052 vector: nested tree', TestNestedVector);
+  Test('ADR-0052 vector: fold order', TestFoldOrderVector);
+  Test('ADR-0052 vector: the #352 substitution changes only tree2',
+    TestIssue352Vectors);
+  Test('ADR-0052 vectors: CRLF, LF, binary, lone CR, and empty content',
+    TestContentVectors);
+  Test('ADR-0052 vectors: non-ASCII and supplementary-plane names',
+    TestNonAsciiVectors);
+  {$IFDEF LINUX}
+  Test('ADR-0052 vector: case collision in either creation order',
+    TestCaseCollisionVector);
+  {$ELSE}
+  Skip('ADR-0052 vector: case collision in either creation order',
+    TestCaseCollisionVector,
+    'the default filesystem cannot hold names differing only in case');
+  {$ENDIF}
+  Test('the comparator orders a case collision A.pas first in either order',
+    TestComparatorTiebreak);
+  Test('one record is magic, type, length, path, size, and digest',
+    TestRecordEncoding);
+  Test('streamed per-file digests equal the buffered definition',
+    TestStreamingEqualsBuffered);
+  Test('hashing a 64 MiB file raises peak heap use by less than 1 MiB',
+    TestTreeIsNotBuffered);
+  Test('strict UTF-16 conversion rejects unpaired surrogates',
+    TestStrictUTF16Conversion);
+  Test('tree paths must be well-formed UTF-8', TestWellFormedPaths);
+  {$IFDEF LINUX}
+  Test('a name that is not UTF-8 fails the digest and is named',
+    TestMalformedPosixNameFails);
+  {$ELSE}
+  Skip('a name that is not UTF-8 fails the digest and is named',
+    TestMalformedPosixNameFails,
+    'only Linux filesystems store arbitrary name bytes');
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Test('names with lone or reversed surrogates fail the digest',
+    TestMalformedWindowsNamesFail);
+  {$ELSE}
+  Skip('names with lone or reversed surrogates fail the digest',
+    TestMalformedWindowsNamesFail, 'UTF-16 names exist only on Windows');
+  {$ENDIF}
+  {$IFDEF UNIX}
+  Test('a CopyDirTree copy with file and directory links hashes alike',
+    TestCopyDirTreeLinkParity);
+  Test('FindTreeLink names file, directory, and dangling links',
+    TestFindTreeLinkNamesEveryLinkKind);
+  {$ELSE}
+  Skip('a CopyDirTree copy with file and directory links hashes alike',
+    TestCopyDirTreeLinkParity, 'link fixtures need FpSymlink');
+  Skip('FindTreeLink names file, directory, and dangling links',
+    TestFindTreeLinkNamesEveryLinkKind, 'link fixtures need FpSymlink');
+  {$ENDIF}
+  Test('a missing directory fails the digest', TestMissingDirectoryFails);
+  Test('IsTreeDigest accepts only the canonical tree2 form', TestIsTreeDigest);
+  Test('rollback retention records a tree2 snapshot',
+    TestRetentionRecordsTree2Snapshot);
+  Test('a legacy tree sidecar from a pre-v4 binary is still recovered',
+    TestLegacySidecarIsRecovered);
 end;
 
 { ── TLoadManifestHappy ────────────────────────────────────────────── }
@@ -1565,12 +2412,90 @@ begin
     'schema v2', Self);
 end;
 
+const
+  V3_LOCK = 'version = 3'#10 + ''#10 + '[package.alpha]'#10
+    + 'source = "owner/alpha"'#10 + 'resolvedRef = "v1.2.3"'#10
+    + 'computedHash = "sha256:aaa"'#10 + 'archiveHash = "sha256:bbb"'#10;
+
+procedure TLockfileLoading.TestSchemaV3RaisesWithRepairHint;
+var Raised: Boolean;
+begin
+  { One message, naming repair and the delete-and-install alternative with
+    its consequences (ADR-0052 section 5). }
+  Expect<string>(LockfileSchemaV3Message).ToBe('`' + LOCKFILE
+    + '` is schema v3, whose tree hash cannot detect a rearranged module '
+    + 'tree (ADR-0052). Run `' + PROGRAM_NAME + ' repair` to upgrade it to '
+    + 'v4 without network access and without changing dependency versions, '
+    + 'then commit `' + LOCKFILE + '`. Deleting `' + LOCKFILE
+    + '` and running `' + PROGRAM_NAME + ' install` also works, but needs '
+    + 'network access and moves range dependencies to their newest matching '
+    + 'versions.');
+  ExpectLockfileLoadError(WriteLockfileContent('schema-v3', V3_LOCK),
+    LockfileSchemaV3Message, Self);
+  Raised := False;
+  try
+    RequireCurrentLockfileSchema(WriteLockfileContent('schema-v3-gate',
+      V3_LOCK));
+  except
+    on E: ELockfileError do
+      Raised := E.Message = LockfileSchemaV3Message;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+end;
+
+procedure TLockfileLoading.TestSchemaV3LoadsOnlyForTheUpgrade;
+var Entries: TResolvedArray;
+begin
+  Entries := LoadLockfile(WriteLockfileContent('schema-v3-upgrade', V3_LOCK),
+    True);
+  Expect<Integer>(Length(Entries)).ToBe(1);
+  Expect<string>(Entries[0].Hash).ToBe('sha256:aaa');
+  Expect<Integer>(ReadLockfileSchemaVersion(
+    WriteLockfileContent('schema-v3-version', V3_LOCK))).ToBe(3);
+  Expect<Integer>(ReadLockfileSchemaVersion(LOCK_TMP_DIR + '/absent.lock'))
+    .ToBe(0);
+  Expect<Integer>(ReadLockfileSchemaVersion(WriteLockfileContent(
+    'schema-corrupt', 'this is { not'#10))).ToBe(-1);
+end;
+
+procedure TLockfileLoading.TestNewerSchemaNamesTheReader;
+begin
+  ExpectLockfileLoadError(WriteLockfileContent('schema-v5', 'version = 5'#10),
+    'schema v5; this ' + PROGRAM_NAME + ' reads up to v4', Self);
+end;
+
+procedure TLockfileLoading.TestLegacyDigestInV4Fails;
+begin
+  { A v4 lock never holds a legacy digest; the entry is named. }
+  ExpectLockfileLoadError(WriteLockfileContent('v4-legacy-digest',
+    'version = 4'#10 + ''#10 + '[package.good]'#10
+    + 'source = "owner/good"'#10 + 'computedHash = "sha256-tree2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'#10
+    + ''#10 + '[package.forged]'#10 + 'source = "owner/forged"'#10
+    + 'computedHash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'#10),
+    'entry "forged" has computedHash', Self);
+end;
+
+procedure TLockfileLoading.TestRegistryTablesShareTheGate;
+var Raised: Boolean; Path: string;
+begin
+  Path := WriteLockfileContent('registry-v3', V3_LOCK);
+  Raised := False;
+  try
+    LoadRegistryLockTables(Path);
+  except
+    on E: ELockfileError do
+      Raised := E.Message = LockfileSchemaV3Message;
+  end;
+  Expect<Boolean>(Raised).ToBe(True);
+  Expect<Integer>(Length(LoadRegistryLockTables(Path, True))).ToBe(0);
+end;
+
 procedure TLockfileLoading.TestEmptyPackageTableReturnsEmptyArray;
 var Entries: TResolvedArray;
 begin
   Entries := LoadLockfile(
     WriteLockfileContent('empty',
-      'version = 3'#10));
+      'version = 4'#10));
   Expect<Integer>(Length(Entries)).ToBe(0);
 end;
 
@@ -1579,27 +2504,27 @@ var Entries: TResolvedArray;
 begin
   Entries := LoadLockfile(
     WriteLockfileContent('three-pkgs',
-      'version = 3'#10 +
+      'version = 4'#10 +
       ''#10 +
       '[package.alpha]'#10 +
       'source = "owner/alpha"'#10 +
       'resolvedRef = "v1.2.3"'#10 +
       'resolvedURL = "https://github.com/owner/alpha/archive/v1.2.3.tar.gz"'#10 +
-      'computedHash = "sha256:aaa"'#10 +
+      'computedHash = "sha256-tree2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'#10 +
       'archiveHash = "sha256:bbb"'#10 +
       ''#10 +
       '[package.beta]'#10 +
       'source = "../local-beta"'#10 +
       'resolvedRef = ""'#10 +
       'resolvedURL = ""'#10 +
-      'computedHash = "sha256:ccc"'#10 +
+      'computedHash = "sha256-tree2:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"'#10 +
       'archiveHash = ""'#10));
   Expect<Integer>(Length(Entries)).ToBe(2);
   Expect<string>(Entries[0].Name).ToBe('alpha');
   Expect<string>(Entries[0].Version).ToBe('v1.2.3');
   Expect<string>(Entries[0].SrcOriginal).ToBe('owner/alpha');
   Expect<string>(Entries[0].SrcLocator).ToBe('owner/alpha');
-  Expect<string>(Entries[0].Hash).ToBe('sha256:aaa');
+  Expect<string>(Entries[0].Hash).ToBe('sha256-tree2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   Expect<string>(Entries[0].ArchiveHash).ToBe('sha256:bbb');
   Expect<string>(Entries[1].Name).ToBe('beta');
   Expect<string>(Entries[1].SrcOriginal).ToBe('../local-beta');
@@ -1616,6 +2541,16 @@ begin
     TestMissingSchemaVersionRaisesELockfileError);
   Test('schema v1 raises with migration hint',
     TestSchemaV1RaisesWithMigrationHint);
+  Test('schema v3 raises the repair hint for every reader',
+    TestSchemaV3RaisesWithRepairHint);
+  Test('schema v3 loads only for the repair upgrade',
+    TestSchemaV3LoadsOnlyForTheUpgrade);
+  Test('a newer schema names the highest version this reader reads',
+    TestNewerSchemaNamesTheReader);
+  Test('a legacy computedHash in a v4 lock fails and names the entry',
+    TestLegacyDigestInV4Fails);
+  Test('registry lock tables share the schema gate',
+    TestRegistryTablesShareTheGate);
   Test('empty [package] table returns empty array (legal: 0 deps)',
     TestEmptyPackageTableReturnsEmptyArray);
   Test('package entries round-trip every field',
@@ -2943,13 +3878,13 @@ begin
     diagnostics; verification works via the resolvedURL + hashes. }
   Entries := LoadLockfile(
     WriteLockfileContent('permissive',
-      'version = 3'#10 +
+      'version = 4'#10 +
       ''#10 +
       '[package.mylib]'#10 +
       'source = "gitea:team/mylib"'#10 +
       'resolvedRef = "v1.0.0"'#10 +
       'resolvedURL = "https://git.example.com/team/mylib/archive/v1.0.0.tar.gz"'#10 +
-      'computedHash = "sha256:abc"'#10 +
+      'computedHash = "sha256-tree2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'#10 +
       'archiveHash = "sha256:def"'#10));
   Expect<Integer>(Length(Entries)).ToBe(1);
   Expect<Integer>(Ord(Entries[0].SrcKind)).ToBe(Ord(skGitHost));
@@ -4066,6 +5001,8 @@ begin
     PROJECT_NAME + '.Core: SHA-256 NIST vectors'));
   TestRunnerProgram.AddSuite(THashTreePaths.Create(
     PROJECT_NAME + '.Core: HashTree paths'));
+  TestRunnerProgram.AddSuite(TTreeDigestV2.Create(
+    PROJECT_NAME + '.Core: sha256-tree2 digest (ADR-0052)'));
   TestRunnerProgram.AddSuite(TLoadManifestHappy.Create(
     PROJECT_NAME + '.Manifest: LoadManifest happy path'));
   TestRunnerProgram.AddSuite(TLoadManifestValidation.Create(

@@ -1,5 +1,7 @@
 # Lockfile schema v2 — archiveHash is a sibling of computedHash
 
+> **Amended by [ADR-0052](./0052-lockfile-schema-v4-framed-tree-digest.md):** `computedHash` is no longer the SHA-256 of the concatenated extracted tree. Schema v4 records `sha256-tree2:<hex>`, a framed digest with one self-delimiting record per file, because the unframed v3 stream let a rearranged tree hash like the original (#352). `archiveHash` keeps its meaning here: the raw SHA-256 of the archive bytes. v1 and v2 keep their migration hint; a v3 lock is refused and upgraded only by `lwpt repair`.
+
 The `lwpt.lock` file records, per resolved dep, both the SHA-256 of the on-disk extracted modules tree (`computedHash`) **and** the SHA-256 of the source `.tar.gz` archive in the cache (`archiveHash`). Both fields are required in v2; `archiveHash` is the empty string for `skLocal` deps that have no archive. Earlier schema (v1) recorded only `computedHash`; v1 lockfiles are rejected at load time with a clear migration hint ("delete and re-run `lwpt install`"). The schema number is stored as `version = 2` at the top of the file. We chose this over keeping a single `computedHash` field because `--frozen` mode is supposed to be a tamper-detection gate (per ADR-0002), and tamper detection that ignores the archive bytes lets an attacker swap the cached tarball under a legitimate-looking modules tree.
 
 ## Considered Options
