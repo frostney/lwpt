@@ -324,7 +324,17 @@ function TransportSecurityTestKeyContainerExists(
   can be pinned without an SChannel server building its own chain. }
 function TransportSecurityTestVerifyServerChain(const ALeaf,
   AIntermediates: TBytes; const AHost: string;
-  const AOptions: TTransportSecurityClientOptions): string;
+  const AOptions: TTransportSecurityClientOptions): string; overload;
+{ As above; ARefused is True only for ETransportSecurityVerificationError. }
+function TransportSecurityTestVerifyServerChain(const ALeaf,
+  AIntermediates: TBytes; const AHost: string;
+  const AOptions: TTransportSecurityClientOptions;
+  out ARefused: Boolean): string; overload;
+{ Makes the next chain evaluations fail to execute: 1 in
+  CertGetCertificateChain, 2 in CertVerifyCertificateChainPolicy, 0 for
+  none. }
+procedure TransportSecurityTestForceSChannelChainExecutionFailure(
+  const AStage: Integer);
 {$ENDIF}
 {$ENDIF}
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
@@ -6372,6 +6382,9 @@ type
     IntermediatesFromPeer: Boolean;
     PeerStoreCount: Integer;
     PolicyError: LongWord;
+    { Empty when both chain calls ran; otherwise which call failed to
+      execute and its GetLastError. PolicyError then reports no verdict. }
+    ExecutionFailure: string;
   end;
 
 {$IFDEF CPU64}
@@ -6556,6 +6569,8 @@ const
 {$IFNDEF PRODUCTION}
 var
   SChannelTestImportedKeyContainers: TUnicodeStringArray;
+  { 0, or the chain call the test seam makes fail to execute. }
+  SChannelTestChainExecutionFailure: Integer;
 {$ENDIF}
 
 function NCryptOpenStorageProvider(out AProvider: PtrUInt;
@@ -7478,9 +7493,21 @@ begin
   ChainPara.RequestedUsage.Usage.cUsageIdentifier := 1;
   ChainPara.RequestedUsage.Usage.rgpszUsageIdentifier := @Usages[0];
   Chain := nil;
+  {$IFNDEF PRODUCTION}
+  if SChannelTestChainExecutionFailure = 1 then
+  begin
+    AReport.ExecutionFailure := 'CertGetCertificateChain failed: '
+      + SChannelStatusText(LongWord(14 { ERROR_OUTOFMEMORY }));
+    Exit;
+  end;
+  {$ENDIF}
   if not CertGetCertificateChain(AEngine, APeer, nil, APeer^.hCertStore,
     ChainPara, AChainFlags, nil, Chain) or not Assigned(Chain) then
+  begin
+    AReport.ExecutionFailure := 'CertGetCertificateChain failed: '
+      + SChannelStatusText(LongWord(Windows.GetLastError));
     Exit;
+  end;
   try
     ChainContext := PCertChainContextLWPT(Chain);
     AReport.ChainErrorStatus := ChainContext^.TrustStatus.dwErrorStatus;
@@ -7515,13 +7542,34 @@ begin
     PolicyPara.pvExtraPolicyPara := @SSLPara;
     FillChar(PolicyStatus, SizeOf(PolicyStatus), 0);
     PolicyStatus.cbSize := SizeOf(PolicyStatus);
+    { A False result means the policy check could not run, not that it
+      rejected the chain; only a completed check reports dwError. }
+    {$IFNDEF PRODUCTION}
+    if SChannelTestChainExecutionFailure = 2 then
+      AReport.ExecutionFailure := 'CertVerifyCertificateChainPolicy failed: '
+        + SChannelStatusText(LongWord(14 { ERROR_OUTOFMEMORY }))
+    else
+    {$ENDIF}
     if CertVerifyCertificateChainPolicy(
       PAnsiChar(PtrUInt(CERT_CHAIN_POLICY_SSL)), Chain, PolicyPara,
       PolicyStatus) then
-      AReport.PolicyError := PolicyStatus.dwError;
+      AReport.PolicyError := PolicyStatus.dwError
+    else
+      AReport.ExecutionFailure := 'CertVerifyCertificateChainPolicy failed: '
+        + SChannelStatusText(LongWord(Windows.GetLastError));
   finally
     CertFreeCertificateChain(Chain);
   end;
+end;
+
+{ An evaluation that could not run is an operational failure, which a
+  retry may overcome, never a verdict on the peer. }
+procedure RequireSChannelChainEvaluated(const AReport: TSChannelChainReport);
+begin
+  if AReport.ExecutionFailure <> '' then
+    raise ETransportSecurityError.CreateFmt(
+      'TLS certificate chain evaluation could not run: %s',
+      [AReport.ExecutionFailure]);
 end;
 
 function SChannelChainPolicyError(const AEngine: Pointer;
@@ -7533,6 +7581,7 @@ var
 begin
   SChannelEvaluateChain(AEngine, APeer, AHost, AServerAuthentication,
     AChainFlags, Report);
+  RequireSChannelChainEvaluated(Report);
   Result := Report.PolicyError;
 end;
 
@@ -7600,6 +7649,7 @@ var
 begin
   SChannelEvaluateAnchorChain(AAnchors, APeer, AHost, AServerAuthentication,
     False, Report);
+  RequireSChannelChainEvaluated(Report);
   Result := Report.PolicyError;
 end;
 
@@ -9547,9 +9597,26 @@ begin
     Result[I] := SChannelTestImportedKeyContainers[I];
 end;
 
+procedure TransportSecurityTestForceSChannelChainExecutionFailure(
+  const AStage: Integer);
+begin
+  SChannelTestChainExecutionFailure := AStage;
+end;
+
 function TransportSecurityTestVerifyServerChain(const ALeaf,
   AIntermediates: TBytes; const AHost: string;
   const AOptions: TTransportSecurityClientOptions): string;
+var
+  Refused: Boolean;
+begin
+  Result := TransportSecurityTestVerifyServerChain(ALeaf, AIntermediates,
+    AHost, AOptions, Refused);
+end;
+
+function TransportSecurityTestVerifyServerChain(const ALeaf,
+  AIntermediates: TBytes; const AHost: string;
+  const AOptions: TTransportSecurityClientOptions;
+  out ARefused: Boolean): string;
 const
   CERT_STORE_PROV_MEMORY = 2;
   CERT_STORE_ADD_USE_EXISTING = 2;
@@ -9583,11 +9650,15 @@ begin
           'Test peer intermediate is not a valid X.509 certificate');
     if Length(AOptions.TrustAnchors) > 0 then
       AnchorStore := CreateSChannelAnchorStore(AOptions.TrustAnchors);
+    ARefused := False;
     try
       VerifySChannelPeerCertificate(Leaf, AHost, AOptions, AnchorStore);
     except
       on E: ETransportSecurityError do
+      begin
         Result := E.Message;
+        ARefused := E is ETransportSecurityVerificationError;
+      end;
     end;
   finally
     if Assigned(Leaf) then

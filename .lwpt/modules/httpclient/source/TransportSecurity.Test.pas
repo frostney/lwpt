@@ -121,6 +121,7 @@ type
     procedure TestNativeMaterialRejectedBeforeConnecting;
     procedure TestSChannelAnchorVerificationStaysOffline;
     procedure TestSChannelAnchorPassMakesNoRetrieval;
+    procedure TestSChannelChainExecutionFailureIsNotARefusal;
   end;
 
   TTransportSecurityServerTests = class(TTestSuite)
@@ -5707,6 +5708,53 @@ begin
   {$ENDIF}
 end;
 
+{ CertVerifyCertificateChainPolicy distinguishes a check that could not run
+  from one that rejected the chain. A failure to execute either chain call
+  must stay a plain, retryable ETransportSecurityError; only a completed
+  check that rejects the peer is a verification refusal. }
+procedure TTransportSecurityClientOptionTests.TestSChannelChainExecutionFailureIsNotARefusal;
+{$IFDEF MSWINDOWS}
+const
+  FIXTURES = 'packages/httpclient/source/fixtures/';
+var
+  ErrorMessage: string;
+  Intermediate, Leaf: TBytes;
+  Options: TTransportSecurityClientOptions;
+  Refused: Boolean;
+  Stage: Integer;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Leaf := PEMCertificateDER(FIXTURES +
+    'localhost-unreachable-aia-leaf-cert.pem');
+  Intermediate := LoadFixtureBytes(FIXTURES +
+    'unreachable-aia-intermediate-cert.pem');
+  Options := AnchorOptions(LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH),
+    tstmAnchorsOnly);
+  for Stage := 1 to 2 do
+  begin
+    TransportSecurityTestForceSChannelChainExecutionFailure(Stage);
+    try
+      ErrorMessage := TransportSecurityTestVerifyServerChain(Leaf,
+        Intermediate, 'localhost', Options, Refused);
+    finally
+      TransportSecurityTestForceSChannelChainExecutionFailure(0);
+    end;
+    Expect<Boolean>(Mentions(ErrorMessage, 'could not run')).ToBe(True);
+    Expect<Boolean>(Refused).ToBe(False);
+  end;
+  { The same chain evaluates and is accepted once the calls run again, and
+    an unrelated anchor is a refusal. }
+  Expect<string>(TransportSecurityTestVerifyServerChain(Leaf, Intermediate,
+    'localhost', Options, Refused)).ToBe('');
+  ErrorMessage := TransportSecurityTestVerifyServerChain(Leaf, Intermediate,
+    'localhost', AnchorOptions(LoadFixtureBytes(FIXTURES
+      + 'unrelated-root-cert.pem'), tstmAnchorsOnly), Refused);
+  Expect<Boolean>(Mentions(ErrorMessage, 'verification')).ToBe(True);
+  Expect<Boolean>(Refused).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityClientOptionTests.SetupTests;
 begin
   Test('default client options select the option-less path',
@@ -5724,12 +5772,17 @@ begin
     TestSChannelAnchorVerificationStaysOffline);
   Test('SChannel anchor pass makes no retrieval that system evaluation makes',
     TestSChannelAnchorPassMakesNoRetrieval);
+  Test('an SChannel chain call that cannot run is not a verification refusal',
+    TestSChannelChainExecutionFailureIsNotARefusal);
   {$ELSE}
   Skip('SChannel anchor verification never fetches certificate URLs',
     TestSChannelAnchorVerificationStaysOffline,
     'the SChannel chain engine is Windows-only');
   Skip('SChannel anchor pass makes no retrieval that system evaluation makes',
     TestSChannelAnchorPassMakesNoRetrieval,
+    'the SChannel chain engine is Windows-only');
+  Skip('an SChannel chain call that cannot run is not a verification refusal',
+    TestSChannelChainExecutionFailureIsNotARefusal,
     'the SChannel chain engine is Windows-only');
   {$ENDIF}
 end;
