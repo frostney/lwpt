@@ -10,8 +10,8 @@ platform	windows/x86_64
 program	*	packages/cli/source/CLI.Events.Test.pas	1	5
 program	*	packages/cli/source/CLI.Parser.Test.pas	1	9
 program	*	packages/cli/source/CLI.Subcommands.Test.pas	1	8
-program	*	packages/httpclient/source/HTTPClient.Test.pas	5	57
-program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	55
+program	*	packages/httpclient/source/HTTPClient.Test.pas	5	63
+program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	61
 program	*	packages/httpclient/source/TransportSecurity.Test.pas	2	53
 program	*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	0	0
 program	linux/*	packages/httpclient/tests/e2e/TransportSecuritySocket.E2E.Test.pas	1	3

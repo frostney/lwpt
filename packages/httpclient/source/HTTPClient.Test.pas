@@ -107,6 +107,12 @@ type
     procedure TestPostRedirect307And308PreservesBody;
     procedure TestPostRejectsContentTypeLineBreaksBeforeConnect;
     procedure TestPostSendsBinaryBodyAndOwnsEntityHeaders;
+    procedure TestPutAndDeleteSendBinaryBodiesAndOwnEntityHeaders;
+    procedure TestPutAndDeleteSendEmptyBodiesWithZeroLength;
+    procedure TestPutAndDeleteRejectContentTypeLineBreaksBeforeConnect;
+    procedure TestPutRedirect301302307And308PreservesMethodAndBody;
+    procedure TestPutAndDeleteRedirect303BecomesGet;
+    procedure TestPutWithZeroRedirectBudgetReturnsTheRedirect;
   end;
 
   THTTPClientDestinationPolicy = class(TTestSuite)
@@ -474,8 +480,35 @@ begin
     'Content-Length: 0' + CRLF + 'Connection: close' + CRLF + CRLF);
 end;
 
+{ Sends one body-carrying request with AMethod through the public API. }
+function SendBodyRequest(const AMethod, AURL: string; const ABody: TBytes;
+  const AContentType: string; const AHeaders: THTTPHeaders;
+  const AOptions: THTTPRequestOptions): THTTPResponse;
+begin
+  if AMethod = 'POST' then
+    Result := HTTPPost(AURL, ABody, AContentType, AHeaders, AOptions)
+  else if AMethod = 'PUT' then
+    Result := HTTPPut(AURL, ABody, AContentType, AHeaders, AOptions)
+  else if AMethod = 'DELETE' then
+    Result := HTTPDelete(AURL, ABody, AContentType, AHeaders, AOptions)
+  else
+    raise Exception.Create('unsupported test method ' + AMethod);
+end;
+
+function ServeBodyRedirectAndCapture(const AMethod: string;
+  const AStatusCode: Integer; const ABody: TBytes;
+  const AContentType: string): TBytes; forward;
+
 function ServePostRedirectAndCapture(const AStatusCode: Integer;
   const ABody: TBytes; const AContentType: string): TBytes;
+begin
+  Result := ServeBodyRedirectAndCapture('POST', AStatusCode, ABody,
+    AContentType);
+end;
+
+function ServeBodyRedirectAndCapture(const AMethod: string;
+  const AStatusCode: Integer; const ABody: TBytes;
+  const AContentType: string): TBytes;
 var
   NoHeaders: THTTPHeaders;
   Options: THTTPRequestOptions;
@@ -493,8 +526,8 @@ begin
       NoHeaders := nil;
       Options := DefaultHTTPRequestOptions;
       Options.RequestTimeoutMilliseconds := 2000;
-      Response := HTTPPost(MockURL(Origin.Port), ABody, AContentType,
-        NoHeaders, Options);
+      Response := SendBodyRequest(AMethod, MockURL(Origin.Port), ABody,
+        AContentType, NoHeaders, Options);
       Origin.WaitDone;
       Target.WaitDone;
       Expect<Integer>(Response.StatusCode).ToBe(200);
@@ -869,6 +902,198 @@ begin
   end;
 end;
 
+procedure THTTPClientRequestBodies.
+  TestPutAndDeleteSendBinaryBodiesAndOwnEntityHeaders;
+const
+  CRLF = #13#10;
+  METHODS: array[0..1] of string = ('PUT', 'DELETE');
+var
+  Body, CapturedBody: TBytes;
+  CapturedHeader, ExpectedHeader, Method: string;
+  Headers: THTTPHeaders;
+  I: Integer;
+  Mock: TMockHTTPServer;
+  Response: THTTPResponse;
+begin
+  { Large enough to span several socket writes, with #0 bytes throughout. }
+  SetLength(Body, 96 * 1024 + 5);
+  for I := 0 to High(Body) do
+    if I mod 7 = 0 then Body[I] := 0
+    else Body[I] := Byte((I * 31) and $ff);
+  SetLength(Headers, 5);
+  Headers[0].Name := 'Host';
+  Headers[0].Value := 'example.invalid';
+  Headers[1].Name := 'Content-Length';
+  Headers[1].Value := '1';
+  Headers[2].Name := 'Content-Type';
+  Headers[2].Value := 'text/plain';
+  Headers[3].Name := 'Authorization';
+  Headers[3].Value := 'Bearer retained';
+  Headers[4].Name := 'Transfer-Encoding';
+  Headers[4].Value := 'chunked';
+  for Method in METHODS do
+  begin
+    Mock := TMockHTTPServer.Create(BuildSimpleResponse(nil));
+    try
+      Mock.Start;
+      Response := SendBodyRequest(Method, MockURL(Mock.Port), Body,
+        'application/gzip', Headers, DefaultHTTPRequestOptions);
+      Mock.WaitDone;
+      Expect<Integer>(Response.StatusCode).ToBe(200);
+      CapturedHeader := RequestHeaderText(Mock.ReceivedRequest);
+      ExpectedHeader := Method + ' /x HTTP/1.1' + CRLF +
+        'Host: 127.0.0.1:' + IntToStr(Mock.Port) + CRLF +
+        'Connection: close' + CRLF +
+        'User-Agent: GocciaScript/1.0' + CRLF +
+        'Content-Length: ' + IntToStr(Length(Body)) + CRLF +
+        'Content-Type: application/gzip' + CRLF +
+        'Authorization: Bearer retained' + CRLF + CRLF;
+      Expect<string>(CapturedHeader).ToBe(ExpectedHeader);
+      CapturedBody := RequestBody(Mock.ReceivedRequest);
+      Expect<Integer>(Length(CapturedBody)).ToBe(Length(Body));
+      Expect<string>(BytesToHex(CapturedBody)).ToBe(BytesToHex(Body));
+    finally
+      Mock.Free;
+    end;
+  end;
+end;
+
+procedure THTTPClientRequestBodies.
+  TestPutAndDeleteSendEmptyBodiesWithZeroLength;
+const
+  CRLF = #13#10;
+  METHODS: array[0..1] of string = ('PUT', 'DELETE');
+var
+  CapturedHeader, Method: string;
+  NoHeaders: THTTPHeaders;
+  Mock: TMockHTTPServer;
+  Response: THTTPResponse;
+begin
+  NoHeaders := nil;
+  for Method in METHODS do
+  begin
+    Mock := TMockHTTPServer.Create(BuildSimpleResponse(nil));
+    try
+      Mock.Start;
+      Response := SendBodyRequest(Method, MockURL(Mock.Port), nil,
+        'application/octet-stream', NoHeaders, DefaultHTTPRequestOptions);
+      Mock.WaitDone;
+      Expect<Integer>(Response.StatusCode).ToBe(200);
+      CapturedHeader := RequestHeaderText(Mock.ReceivedRequest);
+      Expect<Boolean>(Pos(Method + ' /x HTTP/1.1' + CRLF, CapturedHeader) = 1)
+        .ToBe(True);
+      Expect<Boolean>(Pos('Content-Length: 0' + CRLF, CapturedHeader) > 0)
+        .ToBe(True);
+      Expect<Integer>(Length(RequestBody(Mock.ReceivedRequest))).ToBe(0);
+    finally
+      Mock.Free;
+    end;
+  end;
+end;
+
+procedure THTTPClientRequestBodies.
+  TestPutAndDeleteRejectContentTypeLineBreaksBeforeConnect;
+const
+  METHODS: array[0..1] of string = ('PUT', 'DELETE');
+var
+  Endpoint: TMockRefusedEndpoint;
+  ErrorMessage, Method, URL: string;
+  NoHeaders: THTTPHeaders;
+begin
+  Endpoint := TMockRefusedEndpoint.Create;
+  try
+    URL := 'http://' + Endpoint.Host + ':' + IntToStr(Endpoint.Port) + '/x';
+    NoHeaders := nil;
+    for Method in METHODS do
+    begin
+      ErrorMessage := '';
+      try
+        SendBodyRequest(Method, URL, MakeBytes([$00]),
+          'text/plain' + #13#10 + 'X-Injected: yes', NoHeaders,
+          DefaultHTTPRequestOptions);
+      except
+        on E: EHTTPError do ErrorMessage := E.Message;
+      end;
+      Expect<string>(ErrorMessage).ToBe(
+        'HTTP content type must not contain carriage return or line feed');
+    end;
+  finally
+    Endpoint.Free;
+  end;
+end;
+
+procedure THTTPClientRequestBodies.
+  TestPutRedirect301302307And308PreservesMethodAndBody;
+const
+  CRLF = #13#10;
+  STATUSES: array[0..3] of Integer = (301, 302, 307, 308);
+var
+  Body, Captured: TBytes;
+  Header: string;
+  StatusCode: Integer;
+begin
+  Body := MakeBytes([$00, $01, $fe, $ff, $00]);
+  for StatusCode in STATUSES do
+  begin
+    Captured := ServeBodyRedirectAndCapture('PUT', StatusCode, Body,
+      'application/gzip');
+    Header := RequestHeaderText(Captured);
+    Expect<Boolean>(Pos('PUT /target HTTP/1.1' + CRLF, Header) = 1).ToBe(True);
+    Expect<Boolean>(Pos('Content-Length: 5' + CRLF, Header) > 0).ToBe(True);
+    Expect<Boolean>(Pos('Content-Type: application/gzip' + CRLF,
+      Header) > 0).ToBe(True);
+    Expect<string>(BytesToHex(RequestBody(Captured))).ToBe(BytesToHex(Body));
+  end;
+end;
+
+procedure THTTPClientRequestBodies.TestPutAndDeleteRedirect303BecomesGet;
+const
+  CRLF = #13#10;
+  METHODS: array[0..1] of string = ('PUT', 'DELETE');
+var
+  Captured: TBytes;
+  Header, Method: string;
+begin
+  for Method in METHODS do
+  begin
+    Captured := ServeBodyRedirectAndCapture(Method, 303,
+      MakeBytes([$00, $01, $02]), 'application/octet-stream');
+    Header := RequestHeaderText(Captured);
+    Expect<Boolean>(Pos('GET /target HTTP/1.1' + CRLF, Header) = 1).ToBe(True);
+    Expect<Boolean>(Pos('Content-Length:', Header) = 0).ToBe(True);
+    Expect<Boolean>(Pos('Content-Type:', Header) = 0).ToBe(True);
+    Expect<Integer>(Length(RequestBody(Captured))).ToBe(0);
+  end;
+end;
+
+procedure THTTPClientRequestBodies.
+  TestPutWithZeroRedirectBudgetReturnsTheRedirect;
+var
+  NoHeaders: THTTPHeaders;
+  Options: THTTPRequestOptions;
+  Origin: TMockHTTPServer;
+  Response: THTTPResponse;
+begin
+  Origin := TMockHTTPServer.Create(RedirectResponse(307,
+    'http://127.0.0.1:1/elsewhere'));
+  try
+    Origin.Start;
+    NoHeaders := nil;
+    Options := DefaultHTTPRequestOptions;
+    Options.MaximumRedirects := 0;
+    Options.RequestTimeoutMilliseconds := 2000;
+    Response := HTTPPut(MockURL(Origin.Port), MakeBytes([$01]),
+      'application/gzip', NoHeaders, Options);
+    Origin.WaitDone;
+    { The caller sees the redirect itself; nothing is sent to its target. }
+    Expect<Integer>(Response.StatusCode).ToBe(307);
+    Expect<Boolean>(Response.Redirected).ToBe(False);
+    Expect<string>(Response.FinalURL).ToBe(MockURL(Origin.Port));
+  finally
+    Origin.Free;
+  end;
+end;
+
 procedure THTTPClientRequestBodies.TestGetAndHeadWireBehaviorIsUnchanged;
 const
   CRLF = #13#10;
@@ -921,6 +1146,18 @@ begin
     TestPostRedirect303BecomesGet);
   Test('POST redirects through 307 and 308 with method and body preserved',
     TestPostRedirect307And308PreservesBody);
+  Test('PUT and DELETE send complete binary content and own entity headers',
+    TestPutAndDeleteSendBinaryBodiesAndOwnEntityHeaders);
+  Test('PUT and DELETE send an empty body with a zero length',
+    TestPutAndDeleteSendEmptyBodiesWithZeroLength);
+  Test('PUT and DELETE reject Content-Type line breaks before connecting',
+    TestPutAndDeleteRejectContentTypeLineBreaksBeforeConnect);
+  Test('PUT redirects through 301, 302, 307, and 308 keep method and body',
+    TestPutRedirect301302307And308PreservesMethodAndBody);
+  Test('PUT and DELETE redirect through 303 as bodyless GET',
+    TestPutAndDeleteRedirect303BecomesGet);
+  Test('PUT with a zero redirect budget returns the redirect',
+    TestPutWithZeroRedirectBudgetReturnsTheRedirect);
   Test('GET and HEAD request bytes remain unchanged',
     TestGetAndHeadWireBehaviorIsUnchanged);
 end;
