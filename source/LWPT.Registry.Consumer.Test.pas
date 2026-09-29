@@ -15,7 +15,8 @@ uses
   LWPT.Registry.Verification,
   TestingPascalLibrary,
   Tests.RegistryConsumer,
-  Tests.Scratch;
+  Tests.Scratch,
+  Tests.TarSynth;
 
 const
   { A valid Ed25519 pin: the key id is the sha256 of the public key. }
@@ -59,6 +60,7 @@ type
     procedure TestLockedSelectionRequiresValidSignature;
     procedure TestConcurrentStateMergesAreMonotonic;
     procedure TestRotationChainLoadingIsBounded;
+    procedure TestLockedSelectionLoadingIsBounded;
   end;
 
   TMergeThread = class(TThread)
@@ -385,6 +387,29 @@ begin
   Result.PublicKey := ARegistry.PublicKey;
 end;
 
+{ The lock's claims for ASelection: its own bytes' hashes, and the one
+  record recorded as AName@AVersion with its signed archive. }
+function ClaimsOf(ARegistry: TSyntheticRegistry;
+  const ASelection: TLWPTRegistryLockedSelection;
+  const AName, AVersion: string): TLWPTRegistryLockedClaims;
+var Checkpoint: TLWPTUntrustedRegistryCheckpoint;
+begin
+  Checkpoint := InspectRegistryCheckpoint(ASelection.Checkpoint);
+  Result := Default(TLWPTRegistryLockedClaims);
+  Result.Checkpoint := SHA256BytesPrefixed(ASelection.Checkpoint);
+  Result.Signature := SHA256BytesPrefixed(ASelection.Signature);
+  Result.Snapshot := Checkpoint.Snapshot;
+  Result.KeyId := Checkpoint.KeyId;
+  Result.Sequence := Checkpoint.Sequence;
+  Result.PublishedAt := Checkpoint.PublishedAt;
+  Result.ExpiresAt := Checkpoint.ExpiresAt;
+  SetLength(Result.Records, 1);
+  Result.Records[0].RecordHash := SHA256BytesPrefixed(ASelection.Records[0]);
+  Result.Records[0].Name := AName;
+  Result.Records[0].Version := AVersion;
+  Result.Records[0].ArchiveHash := ARegistry.ArchiveHashOf(AName, AVersion);
+end;
+
 procedure TRegistryConsumerTests.TestLockedSelectionVerifiesWithoutHistory;
 var
   Synthetic: TSyntheticRegistry;
@@ -401,7 +426,7 @@ begin
     Index := Synthetic.Publish(RegistryStamp(-10 * 86400), RegistryStamp(-4 * 86400));
     Selection := SelectionOf(Synthetic, Index, Synthetic.RecordHash('json', '1.1.0'));
     Verified := VerifyRegistryLockedSelection(Selection, TrustOf(Synthetic),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Selection, 'json', '1.1.0'));
     Expect<Int64>(Verified.Sequence).ToBe(2);
     Expect<string>(Verified.Packages[0].Version).ToBe('1.1.0');
   finally
@@ -417,15 +442,18 @@ var
   Message: string;
 
   function Failure(const ASelection: TLWPTRegistryLockedSelection;
-    const ATrust: TLWPTRegistryTrust; const AHash: string): string;
+    const ATrust: TLWPTRegistryTrust;
+    const AClaims: TLWPTRegistryLockedClaims): string;
   begin
     Result := '';
     try
-      VerifyRegistryLockedSelection(ASelection, ATrust, AHash);
+      VerifyRegistryLockedSelection(ASelection, ATrust, AClaims);
     except
       on E: Exception do Result := E.Message;
     end;
   end;
+
+var Claims: TLWPTRegistryLockedClaims;
 
 begin
   Synthetic := TSyntheticRegistry.Create('https://packages.example.com');
@@ -435,25 +463,65 @@ begin
     Index := Synthetic.Publish(RegistryStamp(-60), RegistryStamp(86400));
     Selection := SelectionOf(Synthetic, Index, Synthetic.RecordHash('json', '1.0.0'));
     { The recorded checkpoint hash must name these bytes. }
-    Message := Failure(Selection, TrustOf(Synthetic), 'sha256:' + StringOfChar('0', 64));
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Checkpoint := 'sha256:' + StringOfChar('0', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    { So must the recorded signature hash. }
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Signature := 'sha256:' + StringOfChar('0', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    { The recorded sequence, key, and snapshot are the checkpoint's. }
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Sequence := Claims.Sequence + 1;
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Snapshot := 'sha256:' + StringOfChar('1', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    { So are its signed publication and expiry times. }
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.PublishedAt := RegistryStamp(-3600);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.ExpiresAt := RegistryStamp(30 * 86400);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
     Expect<Boolean>(Pos('locked_proof_state_mismatch', Message) > 0).ToBe(True);
     { A different pin cannot verify the signature. }
     Message := Failure(Selection, TrustOf(Other),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
     Expect<Boolean>(Message <> '').ToBe(True);
     { A record outside the signed snapshot is not a member. }
     Tampered := Selection;
+    { The outer array is shared by the record copy: copy it first. }
+    Tampered.Records := Copy(Selection.Records);
     Tampered.Records[0] := Copy(Selection.Records[0]);
     Tampered.Records[0][Length(Tampered.Records[0]) - 3] := Ord('X');
     Message := Failure(Tampered, TrustOf(Synthetic),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Tampered, 'json', '1.0.0'));
     Expect<Boolean>(Pos('registry_record_not_in_snapshot', Message) > 0).ToBe(True);
+    { Record bytes must be the ones the lock names. }
+    Message := Failure(Tampered, TrustOf(Synthetic),
+      ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
+    Expect<Boolean>(Pos('locked_record_mismatch', Message) > 0).ToBe(True);
+    { A member record whose fields differ from the lock fails. }
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Records[0].Version := '1.0.1';
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_record_mismatch', Message) > 0).ToBe(True);
+    Claims := ClaimsOf(Synthetic, Selection, 'json', '1.0.0');
+    Claims.Records[0].ArchiveHash := 'sha256:' + StringOfChar('2', 64);
+    Message := Failure(Selection, TrustOf(Synthetic), Claims);
+    Expect<Boolean>(Pos('locked_record_mismatch', Message) > 0).ToBe(True);
     { A snapshot that is not the checkpoint's fails. }
     Tampered := Selection;
     Tampered.Snapshot := Copy(Selection.Snapshot);
     Tampered.Snapshot[10] := Ord('X');
     Message := Failure(Tampered, TrustOf(Synthetic),
-      SHA256BytesPrefixed(Selection.Checkpoint));
+      ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
     Expect<Boolean>(Pos('snapshot_hash_mismatch', Message) > 0).ToBe(True);
   finally
     Other.Free;
@@ -484,7 +552,7 @@ begin
     Message := '';
     try
       VerifyRegistryLockedSelection(Selection, TrustOf(Synthetic),
-        SHA256BytesPrefixed(Selection.Checkpoint));
+        ClaimsOf(Synthetic, Selection, 'json', '1.0.0'));
     except
       on E: Exception do Message := E.Message;
     end;
@@ -547,6 +615,116 @@ begin
   Expect<Int64>(Loaded.State.Sequence).ToBe(MERGE_WORKERS);
   Expect<string>(Loaded.State.ClockFloor)
     .ToBe(Format('2026-10-%.2dT00:00:00Z', [MERGE_WORKERS]));
+end;
+
+procedure TRegistryConsumerTests.TestLockedSelectionLoadingIsBounded;
+var
+  Synthetic: TSyntheticRegistry;
+  Current: TSyntheticCheckpoint;
+  Checkpoint: TLWPTUntrustedRegistryCheckpoint;
+  Table: TLWPTRegistryLockTable;
+  Selection: TLWPTRegistryLockedSelection;
+  Limits: TLWPTRegistryVerificationLimits;
+  Records, Many: TStringArray;
+  Archives, State, Message, Big: string;
+  Snapshot, RecordBytes: TBytes;
+  Index: Integer;
+
+  procedure Commit(const ABytes: TBytes);
+  begin
+    WriteBytesToFile(RegistryProofPath(Archives, SHA256BytesPrefixed(ABytes)),
+      ABytes);
+  end;
+
+  function Failure(const ATable: TLWPTRegistryLockTable;
+    const ARecords: TStringArray; const ALimits: TLWPTRegistryVerificationLimits;
+    const AState: string = ''): string;
+  begin
+    Result := '';
+    try
+      LoadLockedRegistrySelection(Archives, AState, ATable, ARecords, ALimits);
+    except
+      on E: Exception do Result := E.Message;
+    end;
+  end;
+
+begin
+  Archives := FScratch + '/locked-load/archives';
+  State := FScratch + '/locked-load/state';
+  Synthetic := TSyntheticRegistry.Create('https://packages.example.com');
+  try
+    Synthetic.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Current := Synthetic.Checkpoint(Synthetic.Publish(RegistryStamp(-60),
+      RegistryStamp(86400)));
+    Checkpoint := InspectRegistryCheckpoint(Current.Checkpoint);
+    Synthetic.Document('snapshots/sha256/' + Copy(Checkpoint.Snapshot, 8, 64)
+      + '.toml', Snapshot);
+    Synthetic.Document('records/sha256/' + Copy(Synthetic.RecordHash('json',
+      '1.0.0'), 8, 64) + '.toml', RecordBytes);
+    Commit(Current.Checkpoint);
+    Commit(Current.Signature);
+    Commit(Snapshot);
+    Commit(RecordBytes);
+    Table := Default(TLWPTRegistryLockTable);
+    Table.Checkpoint := SHA256BytesPrefixed(Current.Checkpoint);
+    Table.Signature := SHA256BytesPrefixed(Current.Signature);
+    Table.Snapshot := Checkpoint.Snapshot;
+    SetLength(Records, 1);
+    Records[0] := Synthetic.RecordHash('json', '1.0.0');
+    Limits := DefaultRegistryVerificationLimits;
+    Selection := LoadLockedRegistrySelection(Archives, '', Table, Records, Limits);
+    Expect<Integer>(Length(Selection.Records)).ToBe(1);
+    { A repeated rotation document is refused before any read. }
+    SetLength(Table.Rotations, 3);
+    for Index := 0 to 2 do Table.Rotations[Index] := Table.Snapshot;
+    Expect<Boolean>(Pos('named more than once', Failure(Table, Records, Limits)) > 0)
+      .ToBe(True);
+    { So is a repeated record. }
+    Table.Rotations := nil;
+    SetLength(Many, 2);
+    Many[0] := Records[0];
+    Many[1] := Records[0];
+    Expect<Boolean>(Pos('named more than once', Failure(Table, Many, Limits)) > 0)
+      .ToBe(True);
+    { More rotations than the verifier accepts: refused by count first. }
+    SetLength(Many, 3 * (Limits.Rotations + 1));
+    for Index := 0 to High(Many) do
+      Many[Index] := 'sha256:' + LowerCase(Format('%.64x', [Index]));
+    Table.Rotations := Many;
+    Expect<Boolean>(Pos('proof_limit_exceeded', Failure(Table, Records, Limits)) > 0)
+      .ToBe(True);
+    Table.Rotations := nil;
+    { The cumulative budget is charged before each allocation. }
+    Limits.TotalBytes := Length(Current.Checkpoint) + Length(Current.Signature);
+    Expect<Boolean>(Pos('proof_limit_exceeded', Failure(Table, Records, Limits)) > 0)
+      .ToBe(True);
+    Limits := DefaultRegistryVerificationLimits;
+    { An oversized document is refused by its size, before it is read: a
+      sparse gigabyte named by a canonical hash costs nothing. }
+    Big := 'sha256:' + StringOfChar('c', 64);
+    CreateSparseFile(RegistryProofPath(Archives, Big), Int64(1024) * 1024 * 1024);
+    Table.Rotations := nil;
+    SetLength(Many, 1);
+    Many[0] := Big;
+    Expect<Boolean>(Pos('proof_limit_exceeded', Failure(Table, Many, Limits)) > 0)
+      .ToBe(True);
+    DeleteFile(RegistryProofPath(Archives, Big));
+    { A corrupt committed document is never read around, even when the
+      per-user store holds good bytes; an absent one comes from the store. }
+    WriteBytesToFile(State + '/documents/sha256/'
+      + Copy(Records[0], 8, 64) + '.toml', RecordBytes);
+    WriteBytesToFile(RegistryProofPath(Archives, Records[0]), BytesOf('corrupt'));
+    Message := Failure(Table, Records, Limits, State);
+    Expect<Boolean>(Pos('registry_proof_corrupt', Message) > 0).ToBe(True);
+    DeleteFile(RegistryProofPath(Archives, Records[0]));
+    Selection := LoadLockedRegistrySelection(Archives, State, Table, Records,
+      Limits);
+    Expect<Integer>(Length(Selection.Records[0])).ToBe(Length(RecordBytes));
+    Expect<Boolean>(Pos('registry_proof_missing', Failure(Table, Records,
+      Limits)) > 0).ToBe(True);
+  finally
+    Synthetic.Free;
+  end;
 end;
 
 procedure TRegistryConsumerTests.TestRotationChainLoadingIsBounded;
@@ -657,6 +835,9 @@ begin
     TestLockedSelectionRequiresValidSignature);
   Test('concurrent per-user state merges keep the highest sequence and floor',
     TestConcurrentStateMergesAreMonotonic);
+  Test('locked selection proofs load within count and byte limits, refuse '
+    + 'repeats, and never read around a corrupt committed document',
+    TestLockedSelectionLoadingIsBounded);
   Test('rotation chains load within count and byte limits and refuse repeats',
     TestRotationChainLoadingIsBounded);
 end;

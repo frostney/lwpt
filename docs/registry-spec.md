@@ -465,15 +465,26 @@ time must precede its expiry.
 
 A network-free operation reproducing an already locked selection may verify
 that retained proof after its checkpoint expires. It must require the exact
-recorded checkpoint hash, sequence, snapshot, origin, and signing key; verify
-the signature and rotation chain from the configured trust root; and verify
-record membership, snapshot history, archive identity, and available archive
-bytes. It applies neither the maximum lifetime nor the clock-rollback floor,
-so already accepted content remains verifiable and servable, and is reported
-as expired once its checkpoint expires. This exception does not accept a new
-checkpoint, change a locked selection, or make an expired mirror fresh. Acquisition and locked proof are
-explicit validation modes, not a replacement evaluation time supplied to
-evade an expiry check.
+recorded checkpoint hash, sequence, snapshot, origin, and signing key, and
+verify the signature and rotation chain from the configured trust root. What
+else it verifies depends on what the operation retains:
+
+- A mirror's retained proof also verifies snapshot history back to the first
+  sequence, record membership, archive identity, and available archive bytes.
+- A dependency consumer's locked selection proof retains no history
+  ([ADR-0051](./adr/0051-registry-dependency-sources.md)). It verifies the
+  checkpoint hash, the signature through the rotation chain from the pin, the
+  snapshot hash, membership of each selected record in that snapshot, the
+  record's origin, name, and version, and archive identity. The consumer then
+  checks the archive bytes against the record and re-derives the installed
+  tree from them.
+
+Neither applies the maximum lifetime nor the clock-rollback floor, so already
+accepted content remains verifiable and servable, and is reported as expired
+once its checkpoint expires. This exception does not accept a new checkpoint,
+change a locked selection, or make an expired mirror fresh. Acquisition and
+locked proof are explicit validation modes, not a replacement evaluation time
+supplied to evade an expiry check.
 
 `LWPT.Registry.Verification` provides that shared validation independently of
 transport and persistence. Its caller supplies bounded reads of metadata
