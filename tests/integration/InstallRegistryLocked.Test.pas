@@ -1177,10 +1177,16 @@ begin
     Lines.Free;
   end;
   Expect<Boolean>(Stripped <> V3).ToBe(True);
+  { A trailing comment on the header must not hide the table from the
+    accepted-state update. }
+  Stripped := StringReplace(Stripped, '[registry."' + IDENTITY + '"]',
+    '[registry."' + IDENTITY + '"] # corp', []);
   WriteBytesToFile(CaseRoot + '/project/lwpt.lock', BytesOf(Stripped));
   FOrigin.Mode := scmFail;
   ExpectSuccess('registry repair accepted state', Run(CaseRoot, ['repair']));
-  Expect<string>(LockText(CaseRoot)).ToBe(V4);
+  Expect<string>(LockText(CaseRoot)).ToBe(StringReplace(V4,
+    '[registry."' + IDENTITY + '"]', '[registry."' + IDENTITY + '"] # corp',
+    []));
   Expect<string>(Journal(CaseRoot)).ToBe('');
   FOrigin.Mode := scmServe;
 end;

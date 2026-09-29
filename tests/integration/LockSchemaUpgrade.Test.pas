@@ -70,6 +70,8 @@ type
     procedure TestRepairUpgradesWithoutNetworkOrVersionChange;
     procedure TestNoChurnAfterTheUpgrade;
     procedure TestHistoricalV3LockChangesOnlyItsDigests;
+    procedure TestMultilineValuesAreNeverEdited;
+    procedure TestUnsafeLockFormsFailClosed;
     procedure TestRepairReplacesASubstitutedModule;
     procedure TestRepairMissingArchiveFailsWithMigrationMessage;
     procedure TestRepairCorruptArchiveFailsWithMigrationMessage;
@@ -353,7 +355,8 @@ end;
   `resolvedCommit`, `sourceIdentity`, or `constraintFingerprint`. Unknown
   keys and tables, which every reader tolerates, are added so that the
   upgrade must keep them. Built from scratch, never from a v4 lock. }
-function HistoricalV3Lock(const ARoot, AEnding: string): string;
+function HistoricalV3Lock(const ARoot, AEnding: string;
+  const ASharedHashLine: string = ''; const ASharedExtra: string = ''): string;
 
   procedure Line(const AText: string);
   begin
@@ -367,9 +370,13 @@ function HistoricalV3Lock(const ARoot, AEnding: string): string;
     Line('source = "' + ASource + '"');
     Line('resolvedRef = "' + ARef + '"');
     Line('resolvedURL = "' + AURL + '"');
-    Line('computedHash = "' + LegacyHashTree(ARoot + '/.lwpt/modules/'
-      + AName) + '"');
+    if (AName = 'shared') and (ASharedHashLine <> '') then
+      Line(ASharedHashLine)
+    else
+      Line('computedHash = "' + LegacyHashTree(ARoot + '/.lwpt/modules/'
+        + AName) + '"');
     Line('archiveHash = "' + AArchive + '"');
+    if AName = 'shared' then Result := Result + ASharedExtra;
   end;
 
 begin
@@ -433,6 +440,69 @@ begin
     ExpectSuccess('offline after historical repair',
       Run(Root, ['install', '--offline']));
     Expect<string>(LockText(Root)).ToBe(Upgraded);
+  end;
+end;
+
+{ The historical lock with its version and legacy digests replaced by the
+  values an upgrade must write. }
+function UpgradedText(const AHistorical, ARoot, AV4, AEnding: string): string;
+const NAMES: array[0..2] of string = ('shared', 'local-dep', 'workspace-dep');
+var Index: Integer;
+begin
+  Result := StringReplace(AHistorical, 'version = 3' + AEnding,
+    'version = 4' + AEnding, []);
+  for Index := 0 to High(NAMES) do
+    Result := StringReplace(Result, 'computedHash = "'
+      + LegacyHashTree(ARoot + '/.lwpt/modules/' + NAMES[Index]) + '"',
+      'computedHash = "' + LockEntryField(AV4, NAMES[Index], 'computedHash')
+      + '"', []);
+end;
+
+procedure TLockSchemaUpgrade.TestMultilineValuesAreNeverEdited;
+var Root, V4, Historical: string;
+begin
+  { A multiline string holding a computedHash line and a table header, and
+    a multi-line array whose lines open with '[', are values: they are
+    copied unchanged, and the real key is still upgraded. }
+  V4 := Seed('multiline', Root);
+  Historical := HistoricalV3Lock(Root, #10, '',
+    'notes = ''''''' + #10 + 'computedHash = "sha256:' + StringOfChar('0', 64)
+    + '"' + #10 + '[package.local-dep]' + #10 + '''''''' + #10
+    + 'history = [' + #10 + '  ["computedHash", "kept"],' + #10 + ']' + #10);
+  WriteExactFile(Root + '/lwpt.lock', Historical);
+  ExpectSuccess('repair multiline', Run(Root, ['repair']));
+  Expect<string>(LockText(Root)).ToBe(UpgradedText(Historical, Root, V4,
+    #10));
+  ExpectSuccess('frozen after multiline repair',
+    Run(Root, ['install', '--frozen']));
+end;
+
+procedure TLockSchemaUpgrade.TestUnsafeLockFormsFailClosed;
+var Root, Historical, Before: string; Index: Integer;
+const
+  SHARED_HASH_LINES: array[0..1] of string = (
+    { A quoted key the editor would miss and then duplicate. }
+    '"computedHash" = "sha256:%s"',
+    { A multiline string the editor never edits: the upgraded key would be
+      missing, so the edit must not be written. }
+    'computedHash = """sha256:%s"""');
+  REASONS: array[0..1] of string = ('the key "computedHash" is quoted',
+    'the edited lockfile cannot be parsed');
+begin
+  for Index := 0 to High(SHARED_HASH_LINES) do
+  begin
+    Seed('unsafe-' + IntToStr(Index), Root);
+    Historical := HistoricalV3Lock(Root, #10, Format(SHARED_HASH_LINES[Index],
+      [Copy(LegacyHashTree(Root + '/.lwpt/modules/shared'), 8, 64)]));
+    WriteExactFile(Root + '/lwpt.lock', Historical);
+    Before := ProjectSnapshot(Root, REPAIR_OWNED);
+    ExpectFailureWith('repair unsafe ' + IntToStr(Index), Run(Root, ['repair']),
+      '`' + PROGRAM_NAME + ' repair` cannot upgrade `' + LOCKFILE
+      + '` from schema v3: ');
+    ExpectFailureWith('repair unsafe reason ' + IntToStr(Index),
+      Run(Root, ['repair']), REASONS[Index]);
+    Expect<string>(LockText(Root)).ToBe(Historical);
+    Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
   end;
 end;
 
@@ -692,6 +762,10 @@ begin
     TestNoChurnAfterTheUpgrade);
   Test('repair of a historical v3 lock changes only version and digests',
     TestHistoricalV3LockChangesOnlyItsDigests);
+  Test('repair never edits multiline string or array values',
+    TestMultilineValuesAreNeverEdited);
+  Test('repair fails closed on a quoted or multiline computedHash',
+    TestUnsafeLockFormsFailClosed);
   Test('repair replaces a substituted module a forged v3 digest matched',
     TestRepairReplacesASubstitutedModule);
   Test('repair names a missing archive with the migration message',
