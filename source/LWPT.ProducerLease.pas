@@ -70,6 +70,10 @@ type
       ADescription: string): TLWPTProducerLease;
     function Snapshot(const AObjectKey: string;
       out ASnapshot: TLWPTProducerLeaseSnapshot): Boolean;
+    { Removes the state of a key whose producer is gone, for single-use keys
+      that no later producer will name again. Returns False, leaving the key
+      untouched, while any producer holds it. }
+    function TryRetireKey(const AObjectKey: string): Boolean;
     property Root: string read FRoot;
   end;
 
@@ -651,6 +655,30 @@ begin
     Result := nil;
     Guard.Free;
     raise;
+  end;
+end;
+
+function TLWPTProducerLeaseCoordinator.TryRetireKey(
+  const AObjectKey: string): Boolean;
+var
+  Guard: TLWPTProducerGuard;
+  KeyRootPath, QuarantinePath: string;
+begin
+  Result := False;
+  KeyRootPath := KeyRoot(KeyDigest(AObjectKey));
+  if IsDirSymlinkOrJunction(KeyRootPath) then Exit;
+  if not DirectoryExists(KeyRootPath) then Exit(True);
+  Guard := nil;
+  if not TLWPTProducerGuard.TryCreate(
+       IncludeTrailingPathDelimiter(KeyRootPath) + GUARD_FILE, Guard) then Exit;
+  try
+    QuarantinePath := KeyRootPath + '.retire-' + NewToken(KeyDigest(AObjectKey));
+    if not TryDetachAbandonedKey(KeyRootPath, QuarantinePath, Guard) then Exit;
+    if DirectoryExists(QuarantinePath) and not IsDirSymlinkOrJunction(QuarantinePath) then
+      WipeDir(QuarantinePath);
+    Result := True;
+  finally
+    Guard.Free;
   end;
 end;
 

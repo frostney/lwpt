@@ -18,6 +18,13 @@ uses
   Sockets;
   {$ENDIF}
 
+const
+  { The body deadline is this plus one second per declared MiB. }
+  RegistryBodyBaseDeadlineMilliseconds = 30000;
+  { Processing time granted after a complete body: the bounded lease waits
+    plus the commit itself. }
+  RegistryMutationProcessingMilliseconds = 20000;
+
 type
   TLWPTRegistryHTTPResponse = record
     Status: Integer;
@@ -29,11 +36,48 @@ type
     ResourcePath: string;
     ResourceLength: Int64;
     ResourceDigest: string;
+    { Optional publication headers; empty or zero means absent. }
+    Location: string;
+    RetryAfter: Integer;
+    Challenge: string;
+  end;
+
+  TLWPTRegistryHeader = record
+    Name, Value: string;
+  end;
+
+  { A parsed request line and header block. Header names keep their wire
+    case; lookups are case-insensitive. }
+  TLWPTRegistryRequestHead = record
+    Method, Target, Peer: string;
+    Headers: array of TLWPTRegistryHeader;
+  end;
+
+  { A mutating request admitted past its header checks. The transport feeds
+    exactly BodyLength bytes, then calls Finish once; a transport failure
+    calls Abort instead. Neither Abort nor destruction raises. }
+  TLWPTRegistryMutation = class
+  public
+    function BodyLength: Int64; virtual; abstract;
+    function ExpectsContinue: Boolean; virtual; abstract;
+    procedure Feed(const ABuffer; const ACount: Integer); virtual; abstract;
+    function Finish: TLWPTRegistryHTTPResponse; virtual; abstract;
+    procedure Abort; virtual; abstract;
+  end;
+
+  { Admits or refuses a non-read request after its headers. A nil result
+    means AResponse is final and no body is read. }
+  TLWPTRegistryMutationHandler = class
+  public
+    function BeginMutation(const AHead: TLWPTRegistryRequestHead;
+      out AResponse: TLWPTRegistryHTTPResponse): TLWPTRegistryMutation;
+      virtual; abstract;
   end;
 
   TLWPTRegistryServer = class
   private
     FStore: TLWPTRegistryStore;
+    FHandler: TLWPTRegistryMutationHandler;
     FClients: TThreadList;
     FStopping: Boolean;
     procedure DrainClients;
@@ -51,6 +95,29 @@ function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
 function RegistryErrorResponse(const AStatus: Integer; const AReason,
   ACode, AMessage: string; const ARequestID: string = ''):
   TLWPTRegistryHTTPResponse;
+{ A retryable 429 or 503 error with Retry-After. }
+function RegistryRetryableErrorResponse(const AStatus: Integer; const AReason,
+  ACode, AMessage, ARequestID: string; const ARetryAfterSeconds: Integer):
+  TLWPTRegistryHTTPResponse;
+function NewRegistryRequestID: string;
+{ Parses the header block (without its terminating blank line). Returns
+  False for a malformed request line or header field. }
+function ParseRegistryRequestHead(const AText, APeer: string;
+  out AHead: TLWPTRegistryRequestHead): Boolean;
+{ Values of every header named AName, in wire order. }
+function RegistryHeaderValues(const AHead: TLWPTRegistryRequestHead;
+  const AName: string): TStringArray;
+function RegistryMethodIsRead(const AMethod: string): Boolean;
+{ Answers one request whose headers are complete. Reads go through
+  RegistryHTTPResponse; everything else goes to AHandler, which may return
+  a mutation that needs a body. }
+function RegistryDispatch(AStore: TLWPTRegistryStore;
+  AHandler: TLWPTRegistryMutationHandler;
+  const AHead: TLWPTRegistryRequestHead; AProgress: TSHA256Progress;
+  out AMutation: TLWPTRegistryMutation): TLWPTRegistryHTTPResponse;
+function RegistryBodyDeadlineMilliseconds(const ABodyLength: Int64): QWord;
+function CreateRegistryMutationHandler(AStore: TLWPTRegistryStore):
+  TLWPTRegistryMutationHandler;
 function RegistryResourceFailureResponse(const ADiagnostic: string):
   TLWPTRegistryHTTPResponse;
 function RegistryHTTPWireResponse(const AResponse: TLWPTRegistryHTTPResponse;
@@ -82,6 +149,7 @@ uses
   LWPT.Registry.Server.NetworkFramework,
   {$ENDIF}
   LWPT.Registry.Filesystem,
+  LWPT.Registry.Publication,
   LWPT.Registry.Verification,
   TransportSecurity;
 
@@ -101,13 +169,19 @@ const
 
 var
   RegistryRequestSequence: LongInt;
-  {$IFDEF REGISTRY_TESTING}
+
+threadvar
+  { Ciphertext a TLS connection may receive; raised by an admitted body. }
+  RegistryTLSCiphertextBudget: QWord;
+
+{$IFDEF REGISTRY_TESTING}
+var
   RegistryTestPlainSendActive: Boolean;
   RegistryTestPlainSendAdvance: QWord;
   RegistryTestPlainSendCalls: Integer;
   RegistryTestPlainSendMaximum: Integer;
   RegistryTestPlainSendTime: QWord;
-  {$ENDIF}
+{$ENDIF}
 
 {$IFDEF DARWIN}
 function CurrentRegistryDarwinTLSTransport: TRegistryDarwinTLSTransport;
@@ -130,6 +204,8 @@ type
   private
     FSocket: TSocket;
     FStore: TLWPTRegistryStore;
+    FHandler: TLWPTRegistryMutationHandler;
+    FPeer: string;
     FTLSServerContext: TTransportSecurityServerContext;
     FTLSCiphertextReceived: QWord;
     FDeadline: QWord;
@@ -137,11 +213,14 @@ type
     procedure CheckDeadline;
     procedure ExecutePlain;
     procedure ExecuteTLS;
+    function ReadBodyPlain(AMutation: TLWPTRegistryMutation;
+      const ALeftover: string): Boolean;
   protected
     procedure Execute; override;
   public
     constructor Create(const ASocket: TSocket; AStore: TLWPTRegistryStore;
-      ATLSServerContext: TTransportSecurityServerContext);
+      ATLSServerContext: TTransportSecurityServerContext;
+      AHandler: TLWPTRegistryMutationHandler; const APeer: string);
     procedure Cancel;
     property Done: Boolean read FDone;
   end;
@@ -368,6 +447,29 @@ begin
   Result := Copy(SHA256Hex(Bytes(Identity)), 1, 26);
 end;
 
+function ErrorDocument(const ACode, AMessage, ARequestID: string;
+  const ARetryable: Boolean): TBytes;
+const
+  RETRYABLE_TEXT: array[Boolean] of string = ('false', 'true');
+begin
+  Result := Bytes('schema = '
+    + RegistryTOMLQuote(PROGRAM_NAME + '-registry-error-v1') + #10
+    + 'code = ' + RegistryTOMLQuote(ACode) + #10
+    + 'message = ' + RegistryTOMLQuote(AMessage) + #10
+    + 'request_id = ' + RegistryTOMLQuote(ARequestID) + #10
+    + 'retryable = ' + RETRYABLE_TEXT[ARetryable] + #10);
+end;
+
+function RegistryRetryableErrorResponse(const AStatus: Integer; const AReason,
+  ACode, AMessage, ARequestID: string; const ARetryAfterSeconds: Integer):
+  TLWPTRegistryHTTPResponse;
+begin
+  Result := RegistryErrorResponse(AStatus, AReason, ACode, AMessage, ARequestID);
+  Result.Body := ErrorDocument(ACode, AMessage, ARequestID, True);
+  Result.RetryAfter := ARetryAfterSeconds;
+  if Result.RetryAfter < 1 then Result.RetryAfter := 1;
+end;
+
 function RegistryErrorResponse(const AStatus: Integer; const AReason,
   ACode, AMessage: string; const ARequestID: string):
   TLWPTRegistryHTTPResponse;
@@ -376,6 +478,7 @@ var
 begin
   RequestID := ARequestID;
   if RequestID = '' then RequestID := NewRegistryRequestID;
+  Result := Default(TLWPTRegistryHTTPResponse);
   Result.Status := AStatus;
   Result.Reason := AReason;
   Result.ContentType := 'application/vnd.' + PROGRAM_NAME
@@ -385,12 +488,7 @@ begin
   Result.ResourcePath := '';
   Result.ResourceLength := 0;
   Result.ResourceDigest := '';
-  Result.Body := Bytes('schema = '
-    + RegistryTOMLQuote(PROGRAM_NAME + '-registry-error-v1') + #10
-    + 'code = ' + RegistryTOMLQuote(ACode) + #10
-    + 'message = ' + RegistryTOMLQuote(AMessage) + #10
-    + 'request_id = ' + RegistryTOMLQuote(RequestID) + #10
-    + 'retryable = false' + #10);
+  Result.Body := ErrorDocument(ACode, AMessage, RequestID, False);
 end;
 
 function ErrorResponse(const AStatus: Integer; const AReason,
@@ -418,6 +516,7 @@ function ResourceResponse(AStore: TLWPTRegistryStore;
 var
   RouteStream: TStream;
 begin
+  Result := Default(TLWPTRegistryHTTPResponse);
   RouteStream := nil;
   try
     try
@@ -561,6 +660,7 @@ begin
     Result.Status := 200;
     Result.Reason := 'OK';
     Result.ContentType := 'application/vnd.' + PROGRAM_NAME + '.registry-rotation-page+toml';
+    Result.Location := '';
     Result.CacheControl := 'no-cache';
     Result.Body := Bytes(Body);
   finally
@@ -569,17 +669,267 @@ begin
   end;
 end;
 
+{ Strict query decoding: name=value pairs separated by '&', percent escapes
+  of exactly two hexadecimal digits, printable ASCII after decoding, and no
+  repeated names. }
+function DecodeQueryComponent(const AValue: string; out ADecoded: string): Boolean;
+var
+  Index, High, Low: Integer;
+  Character: Char;
+begin
+  ADecoded := '';
+  Index := 1;
+  while Index <= Length(AValue) do
+  begin
+    Character := AValue[Index];
+    if Character = '%' then
+    begin
+      if Index + 2 > Length(AValue) then Exit(False);
+      High := Pos(UpCase(AValue[Index + 1]), '0123456789ABCDEF') - 1;
+      Low := Pos(UpCase(AValue[Index + 2]), '0123456789ABCDEF') - 1;
+      if (High < 0) or (Low < 0) then Exit(False);
+      Character := Chr(High * 16 + Low);
+      Inc(Index, 3);
+    end
+    else Inc(Index);
+    if (Character < '!') or (Character > '~') then Exit(False);
+    ADecoded := ADecoded + Character;
+  end;
+  Result := True;
+end;
+
+function ParseRegistryQuery(const AQuery: string;
+  const AAllowed: array of string; AParameters: TStringList): Boolean;
+var
+  Pairs: TStringList;
+  Pair, Name, Value: string;
+  EqualsAt, Index: Integer;
+  Known: Boolean;
+begin
+  Result := False;
+  AParameters.Clear;
+  if AQuery = '' then Exit(True);
+  Pairs := TStringList.Create;
+  try
+    Pairs.StrictDelimiter := True;
+    Pairs.Delimiter := '&';
+    Pairs.QuoteChar := #0;
+    Pairs.DelimitedText := AQuery;
+    for Pair in Pairs do
+    begin
+      EqualsAt := Pos('=', Pair);
+      if EqualsAt <= 1 then Exit;
+      if not DecodeQueryComponent(Copy(Pair, 1, EqualsAt - 1), Name)
+        or not DecodeQueryComponent(Copy(Pair, EqualsAt + 1, MaxInt), Value)
+        or (Value = '') then Exit;
+      Known := False;
+      for Index := 0 to High(AAllowed) do
+        if AAllowed[Index] = Name then Known := True;
+      if not Known or (AParameters.IndexOfName(Name) >= 0) then Exit;
+      AParameters.Add(Name + '=' + Value);
+    end;
+  finally
+    Pairs.Free;
+  end;
+  Result := True;
+end;
+
+function PackageCursorBinding(const AIdentity, ASnapshot, AScope, APosition:
+  string): string;
+begin
+  Result := Copy(SHA256Hex(Bytes(AIdentity + #10 + ASnapshot + #10 + AScope
+    + #10 + APosition)), 1, 32);
+end;
+
+function PackagePageResponse(AStore: TLWPTRegistryStore;
+  AView: TLWPTRegistryReadView; const AName, AQuery: string;
+  AProgress: TSHA256Progress): TLWPTRegistryHTTPResponse;
+var
+  Parameters, Parts: TStringList;
+  Cursor, Snapshot, Body, NextCursor, Position: string;
+  Index: TLWPTRegistryPackageIndex;
+  Reference: IInterface;
+  Limit, Start, Item, Count: Integer;
+begin
+  Parameters := TStringList.Create;
+  Parts := TStringList.Create;
+  try
+    if not ParseRegistryQuery(AQuery, ['limit', 'cursor', 'snapshot'],
+      Parameters) then
+      Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+        'package query is invalid'));
+    Limit := 50;
+    if Parameters.IndexOfName('limit') >= 0 then
+      if not TryStrToInt(Parameters.Values['limit'], Limit)
+        or (IntToStr(Limit) <> Parameters.Values['limit']) or (Limit < 1)
+        or (Limit > RegistryRotationPageLimit) then
+        Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+          'package page limit must be 1 to 100'));
+    Cursor := Parameters.Values['cursor'];
+    Snapshot := Parameters.Values['snapshot'];
+    if (Cursor <> '') and (Snapshot = '') then
+      Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+        'a cursor requires its snapshot'));
+    if Snapshot = '' then Snapshot := AView.State.SnapshotHash;
+    Index := AStore.PackageIndex(AView, Snapshot, AProgress, Reference);
+    if Index = nil then
+      Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
+        'requested snapshot is not in accepted history'));
+    if AName = '' then Start := 0
+    else
+    begin
+      Start := Index.FirstOfName(AName);
+      if Start < 0 then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found',
+          'package was not found'));
+    end;
+    if Cursor <> '' then
+    begin
+      Parts.StrictDelimiter := True;
+      Parts.Delimiter := ':';
+      Parts.QuoteChar := #0;
+      Parts.DelimitedText := Cursor;
+      { A position without this origin's snapshot binding never belongs to
+        the requested snapshot. }
+      if (Parts.Count = 2) or ((Parts.Count = 3)
+        and (Parts[2] <> PackageCursorBinding(AStore.Config.Identity,
+          Snapshot, AName, Parts[0] + ':' + Parts[1]))) then
+        Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
+          'cursor does not belong to the requested snapshot'));
+      if Parts.Count <> 3 then
+        Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+          'package cursor is invalid'));
+      Start := Index.PositionAfter(Parts[0], Parts[1]);
+      if (Start < 0) or ((AName <> '') and (Parts[0] <> AName)) then
+        Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+          'package cursor is invalid'));
+    end;
+    Body := 'schema = ' + RegistryTOMLQuote(PROGRAM_NAME + '-registry-page-v1')
+      + #10 + 'origin = ' + RegistryTOMLQuote(AStore.Config.Identity) + #10
+      + 'snapshot = ' + RegistryTOMLQuote(Snapshot) + #10 + 'items = [';
+    Count := 0;
+    NextCursor := '';
+    Item := Start;
+    while (Item <= High(Index.Items))
+      and ((AName = '') or (Index.Items[Item].Name = AName)) do
+    begin
+      if Count >= Limit then
+      begin
+        Position := Index.Items[Item - 1].Name + ':'
+          + Index.Items[Item - 1].Version;
+        NextCursor := Position + ':' + PackageCursorBinding(
+          AStore.Config.Identity, Snapshot, AName, Position);
+        Break;
+      end;
+      if Count > 0 then Body := Body + ', ';
+      Body := Body + '{ name = ' + RegistryTOMLQuote(Index.Items[Item].Name)
+        + ', version = ' + RegistryTOMLQuote(Index.Items[Item].Version)
+        + ', record = ' + RegistryTOMLQuote(Index.Items[Item].RecordHash) + ' }';
+      Inc(Count);
+      Inc(Item);
+    end;
+    Body := Body + ']' + #10 + 'next_cursor = ' + RegistryTOMLQuote(NextCursor)
+      + #10;
+    Result := Default(TLWPTRegistryHTTPResponse);
+    Result.Status := 200;
+    Result.Reason := 'OK';
+    Result.ContentType := 'application/vnd.' + PROGRAM_NAME
+      + '.registry-page+toml';
+    Result.CacheControl := 'no-cache';
+    Result.Body := Bytes(Body);
+  finally
+    Parts.Free;
+    Parameters.Free;
+  end;
+end;
+
+function PackageVersionResponse(AStore: TLWPTRegistryStore;
+  AView: TLWPTRegistryReadView; const AName, AVersion, AQuery: string;
+  AProgress: TSHA256Progress): TLWPTRegistryHTTPResponse;
+var
+  Parameters: TStringList;
+  Snapshot, StoredPath, Digest, RecordHash: string;
+  Index: TLWPTRegistryPackageIndex;
+  Reference: IInterface;
+  Item: Integer;
+begin
+  Parameters := TStringList.Create;
+  try
+    if not ParseRegistryQuery(AQuery, ['snapshot'], Parameters) then
+      Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+        'package query is invalid'));
+    Snapshot := Parameters.Values['snapshot'];
+    if Snapshot = '' then
+      Exit(ErrorResponse(400, 'Bad Request', 'invalid_request',
+        'exact-version lookup requires a snapshot'));
+    Index := AStore.PackageIndex(AView, Snapshot, AProgress, Reference);
+    if Index = nil then
+      Exit(ErrorResponse(409, 'Conflict', 'snapshot_conflict',
+        'requested snapshot is not in accepted history'));
+    RecordHash := '';
+    Item := Index.FirstOfName(AName);
+    if Item >= 0 then
+      while (Item <= High(Index.Items)) and (Index.Items[Item].Name = AName) do
+      begin
+        if Index.Items[Item].Version = AVersion then
+          RecordHash := Index.Items[Item].RecordHash;
+        Inc(Item);
+      end;
+    if (RecordHash = '') or not AView.Resolve('records/sha256/'
+      + Copy(RecordHash, 8, 64) + '.toml', StoredPath, Digest, AProgress) then
+      Exit(ErrorResponse(404, 'Not Found', 'not_found',
+        'package version was not found'));
+    Result := ResourceResponse(AStore, StoredPath, 'application/vnd.'
+      + PROGRAM_NAME + '.registry-package+toml', '"' + RecordHash + '"',
+      Digest, True, AProgress);
+  finally
+    Parameters.Free;
+  end;
+end;
+
+function RegistryCapabilitiesBody(AStore: TLWPTRegistryStore): string;
+var
+  Publication: Boolean;
+begin
+  Publication := (AStore.Config.Role = rrOrigin)
+    and RegistryPublicationEnabled(AStore.Root, RegistryTimestampNow);
+  Result := 'schema = "' + PROGRAM_NAME
+    + '-registry-capabilities-v1"' + #10 + 'protocol = 1' + #10
+    + 'hashes = ["sha256"]' + #10 + 'signatures = ["ed25519"]' + #10
+    + 'schemas = ["' + PROGRAM_NAME + '-registry-capabilities-v1", "'
+    + PROGRAM_NAME + '-registry-checkpoint-v1", "' + PROGRAM_NAME
+    + '-registry-discovery-v1", "' + PROGRAM_NAME
+    + '-registry-error-v1", "' + PROGRAM_NAME
+    + '-registry-key-rotation-v1", "' + PROGRAM_NAME
+    + '-registry-key-v1", "' + PROGRAM_NAME
+    + '-registry-package-v1", "' + PROGRAM_NAME
+    + '-registry-page-v1", "' + PROGRAM_NAME
+    + '-registry-rotation-page-v1", "' + PROGRAM_NAME
+    + '-registry-signature-v1", "' + PROGRAM_NAME
+    + '-registry-snapshot-v1"]' + #10;
+  if Publication then
+    Result := Result + 'features = ["package-list-v1", "publication-v1", '
+      + '"rotation-chain-v1", "snapshot-sync-v1"]' + #10
+      + 'auth_schemes = ["bearer"]' + #10
+  else
+    Result := Result + 'features = ["package-list-v1", "rotation-chain-v1", '
+      + '"snapshot-sync-v1"]' + #10 + 'auth_schemes = []' + #10;
+  Result := Result + 'max_page_size = ' + IntToStr(RegistryRotationPageLimit)
+    + #10;
+end;
+
 function RegistryHTTPResponse(AStore: TLWPTRegistryStore;
   const AMethod, ATarget: string; AProgress: TSHA256Progress):
   TLWPTRegistryHTTPResponse;
 var
   APIPath, Digest, KeyID, Prefix, Relative, RequestID, RoleName, Target, Query,
-    MediaType, ETag, Name, StoredPath, ContentType: string;
+    MediaType, ETag, Name, StoredPath, ContentType, PackageVersion: string;
   Sequence: Int64;
-  Immutable: Boolean;
+  Immutable, HasQuery: Boolean;
   State: TLWPTRegistryState;
   View: TLWPTRegistryReadView;
 begin
+  Result := Default(TLWPTRegistryHTTPResponse);
   RoleName := 'origin';
   if AStore.Config.Role = rrMirror then RoleName := 'mirror';
   try
@@ -611,18 +961,27 @@ begin
   Prefix := BasePath(AStore.Config.BaseURL);
   Target := ATarget;
   Query := '';
-  if Pos('?', Target) > 0 then
+  HasQuery := Pos('?', Target) > 0;
+  if HasQuery then
   begin
     Query := Copy(Target, Pos('?', Target) + 1, MaxInt);
     Target := Copy(Target, 1, Pos('?', Target) - 1);
-    if Target <> Prefix + '/v1/rotations' then
-      Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target', 'query is only supported for rotation pages'));
   end;
-  if Prefix = '' then Prefix := '';
   if not StartsStr(Prefix + '/', Target) then
+  begin
+    if HasQuery then
+      Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
+        'query is only supported for rotation and package pages'));
     Exit(ErrorResponse(404, 'Not Found', 'not_found',
       'request target is outside the configured registry base path'));
+  end;
   APIPath := Copy(Target, Length(Prefix) + 1, MaxInt);
+  { Queries are accepted only where the protocol defines them: rotation
+    discovery and the package views. }
+  if HasQuery and (APIPath <> '/v1/rotations') and (APIPath <> '/v1/packages')
+    and not StartsStr('/v1/packages/', APIPath) then
+    Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
+      'query is only supported for rotation and package pages'));
   if (Pos('..', APIPath) > 0) or (Pos('%', APIPath) > 0) then
     Exit(ErrorResponse(400, 'Bad Request', 'invalid_request_target',
       'request target is not canonical'));
@@ -659,22 +1018,40 @@ begin
     Result.ResourcePath := '';
     Result.ResourceLength := 0;
     Result.ResourceDigest := '';
-    Result.Body := Bytes('schema = "' + PROGRAM_NAME
-      + '-registry-capabilities-v1"' + #10 + 'protocol = 1' + #10
-      + 'hashes = ["sha256"]' + #10 + 'signatures = ["ed25519"]' + #10
-      + 'schemas = ["' + PROGRAM_NAME + '-registry-capabilities-v1", "'
-      + PROGRAM_NAME + '-registry-checkpoint-v1", "' + PROGRAM_NAME
-      + '-registry-discovery-v1", "' + PROGRAM_NAME
-      + '-registry-error-v1", "' + PROGRAM_NAME
-      + '-registry-key-rotation-v1", "' + PROGRAM_NAME
-      + '-registry-key-v1", "' + PROGRAM_NAME
-      + '-registry-package-v1", "' + PROGRAM_NAME
-      + '-registry-rotation-page-v1", "' + PROGRAM_NAME
-      + '-registry-signature-v1", "' + PROGRAM_NAME
-      + '-registry-snapshot-v1"]' + #10
-      + 'features = ["rotation-chain-v1", "snapshot-sync-v1"]' + #10
-      + 'auth_schemes = []' + #10
-      + 'max_page_size = ' + IntToStr(RegistryRotationPageLimit) + #10);
+    Result.Body := Bytes(RegistryCapabilitiesBody(AStore));
+    Exit;
+  end;
+  if (APIPath = '/v1/packages') or StartsStr('/v1/packages/', APIPath) then
+  begin
+    Name := '';
+    PackageVersion := '';
+    if APIPath <> '/v1/packages' then
+    begin
+      Name := Copy(APIPath, Length('/v1/packages/') + 1, MaxInt);
+      if Pos('/', Name) > 0 then
+      begin
+        PackageVersion := Copy(Name, Pos('/', Name) + 1, MaxInt);
+        Name := Copy(Name, 1, Pos('/', Name) - 1);
+        if not RegistryVersionIsCanonical(PackageVersion) then
+          Exit(ErrorResponse(404, 'Not Found', 'not_found',
+            'registry resource was not found'));
+      end;
+      if not RegistryPackageNameIsCanonical(Name) then
+        Exit(ErrorResponse(404, 'Not Found', 'not_found',
+          'registry resource was not found'));
+    end;
+    if not AStore.HasAcceptedState then
+      Exit(ErrorResponse(404, 'Not Found', 'not_found',
+        'registry resource was not found'));
+    View := AStore.CaptureReadView(AProgress);
+    try
+      if PackageVersion <> '' then
+        Result := PackageVersionResponse(AStore, View, Name, PackageVersion,
+          Query, AProgress)
+      else Result := PackagePageResponse(AStore, View, Name, Query, AProgress);
+    finally
+      View.Free;
+    end;
     Exit;
   end;
   { Classify the target before capturing state. Unknown or malformed routes
@@ -791,11 +1168,22 @@ begin
     ContentLength := AResponse.ResourceLength
   else ContentLength := Length(AResponse.Body);
   Header := 'HTTP/1.1 ' + IntToStr(AResponse.Status) + ' '
-    + AResponse.Reason + #13#10 + 'Content-Type: ' + AResponse.ContentType
-    + #13#10 + 'Content-Length: ' + IntToStr(ContentLength) + #13#10
-    + 'Cache-Control: ' + AResponse.CacheControl + #13#10;
+    + AResponse.Reason + #13#10;
+  if AResponse.ContentType <> '' then
+    Header := Header + 'Content-Type: ' + AResponse.ContentType + #13#10;
+  { A 204 carries neither a body nor a length. }
+  if AResponse.Status <> 204 then
+    Header := Header + 'Content-Length: ' + IntToStr(ContentLength) + #13#10;
+  if AResponse.CacheControl <> '' then
+    Header := Header + 'Cache-Control: ' + AResponse.CacheControl + #13#10;
   if AResponse.ETag <> '' then Header := Header + 'ETag: ' + AResponse.ETag
     + #13#10;
+  if AResponse.Location <> '' then
+    Header := Header + 'Location: ' + AResponse.Location + #13#10;
+  if AResponse.RetryAfter > 0 then
+    Header := Header + 'Retry-After: ' + IntToStr(AResponse.RetryAfter) + #13#10;
+  if AResponse.Challenge <> '' then
+    Header := Header + 'WWW-Authenticate: ' + AResponse.Challenge + #13#10;
   Header := Header + 'Connection: close' + #13#10 + #13#10;
   HeaderBytes := Bytes(Header);
   if not AIncludeBody or (AResponse.ResourcePath <> '') then Exit(HeaderBytes);
@@ -806,14 +1194,139 @@ begin
     Result[Length(HeaderBytes)], Length(AResponse.Body));
 end;
 
+function ParseRegistryRequestHead(const AText, APeer: string;
+  out AHead: TLWPTRegistryRequestHead): Boolean;
+var
+  Lines: TStringList;
+  Line, RequestLine, Name, Value: string;
+  Space, Colon, Index, Count: Integer;
+  Character: Char;
+begin
+  Result := False;
+  AHead := Default(TLWPTRegistryRequestHead);
+  AHead.Peer := APeer;
+  { Bare CR or LF inside a line is malformed; only CRLF separates lines. }
+  Lines := TStringList.Create;
+  try
+    Line := AText;
+    while Line <> '' do
+    begin
+      Colon := Pos(#13#10, Line);
+      if Colon = 0 then
+      begin
+        Lines.Add(Line);
+        Break;
+      end;
+      Lines.Add(Copy(Line, 1, Colon - 1));
+      Delete(Line, 1, Colon + 1);
+    end;
+    for Index := 0 to Lines.Count - 1 do
+      if (Pos(#13, Lines[Index]) > 0) or (Pos(#10, Lines[Index]) > 0)
+        or (Pos(#0, Lines[Index]) > 0) then Exit;
+    if Lines.Count = 0 then Exit;
+    RequestLine := Lines[0];
+    Space := Pos(' ', RequestLine);
+    if Space <= 1 then Exit;
+    AHead.Method := Copy(RequestLine, 1, Space - 1);
+    Delete(RequestLine, 1, Space);
+    Space := Pos(' ', RequestLine);
+    if Space <= 1 then Exit;
+    AHead.Target := Copy(RequestLine, 1, Space - 1);
+    for Character in AHead.Method do
+      if not (Character in ['A'..'Z', 'a'..'z']) then Exit;
+    Count := 0;
+    SetLength(AHead.Headers, Lines.Count - 1);
+    for Index := 1 to Lines.Count - 1 do
+    begin
+      Line := Lines[Index];
+      if Line = '' then Continue;
+      { Obsolete line folding and fields without a name are malformed. }
+      if Line[1] in [' ', #9] then Exit;
+      Colon := Pos(':', Line);
+      if Colon <= 1 then Exit;
+      Name := Copy(Line, 1, Colon - 1);
+      for Character in Name do
+        if not (Character in ['A'..'Z', 'a'..'z', '0'..'9', '-', '_', '.',
+          '!', '#', '$', '%', '&', '''', '*', '+', '^', '`', '|', '~']) then
+          Exit;
+      Value := Trim(Copy(Line, Colon + 1, MaxInt));
+      AHead.Headers[Count].Name := Name;
+      AHead.Headers[Count].Value := Value;
+      Inc(Count);
+    end;
+    SetLength(AHead.Headers, Count);
+  finally
+    Lines.Free;
+  end;
+  Result := True;
+end;
+
+function RegistryHeaderValues(const AHead: TLWPTRegistryRequestHead;
+  const AName: string): TStringArray;
+var
+  Index, Count: Integer;
+begin
+  Result := nil;
+  Count := 0;
+  for Index := 0 to High(AHead.Headers) do
+    if SameText(AHead.Headers[Index].Name, AName) then
+    begin
+      SetLength(Result, Count + 1);
+      Result[Count] := AHead.Headers[Index].Value;
+      Inc(Count);
+    end;
+end;
+
+function RegistryMethodIsRead(const AMethod: string): Boolean;
+begin
+  Result := SameText(AMethod, 'GET') or SameText(AMethod, 'HEAD');
+end;
+
+function RegistryDispatch(AStore: TLWPTRegistryStore;
+  AHandler: TLWPTRegistryMutationHandler;
+  const AHead: TLWPTRegistryRequestHead; AProgress: TSHA256Progress;
+  out AMutation: TLWPTRegistryMutation): TLWPTRegistryHTTPResponse;
+begin
+  AMutation := nil;
+  if RegistryMethodIsRead(AHead.Method) or not Assigned(AHandler) then
+    Exit(RegistryHTTPResponse(AStore, AHead.Method, AHead.Target, AProgress));
+  AMutation := AHandler.BeginMutation(AHead, Result);
+end;
+
+function RegistryBodyDeadlineMilliseconds(const ABodyLength: Int64): QWord;
+const
+  MEBIBYTE = Int64(1024) * 1024;
+begin
+  Result := RegistryBodyBaseDeadlineMilliseconds;
+  if ABodyLength > 0 then
+    Inc(Result, QWord((ABodyLength + MEBIBYTE - 1) div MEBIBYTE) * 1000);
+end;
+
+function CreateRegistryMutationHandler(AStore: TLWPTRegistryStore):
+  TLWPTRegistryMutationHandler;
+begin
+  Result := TLWPTRegistryPublisher.Create(AStore);
+end;
+
+function RegistryPeerAddress(const AAddress: TRegistrySockAddr): string;
+var
+  Octets: array[0..3] of Byte absolute AAddress.sin_addr;
+begin
+  Result := IntToStr(Octets[0]) + '.' + IntToStr(Octets[1]) + '.'
+    + IntToStr(Octets[2]) + '.' + IntToStr(Octets[3]);
+end;
+
 constructor TLWPTRegistryClientThread.Create(const ASocket: TSocket;
   AStore: TLWPTRegistryStore;
-  ATLSServerContext: TTransportSecurityServerContext);
+  ATLSServerContext: TTransportSecurityServerContext;
+  AHandler: TLWPTRegistryMutationHandler; const APeer: string);
 begin
   inherited Create(True);
   FreeOnTerminate := False;
   FSocket := ASocket;
   FStore := AStore;
+  FHandler := AHandler;
+  FPeer := APeer;
   FTLSServerContext := ATLSServerContext;
   FTLSCiphertextReceived := 0;
   FDeadline := GetTickCount64 + CLIENT_READ_TIMEOUT_MILLISECONDS;
@@ -979,17 +1492,58 @@ end;
 
 {$ENDIF}
 
+function TLWPTRegistryClientThread.ReadBodyPlain(
+  AMutation: TLWPTRegistryMutation; const ALeftover: string): Boolean;
+var
+  Buffer: array[0..65535] of Byte;
+  Remaining: Int64;
+  Count, Received: Integer;
+begin
+  Result := False;
+  Remaining := AMutation.BodyLength;
+  FDeadline := GetTickCount64 + RegistryBodyDeadlineMilliseconds(Remaining);
+  try
+    if (Remaining > 0) and AMutation.ExpectsContinue then
+      SendAll(FSocket, Bytes('HTTP/1.1 100 Continue' + #13#10#13#10), FDeadline);
+    Count := Length(ALeftover);
+    if Count > Remaining then Count := Integer(Remaining);
+    if Count > 0 then
+    begin
+      AMutation.Feed(ALeftover[1], Count);
+      Dec(Remaining, Count);
+    end;
+    while Remaining > 0 do
+    begin
+      CheckDeadline;
+      ApplyDeadlineTimeout(FSocket, FDeadline);
+      Count := Length(Buffer);
+      if Count > Remaining then Count := Integer(Remaining);
+      Received := RegistrySocketReceive(FSocket, @Buffer[0], Count);
+      if Received <= 0 then Exit;
+      AMutation.Feed(Buffer[0], Received);
+      Dec(Remaining, Received);
+    end;
+  except
+    Exit;
+  end;
+  FDeadline := GetTickCount64 + RegistryMutationProcessingMilliseconds;
+  Result := True;
+end;
+
 procedure TLWPTRegistryClientThread.ExecutePlain;
 var
   Buffer: array[0..4095] of Byte;
-  HeaderEnd, Received, Space: Integer;
+  HeaderEnd, Received: Integer;
   IncludeBody: Boolean;
-  Method, Request, RequestLine, Target: string;
+  Chunk, Request: string;
+  Head: TLWPTRegistryRequestHead;
+  Mutation: TLWPTRegistryMutation;
   ResourceStream: TStream;
   Response: TLWPTRegistryHTTPResponse;
   Wire: TBytes;
 begin
   ResourceStream := nil;
+  Mutation := nil;
   try
     try
       Request := '';
@@ -998,38 +1552,39 @@ begin
         ApplyDeadlineTimeout(FSocket, FDeadline);
         Received := RegistrySocketReceive(FSocket, @Buffer[0], Length(Buffer));
         if Received <= 0 then Exit;
-        if Length(Request) + Received > MAX_REQUEST_HEADER_BYTES then
+        SetString(Chunk, PAnsiChar(@Buffer[0]), Received);
+        Request := Request + Chunk;
+        HeaderEnd := Pos(#13#10#13#10, Request);
+        if ((HeaderEnd = 0) and (Length(Request) > MAX_REQUEST_HEADER_BYTES))
+          or (HeaderEnd > MAX_REQUEST_HEADER_BYTES) then
         begin
           Response := ErrorResponse(431, 'Request Header Fields Too Large',
             'request_headers_too_large', 'request headers exceed 32 KiB');
           SendAll(FSocket, RegistryHTTPWireResponse(Response, True), FDeadline);
           Exit;
         end;
-        SetString(RequestLine, PAnsiChar(@Buffer[0]), Received);
-        Request := Request + RequestLine;
-        HeaderEnd := Pos(#13#10#13#10, Request);
       until HeaderEnd > 0;
-      RequestLine := Copy(Request, 1, Pos(#13#10, Request) - 1);
-      Space := Pos(' ', RequestLine);
-      if Space = 0 then
+      if not ParseRegistryRequestHead(Copy(Request, 1, HeaderEnd - 1), FPeer,
+        Head) then
         Response := ErrorResponse(400, 'Bad Request', 'invalid_request',
           'request line is invalid')
       else
       begin
-        Method := Copy(RequestLine, 1, Space - 1);
-        Delete(RequestLine, 1, Space);
-        Space := Pos(' ', RequestLine);
-        if Space = 0 then
-          Response := ErrorResponse(400, 'Bad Request', 'invalid_request',
-            'request line is invalid')
-        else
+        Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
+          Mutation);
+        if Assigned(Mutation) then
         begin
-          Target := Copy(RequestLine, 1, Space - 1);
-          Response := RegistryHTTPResponse(FStore, Method, Target,
-            CheckDeadline);
+          if not ReadBodyPlain(Mutation, Copy(Request, HeaderEnd + 4,
+            MaxInt)) then
+          begin
+            Mutation.Abort;
+            Exit;
+          end;
+          Response := Mutation.Finish;
+          FreeAndNil(Mutation);
         end;
       end;
-      IncludeBody := not SameText(Method, 'HEAD');
+      IncludeBody := not SameText(Head.Method, 'HEAD');
       if Response.ResourcePath <> '' then
         try
           ResourceStream := OpenRegistryHTTPResource(Response, CheckDeadline);
@@ -1044,6 +1599,7 @@ begin
       if IncludeBody and Assigned(ResourceStream) then
         SendResourcePlain(FSocket, ResourceStream, FDeadline);
     finally
+      Mutation.Free;
       ResourceStream.Free;
     end;
   except
@@ -1089,7 +1645,7 @@ begin
     raise ELWPTRegistryError.CreateStable('tls_io_failed',
       'TLS peer closed before completing the request');
   Inc(AReceivedTotal, Received);
-  if AReceivedTotal > TLS_CIPHERTEXT_BUDGET_BYTES then
+  if AReceivedTotal > RegistryTLSCiphertextBudget then
     raise ELWPTRegistryError.CreateStable('tls_input_limit',
       'TLS connection exceeded its ciphertext byte budget');
   Accepted := TransportSecurityFeedCiphertext(AConnection, @Buffer[0],
@@ -1159,11 +1715,14 @@ end;
 
 procedure TLWPTRegistryClientThread.ExecuteTLS;
 var
-  Buffer: array[0..4095] of Byte;
+  Buffer: array[0..16383] of Byte;
   Connection: TTransportSecurityConnection;
-  HeaderEnd, Space: Integer;
-  IncludeBody: Boolean;
-  Method, Request, RequestChunk, RequestLine, Target: string;
+  Count, HeaderEnd: Integer;
+  IncludeBody, BodyComplete: Boolean;
+  Request, RequestChunk, Leftover: string;
+  Head: TLWPTRegistryRequestHead;
+  Mutation: TLWPTRegistryMutation;
+  Remaining: Int64;
   ResourceStream: TStream;
   Response: TLWPTRegistryHTTPResponse;
   ResultState: TTransportSecurityState;
@@ -1171,6 +1730,8 @@ var
   Wire: TBytes;
 begin
   ResourceStream := nil;
+  Mutation := nil;
+  RegistryTLSCiphertextBudget := TLS_CIPHERTEXT_BUDGET_BYTES;
   FillChar(Connection, SizeOf(Connection), 0);
   BeginTransportSecurityServer(Connection, FTLSServerContext);
   try
@@ -1191,18 +1752,18 @@ begin
     Request := '';
     repeat
       CheckDeadline;
-      IOResult := TransportSecurityServerRead(Connection, Buffer,
-        Length(Buffer));
+      IOResult := TransportSecurityServerRead(Connection, Buffer, 4096);
       if IOResult.BytesProcessed > 0 then
       begin
         SetString(RequestChunk, PAnsiChar(@Buffer[0]),
           IOResult.BytesProcessed);
         Request := Request + RequestChunk;
-        if Length(Request) > MAX_REQUEST_HEADER_BYTES then
-          raise ELWPTRegistryError.CreateStable('request_headers_too_large',
-            'request headers exceed 32 KiB');
       end;
       HeaderEnd := Pos(#13#10#13#10, Request);
+      if ((HeaderEnd = 0) and (Length(Request) > MAX_REQUEST_HEADER_BYTES))
+        or (HeaderEnd > MAX_REQUEST_HEADER_BYTES) then
+        raise ELWPTRegistryError.CreateStable('request_headers_too_large',
+          'request headers exceed 32 KiB');
       if HeaderEnd > 0 then Break;
       case IOResult.State of
         tssDone:;
@@ -1213,16 +1774,67 @@ begin
           'TLS request read failed');
       end;
     until False;
-    RequestLine := Copy(Request, 1, Pos(#13#10, Request) - 1);
-    Space := Pos(' ', RequestLine);
-    if Space = 0 then Exit;
-    Method := Copy(RequestLine, 1, Space - 1);
-    Delete(RequestLine, 1, Space);
-    Space := Pos(' ', RequestLine);
-    if Space = 0 then Exit;
-    Target := Copy(RequestLine, 1, Space - 1);
-    Response := RegistryHTTPResponse(FStore, Method, Target, CheckDeadline);
-    IncludeBody := not SameText(Method, 'HEAD');
+    if not ParseRegistryRequestHead(Copy(Request, 1, HeaderEnd - 1), FPeer,
+      Head) then Exit;
+    Response := RegistryDispatch(FStore, FHandler, Head, CheckDeadline,
+      Mutation);
+    if Assigned(Mutation) then
+    begin
+      Remaining := Mutation.BodyLength;
+      BodyComplete := False;
+      try
+        FDeadline := GetTickCount64 + RegistryBodyDeadlineMilliseconds(Remaining);
+        { Record overhead is far below 1/32 of the plaintext. }
+        RegistryTLSCiphertextBudget := TLS_CIPHERTEXT_BUDGET_BYTES
+          + QWord(Remaining) + QWord(Remaining div 32) + 65536;
+        if (Remaining > 0) and Mutation.ExpectsContinue then
+        begin
+          Wire := Bytes('HTTP/1.1 100 Continue' + #13#10#13#10);
+          SendTLSBuffer(FSocket, Connection, Wire[0], Length(Wire), FDeadline,
+            FTLSCiphertextReceived);
+        end;
+        Leftover := Copy(Request, HeaderEnd + 4, MaxInt);
+        Count := Length(Leftover);
+        if Count > Remaining then Count := Integer(Remaining);
+        if Count > 0 then
+        begin
+          Mutation.Feed(Leftover[1], Count);
+          Dec(Remaining, Count);
+        end;
+        while Remaining > 0 do
+        begin
+          CheckDeadline;
+          Count := Length(Buffer);
+          if Count > Remaining then Count := Integer(Remaining);
+          IOResult := TransportSecurityServerRead(Connection, Buffer, Count);
+          if IOResult.BytesProcessed > 0 then
+          begin
+            Mutation.Feed(Buffer[0], IOResult.BytesProcessed);
+            Dec(Remaining, IOResult.BytesProcessed);
+            Continue;
+          end;
+          case IOResult.State of
+            tssDone:;
+            tssWantRead: ReceiveTLSCiphertext(FSocket, Connection,
+              FTLSCiphertextReceived, FDeadline);
+            tssWantWrite: FlushTLSCiphertext(FSocket, Connection, FDeadline);
+            else raise ELWPTRegistryError.CreateStable('tls_io_failed',
+              'TLS request body read failed');
+          end;
+        end;
+        BodyComplete := True;
+      finally
+        if not BodyComplete then
+        begin
+          Mutation.Abort;
+          FreeAndNil(Mutation);
+        end;
+      end;
+      FDeadline := GetTickCount64 + RegistryMutationProcessingMilliseconds;
+      Response := Mutation.Finish;
+      FreeAndNil(Mutation);
+    end;
+    IncludeBody := not SameText(Head.Method, 'HEAD');
     if Response.ResourcePath <> '' then
       try
         ResourceStream := OpenRegistryHTTPResource(Response, CheckDeadline);
@@ -1250,6 +1862,7 @@ begin
       end;
     until RegistryTLSShutdownStateIsTerminal(ResultState);
   finally
+    Mutation.Free;
     ResourceStream.Free;
     AbortTransportSecurityServer(Connection);
   end;
@@ -1272,6 +1885,7 @@ constructor TLWPTRegistryServer.Create(AStore: TLWPTRegistryStore);
 begin
   inherited Create;
   FStore := AStore;
+  FHandler := CreateRegistryMutationHandler(AStore);
   FClients := TThreadList.Create;
   FStopping := False;
 end;
@@ -1281,6 +1895,7 @@ begin
   RequestStop;
   DrainClients;
   FClients.Free;
+  FHandler.Free;
   inherited Destroy;
 end;
 
@@ -1375,7 +1990,7 @@ begin
     if CurrentRegistryDarwinTLSTransport = rdttNetworkFramework then
     begin
       RunNetworkFrameworkRegistryServer(FStore,
-        FStore.Config.TLSPKCS12Path, Passphrase, @FStopping);
+        FStore.Config.TLSPKCS12Path, Passphrase, @FStopping, FHandler);
       Exit;
     end;
     try
@@ -1479,7 +2094,7 @@ begin
       RegistrySetSocketOption(ClientSocket, SOL_SOCKET, SO_SNDTIMEO, @Timeout,
         SizeOf(Timeout));
       Client := TLWPTRegistryClientThread.Create(ClientSocket, FStore,
-        TLSServerContext);
+        TLSServerContext, FHandler, RegistryPeerAddress(Address));
       Clients := FClients.LockList;
       try
         Clients.Add(Client);
