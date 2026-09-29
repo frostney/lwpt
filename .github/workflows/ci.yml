@@ -416,9 +416,14 @@ jobs:
           sudo apt-get install -y fpc
           fpc -iV
 
+      # The argument selects the compiler for test programs: the official
+      # i386 native compiler on i386-win32, its x86_64 cross compiler
+      # (ppcrossx64) on x86_64-win64 (#329).
       - name: Install FPC (official distribution)
         if: matrix.fpc-install == 'official'
-        run: .github/ci/install-windows-fpc.sh
+        env:
+          LWPT_WINDOWS_TEST_TARGET: ${{ matrix.target }}
+        run: .github/ci/install-windows-fpc.sh "$LWPT_WINDOWS_TEST_TARGET"
 
       - name: bootstrap.bat (Windows cold build)
         if: matrix.bootstrap-check == true && inputs.mode != 'diagnostic'
