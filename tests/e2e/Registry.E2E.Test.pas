@@ -25,14 +25,17 @@ const
   TLS_PASSWORD = 'test-only';
   REGISTRY_TLS_FIXTURE =
     'tests/fixtures/registry/localhost-native-identity.p12';
+  DISCOVERY_PATH = '/.well-known/lwpt-registry';
+  CHECKPOINT_PATH = '/v1/checkpoints/latest.toml';
 
 type
   TRegistryE2EContract = class(TTestSuite)
   private
     FScratch: string;
-    function BasePort: Integer;
     function StartServer(const ADataDirectory: string;
       const ATLS: Boolean): TProcess;
+    function LaunchServer(const ADataDirectory: string;
+      var ABaseURL: string; const ATLS: Boolean): TProcess;
     function Curl(const AURL: string; const AInsecure: Boolean): string;
     function CurlAttempt(const AURL: string; const AInsecure: Boolean;
       out AExitStatus: Integer; out AStandardError: string;
@@ -56,9 +59,23 @@ type
     procedure TestClientResetDoesNotTerminateServer;
   end;
 
-function TRegistryE2EContract.BasePort: Integer;
+{ The port of a base URL of the form scheme://localhost:port[/path]. }
+function URLPort(const AURL: string): Word;
+var
+  Authority: string;
 begin
-  Result := 20000 + (GetProcessID mod 20000);
+  Authority := Copy(AURL, Pos('://', AURL) + 3, MaxInt);
+  if Pos('/', Authority) > 0 then
+    Authority := Copy(Authority, 1, Pos('/', Authority) - 1);
+  Result := StrToInt(Copy(Authority, Pos(':', Authority) + 1, MaxInt));
+end;
+
+{ A base URL on a port the kernel just chose. LaunchServer recovers if another
+  process binds it before the registry does. }
+function FreshBaseURL(const AScheme, APath: string): string;
+begin
+  Result := AScheme + '://localhost:' + IntToStr(FindAvailableRegistryTestPort)
+    + APath;
 end;
 
 function TRegistryE2EContract.StartServer(const ADataDirectory: string;
@@ -74,7 +91,20 @@ begin
   if ATLS then ConfigureProcessEnvironment(Result,
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
   Result.Options := [];
+  BindRegistryChildToParent(Result);
   Result.Execute;
+end;
+
+{ Starts a server that is expected to serve: returns once the child announces
+  that it bound ABaseURL's port. A port another process took after it was
+  chosen moves the data directory to a fresh port and updates ABaseURL. }
+function TRegistryE2EContract.LaunchServer(const ADataDirectory: string;
+  var ABaseURL: string; const ATLS: Boolean): TProcess;
+begin
+  if ATLS then
+    Result := LaunchRegistryCLI(ADataDirectory, ABaseURL,
+      [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD], FScratch)
+  else Result := LaunchRegistryCLI(ADataDirectory, ABaseURL, [], FScratch);
 end;
 
 procedure DrainCurlDiagnosticStream(AStream: TInputPipeStream;
@@ -322,7 +352,7 @@ end;
 procedure TRegistryE2EContract.TestSlowClientsAreBoundedByOneDeadline;
 var
   Address: TInetSockAddr;
-  DataDirectory, DiscoveryURL: string;
+  BaseURL, DataDirectory, DiscoveryURL: string;
   Init: TLwptResult;
   Index: Integer;
   Server: TProcess;
@@ -330,19 +360,18 @@ var
   Partial: AnsiString;
 begin
   DataDirectory := FScratch + '/slow-origin';
-  DiscoveryURL := 'http://localhost:' + IntToStr(BasePort + 3)
-    + '/.well-known/lwpt-registry';
+  BaseURL := FreshBaseURL('http', '');
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'http://localhost:' + IntToStr(BasePort + 3), '--port',
-    IntToStr(BasePort + 3)]);
+    '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL))]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
-  Server := StartServer(DataDirectory, False);
+  Server := LaunchServer(DataDirectory, BaseURL, False);
+  DiscoveryURL := BaseURL + DISCOVERY_PATH;
   for Index := 0 to High(SlowSockets) do SlowSockets[Index] := -1;
   try
     WaitUntilReady(DiscoveryURL, False, Server);
     FillChar(Address, SizeOf(Address), 0);
     Address.sin_family := AF_INET;
-    Address.sin_port := HToNs(BasePort + 3);
+    Address.sin_port := HToNs(URLPort(BaseURL));
     Address.sin_addr := StrToNetAddr('127.0.0.1');
     Partial := 'GET /';
     for Index := 0 to High(SlowSockets) do
@@ -375,7 +404,7 @@ type
   end;
 var
   Address: TInetSockAddr;
-  DataDirectory, DiscoveryURL: string;
+  BaseURL, DataDirectory, DiscoveryURL: string;
   Index: Integer;
   Init: TLwptResult;
   Linger: TResetLinger;
@@ -386,18 +415,17 @@ var
 begin
   {$IFDEF UNIX}
   DataDirectory := FScratch + '/reset-origin';
-  DiscoveryURL := 'http://localhost:' + IntToStr(BasePort + 6)
-    + '/.well-known/lwpt-registry';
+  BaseURL := FreshBaseURL('http', '');
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'http://localhost:' + IntToStr(BasePort + 6), '--port',
-    IntToStr(BasePort + 6)]);
+    '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL))]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
-  Server := StartServer(DataDirectory, False);
+  Server := LaunchServer(DataDirectory, BaseURL, False);
+  DiscoveryURL := BaseURL + DISCOVERY_PATH;
   try
     WaitUntilReady(DiscoveryURL, False, Server);
     FillChar(Address, SizeOf(Address), 0);
     Address.sin_family := AF_INET;
-    Address.sin_port := HToNs(BasePort + 6);
+    Address.sin_port := HToNs(URLPort(BaseURL));
     Address.sin_addr := StrToNetAddr('127.0.0.1');
     Linger.Enabled := 1;
     Linger.Seconds := 0;
@@ -498,19 +526,23 @@ procedure TRegistryE2EContract.TestInitPolicyAndStableIdentityThroughCLI;
 var
   ControlRejected, First, Reconfigured, Rejected: TLwptResult;
   ControlDirectory, DataDirectory: string;
+  FirstPort, SecondPort: Word;
 begin
+  { Nothing listens in this case; the ports only need to be valid. }
+  FirstPort := FindAvailableRegistryTestPort;
+  SecondPort := FindAvailableRegistryTestPort;
   DataDirectory := FScratch + '/origin';
   First := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'https://localhost:' + IntToStr(BasePort), '--identity',
-    'https://identity.example', '--port', IntToStr(BasePort), '--tls-pkcs12',
+    '--base-url', 'https://localhost:' + IntToStr(FirstPort), '--identity',
+    'https://identity.example', '--port', IntToStr(FirstPort), '--tls-pkcs12',
     REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV], '',
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
   DumpRunFailure('registry init', First, 0);
   Expect<Integer>(First.ExitCode).ToBe(0);
   Reconfigured := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'https://localhost:' + IntToStr(BasePort + 1), '--port',
-    IntToStr(BasePort + 1), '--tls-pkcs12',
+    '--base-url', 'https://localhost:' + IntToStr(SecondPort), '--port',
+    IntToStr(SecondPort), '--tls-pkcs12',
     REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV], '',
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
@@ -528,7 +560,7 @@ begin
   { DEL crosses both Unix and Windows command-line tokenization unchanged. }
   ControlRejected := RunLwpt(['registry', 'init', '--data-dir',
     ControlDirectory, '--base-url', 'https://localhost:'
-    + IntToStr(BasePort + 2), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
+    + IntToStr(FirstPort), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV + #127]);
   DumpRunFailure('control-character configuration rejection',
     ControlRejected, 1);
@@ -546,7 +578,7 @@ end;
 
 procedure TRegistryE2EContract.TestForegroundServerSurvivesRestartAndConcurrentReaders;
 var
-  DataDirectory, DiscoveryURL, ResourceURL: string;
+  BaseURL, DataDirectory, DiscoveryURL, ResourceURL: string;
   Init: TLwptResult;
   Index: Integer;
   Readers: array[0..7] of TProcess;
@@ -557,15 +589,13 @@ var
   {$ENDIF}
 begin
   DataDirectory := FScratch + '/plain-origin';
-  DiscoveryURL := 'http://localhost:' + IntToStr(BasePort)
-    + '/registry%2Fstable//instance/.well-known/lwpt-registry';
-  ResourceURL := 'http://localhost:' + IntToStr(BasePort)
-    + '/registry%2Fstable//instance/v1/checkpoints/latest.toml';
+  BaseURL := FreshBaseURL('http', '/registry%2Fstable//instance');
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'http://localhost:' + IntToStr(BasePort)
-    + '/registry%2Fstable//instance', '--port', IntToStr(BasePort)]);
+    '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL))]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
-  Server := StartServer(DataDirectory, False);
+  Server := LaunchServer(DataDirectory, BaseURL, False);
+  DiscoveryURL := BaseURL + DISCOVERY_PATH;
+  ResourceURL := BaseURL + CHECKPOINT_PATH;
   try
     WaitUntilReady(DiscoveryURL, False, Server);
     {$IFDEF MSWINDOWS}
@@ -616,7 +646,9 @@ begin
   finally
     StopServer(Server);
   end;
-  Server := StartServer(DataDirectory, False);
+  Server := LaunchServer(DataDirectory, BaseURL, False);
+  DiscoveryURL := BaseURL + DISCOVERY_PATH;
+  ResourceURL := BaseURL + CHECKPOINT_PATH;
   try
     WaitUntilReady(DiscoveryURL, False, Server);
     Expect<Boolean>(Pos('lwpt-registry-checkpoint-v1', Curl(ResourceURL,
@@ -628,23 +660,21 @@ end;
 
 procedure TRegistryE2EContract.TestConfiguredTLSServerCompletesARequest;
 var
-  DataDirectory, DiscoveryURL, ResourceURL: string;
+  BaseURL, DataDirectory, DiscoveryURL, ResourceURL: string;
   Init: TLwptResult;
   Server: TProcess;
 begin
   DataDirectory := FScratch + '/tls-origin';
-  DiscoveryURL := 'https://localhost:' + IntToStr(BasePort + 2)
-    + '/.well-known/lwpt-registry';
-  ResourceURL := 'https://localhost:' + IntToStr(BasePort + 2)
-    + '/v1/checkpoints/latest.toml';
+  BaseURL := FreshBaseURL('https', '');
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'https://localhost:' + IntToStr(BasePort + 2), '--port',
-    IntToStr(BasePort + 2), '--tls-pkcs12',
-    REGISTRY_TLS_FIXTURE,
+    '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL)),
+    '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV], '',
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
-  Server := StartServer(DataDirectory, True);
+  Server := LaunchServer(DataDirectory, BaseURL, True);
+  DiscoveryURL := BaseURL + DISCOVERY_PATH;
+  ResourceURL := BaseURL + CHECKPOINT_PATH;
   try
     WaitUntilReady(DiscoveryURL, True, Server);
     Expect<Boolean>(Pos('lwpt-registry-checkpoint-v1', Curl(ResourceURL,
@@ -667,7 +697,7 @@ const
     '11111111111111111111111111111111';
 var
   BoundedPaths: array of string;
-  CrashedPath, DataDirectory, DiscoveryURL, LivePath, Nonce,
+  BaseURL, CrashedPath, DataDirectory, DiscoveryURL, LivePath, Nonce,
     RegistryResiduePath, RegistrySymlinkPath, SecureTransportResiduePath,
     SecureTransportSymlinkPath: string;
   CrashedPID, DeadPID, RecoveredPID: LongInt;
@@ -716,11 +746,10 @@ begin
     Expect<Integer>(FpSymlink(PChar(SecureTransportResiduePath),
       PChar(SecureTransportSymlinkPath))).ToBe(0);
     DataDirectory := FScratch + '/crash-safe-tls-origin';
-    DiscoveryURL := 'https://localhost:' + IntToStr(BasePort + 5)
-      + '/.well-known/lwpt-registry';
+    BaseURL := FreshBaseURL('https', '');
     Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-      '--base-url', 'https://localhost:' + IntToStr(BasePort + 5), '--port',
-      IntToStr(BasePort + 5), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
+      '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL)),
+      '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
       '--tls-password-env', TLS_PASSWORD_ENV], '',
       [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
     Expect<Integer>(Init.ExitCode).ToBe(0);
@@ -752,7 +781,8 @@ begin
     Residue.Free;
     Residue := TFileStream.Create(SecureTransportResiduePath, fmCreate);
     Residue.Free;
-    Server := StartServer(DataDirectory, True);
+    Server := LaunchServer(DataDirectory, BaseURL, True);
+    DiscoveryURL := BaseURL + DISCOVERY_PATH;
     WaitUntilReady(DiscoveryURL, True, Server);
     Expect<Boolean>(FileExists(RegistryResiduePath)
       xor FileExists(SecureTransportResiduePath)).ToBe(True);
@@ -772,7 +802,8 @@ begin
     Expect<Boolean>(Server.Running).ToBe(False);
     Expect<Integer>(TemporaryKeychainPathCount(CrashedPID)).ToBe(1);
     StopServer(Server);
-    Server := StartServer(DataDirectory, True);
+    Server := LaunchServer(DataDirectory, BaseURL, True);
+    DiscoveryURL := BaseURL + DISCOVERY_PATH;
     WaitUntilReady(DiscoveryURL, True, Server);
     RecoveredPID := Server.ProcessID;
     Expect<Integer>(TemporaryKeychainPathCount(CrashedPID)).ToBe(0);
@@ -804,28 +835,28 @@ end;
 procedure TRegistryE2EContract.TestIdleTLSHandshakesExpireAndReleaseAdmission;
 var
   Address: TInetSockAddr;
-  DataDirectory, DiscoveryURL: string;
+  BaseURL, DataDirectory, DiscoveryURL: string;
   IdleSockets: array[0..31] of TSocket;
   Index: Integer;
   Init: TLwptResult;
   Server: TProcess;
 begin
   DataDirectory := FScratch + '/idle-tls-origin';
-  DiscoveryURL := 'https://localhost:' + IntToStr(BasePort + 4)
-    + '/.well-known/lwpt-registry';
+  BaseURL := FreshBaseURL('https', '');
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
-    '--base-url', 'https://localhost:' + IntToStr(BasePort + 4), '--port',
-    IntToStr(BasePort + 4), '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
+    '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL)),
+    '--tls-pkcs12', REGISTRY_TLS_FIXTURE,
     '--tls-password-env', TLS_PASSWORD_ENV], '',
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
-  Server := StartServer(DataDirectory, True);
+  Server := LaunchServer(DataDirectory, BaseURL, True);
+  DiscoveryURL := BaseURL + DISCOVERY_PATH;
   for Index := 0 to High(IdleSockets) do IdleSockets[Index] := -1;
   try
     WaitUntilReady(DiscoveryURL, True, Server);
     FillChar(Address, SizeOf(Address), 0);
     Address.sin_family := AF_INET;
-    Address.sin_port := HToNs(BasePort + 4);
+    Address.sin_port := HToNs(URLPort(BaseURL));
     Address.sin_addr := StrToNetAddr('127.0.0.1');
     for Index := 0 to High(IdleSockets) do
     begin
