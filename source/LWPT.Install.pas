@@ -4994,14 +4994,20 @@ end;
 procedure PublishRegistryProofs(const AArchivesRoot, ATmpRoot,
   ARollbackRoot: string; const ADocuments: TRegistryProofDocumentArray;
   out ABackup, APublishedPath: string);
-var Root, Staged: string; k: Integer;
+var Root, Staged, Backup: string; k: Integer;
 begin
   ABackup := '';
   APublishedPath := '';
   Root := IncludeTrailingPathDelimiter(AArchivesRoot) + REGISTRY_PROOFS_DIR;
   if RegistryProofsCurrent(Root, ADocuments) then Exit;
-  if not AtomicRetainPath(Root, ARollbackRoot, 'registry-proofs', ABackup) then
+  { The retained copy nests sha256/<64 hex>.toml below the journaled
+    transaction root, so its hint stays short to keep deep projects inside
+    the legacy Windows path limit. The outputs are set only once the copy
+    is validated: a failed retention has nothing to restore. }
+  Backup := '';
+  if not AtomicRetainPath(Root, ARollbackRoot, 'proofs', Backup) then
     raise EExtractError.Create('failed to retain registry proof rollback copy');
+  ABackup := Backup;
   APublishedPath := Root;
   if Length(ADocuments) = 0 then
   begin
@@ -5009,7 +5015,7 @@ begin
       raise EExtractError.Create('failed to remove unreferenced registry proofs');
     Exit;
   end;
-  Staged := MakeTmpPath(ATmpRoot, 'registry-proofs');
+  Staged := MakeTmpPath(ATmpRoot, 'proofs');
   ForceDirectories(Staged + '/sha256');
   for k := 0 to High(ADocuments) do
     AtomicWriteBytes(Staged + '/sha256/' + RegistryDigestHex(ADocuments[k].Hash)
@@ -5519,7 +5525,7 @@ begin
         if ManifestBackup <> '' then
           TryRollbackRestore(ManifestBackup, ManifestPath,
             'failed to restore manifest', RollbackFailures);
-        if ProofsBackup <> '' then
+        if (ProofsBackup <> '') and (ProofsPublished <> '') then
           TryRollbackRestore(ProofsBackup, ProofsPublished,
             'failed to restore registry proofs', RollbackFailures);
         if (RollbackRoot <> '') and DirectoryExists(RollbackRoot)

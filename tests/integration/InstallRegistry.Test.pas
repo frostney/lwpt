@@ -36,8 +36,10 @@ type
 
   TInstallRegistry = class(TTestSuite)
   private
-    FScratch, FReleaseBinary: string;
+    FScratch, FReleaseBinary, FCurrentCase: string;
     FCount: Integer;
+    procedure DumpCase(const ALabel: string);
+    procedure ExpectUnchanged(const ACase, ABefore: string);
     function NewCase(const AName: string): string;
     procedure WriteProject(const ACase, ARegistries, ADependencies: string;
       const AExtra: string = '');
@@ -179,7 +181,13 @@ end;
 function TInstallRegistry.NewCase(const AName: string): string;
 begin
   Inc(FCount);
-  Result := FScratch + '/' + IntToStr(FCount) + '-' + AName;
+  { Short directory names keep the deepest transaction paths (a retained
+    proof below the journaled rollback root) inside the legacy Windows
+    MAX_PATH on CI runners with deep workspaces. The name is kept in a file. }
+  Result := FScratch + '/c' + IntToStr(FCount);
+  FCurrentCase := Result;
+  ForceDirectories(Result);
+  WriteTextFile(Result + '/CASE', AName + #10);
   ForceDirectories(Result + '/project/source');
   ForceDirectories(Result + '/state');
   ForceDirectories(Result + '/cache');
@@ -261,11 +269,65 @@ begin
   Result := ARun.Stdout + ARun.Stderr;
 end;
 
+{ Lists the case's project and state files, so a native-only failure shows
+  what the install left behind. }
+procedure TInstallRegistry.DumpCase(const ALabel: string);
+
+  procedure Walk(const ADirectory, APrefix: string; var ALines: Integer);
+  var Entry: TSearchRec;
+  begin
+    if FindFirst(ADirectory + '/*', faAnyFile, Entry) <> 0 then Exit;
+    try
+      repeat
+        if (Entry.Name = '.') or (Entry.Name = '..') then Continue;
+        Inc(ALines);
+        if ALines > 80 then Exit;
+        if (Entry.Attr and faDirectory) <> 0 then
+        begin
+          WriteLn('  ', APrefix, Entry.Name, '/');
+          Walk(ADirectory + '/' + Entry.Name, APrefix + Entry.Name + '/', ALines);
+        end
+        else WriteLn('  ', APrefix, Entry.Name, ' (', Entry.Size, ' bytes, path ',
+          Length(ADirectory + '/' + Entry.Name), ' chars)');
+      until FindNext(Entry) <> 0;
+    finally
+      FindClose(Entry);
+    end;
+  end;
+
+var Lines: Integer;
+begin
+  if FCurrentCase = '' then Exit;
+  WriteLn('--- ', ALabel, ': case ', FCurrentCase, ' (', Trim(ReadText(FCurrentCase
+    + '/CASE')), ') ---');
+  WriteLn('  lwpt.lock exists: ', FileExists(FCurrentCase + '/project/lwpt.lock'));
+  Lines := 0;
+  Walk(FCurrentCase + '/project/.lwpt', '.lwpt/', Lines);
+  Walk(FCurrentCase + '/state', 'state/', Lines);
+end;
+
+procedure TInstallRegistry.ExpectUnchanged(const ACase, ABefore: string);
+var After: string;
+begin
+  After := Fingerprint(ACase);
+  if After <> ABefore then
+  begin
+    WriteLn('--- state changed: lock|cfg|modules|archives|state ---');
+    WriteLn('  before ', ABefore);
+    WriteLn('  after  ', After);
+    DumpCase('state changed');
+  end;
+  Expect<string>(After).ToBe(ABefore);
+end;
+
 procedure TInstallRegistry.ExpectSuccess(const ALabel: string;
   const ARun: TLwptResult);
 begin
   if ARun.ExitCode <> 0 then
+  begin
     WriteLn('--- ', ALabel, ' ---'#10, Output(ARun), '---');
+    DumpCase(ALabel);
+  end;
   Expect<Integer>(ARun.ExitCode).ToBe(0);
 end;
 
@@ -273,8 +335,11 @@ procedure TInstallRegistry.ExpectFailure(const ARun: TLwptResult;
   const AText: string);
 begin
   if (ARun.ExitCode = 0) or (Pos(AText, Output(ARun)) = 0) then
+  begin
     WriteLn('--- expected failure containing "', AText, '" ---'#10,
       Output(ARun), '---');
+    DumpCase('expected failure');
+  end;
   Expect<Boolean>(ARun.ExitCode <> 0).ToBe(True);
   Expect<Boolean>(Pos(AText, Output(ARun)) > 0).ToBe(True);
 end;
@@ -368,7 +433,7 @@ begin
     { The same pin now advertises a different origin. }
     Origin.Registry := Other;
     ExpectFailure(Install(CaseRoot, ['install']), 'registry_identity_changed');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     Origin.Free;
     Other.Free;
@@ -539,7 +604,7 @@ begin
     Before := Fingerprint(CaseRoot);
     ATamper(Registry, Origin);
     ExpectFailure(Install(CaseRoot, ['install']), AExpected);
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     Origin.Free;
     Registry.Free;
@@ -715,7 +780,7 @@ begin
     Before := Fingerprint(CaseRoot);
     TamperDowngrade(Registry, Origin);
     ExpectFailure(Install(CaseRoot, ['install']), 'checkpoint_downgrade');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     Origin.Free;
     Registry.Free;
@@ -1250,7 +1315,7 @@ begin
     ExpectFailure(Install(CaseRoot, ['install', '--frozen']), 'cannot yet be verified');
     ExpectFailure(Install(CaseRoot, ['install', '--offline']), 'cannot yet be restored');
     Expect<Integer>(Origin.Requests).ToBe(Requests);
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     Origin.Free;
     Registry.Free;
@@ -1376,14 +1441,14 @@ begin
     { A third origin under the same key is never a first discovery. }
     FirstContact.Registry := Third;
     ExpectFailure(Install(CaseRoot, ['install']), 'registry_identity_changed');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
     { With no locked dependency binding the alias, two unclaimed tables under
       its key are ambiguous: the install fails before any request. }
     FirstContact.Registry := First;
     WriteMember(CaseRoot, '[dependencies]'#10 + 'extra = "registry:corp/extra"'#10);
     ExpectFailure(Install(CaseRoot, ['install']),
       'records several origins pinned to the key of [registries.corp]');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     FirstContact.Free;
     SecondContact.Free;
@@ -1491,7 +1556,7 @@ begin
       'json = "registry:json"'#10);
     Before := Fingerprint(CaseRoot);
     ExpectFailure(Install(CaseRoot, ['install']), 'before the install could publish');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     Origin.Free;
     Registry.Free;
@@ -1520,7 +1585,7 @@ begin
     ExpectFailure(InstallWith(CaseRoot, ['install'],
       [PROJECT_NAME + '_TEST_FAIL_REGISTRY_STATE_WRITE=1']),
       'registry_state_not_persisted');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
     Expect<Integer>(StateSequence(CaseRoot)).ToBe(1);
     ExpectSuccess('state recovers', Install(CaseRoot, ['install']));
     Expect<Integer>(StateSequence(CaseRoot)).ToBe(2);
@@ -1565,7 +1630,7 @@ begin
     finally
       Coordinator.Free;
     end;
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
     Expect<Integer>(StateSequence(CaseRoot)).ToBe(1);
   finally
     Origin.Free;
@@ -1656,7 +1721,7 @@ begin
     Before := Fingerprint(CaseRoot);
     Origin.Mode := scmFail;
     ExpectFailure(Install(CaseRoot, ['install']), 'signature_invalid');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     Origin.Free;
     Registry.Free;
@@ -1712,13 +1777,13 @@ begin
     ExpectFailure(InstallWith(CaseRoot, ['install'],
       [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']),
       'injected failure after lockfile publication');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
     { Dropping the dependency prunes every proof; the failure restores them. }
     WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []), '');
     ExpectFailure(InstallWith(CaseRoot, ['install'],
       [PROJECT_NAME + '_TEST_FAIL_AFTER_LOCK_WRITE=1']),
       'injected failure after lockfile publication');
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
   finally
     Origin.Free;
     Registry.Free;
@@ -1814,7 +1879,7 @@ begin
     Run := Install(CaseRoot, ['install']);
     ExpectFailure(Run, 'registry_contacts_stale');
     Expect<Boolean>(Pos('reusing the locked selection', Output(Run)) = 0).ToBe(True);
-    Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+    ExpectUnchanged(CaseRoot, Before);
     { Fresh CI: the committed proof holds the accepted snapshot. }
     RecursiveDelete(CaseRoot + '/state');
     ForceDirectories(CaseRoot + '/state');
