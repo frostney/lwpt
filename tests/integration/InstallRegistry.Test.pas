@@ -115,7 +115,6 @@ type
     procedure TestWorkspaceMemberUsesRootRegistries;
     procedure TestPackageManifestCannotDeclareRegistryDependency;
     procedure TestReleaseBinaryRejectsLocalhostHTTP;
-    procedure TestFrozenAndOfflineFailClosed;
     procedure TestPerUserStateIsSharedAndCorruptionNamed;
     procedure TestWorkspaceOnlyBindingsSurviveSharedPin;
     procedure TestTwoAliasesCannotShareAnOrigin;
@@ -1295,33 +1294,6 @@ begin
   end;
 end;
 
-procedure TInstallRegistry.TestFrozenAndOfflineFailClosed;
-var
-  Registry: TSyntheticRegistry;
-  Origin: TSyntheticContact;
-  CaseRoot, Before: string;
-  Requests: Integer;
-begin
-  CaseRoot := NewCase('frozen-offline');
-  Registry := NewRegistry(IDENTITY, Origin);
-  try
-    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
-    Window(Registry);
-    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
-      'json = "registry:json"'#10);
-    ExpectSuccess('frozen baseline', Install(CaseRoot, ['install']));
-    Before := Fingerprint(CaseRoot);
-    Requests := Origin.Requests;
-    ExpectFailure(Install(CaseRoot, ['install', '--frozen']), 'cannot yet be verified');
-    ExpectFailure(Install(CaseRoot, ['install', '--offline']), 'cannot yet be restored');
-    Expect<Integer>(Origin.Requests).ToBe(Requests);
-    ExpectUnchanged(CaseRoot, Before);
-  finally
-    Origin.Free;
-    Registry.Free;
-  end;
-end;
-
 procedure TInstallRegistry.TestPerUserStateIsSharedAndCorruptionNamed;
 var
   Registry: TSyntheticRegistry;
@@ -2003,8 +1975,6 @@ begin
     TestPackageManifestCannotDeclareRegistryDependency);
   Test('a release binary rejects an http://localhost contact at load',
     TestReleaseBinaryRejectsLocalhostHTTP);
-  Test('--frozen and --offline fail closed on registry dependencies without '
-    + 'a request', TestFrozenAndOfflineFailClosed);
   Test('per-user state is shared across projects and corruption names the '
     + 'file', TestPerUserStateIsSharedAndCorruptionNamed);
   Test('decision 2: workspace-only bindings survive two origins sharing a '

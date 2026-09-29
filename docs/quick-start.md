@@ -101,6 +101,16 @@ materialization and read-only `--frozen` verification are mutually exclusive.
 archives and extracted modules against `lwpt.lock` and never writes the lockfile.
 Some other package managers use "frozen" only to mean "don't write the lock".
 
+Registry dependencies follow the same two modes without contacting any
+registry. Both verify each locked selection from the signed documents
+committed under `.lwpt/archives/registry-proofs/` and the key pinned in
+`lwpt.toml`, so an edited lock, proof, or archive fails. `--frozen` also
+re-derives each registry module from its archive and fails when an installed
+unit was edited, even together with its recorded hash. `--offline` restores a
+missing proof document from the per-user registry state directory. A changed
+pin fails both modes; run `lwpt install` online to verify from the new pin
+([ADR-0051](./adr/0051-registry-dependency-sources.md)).
+
 A tag names a reviewed commit, and `lwpt.lock` records both the commit and
 whether the ref was a tag or a branch. An online install fails before fetching
 anything when a locked tag changes upstream:
@@ -281,6 +291,17 @@ bar = { source = "owner/bar", version = "^1.0", include = ["src/**"] } # inline-
 committed project archive nor the shared content-addressed cache contains the
 archive hash recorded in `lwpt.lock`. Restore the committed archive or run
 `lwpt install` online once to seed verified content.
+
+**`[frozen] module tree of "<name>" differs from the tree re-derived from its
+proof-authenticated archive`** — an installed file of a registry dependency
+differs from its signed archive, even though `lwpt.lock` may have been
+updated to match. Restore `.lwpt/modules/<name>/` from version control, or run
+`lwpt install --offline` to re-extract it from the archive.
+
+**`trust pin for <identity> changed`** — the `key-id` or `public-key` of a
+`[registries.<alias>]` declaration no longer matches the key the lock was
+verified from. Review the change, then run `lwpt install` online to verify
+from the new pin.
 
 **Pre-commit hook auto-formatted files unexpectedly** — the hook runs `lwpt format` and `lwpt agents` with `stage_fixed: true`, so any drift (source formatting, the AGENTS.md agents block) gets rewritten + re-staged into the same commit. Review the staged diff before pushing.
 
