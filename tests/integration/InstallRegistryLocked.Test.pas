@@ -1070,7 +1070,8 @@ begin
   CaseRoot := Clone(Baseline, 'frozen-readonly');
   { A file where a sibling intermediate tar would go must survive. }
   Sentinel := CaseRoot + '/project/.lwpt/archives/json-1.0.0.tar.gz.tar';
-  WriteTextFile(Sentinel, 'sentinel'#10);
+  { Exact bytes: WriteTextFile uses the platform line ending. }
+  WriteBytesToFile(Sentinel, BytesOf('sentinel'#10));
   Before := Fingerprint(CaseRoot);
   FOrigin.Mode := scmFail;
   SetArchivesReadOnly(CaseRoot, True);
