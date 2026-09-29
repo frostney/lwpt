@@ -106,7 +106,8 @@ program	*	tests/integration/Init.Test.pas	1	21
 program	*	tests/integration/InstallCommitPin.Test.pas	1	12
 program	*	tests/integration/InstallFetchFailure.Test.pas	4	24
 program	*	tests/integration/InstallGitGraph.Test.pas	1	31
-program	*	tests/integration/InstallRegistry.Test.pas	1	49
+program	*	tests/integration/InstallRegistry.Test.pas	1	48
+program	*	tests/integration/InstallRegistryLocked.Test.pas	1	26
 program	*	tests/integration/InstallGraphConflict.Test.pas	1	20
 program	*	tests/integration/InstallLocalDiamond.Test.pas	2	10
 program	*	tests/integration/InstallNestedManifest.Test.pas	1	4
