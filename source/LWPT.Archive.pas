@@ -107,6 +107,20 @@ function StripFirstComponent(const AName: string): string;
 function TarOctal(const ABlock: array of Byte; AOffset, ALen: Integer): Int64;
 function TarStr(const ABlock: array of Byte; AOffset, ALen: Integer): string;
 
+{ Why a relative archive path could alias another path on a platform file
+  system, or '' when it cannot. Applied to every entry of a publication
+  archive, following Git's is_hfs_dotgit/is_ntfs_dotgit protections but for
+  all names, not only one:
+  - HFS+ ignores some code points when comparing names, so 'a<U+200C>b'
+    names the file 'ab'. Git's list: U+200C-U+200F, U+202A-U+202E,
+    U+206A-U+206F, and U+FEFF.
+  - NTFS gives a long name an 8.3 short name that later entries can spell,
+    including checksum-based ones ('LW1A2B~1.TOM') once the simple 'NAME~N'
+    slots are taken. Any component whose base name (before its first '.')
+    has '~' followed by a digit within its first eight characters has that
+    shape and is refused. }
+function ArchivePathPlatformAlias(const APath: string): string;
+
 { True when AValue is well-formed UTF-8 (no overlong forms, surrogates, or
   code points above U+10FFFF) and contains no C0, DEL, or C1 control
   character. }
@@ -235,6 +249,42 @@ begin
     if ABlock[i] = 0 then Break;
     Result := Result + Chr(ABlock[i]);
   end;
+end;
+
+function ArchivePathPlatformAlias(const APath: string): string;
+var
+  i, Tilde, Dot: Integer;
+  Parts: TStringArray;
+  Base: string;
+  B1, B2, B3: Byte;
+begin
+  for i := 1 to Length(APath) - 2 do
+  begin
+    B1 := Byte(APath[i]);
+    B2 := Byte(APath[i + 1]);
+    B3 := Byte(APath[i + 2]);
+    { U+200C-U+200F and U+202A-U+202E: E2 80 8C-8F, E2 80 AA-AE;
+      U+206A-U+206F: E2 81 AA-AF; U+FEFF: EF BB BF. }
+    if ((B1 = $E2) and (B2 = $80)
+         and (((B3 >= $8C) and (B3 <= $8F)) or ((B3 >= $AA) and (B3 <= $AE))))
+       or ((B1 = $E2) and (B2 = $81) and (B3 >= $AA) and (B3 <= $AF))
+       or ((B1 = $EF) and (B2 = $BB) and (B3 = $BF)) then
+      Exit('holds a code point HFS+ ignores in names');
+  end;
+  Parts := StringReplace(APath, '\', '/', [rfReplaceAll]).Split(['/']);
+  for i := 0 to High(Parts) do
+  begin
+    Dot := Pos('.', Parts[i]);
+    if Dot > 0 then
+      Base := System.Copy(Parts[i], 1, Dot - 1)
+    else
+      Base := Parts[i];
+    for Tilde := 1 to 8 do
+      if (Tilde < Length(Base)) and (Base[Tilde] = '~')
+         and (Base[Tilde + 1] in ['0'..'9']) then
+        Exit(Format('has the 8.3 short-name component "%s"', [Parts[i]]));
+  end;
+  Result := '';
 end;
 
 function IsStrictUTF8WithoutControls(const AValue: RawByteString): Boolean;

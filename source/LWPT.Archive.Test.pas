@@ -24,6 +24,7 @@ type
     procedure TestStrictUTF8Names;
     procedure TestInstallerTarHeaderReaders;
     procedure TestStableErrorShape;
+    procedure TestPlatformAliases;
   end;
 
 procedure TArchiveSuite.TestDefaultLimitsMatchTheADR;
@@ -150,6 +151,48 @@ begin
     .ToBe('unsupported_dependencies');
 end;
 
+procedure TArchiveSuite.TestPlatformAliases;
+var
+  Ignorable: Cardinal;
+  Encoded: string;
+begin
+  { Every code point on Git's HFS+-ignorable list, and its neighbours. }
+  for Ignorable := $200C to $200F do
+  begin
+    Encoded := #$E2#$80 + Chr($80 + (Ignorable and $3F));
+    Expect<Boolean>(ArchivePathPlatformAlias('a' + Encoded + 'b') <> '')
+      .ToBe(True);
+  end;
+  for Ignorable := $202A to $202E do
+  begin
+    Encoded := #$E2#$80 + Chr($80 + (Ignorable and $3F));
+    Expect<Boolean>(ArchivePathPlatformAlias('a/' + Encoded) <> '')
+      .ToBe(True);
+  end;
+  for Ignorable := $206A to $206F do
+  begin
+    Encoded := #$E2#$81 + Chr($80 + (Ignorable and $3F));
+    Expect<Boolean>(ArchivePathPlatformAlias(Encoded + 'x') <> '')
+      .ToBe(True);
+  end;
+  Expect<Boolean>(ArchivePathPlatformAlias(#$EF#$BB#$BF'x') <> '')
+    .ToBe(True);
+  Expect<string>(ArchivePathPlatformAlias('a'#$E2#$80#$8B'b')).ToBe('');
+  Expect<string>(ArchivePathPlatformAlias('a'#$E2#$80#$A9'b')).ToBe('');
+  Expect<string>(ArchivePathPlatformAlias('a'#$E2#$81#$A9'b')).ToBe('');
+  Expect<string>(ArchivePathPlatformAlias('a'#$EF#$BB#$BE'b')).ToBe('');
+  { 8.3 short-name shape: '~' then a digit within the base's first eight
+    characters, in any component. }
+  Expect<string>(ArchivePathPlatformAlias('src/LW1A2B~1.TOM'))
+    .ToBe('has the 8.3 short-name component "LW1A2B~1.TOM"');
+  Expect<Boolean>(ArchivePathPlatformAlias('PROGRA~1/x') <> '').ToBe(True);
+  Expect<Boolean>(ArchivePathPlatformAlias('a\NAME~12') <> '').ToBe(True);
+  Expect<Boolean>(ArchivePathPlatformAlias('ABCDEFG~1') <> '').ToBe(True);
+  Expect<string>(ArchivePathPlatformAlias('ABCDEFGH~1')).ToBe('');
+  Expect<string>(ArchivePathPlatformAlias('a~b/name~x/x.y~1/~')).ToBe('');
+  Expect<string>(ArchivePathPlatformAlias('plain/path.txt')).ToBe('');
+end;
+
 procedure TArchiveSuite.SetupTests;
 begin
   Test('default limits match the ADR bounds',
@@ -163,6 +206,8 @@ begin
   Test('the installer''s tar header readers are shared',
     TestInstallerTarHeaderReaders);
   Test('refusals carry a stable code', TestStableErrorShape);
+  Test('HFS+-ignorable code points and 8.3 short names',
+    TestPlatformAliases);
 end;
 
 begin

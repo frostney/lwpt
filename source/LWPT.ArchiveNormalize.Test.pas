@@ -99,6 +99,7 @@ type
     procedure TestTarManifestOverwriteIsRefused;
     procedure TestTarManifestAliases;
     procedure TestZipManifestAliases;
+    procedure TestPlatformAliasesInEveryEntry;
   end;
 
   TTarGzipScanSuite = class(TTestSuite)
@@ -1300,9 +1301,17 @@ procedure TManifestAliasSuite.TestTarManifestAliases;
 const
   { Typed arrays: FPC sizes an untyped string-array constructor in a for-in
     loop to its first element. }
-  ALIASES: array[0..7] of string = ('LWPT.TOML', 'Lwpt.toml', 'lwpt.toml.',
-    'lwpt.toml ', 'lwpt.toml..', 'lwpt.toml::$DATA', 'LWPT~1.TOM',
-    'lwpt~2.tom');
+  ALIASES: array[0..5] of string = ('LWPT.TOML', 'Lwpt.toml', 'lwpt.toml.',
+    'lwpt.toml ', 'lwpt.toml..', 'lwpt.toml::$DATA');
+  { NTFS 8.3 short names, simple and checksum-based, and names HFS+
+    compares equal to lwpt.toml by ignoring a code point (U+200C, U+200F,
+    U+202A, U+202E, U+206A, U+206F, U+FEFF). }
+  SHORT_NAMES: array[0..3] of string = ('LWPT~1.TOM', 'lwpt~2.tom',
+    'LW1A2B~1.TOM', 'LWC3F4~9.TOM');
+  HFS_IGNORABLE: array[0..6] of string = ('lwpt'#$E2#$80#$8C'.toml',
+    'lwpt.toml'#$E2#$80#$8F, #$E2#$80#$AA'lwpt.toml', 'lw'#$E2#$80#$AE'pt.toml',
+    'lwpt'#$E2#$81#$AA'.toml', 'lwpt.tom'#$E2#$81#$AF'l',
+    #$EF#$BB#$BF'lwpt.toml');
   DISTINCT: array[0..4] of string = ('sub/lwpt.toml', 'lwpt.toml.bak',
     'lwpt.tomlx', 'xlwpt.toml', 'sub/LWPT.TOML');
 var
@@ -1324,6 +1333,14 @@ begin
     Expect<string>(Rejection(ManifestPairTarGz(MakeRegularFileEntry(
       'demo-1.0.0/' + Spelling, TextBytes(OTHER_MANIFEST))),
       'aliases lwpt.toml')).ToBe(ARCHIVE_INVALID);
+  for Spelling in SHORT_NAMES do
+    Expect<string>(Rejection(ManifestPairTarGz(MakeRegularFileEntry(
+      'demo-1.0.0/' + Spelling, TextBytes(OTHER_MANIFEST))),
+      'has the 8.3 short-name component')).ToBe(ARCHIVE_INVALID);
+  for Spelling in HFS_IGNORABLE do
+    Expect<string>(Rejection(ManifestPairTarGz(MakeRegularFileEntry(
+      'demo-1.0.0/' + Spelling, TextBytes(OTHER_MANIFEST))),
+      'holds a code point HFS+ ignores')).ToBe(ARCHIVE_INVALID);
   { An alias before the manifest is refused too. }
   Expect<string>(Rejection(Gzip(BuildTar([
     MakeRegularFileEntry('demo-1.0.0/LWPT.TOML', TextBytes(OTHER_MANIFEST)),
@@ -1338,8 +1355,8 @@ end;
 
 procedure TManifestAliasSuite.TestZipManifestAliases;
 const
-  ALIASES: array[0..5] of RawByteString = ('pkg/lwpt.toml.',
-    'pkg/lwpt.toml ', 'pkg/lwpt.toml:x', 'pkg/LWPT~1.TOM', 'pkg/LWPT.TOML/',
+  ALIASES: array[0..4] of RawByteString = ('pkg/lwpt.toml.',
+    'pkg/lwpt.toml ', 'pkg/lwpt.toml:x', 'pkg/LWPT.TOML/',
     'pkg/lwpt.toml./x');
 var
   Spelling: RawByteString;
@@ -1347,8 +1364,40 @@ begin
   for Spelling in ALIASES do
     Expect<string>(Rejection(DemoZip([Spelling]), 'aliases lwpt.toml'))
       .ToBe(ARCHIVE_INVALID);
-  Expect<string>(Rejection(DemoZip(['pkg/sub/LWPT~1.TOM',
-    'pkg/lwpt.toml.bak']), '')).ToBe('accepted');
+  Expect<string>(Rejection(DemoZip(['pkg/LW1A2B~1.TOM']),
+    'has the 8.3 short-name component')).ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(DemoZip(['pkg/lwpt'#$E2#$80#$8C'.toml']),
+    'holds a code point HFS+ ignores')).ToBe(ARCHIVE_INVALID);
+  Expect<string>(Rejection(DemoZip(['pkg/lwpt.toml.bak']), ''))
+    .ToBe('accepted');
+end;
+
+{ The rules hold for every entry, not only spellings of the manifest: any
+  name that a platform could fold onto another is refused. }
+procedure TManifestAliasSuite.TestPlatformAliasesInEveryEntry;
+const
+  REFUSED: array[0..6] of RawByteString = ('pkg/PROGRA~1/x',
+    'pkg/src/NAME~1', 'pkg/docs/AB12CD~3.MD', 'pkg/~1', 'pkg/a~0b.txt',
+    'pkg/docs/a'#$EF#$BB#$BF'.md', 'pkg/'#$E2#$80#$8D'src/x.pas');
+  ACCEPTED: array[0..6] of RawByteString = ('pkg/a~b', 'pkg/name~x.txt',
+    'pkg/verylongn~1.txt', 'pkg/a.b~1', 'pkg/~', 'pkg/a'#$E2#$80#$8B'b',
+    'pkg/a'#$E2#$80#$A9'b');
+var
+  Name: RawByteString;
+begin
+  for Name in REFUSED do
+  begin
+    Expect<string>(Rejection(DemoZip([Name]), 'zip entry'))
+      .ToBe(ARCHIVE_INVALID);
+    Expect<string>(Rejection(Gzip(BuildTar([
+      MakeRegularFileEntry('demo-1.0.0/lwpt.toml', TextBytes(DEMO_MANIFEST)),
+      MakeRegularFileEntry('demo-1.0.0/' + System.Copy(Name, 5, MaxInt),
+        TextBytes('x'))])), 'entry "demo-1.0.0/')).ToBe(ARCHIVE_INVALID);
+  end;
+  { A tilde past the eighth character, without a digit, or only in the
+    extension, and zero-width code points HFS+ does not ignore. }
+  for Name in ACCEPTED do
+    Expect<string>(Rejection(DemoZip([Name]), '')).ToBe('accepted');
 end;
 
 procedure TManifestAliasSuite.SetupTests;
@@ -1358,6 +1407,8 @@ begin
   Test('tar links, directories, and platform spellings of lwpt.toml',
     TestTarManifestAliases);
   Test('zip spellings of lwpt.toml', TestZipManifestAliases);
+  Test('HFS+-ignorable and 8.3 short names are refused in every entry',
+    TestPlatformAliasesInEveryEntry);
 end;
 
 { ---- tar.gz scan -------------------------------------------------------- }

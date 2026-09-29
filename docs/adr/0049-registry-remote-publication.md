@@ -461,6 +461,14 @@ is a zip. Anything else fails with `unsupported_archive`.
   trailing `.` or space, an NTFS stream suffix, or the `lwpt~` 8.3 short
   name) is refused, because installing it would replace the identity that
   was inspected. Zip normalization refuses the same spellings.
+  Like Git's `.git` protections (`is_hfs_dotgit`, `is_ntfs_dotgit`), but
+  applied to every entry of both input types, a name is refused with
+  `invalid_archive` when it holds a code point that HFS+ ignores when
+  comparing names (U+200C–U+200F, U+202A–U+202E, U+206A–U+206F, U+FEFF), or
+  when any component has the shape of an NTFS 8.3 short name (`~` followed
+  by a digit within the first eight characters of its base name, which
+  covers checksum-based names such as `LW1A2B~1.TOM`). Either could let a
+  later entry replace an earlier one on some platform.
 - **zip** is normalized on the client into one canonical tar.gz, described
   in the next section. Only that tar.gz is uploaded, stored, hashed, and
   served.

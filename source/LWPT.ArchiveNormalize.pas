@@ -346,7 +346,7 @@ end;
 procedure TLWPTTarScanner.CheckEntry(const AName: string;
   const ATypeFlag: Byte; const ALinkName: string; const ASize: Int64);
 var
-  Normalized, Top, RelName: string;
+  Normalized, Top, RelName, Alias: string;
   Slash: Integer;
   TypeChar: Char;
 begin
@@ -380,6 +380,9 @@ begin
     RaiseInvalid(Format('entry path escapes the extraction root: %s',
       [AName]));
   CheckComponents(RelName);
+  Alias := ArchivePathPlatformAlias(RelName);
+  if Alias <> '' then
+    RaiseInvalid(Format('entry "%s" %s', [AName, Alias]));
   if TypeChar in ['1', '2'] then
   begin
     if ArchiveLinkTargetEscapesRoot(RelName, ALinkName) then
@@ -694,6 +697,7 @@ procedure CheckRelativePath(const APath, AWhere: string;
 var
   Parts: TStringArray;
   k: Integer;
+  Alias: string;
 begin
   if APath = '' then
     RaiseInvalid(AWhere + ' has an empty path');
@@ -713,6 +717,9 @@ begin
       RaiseInvalid(Format('%s has a %d-byte component; the limit is %d',
         [AWhere, Length(Parts[k]), ARCHIVE_NAME_COMPONENT_LIMIT]));
   end;
+  Alias := ArchivePathPlatformAlias(APath);
+  if Alias <> '' then
+    RaiseInvalid(AWhere + ' ' + Alias);
 end;
 
 const
