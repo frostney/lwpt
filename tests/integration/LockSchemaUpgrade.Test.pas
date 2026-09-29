@@ -59,6 +59,8 @@ type
     procedure ExpectFailureWith(const ALabel: string; const ARun: TLwptResult;
       const AText: string);
     procedure ExpectSuccess(const ALabel: string; const ARun: TLwptResult);
+    procedure ExpectRefusedLock(const ALabel, ARoot, AHistorical,
+      AReason: string);
     function ArchiveMessage: string;
   protected
     procedure BeforeAll; override;
@@ -70,7 +72,7 @@ type
     procedure TestRepairUpgradesWithoutNetworkOrVersionChange;
     procedure TestNoChurnAfterTheUpgrade;
     procedure TestHistoricalV3LockChangesOnlyItsDigests;
-    procedure TestMultilineValuesAreNeverEdited;
+    procedure TestMultilineValuesFailClosed;
     procedure TestUnsafeLockFormsFailClosed;
     procedure TestRepairReplacesASubstitutedModule;
     procedure TestRepairMissingArchiveFailsWithMigrationMessage;
@@ -443,67 +445,80 @@ begin
   end;
 end;
 
-{ The historical lock with its version and legacy digests replaced by the
-  values an upgrade must write. }
-function UpgradedText(const AHistorical, ARoot, AV4, AEnding: string): string;
-const NAMES: array[0..2] of string = ('shared', 'local-dep', 'workspace-dep');
-var Index: Integer;
+{ Repair must fail closed on AHistorical: a migration error naming AReason,
+  the lock byte-identical, and the project unchanged. }
+procedure TLockSchemaUpgrade.ExpectRefusedLock(const ALabel, ARoot,
+  AHistorical, AReason: string);
+var Before: string;
 begin
-  Result := StringReplace(AHistorical, 'version = 3' + AEnding,
-    'version = 4' + AEnding, []);
-  for Index := 0 to High(NAMES) do
-    Result := StringReplace(Result, 'computedHash = "'
-      + LegacyHashTree(ARoot + '/.lwpt/modules/' + NAMES[Index]) + '"',
-      'computedHash = "' + LockEntryField(AV4, NAMES[Index], 'computedHash')
-      + '"', []);
+  WriteExactFile(ARoot + '/lwpt.lock', AHistorical);
+  Before := ProjectSnapshot(ARoot, REPAIR_OWNED);
+  ExpectFailureWith(ALabel, Run(ARoot, ['repair']), '`' + PROGRAM_NAME
+    + ' repair` cannot upgrade `' + LOCKFILE + '` from schema v3: it cannot '
+    + 'be edited safely: ');
+  ExpectFailureWith(ALabel + ' reason', Run(ARoot, ['repair']), AReason);
+  Expect<string>(LockText(ARoot)).ToBe(AHistorical);
+  Expect<string>(ProjectSnapshot(ARoot, REPAIR_OWNED)).ToBe(Before);
 end;
 
-procedure TLockSchemaUpgrade.TestMultilineValuesAreNeverEdited;
-var Root, V4, Historical: string;
+procedure TLockSchemaUpgrade.TestMultilineValuesFailClosed;
+var Root, Legacy: string;
 begin
-  { A multiline string holding a computedHash line and a table header, and
-    a multi-line array whose lines open with '[', are values: they are
-    copied unchanged, and the real key is still upgraded. }
-  V4 := Seed('multiline', Root);
-  Historical := HistoricalV3Lock(Root, #10, '',
-    'notes = ''''''' + #10 + 'computedHash = "sha256:' + StringOfChar('0', 64)
-    + '"' + #10 + '[package.local-dep]' + #10 + '''''''' + #10
-    + 'history = [' + #10 + '  ["computedHash", "kept"],' + #10 + ']' + #10);
-  WriteExactFile(Root + '/lwpt.lock', Historical);
-  ExpectSuccess('repair multiline', Run(Root, ['repair']));
-  Expect<string>(LockText(Root)).ToBe(UpgradedText(Historical, Root, V4,
-    #10));
-  ExpectSuccess('frozen after multiline repair',
-    Run(Root, ['install', '--frozen']));
+  { The writer never emits a multiline string or a multi-line array, so a
+    lock holding one is refused rather than edited around. The escaped
+    triple quote is the review's case: a tracker that took it for the
+    closing delimiter would edit the header and key inside the string. }
+  Seed('multiline', Root);
+  Legacy := LegacyHashTree(Root + '/.lwpt/modules/shared');
+  ExpectRefusedLock('multiline string', Root, HistoricalV3Lock(Root, #10, '',
+    'notes = ''''''' + #10 + 'computedHash = "' + Legacy + '"' + #10
+    + '[package.local-dep]' + #10 + '''''''' + #10),
+    'it contains a multiline string');
+  ExpectRefusedLock('escaped triple quote', Root, HistoricalV3Lock(Root, #10,
+    '', 'notes = """' + #10 + '\"""' + #10 + '[package.local-dep]' + #10
+    + 'computedHash = "preserve this text"' + #10 + '# """' + #10),
+    'it contains a multiline string');
+  ExpectRefusedLock('multi-line array', Root, HistoricalV3Lock(Root, #10, '',
+    'history = [' + #10 + '  ["computedHash", "kept"],' + #10 + ']' + #10),
+    'line ');
 end;
 
 procedure TLockSchemaUpgrade.TestUnsafeLockFormsFailClosed;
-var Root, Historical, Before: string; Index: Integer;
-const
-  SHARED_HASH_LINES: array[0..1] of string = (
-    { A quoted key the editor would miss and then duplicate. }
-    '"computedHash" = "sha256:%s"',
-    { A multiline string the editor never edits: the upgraded key would be
-      missing, so the edit must not be written. }
-    'computedHash = """sha256:%s"""');
-  REASONS: array[0..1] of string = ('the key "computedHash" is quoted',
-    'the edited lockfile cannot be parsed');
+var Root, Legacy, Historical: string;
 begin
-  for Index := 0 to High(SHARED_HASH_LINES) do
-  begin
-    Seed('unsafe-' + IntToStr(Index), Root);
-    Historical := HistoricalV3Lock(Root, #10, Format(SHARED_HASH_LINES[Index],
-      [Copy(LegacyHashTree(Root + '/.lwpt/modules/shared'), 8, 64)]));
-    WriteExactFile(Root + '/lwpt.lock', Historical);
-    Before := ProjectSnapshot(Root, REPAIR_OWNED);
-    ExpectFailureWith('repair unsafe ' + IntToStr(Index), Run(Root, ['repair']),
-      '`' + PROGRAM_NAME + ' repair` cannot upgrade `' + LOCKFILE
-      + '` from schema v3: ');
-    ExpectFailureWith('repair unsafe reason ' + IntToStr(Index),
-      Run(Root, ['repair']), REASONS[Index]);
-    Expect<string>(LockText(Root)).ToBe(Historical);
-    Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
-  end;
+  Seed('unsafe', Root);
+  Legacy := LegacyHashTree(Root + '/.lwpt/modules/shared');
+  { A quoted key the editor would miss and then duplicate. }
+  ExpectRefusedLock('quoted key', Root, HistoricalV3Lock(Root, #10,
+    '"computedHash" = "' + Legacy + '"'), 'which is not a bare key');
+  { The review's aliasing case: a single root key whose escaped \u0001
+    separators spell the permitted path package.shared.computedHash, holding
+    a string with an escaped triple quote and an embedded header. }
+  Historical := HistoricalV3Lock(Root, #10);
+  Historical := StringReplace(Historical, 'version = 3' + #10,
+    'version = 3' + #10 + '"package\u0001shared\u0001computedHash" = """'
+    + #10 + '\"""' + #10 + '[package.shared]' + #10
+    + 'computedHash = "preserve this text"' + #10 + '# """' + #10, []);
+  ExpectRefusedLock('aliasing key', Root, Historical,
+    'it contains a multiline string');
+  { The same aliasing key with a single-line value: refused as a quoted key
+    before any edit, and the component-wise comparison could not alias it
+    either. }
+  Historical := StringReplace(HistoricalV3Lock(Root, #10),
+    'version = 3' + #10, 'version = 3' + #10
+    + '"package\u0001shared\u0001computedHash" = "preserve this text"' + #10,
+    []);
+  ExpectRefusedLock('aliasing key, single line', Root, Historical,
+    'which is not a bare key');
+  { An inline table the writer never emits. }
+  ExpectRefusedLock('inline table', Root, HistoricalV3Lock(Root, #10, '',
+    'extra = { computedHash = "x" }' + #10), 'has a value');
+  { A dotted key is not a bare key either. }
+  ExpectRefusedLock('dotted key', Root, HistoricalV3Lock(Root, #10, '',
+    'meta.computedHash = "x"' + #10), 'which is not a bare key');
+  { An array-of-tables header the writer never emits. }
+  ExpectRefusedLock('array of tables', Root, HistoricalV3Lock(Root, #10) + #10
+    + '[[extra]]' + #10 + 'note = "x"' + #10, 'is not a table header');
 end;
 
 procedure TLockSchemaUpgrade.TestRepairReplacesASubstitutedModule;
@@ -762,9 +777,9 @@ begin
     TestNoChurnAfterTheUpgrade);
   Test('repair of a historical v3 lock changes only version and digests',
     TestHistoricalV3LockChangesOnlyItsDigests);
-  Test('repair never edits multiline string or array values',
-    TestMultilineValuesAreNeverEdited);
-  Test('repair fails closed on a quoted or multiline computedHash',
+  Test('repair refuses multiline strings and arrays the writer never emits',
+    TestMultilineValuesFailClosed);
+  Test('repair refuses quoted, aliasing, dotted, and inline-table forms',
     TestUnsafeLockFormsFailClosed);
   Test('repair replaces a substituted module a forged v3 digest matched',
     TestRepairReplacesASubstitutedModule);

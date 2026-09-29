@@ -5626,31 +5626,71 @@ begin
   end;
 end;
 
-const
-  LOCK_PATH_SEPARATOR = #1;
+type
+  { A TOML key path as its components: never joined, so no key can alias a
+    path however its characters are escaped. }
+  TLockKeyPath = array of string;
+  TLockPermittedKey = record
+    Path: TLockKeyPath;
+    Expected: string;   { the TOML value text the key must hold }
+  end;
+  TLockPermittedKeys = array of TLockPermittedKey;
+
+function LockKeyPath(const AComponents: array of string): TLockKeyPath;
+var i: Integer;
+begin
+  SetLength(Result, Length(AComponents));
+  for i := 0 to High(AComponents) do Result[i] := AComponents[i];
+end;
+
+function SameLockKeyPath(const ALeft, ARight: TLockKeyPath): Boolean;
+var i: Integer;
+begin
+  Result := Length(ALeft) = Length(ARight);
+  if not Result then Exit;
+  for i := 0 to High(ALeft) do
+    if ALeft[i] <> ARight[i] then Exit(False);
+end;
+
+function IsPermittedLockPath(const APath: TLockKeyPath;
+  const APermitted: TLockPermittedKeys): Boolean;
+var i: Integer;
+begin
+  for i := 0 to High(APermitted) do
+    if SameLockKeyPath(APath, APermitted[i].Path) then Exit(True);
+  Result := False;
+end;
+
+{ Length-prefixed, so no component or scalar text can be read as a
+  boundary. }
+function LockReprField(const AText: string): string;
+begin
+  Result := IntToStr(Length(AText)) + ':' + AText;
+end;
 
 { A canonical, order-independent rendering of a TOML value: table keys are
-  sorted, and a scalar is its kind and text. Paths in ASkip (joined with
-  LOCK_PATH_SEPARATOR) are left out. }
-function LockValueRepr(ANode: TTOMLNode; const APath: string;
-  ASkip: TStringList): string;
+  sorted, and a scalar is its kind and text. Keys at a permitted path are
+  left out. }
+function LockValueRepr(ANode: TTOMLNode; const APath: TLockKeyPath;
+  const ASkip: TLockPermittedKeys): string;
 var
   Keys: TStringList;
   Pair: TTOMLNodeMap.TKeyValuePair;
   Child: TTOMLNode;
   i: Integer;
-  ChildPath: string;
+  ChildPath: TLockKeyPath;
 begin
-  if ANode = nil then Exit('<none>');
+  if ANode = nil then Exit('n');
   case ANode.Kind of
     tnkScalar:
-      Result := IntToStr(Ord(ANode.ScalarKind)) + ':' + ANode.ScalarText;
+      Result := 's' + IntToStr(Ord(ANode.ScalarKind))
+        + LockReprField(ANode.ScalarText);
     tnkArray, tnkArrayOfTables:
       begin
-        Result := '[';
+        Result := 'a' + IntToStr(ANode.Items.Count) + '[';
         for i := 0 to ANode.Items.Count - 1 do
-          Result := Result + LockValueRepr(ANode.Items[i],
-            APath + LOCK_PATH_SEPARATOR + IntToStr(i), ASkip) + #2;
+          Result := Result + LockReprField(LockValueRepr(ANode.Items[i],
+            nil, nil));
         Result := Result + ']';
       end;
   else
@@ -5660,15 +5700,16 @@ begin
         Keys.CaseSensitive := True;
         Keys.Sorted := True;
         for Pair in ANode.Children do Keys.Add(Pair.Key);
-        Result := '{';
+        Result := 't{';
         for i := 0 to Keys.Count - 1 do
         begin
-          if APath = '' then ChildPath := Keys[i]
-          else ChildPath := APath + LOCK_PATH_SEPARATOR + Keys[i];
-          if ASkip.IndexOf(ChildPath) >= 0 then Continue;
+          ChildPath := Copy(APath);
+          SetLength(ChildPath, Length(ChildPath) + 1);
+          ChildPath[High(ChildPath)] := Keys[i];
+          if IsPermittedLockPath(ChildPath, ASkip) then Continue;
           ANode.Children.TryGetValue(Keys[i], Child);
-          Result := Result + Keys[i] + '=' + LockValueRepr(Child, ChildPath,
-            ASkip) + #3;
+          Result := Result + LockReprField(Keys[i])
+            + LockReprField(LockValueRepr(Child, ChildPath, ASkip));
         end;
         Result := Result + '}';
       finally
@@ -5678,28 +5719,34 @@ begin
   end;
 end;
 
-function LockNodeAt(ARoot: TTOMLNode; const APath: string): TTOMLNode;
-var Rest, Part: string; Separator: Integer;
+function LockNodeAt(ARoot: TTOMLNode; const APath: TLockKeyPath): TTOMLNode;
+var i: Integer;
 begin
   Result := ARoot;
-  Rest := APath;
-  while (Result <> nil) and (Rest <> '') do
+  for i := 0 to High(APath) do
+    if (Result = nil) or (Result.Kind <> tnkTable)
+       or not Result.Children.TryGetValue(APath[i], Result) then
+      Exit(nil);
+end;
+
+function LockKeyPathText(const APath: TLockKeyPath): string;
+var i: Integer;
+begin
+  Result := '';
+  for i := 0 to High(APath) do
   begin
-    Separator := Pos(LOCK_PATH_SEPARATOR, Rest);
-    if Separator = 0 then
-    begin
-      Part := Rest;
-      Rest := '';
-    end
-    else
-    begin
-      Part := Copy(Rest, 1, Separator - 1);
-      Rest := Copy(Rest, Separator + 1, MaxInt);
-    end;
-    if (Result.Kind <> tnkTable)
-       or not Result.Children.TryGetValue(Part, Result) then
-      Result := nil;
+    if i > 0 then Result := Result + '.';
+    Result := Result + APath[i];
   end;
+end;
+
+procedure RaiseUnsafeLockEdit(const AReason: string);
+begin
+  raise ELockfileError.Create(SchemaUpgradePrefix + 'it cannot be edited '
+    + 'safely: ' + AReason + '. Only the form ' + PROGRAM_NAME + ' writes is '
+    + 'upgraded; restore the machine-written `' + LWPT.Core.LOCKFILE + '`, '
+    + 'for example from version control, and run `' + PROGRAM_NAME
+    + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE);
 end;
 
 function ParseLockText(const AText, ALabel: string): TTOMLNode;
@@ -5711,55 +5758,143 @@ begin
       Result := Parser.ParseDocument(AText);
     except
       on E: ETOMLParseError do
-        raise ELockfileError.Create(SchemaUpgradePrefix + 'the ' + ALabel
-          + ' cannot be parsed (' + E.Message + '). Restore the '
-          + 'machine-written `' + LWPT.Core.LOCKFILE + '`, for example from '
-          + 'version control, and run `' + PROGRAM_NAME + ' repair` again.'
-          + SCHEMA_UPGRADE_ALTERNATIVE);
+        RaiseUnsafeLockEdit('the ' + ALabel + ' cannot be parsed ('
+          + E.Message + ')');
     end;
   finally
     Parser.Free;
   end;
 end;
 
+function IsLockBareKey(const AText: string): Boolean;
+var i: Integer;
+begin
+  Result := AText <> '';
+  for i := 1 to Length(AText) do
+    if not (AText[i] in ['A'..'Z', 'a'..'z', '0'..'9', '_', '-']) then
+      Exit(False);
+end;
+
+{ One component of a table header as the writer emits it: a bare key, or a
+  basic string without escapes, quotes, or control characters. }
+function IsLockHeaderComponent(const AText: string): Boolean;
+var i: Integer; Inner: string;
+begin
+  if IsLockBareKey(AText) then Exit(True);
+  Result := (Length(AText) >= 3) and (AText[1] = '"')
+    and (AText[Length(AText)] = '"');
+  if not Result then Exit;
+  Inner := Copy(AText, 2, Length(AText) - 2);
+  for i := 1 to Length(Inner) do
+    if (Inner[i] in ['"', '\', '''']) or (Ord(Inner[i]) < $20)
+       or (Ord(Inner[i]) = $7F) then
+      Exit(False);
+end;
+
+{ The header of a line in the writer's form without any trailing comment,
+  or '' when the line is not a well-formed single table header. }
+function LockHeaderOf(const ATrimmed: string): string;
+var Body, Component: string; i, Start: Integer; Quoted: Boolean;
+begin
+  Result := '';
+  if Copy(ATrimmed, 1, 2) = '[[' then Exit;
+  i := Pos(']', ATrimmed);
+  { An identity never holds ']', so the first one closes the header. }
+  if (Copy(ATrimmed, 1, 1) <> '[') or (i = 0) then Exit;
+  if (Trim(Copy(ATrimmed, i + 1, MaxInt)) <> '')
+     and (Copy(Trim(Copy(ATrimmed, i + 1, MaxInt)), 1, 1) <> '#') then
+    Exit;
+  Body := Copy(ATrimmed, 2, i - 2);
+  Start := 1;
+  Quoted := False;
+  for i := 1 to Length(Body) + 1 do
+  begin
+    if (i <= Length(Body)) and (Body[i] = '"') then Quoted := not Quoted;
+    if (i > Length(Body)) or ((Body[i] = '.') and not Quoted) then
+    begin
+      Component := Copy(Body, Start, i - Start);
+      if not IsLockHeaderComponent(Component) then Exit;
+      Start := i + 1;
+    end;
+  end;
+  Result := '[' + Body + ']';
+end;
+
+{ Refuses every form the lock writer never emits (ADR-0052 section 5): the
+  upgrade edits machine-written documents only. Every line must be blank, a
+  comment, a single table header in the writer's form, or `bare-key =
+  value` with a single-line value that is not a multiline string or an
+  inline table. }
+procedure RequireMachineWrittenLockForm(const AText: string);
+var
+  Lines: TStringList;
+  i: Integer;
+  Trimmed, Key, Value: string;
+begin
+  if (Pos('"""', AText) > 0) or (Pos('''''''', AText) > 0) then
+    RaiseUnsafeLockEdit('it contains a multiline string');
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AText;
+    for i := 0 to Lines.Count - 1 do
+    begin
+      Trimmed := Trim(Lines[i]);
+      if (Trimmed = '') or (Copy(Trimmed, 1, 1) = '#') then Continue;
+      if Copy(Trimmed, 1, 1) = '[' then
+      begin
+        if LockHeaderOf(Trimmed) = '' then
+          RaiseUnsafeLockEdit(Format('line %d is not a table header %s '
+            + 'writes', [i + 1, PROGRAM_NAME]));
+        Continue;
+      end;
+      if Pos('=', Trimmed) = 0 then
+        RaiseUnsafeLockEdit(Format('line %d is neither a key nor a table '
+          + 'header', [i + 1]));
+      Key := Trim(Copy(Trimmed, 1, Pos('=', Trimmed) - 1));
+      Value := Trim(Copy(Trimmed, Pos('=', Trimmed) + 1, MaxInt));
+      if not IsLockBareKey(Key) then
+        RaiseUnsafeLockEdit(Format('line %d has the key %s, which is not a '
+          + 'bare key %s writes', [i + 1, Key, PROGRAM_NAME]));
+      if (Value = '') or (Value[1] = '{') then
+        RaiseUnsafeLockEdit(Format('line %d has a value %s never writes',
+          [i + 1, PROGRAM_NAME]));
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
 { The fail-closed guarantee of the in-place edit (ADR-0052 section 5, step
   4): the original and the edited document must be structurally identical
-  except for the permitted keys, and each permitted key must hold exactly
-  its expected value. APermitted holds `path #0 value` rows, the value being
-  the TOML text the key must parse to. }
+  except for the permitted keys, compared by key components, and each
+  permitted key must hold exactly its expected value. }
 procedure RequireOnlyPermittedLockChanges(const AOriginal, AEdited: string;
-  APermitted: TStringList);
+  const APermitted: TLockPermittedKeys);
 var
   OldRoot, NewRoot, ExpectedRoot: TTOMLNode;
-  Skip: TStringList;
-  i, Separator: Integer;
-  Path, Expected, Difference: string;
+  i: Integer;
+  Difference: string;
 begin
   Difference := '';
-  Skip := TStringList.Create;
   OldRoot := nil;
   NewRoot := nil;
   try
-    Skip.CaseSensitive := True;
-    for i := 0 to APermitted.Count - 1 do
-      Skip.Add(Copy(APermitted[i], 1, Pos(#0, APermitted[i]) - 1));
     OldRoot := ParseLockText(AOriginal, 'schema-v3 lockfile');
     NewRoot := ParseLockText(AEdited, 'edited lockfile');
-    if LockValueRepr(OldRoot, '', Skip) <> LockValueRepr(NewRoot, '', Skip) then
+    if LockValueRepr(OldRoot, nil, APermitted)
+       <> LockValueRepr(NewRoot, nil, APermitted) then
       Difference := 'a key other than version, computedHash, or registry '
         + 'accepted state would change';
-    for i := 0 to APermitted.Count - 1 do
+    for i := 0 to High(APermitted) do
     begin
       if Difference <> '' then Break;
-      Separator := Pos(#0, APermitted[i]);
-      Path := Copy(APermitted[i], 1, Separator - 1);
-      Expected := Copy(APermitted[i], Separator + 1, MaxInt);
-      ExpectedRoot := ParseLockText('v = ' + Expected, 'expected value');
+      ExpectedRoot := ParseLockText('v = ' + APermitted[i].Expected,
+        'expected value');
       try
-        if LockValueRepr(LockNodeAt(NewRoot, Path), '', Skip)
-           <> LockValueRepr(TomlGet(ExpectedRoot, 'v'), '', Skip) then
-          Difference := StringReplace(Path, LOCK_PATH_SEPARATOR, '.',
-            [rfReplaceAll]) + ' would not hold its upgraded value';
+        if LockValueRepr(LockNodeAt(NewRoot, APermitted[i].Path), nil, nil)
+           <> LockValueRepr(TomlGet(ExpectedRoot, 'v'), nil, nil) then
+          Difference := LockKeyPathText(APermitted[i].Path)
+            + ' would not hold its upgraded value';
       finally
         ExpectedRoot.Free;
       end;
@@ -5767,23 +5902,17 @@ begin
   finally
     NewRoot.Free;
     OldRoot.Free;
-    Skip.Free;
   end;
-  if Difference <> '' then
-    raise ELockfileError.Create(SchemaUpgradePrefix + 'editing it in place '
-      + 'would not be safe: ' + Difference + '. Only machine-written lines '
-      + 'are edited; restore the machine-written `' + LWPT.Core.LOCKFILE
-      + '`, for example from version control, and run `' + PROGRAM_NAME
-      + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE);
+  if Difference <> '' then RaiseUnsafeLockEdit(Difference);
 end;
 
 { Writes the v4 lock of the v3-to-v4 upgrade by editing the v3 document
   rather than rendering a new one (ADR-0052 section 5, step 4): only the
   `version` line, every entry's `computedHash`, and the accepted-state lines
   of an origin whose merged accepted state moved (decision 11) change. Every
-  other line, including fields an older writer omitted and tolerated unknown
-  keys and tables, keeps its bytes and line ending. The result is reloaded
-  as v4 and must carry exactly the re-derived digests. }
+  other line keeps its bytes and line ending. The document must be in the
+  form the writer emits (RequireMachineWrittenLockForm), and the edit is
+  verified structurally before it is written. }
 procedure WriteUpgradedLock(const APath, ATmpRoot: string;
   const AResolved: TResolvedArray;
   const AOldTables, ANewTables: TLWPTRegistryLockTableArray);
@@ -5802,64 +5931,7 @@ var
   Accepted: TStringList;
   AcceptedWritten: array of Boolean;
   Reloaded: TResolvedArray;
-  Permitted: TStringList;
-  MultilineDelimiter: string;
-  ArrayDepth: Integer;
-
-  procedure Unsafe(const AReason: string);
-  begin
-    raise ELockfileError.Create(SchemaUpgradePrefix + 'editing it in place '
-      + 'would not be safe: ' + AReason + '. Only machine-written lines are '
-      + 'edited; restore the machine-written `' + LWPT.Core.LOCKFILE + '`, '
-      + 'for example from version control, and run `' + PROGRAM_NAME
-      + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE);
-  end;
-
-  { Updates the multiline-string state for one line; True while any part
-    of the line is inside, opens, or closes a multiline string. }
-  function TrackMultiline(const AContent: string): Boolean;
-  var j: Integer; Token: string;
-  begin
-    Result := MultilineDelimiter <> '';
-    j := 1;
-    while j <= Length(AContent) - 2 do
-    begin
-      if (MultilineDelimiter = '') and (AContent[j] = '#') then Break;
-      Token := Copy(AContent, j, 3);
-      if (Token = '"""') or (Token = '''''''') then
-      begin
-        if MultilineDelimiter = '' then
-          MultilineDelimiter := Token
-        else if Token = MultilineDelimiter then
-          MultilineDelimiter := '';
-        Result := True;
-        Inc(j, 3);
-        Continue;
-      end;
-      Inc(j);
-    end;
-  end;
-
-  { Bracket depth change of a line outside quoted strings and comments. }
-  function BracketBalance(const AContent: string): Integer;
-  var j: Integer; Quote: Char;
-  begin
-    Result := 0;
-    Quote := #0;
-    for j := 1 to Length(AContent) do
-    begin
-      if Quote <> #0 then
-      begin
-        if (AContent[j] = Quote) and ((Quote = '''')
-             or (j = 1) or (AContent[j - 1] <> '\')) then
-          Quote := #0;
-      end
-      else if AContent[j] in ['"', ''''] then Quote := AContent[j]
-      else if AContent[j] = '#' then Break
-      else if AContent[j] = '[' then Inc(Result)
-      else if AContent[j] = ']' then Dec(Result);
-    end;
-  end;
+  Permitted: TLockPermittedKeys;
 
   function AcceptedChanged(ATable: Integer): Boolean;
   var Old: TLWPTRegistryLockTable; j: Integer;
@@ -5955,6 +6027,14 @@ var
     for j := 0 to High(AcceptedWritten) do AcceptedWritten[j] := False;
   end;
 
+  procedure Permit(const APathComponents: array of string;
+    const AExpected: string);
+  begin
+    SetLength(Permitted, Length(Permitted) + 1);
+    Permitted[High(Permitted)].Path := LockKeyPath(APathComponents);
+    Permitted[High(Permitted)].Expected := AExpected;
+  end;
+
 begin
   for i := 0 to High(AResolved) do
     if not IsTreeDigest(AResolved[i].Hash) then
@@ -5963,6 +6043,7 @@ begin
         [LWPT.Core.LOCKFILE, AResolved[i].Name, TREE_DIGEST_ALGORITHM,
          AResolved[i].Hash]);
   Source := ReadFileText(APath);
+  RequireMachineWrittenLockForm(Source);
   { Split into lines, keeping each line's own terminator. }
   Lines := nil;
   Start := 1;
@@ -6010,57 +6091,28 @@ begin
     EntryIndex := -1;
     TableIndex := -1;
     SectionLast := -1;
-    MultilineDelimiter := '';
-    ArrayDepth := 0;
     for i := 0 to High(Lines) do
     begin
       Trimmed := Trim(Lines[i].Content);
-      { Lines inside a multiline string or a multi-line array are values,
-        never headers or keys: they are copied unchanged. }
-      if TrackMultiline(Lines[i].Content) or (ArrayDepth > 0) then
-      begin
-        if MultilineDelimiter = '' then
-          Inc(ArrayDepth, BracketBalance(Lines[i].Content));
-        if ArrayDepth < 0 then ArrayDepth := 0;
-        Emit(Lines[i].Content, Lines[i].Ending);
-        if Trimmed <> '' then SectionLast := High(Output);
-        Continue;
-      end;
+      { RequireMachineWrittenLockForm admitted only single-line values, so
+        a line opening with '[' is a header. }
       if Copy(Trimmed, 1, 1) = '[' then
       begin
-        { A trailing comment after a header is allowed; any other form is
-          refused rather than guessed. }
-        if Pos('#', Trimmed) > 0 then
-        begin
-          Key := TrimRight(Copy(Trimmed, 1, Pos('#', Trimmed) - 1));
-          if Copy(Key, Length(Key), 1) = ']' then Trimmed := Key;
-        end;
-        if Copy(Trimmed, Length(Trimmed), 1) <> ']' then
-          Unsafe('the table header "' + Trimmed + '" has an unexpected form');
         CloseSection;
-        OpenSection(Trimmed);
+        OpenSection(LockHeaderOf(Trimmed));
         Emit(Lines[i].Content, Lines[i].Ending);
         SectionLast := High(Output);
         Continue;
       end;
       Written := Lines[i].Content;
-      if (Trimmed <> '') and (Copy(Trimmed, 1, 1) <> '#')
-         and (Pos('=', Trimmed) > 0) then
+      if (Trimmed <> '') and (Copy(Trimmed, 1, 1) <> '#') then
       begin
         Key := Trim(Copy(Trimmed, 1, Pos('=', Trimmed) - 1));
-        { A quoted key is not machine-written; it is refused rather than
-          missed and duplicated. }
-        if Copy(Key, 1, 1) = '"' then Unsafe('the key ' + Key + ' is quoted');
-        if Copy(Key, 1, 1) = '''' then Unsafe('the key ' + Key + ' is quoted');
-        Inc(ArrayDepth, BracketBalance(Copy(Trimmed, Pos('=', Trimmed) + 1,
-          MaxInt)));
-        if ArrayDepth < 0 then ArrayDepth := 0;
         if (Header = '') and (Key = 'version') then
         begin
           if StringReplace(Trimmed, ' ', '', [rfReplaceAll])
              <> 'version=' + IntToStr(LOCKFILE_SCHEMA_V3) then
-            raise ELockfileError.CreateFmt(
-              'internal: %s is not a schema-v3 lockfile', [APath]);
+            RaiseUnsafeLockEdit('its version line is not `version = 3`');
           Written := 'version = ' + IntToStr(LOCKFILE_SCHEMA_VERSION);
           VersionSeen := True;
         end
@@ -6086,13 +6138,11 @@ begin
     Accepted.Free;
   end;
   if not VersionSeen then
-    raise ELockfileError.CreateFmt(
-      'internal: %s has no top-level schema version line', [APath]);
+    RaiseUnsafeLockEdit('it has no top-level `version = 3` line');
   for i := 0 to High(AResolved) do
     if not HashWritten[i] then
-      raise ELockfileError.CreateFmt(
-        'cannot upgrade %s: it has no [package.%s] table to carry the new '
-        + 'digest', [LWPT.Core.LOCKFILE, AResolved[i].Name]);
+      RaiseUnsafeLockEdit('it has no [package.' + AResolved[i].Name
+        + '] table to carry the new digest');
 
   Written := '';
   for i := 0 to High(Output) do
@@ -6100,31 +6150,27 @@ begin
 
   { Fail closed: the edit may change nothing but the permitted keys, and
     each must hold exactly its upgraded value. }
-  Permitted := TStringList.Create;
+  Permitted := nil;
+  Permit(['version'], IntToStr(LOCKFILE_SCHEMA_VERSION));
+  for i := 0 to High(AResolved) do
+    Permit(['package', AResolved[i].Name, 'computedHash'],
+      '"' + AResolved[i].Hash + '"');
   Accepted := TStringList.Create;
   try
-    Permitted.Add('version'#0 + IntToStr(LOCKFILE_SCHEMA_VERSION));
-    for i := 0 to High(AResolved) do
-      Permitted.Add('package' + LOCK_PATH_SEPARATOR + AResolved[i].Name
-        + LOCK_PATH_SEPARATOR + 'computedHash'#0'"' + AResolved[i].Hash + '"');
     for TableIndex := 0 to High(ANewTables) do
     begin
       if not AcceptedChanged(TableIndex) then Continue;
       Accepted.Clear;
       RenderRegistryAcceptedState(ANewTables[TableIndex].Accepted, Accepted);
       for k := 0 to Accepted.Count - 1 do
-      begin
-        Key := Copy(Accepted[k], 1, Pos(' = ', Accepted[k]) - 1);
-        Permitted.Add('registry' + LOCK_PATH_SEPARATOR
-          + ANewTables[TableIndex].Identity + LOCK_PATH_SEPARATOR + Key + #0
-          + Copy(Accepted[k], Pos(' = ', Accepted[k]) + 3, MaxInt));
-      end;
+        Permit(['registry', ANewTables[TableIndex].Identity,
+          Copy(Accepted[k], 1, Pos(' = ', Accepted[k]) - 1)],
+          Copy(Accepted[k], Pos(' = ', Accepted[k]) + 3, MaxInt));
     end;
-    RequireOnlyPermittedLockChanges(Source, Written, Permitted);
   finally
     Accepted.Free;
-    Permitted.Free;
   end;
+  RequireOnlyPermittedLockChanges(Source, Written, Permitted);
   AtomicWriteBytes(APath, ATmpRoot, BytesOf(Written));
 
   { The written document must load as v4 with exactly these digests. }
@@ -6454,6 +6500,9 @@ begin
     raise ELockfileError.CreateFmt(
       'internal: the schema upgrade needs a schema-v3 %s at %s',
       [LWPT.Core.LOCKFILE, LockfilePath]);
+  { The upgrade edits only documents in the form the writer emits; any
+    other form is refused before anything is touched. }
+  if Upgrade then RequireMachineWrittenLockForm(ReadFileText(LockfilePath));
 
   Lock := TInstallLock.Create(LockPath);
   ObjectStore := nil;
