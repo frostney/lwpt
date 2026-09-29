@@ -176,13 +176,22 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 | `x86_64-win64` | `windows-latest` |
 | `i386-win32` | `windows-latest` |
 
-Each runner installs FPC natively (`brew`, `apt`, or the pinned official Windows distribution through `.github/ci/install-windows-fpc.sh`), then the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke through both the direct-`fpc` fallback and the InstantFPC path, rebuilds LWPT twice with the InstantFPC-bootstrapped `build\lwpt.exe` (each rebuild replaces the running image), and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. Every native test-matrix job has a 20-minute ceiling, containing a stalled test process without treating the bound as a root-cause fix. The Windows installer verifies the download's SHA-256 and retries only the download. Tests themselves are never retried. After setup, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
+Each runner installs FPC natively (`brew`, `apt`, or the pinned official Windows distribution through `.github/ci/install-windows-fpc.sh <target>`), then the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke through both the direct-`fpc` fallback and the InstantFPC path, rebuilds LWPT twice with the InstantFPC-bootstrapped `build\lwpt.exe` (each rebuild replaces the running image), and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. Every native test-matrix job has a 20-minute ceiling, containing a stalled test process without treating the bound as a root-cause fix. The Windows installer verifies the download's SHA-256 and retries only the download. Tests themselves are never retried. After setup, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
 
 1. **Sanity** — `lwpt --help` (does the binary even load?)
 2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
 3. **`lwpt format --check`** — only on `aarch64-darwin` runner (formatting is platform-independent; one check is enough)
-4. **`lwpt test <ordinary paths> --bail=0`** — the repository's co-located and integration programs; compiles them via the runner's native FPC, runs them concurrently, and runs the full queue so one run reports every failing program (a first-failure bail hid independent intermittent failures behind separate reruns, #299)
+4. **`lwpt test <ordinary paths> --bail=0`** — the repository's co-located and integration programs; compiles them via the runner's FPC (on Windows, the leg's compiler from the table below), runs them concurrently, and runs the full queue so one run reports every failing program (a first-failure bail hid independent intermittent failures behind separate reruns, #299)
 5. **`lwpt test <E2E paths> --bail=0`** — with `LWPT_ENABLE_NETWORK=1` set in the job environment, the repository's E2E programs run on every platform (Q23 decision: surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
+
+The official FPC 3.2.2 Windows distribution's native compiler is i386, so both Windows legs install its `i386-win32` base and differ in the compiler that `LWPT_FPC` publishes for test programs:
+
+| Leg | Test-program compiler (`LWPT_FPC`) | Units (`LWPT_FPC_UNIT_PATHS`) | Test programs run as |
+| --- | --- | --- | --- |
+| `x86_64-win64` | `ppcrossx64.exe` from the official `x86_64-win64` cross add-on | `units/x86_64-win64/` | 64-bit (`Target OS: Win64 for x64`) |
+| `i386-win32` | the native i386 `fpc.exe` | `units/i386-win32/` | 32-bit (`Target OS: Win32 for i386`) |
+
+Both installers are SHA-256-pinned. The setup script fails unless the selected compiler reports the leg's `-iTO -iTP` target, then compiles and runs a probe, so the setup log shows the compiler banner and the probe's pointer width. On the `x86_64-win64` leg the `bootstrap.bat` smoke uses the same `LWPT_FPC` and therefore builds a 64-bit `lwpt.exe`. The `fpc` and `instantfpc` on `PATH` remain the i386 host tools on both legs; they run host-side scripts, not test programs.
 
 Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
 
@@ -208,11 +217,11 @@ The PR workflow deliberately uses the distro FPC (same as the install instructio
 
 A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources. The job also runs the no-OpenSSL guard (ADR-0016 for clients, ADR-0033 for servers — Windows must contain no OpenSSL linkage in either direction) against the produced `lwpt.exe`, surfacing that release-blocker in the automatic gate instead of waiting for the full matrix.
 
-The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC through the shared `.github/ci/install-windows-fpc.sh` (`lwpt test` compiles `*.Test.pas` with the native FPC at run time per Q22=b), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=0` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
+The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC through the shared `.github/ci/install-windows-fpc.sh x86_64-win64` (`lwpt test` compiles `*.Test.pas` at run time per Q22=b, here with the x86_64 cross compiler `ppcrossx64.exe`, so the test programs run as 64-bit code like the `lwpt.exe` under test), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=0` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
 
 Deliberately outside the automatic gate, and covered by the required manual `ci.yml` run before merge:
 
-- **The `i386-win32` leg** (win32 and win64 share `{$IFDEF WINDOWS}` sources; the 32-bit leg re-verifies, it rarely diverges).
+- **The `i386-win32` leg** (win32 and win64 share `{$IFDEF WINDOWS}` sources, but only this leg compiles its test programs as 32-bit code, whose pointer widths, structure layouts and native-integer arithmetic differ from the automatic win64 leg).
 - **The E2E paths on non-Linux platforms** and the `bootstrap.bat` cold-build smoke (the Linux E2E leg runs pre-merge per #102).
 - **`x86_64-darwin` and `aarch64-linux` runtime.** The aarch64-darwin PR leg covers `{$IFDEF DARWIN}` compile + arm64 runtime pre-merge (added per #102 after the #105 env-race family surfaced on darwin legs first); the intel-mac and arm-linux permutations run only in the manual and push matrices.
 
