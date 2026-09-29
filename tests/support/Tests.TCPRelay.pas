@@ -105,24 +105,33 @@ begin
   {$ENDIF}
 end;
 
-function NewRelaySocket: TSocket;
+{ Darwin has no MSG_NOSIGNAL: a send to a peer that has closed raises
+  SIGPIPE unless the socket itself opts out. Every socket the relay creates
+  or accepts does, so a closed peer is an ordinary EPIPE failure. Accepted
+  sockets are set explicitly rather than relying on inheritance. }
+function PreventRelaySigPipe(const ASocket: TSocket): Boolean;
 {$IFDEF DARWIN}
 var
   Enabled: LongInt;
 {$ENDIF}
+begin
+  Result := True;
+  {$IFDEF DARWIN}
+  Enabled := 1;
+  Result := fpSetSockOpt(ASocket, SOL_SOCKET, RELAY_SO_NOSIGPIPE, @Enabled,
+    SizeOf(Enabled)) = 0;
+  {$ENDIF}
+end;
+
+function NewRelaySocket: TSocket;
 begin
   {$IFDEF UNIX}
   Result := fpSocket(AF_INET, SOCK_STREAM, 0);
   {$ELSE}
   Result := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
   {$ENDIF}
-  {$IFDEF DARWIN}
-  if RelaySocketValid(Result) then
-  begin
-    Enabled := 1;
-    fpSetSockOpt(Result, SOL_SOCKET, RELAY_SO_NOSIGPIPE, @Enabled, SizeOf(Enabled));
-  end;
-  {$ENDIF}
+  if RelaySocketValid(Result) and not PreventRelaySigPipe(Result) then
+    raise Exception.Create('relay socket cannot suppress SIGPIPE');
 end;
 
 function SetRelayBlocking(const ASocket: TSocket; const ABlocking: Boolean): Boolean;
@@ -266,6 +275,7 @@ begin
         InterlockedIncrement(FOwner.FSendStalls);
         Continue;
       end;
+      { EPIPE or a reset: the destination closed, which ends this copy. }
       if Sent <= 0 then Exit;
       Inc(Offset, Sent);
     end;
@@ -410,7 +420,7 @@ begin
     Track(Client);
     { The copies poll nonblocking sockets; set the mode explicitly, since
       only some platforms (BSD, Windows) inherit it from the listener. }
-    if not SetRelayBlocking(Client, False) then
+    if not PreventRelaySigPipe(Client) or not SetRelayBlocking(Client, False) then
     begin
       ShutdownRelaySocket(Client);
       Continue;

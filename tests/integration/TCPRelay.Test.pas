@@ -224,6 +224,24 @@ begin
   {$ENDIF}
 end;
 
+{ Darwin raises SIGPIPE on a send to a closed peer unless the socket opts
+  out; Linux sends use MSG_NOSIGNAL instead. }
+procedure PreventSigPipe(const ASocket: TSocket);
+{$IFDEF DARWIN}
+const
+  SO_NOSIGPIPE_DARWIN = $1022;
+var
+  Enabled: LongInt;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  Enabled := 1;
+  if fpSetSockOpt(ASocket, SOL_SOCKET, SO_NOSIGPIPE_DARWIN, @Enabled,
+    SizeOf(Enabled)) <> 0 then
+    raise Exception.Create('test socket cannot suppress SIGPIPE');
+  {$ENDIF}
+end;
+
 procedure SetNonblocking(const ASocket: TSocket);
 {$IFDEF MSWINDOWS}
 var
@@ -276,6 +294,7 @@ begin
     raise Exception.Create('flooder listen failed');
   FPort := WinSock2.ntohs(Address.sin_port);
   {$ENDIF}
+  PreventSigPipe(FListen);
   SetNonblocking(FListen);
   inherited Create(False);
 end;
@@ -294,7 +313,11 @@ begin
       {$ELSE}
       FClient := WinSock2.accept(FListen, nil, nil);
       {$ENDIF}
-      if SocketValid(FClient) then SetNonblocking(FClient);
+      if SocketValid(FClient) then
+      begin
+        PreventSigPipe(FClient);
+        SetNonblocking(FClient);
+      end;
     end;
   while not Terminated do
   begin
@@ -304,7 +327,17 @@ begin
     {$ELSE}
     Sent := WinSock2.send(FClient, Chunk[0], SizeOf(Chunk), 0);
     {$ENDIF}
+    { A closed relay gives EPIPE or a reset; stop flooding. }
     if Sent = 0 then Exit;
+    if Sent < 0 then
+    begin
+      {$IFDEF UNIX}
+      if (fpGetErrNo <> ESysEAGAIN) and (fpGetErrNo <> ESysEWOULDBLOCK)
+        and (fpGetErrNo <> ESysEINTR) then Exit;
+      {$ELSE}
+      if WSAGetLastError <> WSAEWOULDBLOCK then Exit;
+      {$ENDIF}
+    end;
   end;
 end;
 
