@@ -115,7 +115,7 @@ type
     procedure TestIdenticalRetriesSucceed;
     procedure TestConflictingContentIsRejected;
     procedure TestRecordValidation;
-    procedure TestDependencyRefusalIsSeparable;
+    procedure TestDependencyBearingRecordsPublish;
     procedure TestYankAndRestore;
     procedure TestAuthenticationFailures;
     procedure TestScopes;
@@ -488,7 +488,6 @@ begin
   SetRegistryClockForTesting('');
   SetRegistryFailurePointForTesting('');
   SetRegistryRateLimitsForTesting(0, 0);
-  SetRegistryDependencyRefusalForTesting(True);
 end;
 
 procedure TRegistryPublicationContract.AfterEach;
@@ -497,7 +496,6 @@ begin
   SetRegistryClockForTesting('');
   SetRegistryFailurePointForTesting('');
   SetRegistryRateLimitsForTesting(0, 0);
-  SetRegistryDependencyRefusalForTesting(True);
   SetRegistryPublicationBarrierForTesting('', '');
   SetRegistryBodyDeadlineForTesting(0);
   SetRegistryHeaderDeadlineForTesting(0);
@@ -691,21 +689,48 @@ begin
   Expect<Integer>(Publish('valid-lib', '1.0.0', Archive).Status).ToBe(201);
 end;
 
-procedure TRegistryPublicationContract.TestDependencyRefusalIsSeparable;
+procedure TRegistryPublicationContract.TestDependencyBearingRecordsPublish;
+const
+  { Sorted by effective origin: the origin's own http://localhost identity
+    sorts before https://. }
+  DEPENDENCIES = '[{ name = "base-lib", version = "^1.0.0" }, '
+    + '{ origin = "https://other.example.com", name = "far-lib", '
+    + 'version = ">=2.0.0 <3.0.0" }]';
 var
   Archive: TBytes;
   Text: string;
+  Response: TRawHTTPResponse;
+  Head: string;
 begin
   StartOrigin('', '', RegistryTimestampNow);
   Archive := Bytes('dependent archive');
   Expect<Integer>(Upload(Archive).Status).ToBe(201);
+  { ADR-0049 decision 4 is lifted (ADR-0051 decision 10): the commit path
+    validates the canonical dependency list and nothing more. }
   Text := RecordText('dependent-lib', '1.0.0', Archive, RegistryTimestampNow,
-    False, '[{ name = "base-lib", version = "^1.0.0" }]');
-  Expect<Boolean>(RegistryRecordDependenciesSupported(0)).ToBe(True);
-  Expect<Boolean>(RegistryRecordDependenciesSupported(1)).ToBe(False);
-  Expect<Integer>(PublishText('dependent-lib', '1.0.0', Text).Status).ToBe(400);
-  SetRegistryDependencyRefusalForTesting(False);
-  Expect<Integer>(PublishText('dependent-lib', '1.0.0', Text).Status).ToBe(201);
+    False, DEPENDENCIES);
+  Response := PublishText('dependent-lib', '1.0.0', Text);
+  Expect<Integer>(Response.Status).ToBe(201);
+  Expect<string>(RawHTTPBodyText(Get('/v1/records/sha256/'
+    + Copy(SHA256BytesPrefixed(Bytes(Text)), 8, 64) + '.toml'))).ToBe(Text);
+  Head := LatestCheckpointHash;
+  { Dependencies are content identity: the same list is idempotent, and a
+    different one conflicts. }
+  Expect<Integer>(PublishText('dependent-lib', '1.0.0', Text).Status).ToBe(204);
+  Expect<Integer>(PublishText('dependent-lib', '1.0.0', RecordText(
+    'dependent-lib', '1.0.0', Archive, RegistryTimestampNow, False,
+    '[{ name = "base-lib", version = "^1.1.0" }]')).Status).ToBe(409);
+  { Non-canonical lists are refused: unsorted, or with a non-canonical
+    constraint. }
+  Expect<Integer>(PublishText('other-lib', '1.0.0', RecordText('other-lib',
+    '1.0.0', Archive, RegistryTimestampNow, False,
+    '[{ origin = "https://other.example.com", name = "far-lib", '
+    + 'version = "^2.0.0" }, { name = "base-lib", version = "^1.0.0" }]'))
+    .Status).ToBe(400);
+  Expect<Integer>(PublishText('other-lib', '1.0.0', RecordText('other-lib',
+    '1.0.0', Archive, RegistryTimestampNow, False,
+    '[{ name = "base-lib", version = ">= 1.0.0" }]')).Status).ToBe(400);
+  Expect<string>(LatestCheckpointHash).ToBe(Head);
 end;
 
 procedure TRegistryPublicationContract.TestYankAndRestore;
@@ -1322,16 +1347,14 @@ begin
   Expect<string>(RawHTTPHeader(Response, 'WWW-Authenticate')).ToBe('Bearer');
   Expect<string>(WithoutRequestID(RawHTTPBodyText(Response)))
     .ToBe(WithoutRequestID(ReadBinaryFile(FIXTURES + 'errors/authentication-required.toml')));
-  { publish-package-created and publish-package-existing, with the decision-4
-    refusal lifted because the corpus record declares dependencies. }
-  SetRegistryDependencyRefusalForTesting(False);
+  { publish-package-created and publish-package-existing: the corpus record
+    declares dependencies, on this origin and on another. }
   Expect<Integer>(Request('PUT', '/v1/packages/consumer-lib/1.0.0', FToken,
     Fixture('records/222cb734f0f27085a49968889da26598be9c63a3ac497ad206403cd912ed0666.toml'))
     .Status).ToBe(201);
   Expect<Integer>(Request('PUT', '/v1/packages/consumer-lib/1.0.0', FToken,
     Fixture('records/222cb734f0f27085a49968889da26598be9c63a3ac497ad206403cd912ed0666.toml'))
     .Status).ToBe(204);
-  SetRegistryDependencyRefusalForTesting(True);
   { yank-package-version and yank-idempotent }
   SetRegistryClockForTesting('2026-01-04T00:00:00Z');
   Response := Request('PUT', '/v1/packages/example-lib/1.1.0/yank', FToken, nil);
@@ -1692,7 +1715,8 @@ begin
     TestConflictingContentIsRejected);
   Test('records are validated for yank state, skew, identity, and archive',
     TestRecordValidation);
-  Test('the dependency refusal is a separable check', TestDependencyRefusalIsSeparable);
+  Test('records that declare dependencies publish; their list is content identity',
+    TestDependencyBearingRecordsPublish);
   Test('yank and restore replace the active record', TestYankAndRestore);
   Test('authentication failures answer one 401 and record their cause',
     TestAuthenticationFailures);
