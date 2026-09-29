@@ -181,7 +181,8 @@ begin
   Expect<Boolean>(FileExists(FRoot + '/' + LOCKFILE)).ToBe(True);
   Lock := ReadFileText(FRoot + '/' + LOCKFILE);
   Expect<Boolean>(Pos('[package.cyclic]', Lock) > 0).ToBe(True);
-  Expect<Boolean>(Pos('sha256:', Lock) > 0).ToBe(True);
+  Expect<Boolean>(Pos('computedHash = "' + TREE_DIGEST_PREFIX, Lock) > 0)
+    .ToBe(True);
 end;
 
 procedure TInstallSymlinkCycle.SetupTests;

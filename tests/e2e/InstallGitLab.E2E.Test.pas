@@ -159,7 +159,7 @@ begin
     three hosts. The host is also recoverable from the resolvedURL. }
   Expect<Boolean>(Pos('source = "gitlab:' + REPO_SLUG + '"', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('resolvedURL = "https://gitlab.com/', Lock) > 0).ToBe(True);
-  Expect<Boolean>(Pos('computedHash = "sha256:', Lock) > 0).ToBe(True);
+  Expect<Boolean>(Pos('computedHash = "sha256-tree2:', Lock) > 0).ToBe(True);
   Expect<Boolean>(Pos('archiveHash = "sha256:',  Lock) > 0).ToBe(True);
 end;
 

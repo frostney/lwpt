@@ -23,6 +23,7 @@ uses
 
   LWPT.Core,
   TestingPascalLibrary,
+  Tests.LockSchema,
   Tests.LwptSubprocess,
   Tests.RegistryConsumer,
   Tests.Scratch,
@@ -120,6 +121,10 @@ type
     procedure TestRecordSubstitutionSameOriginFails;
     procedure TestRecordSubstitutionAcrossOriginsFails;
     procedure TestLayoutSubstitutionWithEqualTreeHashFails;
+    procedure TestRegistryV3LockIsRefusedEverywhere;
+    procedure TestRegistryRepairUpgradesWithoutNetwork;
+    procedure TestRegistryRepairReplacesForgedTree;
+    procedure TestRegistryRepairNeedsItsProofs;
     procedure TestFrozenLeavesArchiveStorageUntouched;
     procedure TestRepeatedRotationHashesAreRefused;
     procedure TestRotationCountIsBoundedBeforeReading;
@@ -563,7 +568,7 @@ end;
 
 procedure TInstallRegistryLocked.SchemaTwo(const ACase: string);
 begin
-  EditLock(ACase, 'version = 3', 'version = 2');
+  EditLock(ACase, 'version = 4', 'version = 2');
 end;
 
 procedure TInstallRegistryLocked.ChangeRange(const ACase: string);
@@ -1021,28 +1026,132 @@ begin
 end;
 
 procedure TInstallRegistryLocked.TestLayoutSubstitutionWithEqualTreeHashFails;
-var CaseRoot, Module, Original, TreeHash, Before: string; Split: Integer;
+var CaseRoot, Module, Legacy, Tree2, Before: string;
 begin
-  { HashTree folds "path LF contents" without framing, so emptying a unit and
-    adding a file named after its first line, holding the rest, keeps the
-    hash. Only an exact comparison with the authenticated extraction sees
-    the different layout. }
+  { #352: emptying a unit and adding a file named after its first line,
+    holding the rest, keeps the legacy digest. The framed digest changes,
+    so --frozen fails on the tree hash itself (ADR-0052). }
   CaseRoot := Clone(Baseline, 'frozen-layout');
   Module := CaseRoot + '/project/.lwpt/modules/json';
-  TreeHash := HashTree(Module);
-  Original := ReadText(Module + '/source/json.pas');
-  Split := Pos(#10, Original);
-  Expect<Boolean>(Split > 1).ToBe(True);
-  WriteBytesToFile(Module + '/source/json.pas', nil);
-  WriteBytesToFile(Module + '/' + Copy(Original, 1, Split - 1),
-    BytesOf(Copy(Original, Split + 1, MaxInt)));
-  Expect<string>(HashTree(Module)).ToBe(TreeHash);
+  Legacy := LegacyHashTree(Module);
+  Tree2 := HashTree(Module);
+  SubstituteModuleLayout(Module, 'source/json.pas');
+  Expect<string>(LegacyHashTree(Module)).ToBe(Legacy);
+  Expect<Boolean>(HashTree(Module) <> Tree2).ToBe(True);
   Before := Fingerprint(CaseRoot);
   FOrigin.Mode := scmFail;
   ExpectFailure(Run(CaseRoot, ['install', '--frozen']),
-    'differs from the tree re-derived from its proof-authenticated archive');
+    'tree hash mismatch for "json"');
   Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
   Expect<string>(Journal(CaseRoot)).ToBe('');
+end;
+
+{ ---------------------------------------------------------------------------
+  Schema v4 (ADR-0052)
+  --------------------------------------------------------------------------- }
+
+procedure TInstallRegistryLocked.TestRegistryV3LockIsRefusedEverywhere;
+var CaseRoot, Before, Manifest: string; Requests: Integer;
+begin
+  CaseRoot := Clone(Baseline, 'v3-refused');
+  DowngradeLockToV3(CaseRoot + '/project');
+  Before := Fingerprint(CaseRoot);
+  Manifest := ReadText(CaseRoot + '/project/lwpt.toml');
+  FOrigin.Mode := scmFail;
+  Requests := FOrigin.Requests;
+  ExpectFailure(Run(CaseRoot, ['install']), LockfileSchemaV3Message);
+  ExpectFailure(Run(CaseRoot, ['install', '--frozen']), LockfileSchemaV3Message);
+  ExpectFailure(Run(CaseRoot, ['install', '--offline']),
+    LockfileSchemaV3Message);
+  ExpectFailure(Run(CaseRoot, ['add', 'registry:corp/misc@^1.0.0']),
+    LockfileSchemaV3Message);
+  ExpectFailure(Run(CaseRoot, ['remove', 'local']), LockfileSchemaV3Message);
+  ExpectFailure(Run(CaseRoot, ['update']), LockfileSchemaV3Message);
+  ExpectFailure(Run(CaseRoot, ['outdated']), LockfileSchemaV3Message);
+  ExpectNetworkFree(CaseRoot, Requests);
+  Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  Expect<string>(ReadText(CaseRoot + '/project/lwpt.toml')).ToBe(Manifest);
+  FOrigin.Mode := scmServe;
+end;
+
+procedure TInstallRegistryLocked.TestRegistryRepairUpgradesWithoutNetwork;
+var CaseRoot, V4, Archives, Modules: string; Requests: Integer;
+begin
+  { The selection proof and its documents are carried forward byte for
+    byte; with no newer per-user state the upgraded lock is exactly the v4
+    lock an install wrote. }
+  CaseRoot := Clone(Baseline, 'v3-repair');
+  V4 := LockText(CaseRoot);
+  Archives := TreeFingerprint(CaseRoot + '/project/.lwpt/archives');
+  Modules := TreeFingerprint(CaseRoot + '/project/.lwpt/modules');
+  DowngradeLockToV3(CaseRoot + '/project');
+  FOrigin.Mode := scmFail;
+  Requests := FOrigin.Requests;
+  ExpectSuccess('registry repair', Run(CaseRoot, ['repair']));
+  ExpectNetworkFree(CaseRoot, Requests);
+  Expect<string>(LockText(CaseRoot)).ToBe(V4);
+  Expect<string>(TreeFingerprint(CaseRoot + '/project/.lwpt/archives'))
+    .ToBe(Archives);
+  Expect<string>(TreeFingerprint(CaseRoot + '/project/.lwpt/modules'))
+    .ToBe(Modules);
+  ExpectSuccess('registry frozen after repair',
+    Run(CaseRoot, ['install', '--frozen']));
+  ExpectSuccess('registry offline after repair',
+    Run(CaseRoot, ['install', '--offline']));
+  Expect<string>(LockText(CaseRoot)).ToBe(V4);
+  ExpectNetworkFree(CaseRoot, Requests);
+  FOrigin.Mode := scmServe;
+end;
+
+procedure TInstallRegistryLocked.TestRegistryRepairReplacesForgedTree;
+var CaseRoot, V4, Module, Output: string; Outcome: TLwptResult;
+begin
+  { A v4 lock rewritten as v3 with the legacy digest of a forged tree gains
+    nothing: --frozen refuses v3, and repair re-derives the module from the
+    proof-authenticated archive. }
+  CaseRoot := Clone(Baseline, 'v3-forged');
+  V4 := LockText(CaseRoot);
+  Module := CaseRoot + '/project/.lwpt/modules/json';
+  SubstituteModuleLayout(Module, 'source/json.pas');
+  DowngradeLockToV3(CaseRoot + '/project');
+  FOrigin.Mode := scmFail;
+  ExpectFailure(Run(CaseRoot, ['install', '--frozen']), LockfileSchemaV3Message);
+  Outcome := Run(CaseRoot, ['repair']);
+  ExpectSuccess('registry repair of a forged tree', Outcome);
+  Output := Outcome.Stdout + Outcome.Stderr;
+  Expect<Boolean>(Pos('module "json"', Output) > 0).ToBe(True);
+  Expect<string>(HashTree(Module))
+    .ToBe(EntryField(V4, 'json', 'computedHash'));
+  Expect<string>(LockText(CaseRoot)).ToBe(V4);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+  FOrigin.Mode := scmServe;
+end;
+
+procedure TInstallRegistryLocked.TestRegistryRepairNeedsItsProofs;
+var CaseRoot, V3, Snapshot, Before: string;
+begin
+  CaseRoot := Clone(Baseline, 'v3-proof');
+  V3 := DowngradeLockToV3(CaseRoot + '/project');
+  Snapshot := Copy(TableField(CaseRoot, 'snapshot'), 8, 64);
+  Expect<Boolean>(DeleteFile(CaseRoot + PROOFS + Snapshot + '.toml'))
+    .ToBe(True);
+  Before := Fingerprint(CaseRoot);
+  FOrigin.Mode := scmFail;
+  ExpectFailure(Run(CaseRoot, ['repair']), '`' + PROGRAM_NAME
+    + ' repair` cannot upgrade `' + LOCKFILE + '` from schema v3: the '
+    + 'registry proof document for "');
+  ExpectFailure(Run(CaseRoot, ['repair']), '" at `.lwpt/archives/'
+    + 'registry-proofs/sha256/' + Snapshot + '.toml` is missing or does not '
+    + 'match its hash, and the per-user document store has no matching copy. '
+    + 'Restore that exact document, for example from version control, and '
+    + 'run `' + PROGRAM_NAME + ' repair` again. To give up the '
+    + 'version-stable migration, delete `' + LOCKFILE + '` and run `'
+    + PROGRAM_NAME + ' install`; that needs network access and moves range '
+    + 'dependencies to their newest matching versions.');
+  Expect<string>(LockText(CaseRoot)).ToBe(V3);
+  Expect<string>(Fingerprint(CaseRoot)).ToBe(Before);
+  Expect<string>(Journal(CaseRoot)).ToBe('');
+  FOrigin.Mode := scmServe;
 end;
 
 procedure TInstallRegistryLocked.SetArchivesReadOnly(const ACase: string;
@@ -1188,8 +1297,16 @@ begin
     TestRecordSubstitutionSameOriginFails);
   Test('review: a lock entry pointed at another origin''s record fails',
     TestRecordSubstitutionAcrossOriginsFails);
-  Test('review: a re-laid-out module with an equal tree hash fails --frozen',
+  Test('#352: a re-laid-out module with an equal legacy digest fails --frozen',
     TestLayoutSubstitutionWithEqualTreeHashFails);
+  Test('ADR-0052: every reader refuses a registry v3 lock and changes nothing',
+    TestRegistryV3LockIsRefusedEverywhere);
+  Test('ADR-0052: repair upgrades a registry v3 lock without network',
+    TestRegistryRepairUpgradesWithoutNetwork);
+  Test('ADR-0052: repair replaces a forged registry tree behind a v3 lock',
+    TestRegistryRepairReplacesForgedTree);
+  Test('ADR-0052: repair names a missing registry proof document',
+    TestRegistryRepairNeedsItsProofs);
   Test('review: --frozen never writes beside committed archives, even on failure',
     TestFrozenLeavesArchiveStorageUntouched);
   Test('review: repeated rotation hashes in the lock are refused',
