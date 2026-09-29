@@ -10,6 +10,10 @@ program TCPRelay.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  Sockets,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  WinSock2,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -34,6 +38,16 @@ type
     procedure TestTeardownDuringAStalledBackendConnection;
     procedure TestStalledBackendConnectionIsBounded;
     procedure TestTeardownWhileCopiesAreBlocked;
+    procedure TestReadinessThatDisappearsBeforeAccept;
+  end;
+
+  { Takes the pending connection off the relay's listener after the
+    relay saw it ready and before its own accept, once. }
+  TAcceptThief = class
+  public
+    Taken: Integer;
+    Stolen: TSocket;
+    procedure Steal(ASender: TObject);
   end;
 
 function TimedFree(ARelay: TTCPRelay): QWord;
@@ -155,6 +169,54 @@ begin
   end;
 end;
 
+procedure TAcceptThief.Steal(ASender: TObject);
+var
+  Relay: TTCPRelay;
+begin
+  if Taken > 0 then Exit;
+  Relay := TTCPRelay(ASender);
+  {$IFDEF UNIX}
+  Stolen := fpAccept(Relay.ListenSocket, nil, nil);
+  {$ELSE}
+  Stolen := WinSock2.accept(Relay.ListenSocket, nil, nil);
+  {$ENDIF}
+  Inc(Taken);
+end;
+
+procedure TTCPRelayTests.TestReadinessThatDisappearsBeforeAccept;
+var
+  Relay: TTCPRelay;
+  Thief: TAcceptThief;
+  Client: TRawHTTPConnection;
+  Started: QWord;
+begin
+  Thief := TAcceptThief.Create;
+  try
+    Relay := TTCPRelay.Create(1);
+    Relay.BeforeAccept := Thief.Steal;
+    Client := TRawHTTPConnection.Create(Relay.Port);
+    try
+      Started := GetTickCount64;
+      while (Thief.Taken = 0) and (GetTickCount64 - Started < 5000) do Sleep(10);
+      Expect<Integer>(Thief.Taken).ToBe(1);
+      Sleep(200);
+      { The relay's accept found nothing and did not block, so it counted
+        nothing and tears down at once. }
+      Expect<Integer>(Relay.Accepted).ToBe(0);
+      Expect<Boolean>(TimedFree(Relay) < TEARDOWN_BOUND_MILLISECONDS).ToBe(True);
+    finally
+      Client.Free;
+    end;
+    {$IFDEF UNIX}
+    if Thief.Stolen >= 0 then CloseSocket(Thief.Stolen);
+    {$ELSE}
+    if Thief.Stolen <> INVALID_SOCKET then WinSock2.closesocket(Thief.Stolen);
+    {$ENDIF}
+  finally
+    Thief.Free;
+  end;
+end;
+
 procedure TTCPRelayTests.SetupTests;
 begin
   Test('relays bytes unchanged and counts connections', TestRelaysAndCountsConnections);
@@ -165,6 +227,8 @@ begin
     TestStalledBackendConnectionIsBounded);
   Test('teardown ends copies blocked on an idle backend',
     TestTeardownWhileCopiesAreBlocked);
+  Test('readiness that disappears before accept never blocks the relay',
+    TestReadinessThatDisappearsBeforeAccept);
 end;
 
 begin

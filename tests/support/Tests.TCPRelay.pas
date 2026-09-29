@@ -4,8 +4,11 @@
   bytes are copied both ways unchanged, so TLS passes through end to end.
   Tests use the accept count to prove how many connections a client made.
 
-  Every wait is bounded and cancellable: the accept loop polls its listener
-  in short slices, a backend connection must be established within
+  Every wait is bounded and cancellable: the listener is nonblocking and
+  polled in short slices, so an accept whose readiness disappeared (a
+  connection reset or taken before accept) returns at once instead of
+  blocking; accepted sockets are made blocking for the copies; a backend
+  connection must be established within
   ConnectTimeoutMilliseconds (the client is closed otherwise), and teardown
   first shuts every socket down, which ends every copy, and only then joins
   the threads. No wake-up connection is needed, so teardown cannot depend on
@@ -41,6 +44,11 @@ type
     {$ENDIF}
     procedure Track(const ASocket: TSocket);
     function ConnectBackend(out ASocket: TSocket): Boolean;
+  public
+    { Test-only: runs on the relay thread after the listener reported
+      readiness and before accept, so a test can take the pending
+      connection away. }
+    BeforeAccept: TNotifyEvent;
   protected
     procedure Execute; override;
   public
@@ -49,6 +57,8 @@ type
     constructor Create(const ABackend: Word; const ABackendHost: string = '127.0.0.1');
     destructor Destroy; override;
     property Port: Word read FPort;
+    { The listening socket, for BeforeAccept only. }
+    property ListenSocket: TSocket read FListen;
     property Backend: Word read FBackend write FBackend;
     function Accepted: Integer;
     { Backend connections that failed or timed out. }
@@ -112,7 +122,7 @@ begin
   {$ENDIF}
 end;
 
-procedure SetRelayBlocking(const ASocket: TSocket; const ABlocking: Boolean);
+function SetRelayBlocking(const ASocket: TSocket; const ABlocking: Boolean): Boolean;
 var
   {$IFDEF UNIX}
   Flags: LongInt;
@@ -122,12 +132,13 @@ var
 begin
   {$IFDEF UNIX}
   Flags := fpFcntl(ASocket, F_GETFL, 0);
+  if Flags < 0 then Exit(False);
   if ABlocking then Flags := Flags and not O_NONBLOCK
   else Flags := Flags or O_NONBLOCK;
-  fpFcntl(ASocket, F_SETFL, Flags);
+  Result := fpFcntl(ASocket, F_SETFL, Flags) = 0;
   {$ELSE}
   if ABlocking then Mode := 0 else Mode := 1;
-  WinSock2.ioctlsocket(ASocket, LongInt(FIONBIO), Mode);
+  Result := WinSock2.ioctlsocket(ASocket, LongInt(FIONBIO), Mode) = 0;
   {$ENDIF}
 end;
 
@@ -268,6 +279,8 @@ begin
     raise Exception.Create('relay listen failed');
   FPort := WinSock2.ntohs(Address.sin_port);
   {$ENDIF}
+  if not SetRelayBlocking(FListen, False) then
+    raise Exception.Create('relay listener cannot be made nonblocking');
   inherited Create(False);
 end;
 
@@ -305,7 +318,7 @@ begin
   ASocket := NewRelaySocket;
   if not RelaySocketValid(ASocket) then Exit;
   Track(ASocket);
-  SetRelayBlocking(ASocket, False);
+  if not SetRelayBlocking(ASocket, False) then Exit;
   Address := RelayAddress(FBackendHost, FBackend);
   {$IFDEF UNIX}
   fpConnect(ASocket, @Address, SizeOf(Address));
@@ -327,8 +340,7 @@ begin
         ErrorLength) <> 0 then Exit;
       {$ENDIF}
       if SocketError <> 0 then Exit;
-      SetRelayBlocking(ASocket, True);
-      Exit(True);
+      Exit(SetRelayBlocking(ASocket, True));
     end;
   until GetTickCount64 - Started >= ConnectTimeoutMilliseconds;
 end;
@@ -343,7 +355,9 @@ begin
   begin
     if not WaitRelaySocket(FListen, False, POLL_MILLISECONDS) then Continue;
     if Terminated then Break;
+    if Assigned(BeforeAccept) then BeforeAccept(Self);
     Length_ := SizeOf(Address);
+    { Nonblocking: a readiness that disappeared gives EAGAIN, not a wait. }
     {$IFDEF UNIX}
     Client := fpAccept(FListen, @Address, @Length_);
     {$ELSE}
@@ -352,6 +366,13 @@ begin
     if not RelaySocketValid(Client) then Continue;
     InterlockedIncrement(FAccepted);
     Track(Client);
+    { Some platforms (BSD, Windows) hand the listener's nonblocking mode to
+      accepted sockets; the copies block. }
+    if not SetRelayBlocking(Client, True) then
+    begin
+      ShutdownRelaySocket(Client);
+      Continue;
+    end;
     if not ConnectBackend(Upstream) then
     begin
       InterlockedIncrement(FFailedConnects);
@@ -367,10 +388,12 @@ destructor TTCPRelay.Destroy;
 var
   Index: Integer;
 begin
-  { Cancel first, then join: the accept loop and a pending backend
-    connection notice Terminated within one poll slice, and shut-down
-    sockets end every copy. }
+  { Cancel first, then join: the listener is shut down, the accept loop
+    and a pending backend connection notice Terminated within one poll
+    slice, and shut-down sockets end every copy. The listener is closed
+    only after the join, so no thread uses a closed handle. }
   Terminate;
+  ShutdownRelaySocket(FListen);
   EnterCriticalSection(FLock);
   try
     for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
