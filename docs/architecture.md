@@ -30,6 +30,14 @@ How LWPT is shaped: the through-line that ties every subcommand to the manifest,
   existing publication lease and checkpoint path with the server clock, and
   `registry issue-token|revoke-token` manage hashed, scoped, expiring
   credentials, per [ADR-0049](./adr/0049-registry-remote-publication.md).
+  `registry publish` is the client (`LWPT.Registry.Client`): it validates or
+  normalizes the archive and refuses declared dependencies before it reads
+  the token from its environment variable or connects, uploads to the one
+  origin named on its command line without following redirects, and exits
+  0 only after verifying from the `--key-id`/`--public-key` pin that the new
+  signed head extends the head it saw first and includes the published
+  record. Its diagnostics are local text plus allow-listed codes, and every
+  message is redacted for the credential.
   Publication and clients build on the wire contract in
   [`registry-spec.md`](./registry-spec.md).
 - **Error handling is production-grade.** Every multi-step install write goes through `.lwpt/tmp/` + atomic rename (EXDEV fallback to copy-then-delete), and `lwpt install` takes a cross-process lock (`.lwpt/install.lock`, O_CREAT|O_EXCL). See ADR-0002 and ADR-0008.
@@ -399,8 +407,8 @@ tar.gz writer), `LWPT.Zip.pas` (the bounded in-tree zip container reader),
 zip normalization per [ADR-0049](./adr/0049-registry-remote-publication.md)),
 and the `LWPT.Registry.*` origin storage, signing,
 shared proof verification, mirror synchronization, HTTP routing, upload
-staging, publication tokens, audit records, publication handling, and native
-macOS listener units) plus a small remainder of utility units
+staging, publication tokens, audit records, publication handling, the
+publication client, and native macOS listener units) plus a small remainder of utility units
 (`Platform.pas`, `Shared.inc`) not yet extracted into `packages/`. The five
 LWPT-canonical packages — `httpclient`, `cli`, `semver`, `toml`, `testing` —
 live under `packages/<name>/` per

@@ -253,34 +253,6 @@ begin
 end;
 {$ENDIF}
 
-{ Discovery may only name protocol resources below the configured upstream.
-  Percent-encoded or dot segments can be decoded into another path by an
-  intermediary, so they are refused rather than interpreted. }
-function EndpointSuffixIsUnambiguous(const ASuffix: string): Boolean;
-var
-  Segments: TStringList;
-  Segment: string;
-  Character: Char;
-begin
-  Result := ASuffix <> '';
-  if not Result then Exit;
-  Segments := TStringList.Create;
-  try
-    Segments.StrictDelimiter := True;
-    Segments.Delimiter := '/';
-    Segments.DelimitedText := ASuffix;
-    for Segment in Segments do
-    begin
-      if (Segment = '') or (Segment = '.') or (Segment = '..') then Exit(False);
-      for Character in Segment do
-        if not (Character in ['A'..'Z', 'a'..'z', '0'..'9', '-', '.', '_', '~']) then
-          Exit(False);
-    end;
-  finally
-    Segments.Free;
-  end;
-end;
-
 function GetDocument(const AURL, AMediaType: string;
   const AMaximumBytes: Int64; const ATimeoutMilliseconds: QWord): TBytes;
 var
@@ -1108,7 +1080,7 @@ var
   procedure RequireScope(const AURL: string);
   begin
     if not StartsStr(Config.UpstreamURL + '/', AURL)
-      or not EndpointSuffixIsUnambiguous(Copy(AURL, Length(Config.UpstreamURL) + 2, MaxInt)) then
+      or not RegistryEndpointSuffixIsUnambiguous(Copy(AURL, Length(Config.UpstreamURL) + 2, MaxInt)) then
       raise ELWPTRegistryError.CreateStable('registry_discovery_scope_mismatch',
         'discovery endpoint escapes or ambiguously encodes the configured transport');
   end;

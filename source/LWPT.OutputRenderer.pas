@@ -48,6 +48,9 @@ type
     FOriginalError: TextRec;
     FOriginalOutput: TextRec;
     FOutputStream: TObject;
+    { Outcome lines kept through silent capture and written to the real
+      stdout when the command succeeds. }
+    FOutcome: string;
     procedure ClearInvocation;
     procedure PublishChild(const AStandardOutput,
       AStandardError: RawByteString);
@@ -69,6 +72,10 @@ function SilentOutputActive: Boolean;
 procedure SetActiveOutputRenderer(ARenderer: TLWPTOutputRenderer);
 procedure WriteCommandResult(const AText: string);
 procedure WriteCommandResultLine(const AText: string);
+{ One outcome line that --silent keeps: in silent mode it is held and
+  written to stdout after capture ends, before the terminal line, and only
+  when the command succeeds. Otherwise it is written at once. }
+procedure WriteCommandOutcomeLine(const AText: string);
 
 implementation
 
@@ -187,6 +194,14 @@ end;
 procedure WriteCommandResultLine(const AText: string);
 begin
   WriteCommandResult(AText + LineEnding);
+end;
+
+procedure WriteCommandOutcomeLine(const AText: string);
+begin
+  if SilentOutputActive then
+    ActiveRenderer.FOutcome := ActiveRenderer.FOutcome + AText + LineEnding
+  else
+    Write(Output, AText + LineEnding);
 end;
 
 constructor TLWPTEmergencyRing.Create(const ACapacity: SizeInt);
@@ -492,6 +507,13 @@ end;
 
 procedure TLWPTOutputRenderer.ClearInvocation;
 begin
+  { An outcome may be a credential (registry issue-token). }
+  if FOutcome <> '' then
+  begin
+    UniqueString(FOutcome);
+    FillChar(FOutcome[1], Length(FOutcome), 0);
+    FOutcome := '';
+  end;
   FOutputStream.Free;
   FOutputStream := nil;
   FErrorStream.Free;
@@ -608,6 +630,11 @@ begin
   end;
   try
     try
+      if (AExitCode = 0) and (FOutcome <> '') then
+      begin
+        Write(Output, FOutcome);
+        Flush(Output);
+      end;
       if AExitCode <> 0 then
       begin
         if CloseError <> '' then

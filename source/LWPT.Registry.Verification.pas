@@ -157,6 +157,15 @@ function ValidateRegistryKeyDocument(const ABytes: TBytes;
   const AExactSequence: Boolean = False): Int64;
 function ValidateRegistryCapabilities(const AContent, ARole: string;
   out AHasRotations: Boolean): Integer;
+{ True when capabilities already accepted by ValidateRegistryCapabilities
+  advertise publication-v1 with the bearer authentication scheme. }
+function RegistryCapabilitiesAcceptBearerPublication(
+  const AContent: string): Boolean;
+{ True when ASuffix, the part of an endpoint URL below its base, is a
+  nonempty path of unreserved-character segments without '.' or '..'.
+  Percent-encoded or dot segments can be decoded into another path by an
+  intermediary, so they are refused rather than interpreted. }
+function RegistryEndpointSuffixIsUnambiguous(const ASuffix: string): Boolean;
 function RegistryURIIsCanonical(const AValue: string;
   const AAllowLocalhostHTTP: Boolean): Boolean;
 function RegistryHashIsCanonical(const AValue: string): Boolean;
@@ -1193,6 +1202,57 @@ begin
         'a read-only origin cannot advertise authentication');
   finally
     Root.Free;
+  end;
+end;
+
+function RegistryCapabilitiesAcceptBearerPublication(
+  const AContent: string): Boolean;
+var
+  Root: TTOMLNode;
+  Values: TLWPTRegistryStringArray;
+  HasPublication, HasBearer: Boolean;
+  Index: Integer;
+begin
+  Root := ParseCanonical(AContent, PROGRAM_NAME + '-registry-capabilities-v1',
+    ['schema', 'protocol', 'hashes', 'signatures', 'schemas', 'features',
+     'auth_schemes', 'max_page_size']);
+  try
+    HasPublication := False;
+    Values := NodeStringArray(Root, 'features');
+    for Index := 0 to High(Values) do
+      if Values[Index] = 'publication-v1' then HasPublication := True;
+    HasBearer := False;
+    Values := NodeStringArray(Root, 'auth_schemes');
+    for Index := 0 to High(Values) do
+      if Values[Index] = 'bearer' then HasBearer := True;
+    Result := HasPublication and HasBearer;
+  finally
+    Root.Free;
+  end;
+end;
+
+function RegistryEndpointSuffixIsUnambiguous(const ASuffix: string): Boolean;
+var
+  Segments: TStringList;
+  Segment: string;
+  Character: Char;
+begin
+  Result := ASuffix <> '';
+  if not Result then Exit;
+  Segments := TStringList.Create;
+  try
+    Segments.StrictDelimiter := True;
+    Segments.Delimiter := '/';
+    Segments.DelimitedText := ASuffix;
+    for Segment in Segments do
+    begin
+      if (Segment = '') or (Segment = '.') or (Segment = '..') then Exit(False);
+      for Character in Segment do
+        if not (Character in ['A'..'Z', 'a'..'z', '0'..'9', '-', '.', '_', '~']) then
+          Exit(False);
+    end;
+  finally
+    Segments.Free;
   end;
 end;
 
