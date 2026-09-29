@@ -510,9 +510,11 @@ begin
         on E: EHTTPError do
         begin
           Failure := RedactRegistryCredential(E.Message, FToken);
-          { A verification refusal (ADR-0050's stable message) is not a
-            transient failure; everything else at the transport is. }
-          Retryable := not StartsStr('TLS certificate verification failed', E.Message);
+          { A refused peer certificate is not transient. HTTPClient names
+            it "TLS certificate verification failed" (ADR-0050), or
+            "OpenSSL certificate verification failed" without options;
+            every other transport failure is retried. }
+          Retryable := Pos('certificate verification failed', E.Message) = 0;
         end;
       end;
       if Failure = '' then

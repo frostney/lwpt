@@ -60,6 +60,7 @@ program	*	source/LWPT.ManifestEdit.Test.pas	5	31
 program	*	source/LWPT.Observability.Test.pas	1	6
 program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
+program	*	source/LWPT.Registry.Client.Test.pas	1	9
 program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
 program	*	source/LWPT.Registry.Incoming.Test.pas	1	11
 program	*	source/LWPT.Registry.Mirror.Test.pas	1	40
@@ -87,6 +88,8 @@ program	*	tests/e2e/InstallScript.E2E.Test.pas	3	13
 program	*	tests/e2e/Registry.E2E.Test.pas	1	8
 program	*	tests/e2e/RegistryMirror.E2E.Test.pas	1	14
 program	*	tests/e2e/RegistryPublication.E2E.Test.pas	1	6
+program	*	tests/e2e/RegistryPublish.E2E.Test.pas	1	6
+program	*	tests/e2e/RegistryPublishHostile.E2E.Test.pas	1	8
 program	*	tests/integration/AddRemove.Test.pas	1	8
 program	*	tests/integration/Agents.Test.pas	1	15
 program	*	tests/integration/BuildClean.Test.pas	1	6
