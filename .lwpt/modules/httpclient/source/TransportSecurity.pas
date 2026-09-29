@@ -121,6 +121,8 @@ type
     InsecureSkipVerify: Boolean;
   end;
 
+  TUnicodeStringArray = array of UnicodeString;
+
   TTransportSecurityServerContext = class
   private
     FBackendData: Pointer;
@@ -193,9 +195,12 @@ function TransportSecurityClientOptionsAreDefault(
   const AOptions: TTransportSecurityClientOptions): Boolean;
 { Raises ETransportSecurityError when AOptions is inconsistent or malformed:
   anchors-only trust without anchors, insecure mode combined with anchors, a
-  passphrase without an identity, oversized inputs, or trust anchors that are
-  neither PEM CERTIFICATE blocks nor one DER certificate. Performs no
-  platform work, so callers can check options before connecting. }
+  passphrase without an identity, or oversized inputs; then parses every
+  anchor and opens the PKCS#12 identity with its passphrase through the
+  platform's own APIs. Opens no socket and persists nothing, so callers
+  (HTTPClient among them) reject bad material before connecting. On macOS
+  the identity check creates and removes a temporary keychain; on Windows
+  it imports without persisting keys and requires exactly one identity. }
 procedure ValidateTransportSecurityClientOptions(
   const AOptions: TTransportSecurityClientOptions);
 { DER encoding of the peer's leaf certificate on an active client
@@ -239,13 +244,16 @@ procedure AbortTransportSecurityServer(
 {$IFNDEF PRODUCTION}
 { Test-only seam: make a server connection returned by
   BeginTransportSecurityServer, before its first handshake step, require a
-  client certificate. The handshake fails when the client presents none; any
-  presented certificate is accepted without chain validation. Exists so the
-  client-identity (mTLS) options can be exercised against the package's own
-  server backends; the production server never requests client
-  certificates. }
+  client certificate that chains to one of AClientAnchors (PEM or DER) for
+  client authentication. Intermediates must come from the client's own
+  certificate message: no system store, AIA fetch, or keychain supplies
+  them. The handshake fails when the client presents no certificate or an
+  unanchored one. Exists so the client-identity (mTLS) options can be
+  exercised against the package's own server backends; the production
+  server never requests client certificates. }
 procedure TransportSecurityTestRequireClientCertificate(
-  var AConnection: TTransportSecurityConnection);
+  var AConnection: TTransportSecurityConnection;
+  const AClientAnchors: TBytes);
 {$ENDIF}
 {$ENDIF}
 {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
@@ -288,6 +296,12 @@ function TransportSecurityTestInjectSyscallError(
 {$IFNDEF PRODUCTION}
 function TransportSecurityTestServerKeyContainer(
   const AContext: TTransportSecurityServerContext): UnicodeString;
+{ Container names persisted by the most recent PKCS#12 import on this
+  process, including imports that were then rejected. }
+function TransportSecurityTestLastImportedKeyContainers: TUnicodeStringArray;
+{ Whether a user-scope CNG key container with this name still exists. }
+function TransportSecurityTestKeyContainerExists(
+  const AContainerName: UnicodeString): Boolean;
 {$ENDIF}
 {$ENDIF}
 procedure CloseTransportSecurity(var AConnection: TTransportSecurityConnection);
@@ -702,7 +716,9 @@ begin
       'Configured TLS trust anchors contain no PEM CERTIFICATE block');
 end;
 
-procedure ValidateTransportSecurityClientOptions(
+{ Structural checks only; ValidateTransportSecurityClientOptions adds the
+  platform parse of the anchors and the PKCS#12 identity. }
+procedure ValidateClientOptionsStructure(
   const AOptions: TTransportSecurityClientOptions);
 begin
   if (Ord(AOptions.TrustMode) < Ord(Low(TTransportSecurityTrustMode))) or
@@ -786,6 +802,9 @@ type
     { Imported client identity (temporary keychain plus certificate array);
       nil without ClientPkcs12. }
     ClientIdentity: TSecureTransportServerSnapshot;
+    { Parsed trust anchors, built before the handshake; nil without
+      anchors. }
+    AnchorArray: Pointer;
   end;
 
   TSecureTransportServerData = class
@@ -806,8 +825,10 @@ type
     PendingPlaintextOffset: Integer;
     WriteNeedsResume: Boolean;
     Snapshot: TSecureTransportServerSnapshot;
-    { Set only by the test-only client-certificate seam. }
+    { Set only by the test-only client-certificate seam, together with the
+      anchors the client's chain must reach. }
     RequireClientCertificate: Boolean;
+    ClientAnchorArray: Pointer;
   end;
 
   TSecureTransportReadFunc = function(AConnection: SSLConnectionRef;
@@ -1921,15 +1942,18 @@ begin
 end;
 
 procedure EvaluateSecureTransportServerTrust(const AContext: SSLContextRef;
-  const AHost: string; const AOptions: TTransportSecurityClientOptions);
+  const AHost: string; const AOptions: TTransportSecurityClientOptions;
+  const AAnchors: Pointer);
 var
-  Anchors, ErrorReference, HostName, Policy, Trust: Pointer;
+  ErrorReference, HostName, Policy, Trust: Pointer;
   EncodedHost: UTF8String;
   Status: OSStatus;
 begin
   if AOptions.InsecureSkipVerify then
     Exit;
-  Anchors := nil;
+  if AAnchors = nil then
+    raise ETransportSecurityError.Create(
+      'TLS server evaluation requires at least one trust anchor');
   ErrorReference := nil;
   HostName := nil;
   Policy := nil;
@@ -1950,11 +1974,9 @@ begin
        (SecTrustSetPolicies(Trust, Policy) <> ERR_SEC_SUCCESS) then
       raise ETransportSecurityError.Create(
         'Failed to configure the TLS server trust policy');
-    Anchors := CreateSecureTransportAnchorArray(
-      ParseTransportSecurityTrustAnchors(AOptions.TrustAnchors));
     { Setting anchors implies anchors-only; the second call restores the
       system anchors for tstmSystemAndAnchors. }
-    if (SecTrustSetAnchorCertificates(Trust, Anchors) <> ERR_SEC_SUCCESS) or
+    if (SecTrustSetAnchorCertificates(Trust, AAnchors) <> ERR_SEC_SUCCESS) or
        (SecTrustSetAnchorCertificatesOnly(Trust,
         AOptions.TrustMode = tstmAnchorsOnly) <> ERR_SEC_SUCCESS) then
       raise ETransportSecurityError.Create(
@@ -1969,12 +1991,46 @@ begin
   finally
     if ErrorReference <> nil then
       CFRelease(ErrorReference);
-    if Anchors <> nil then
-      CFRelease(Anchors);
     if Policy <> nil then
       CFRelease(Policy);
     if HostName <> nil then
       CFRelease(HostName);
+    if Trust <> nil then
+      CFRelease(Trust);
+  end;
+end;
+
+{ Test-only seam helper: whether the client's certificate chain, as sent in
+  its own Certificate message, reaches AAnchors for client authentication,
+  with network fetching disabled. }
+function SecureTransportClientTrustAccepted(const AContext: SSLContextRef;
+  const AAnchors: Pointer): Boolean;
+var
+  ErrorReference, Policy, Trust: Pointer;
+begin
+  Result := False;
+  if AAnchors = nil then
+    Exit;
+  ErrorReference := nil;
+  Policy := nil;
+  Trust := nil;
+  try
+    if (SSLCopyPeerTrust(AContext, Trust) <> ERR_SEC_SUCCESS) or
+       (Trust = nil) or (SecTrustGetCertificateCount(Trust) < 1) then
+      Exit;
+    Policy := SecPolicyCreateSSL(False, nil);
+    if (Policy = nil) or
+       (SecTrustSetPolicies(Trust, Policy) <> ERR_SEC_SUCCESS) or
+       (SecTrustSetNetworkFetchAllowed(Trust, False) <> ERR_SEC_SUCCESS) or
+       (SecTrustSetAnchorCertificates(Trust, AAnchors) <> ERR_SEC_SUCCESS) or
+       (SecTrustSetAnchorCertificatesOnly(Trust, True) <> ERR_SEC_SUCCESS) then
+      Exit;
+    Result := SecTrustEvaluateWithError(Trust, ErrorReference);
+  finally
+    if ErrorReference <> nil then
+      CFRelease(ErrorReference);
+    if Policy <> nil then
+      CFRelease(Policy);
     if Trust <> nil then
       CFRelease(Trust);
   end;
@@ -2036,6 +2092,7 @@ begin
   Data.WantRead := False;
   Data.WantWrite := False;
   Data.ClientIdentity := nil;
+  Data.AnchorArray := nil;
   Data.Context := SSLCreateContext(nil, K_SSL_CLIENT_SIDE, K_SSL_STREAM_TYPE);
   if Data.Context = nil then
   begin
@@ -2065,6 +2122,11 @@ begin
 
     if AUseOptions then
     begin
+      { Anchors are parsed before the first handshake byte, so a malformed
+        anchor never reaches the network. }
+      if Length(AOptions.TrustAnchors) > 0 then
+        Data.AnchorArray := CreateSecureTransportAnchorArray(
+          ParseTransportSecurityTrustAnchors(AOptions.TrustAnchors));
       if Length(AOptions.ClientPkcs12) > 0 then
       begin
         { The server-identity importer is reused with permissive validation:
@@ -2096,7 +2158,8 @@ begin
       Status := SSLHandshake(Data.Context);
       if AUseOptions and (Status = ERR_SSL_PEER_AUTH_COMPLETED) then
       begin
-        EvaluateSecureTransportServerTrust(Data.Context, AHost, AOptions);
+        EvaluateSecureTransportServerTrust(Data.Context, AHost, AOptions,
+          Data.AnchorArray);
         { Resume the paused handshake without waiting for the socket. }
         Status := ERR_SSL_WOULD_BLOCK;
         Continue;
@@ -2116,10 +2179,36 @@ begin
     AConnection.Active := True;
   except
     CFRelease(Data.Context);
+    if Data.AnchorArray <> nil then
+      CFRelease(Data.AnchorArray);
     if Assigned(Data.ClientIdentity) then
       Data.ClientIdentity.Release;
     Data.Free;
     raise;
+  end;
+end;
+
+{ Native parse of the anchors and the identity (with its passphrase) through
+  the same importers the connection uses, so a caller can reject bad
+  material before dialing. The identity check creates and removes a
+  temporary keychain. }
+procedure ValidateSecureTransportClientMaterial(
+  const AOptions: TTransportSecurityClientOptions);
+var
+  Anchors: Pointer;
+  Identity: TSecureTransportServerSnapshot;
+begin
+  if Length(AOptions.TrustAnchors) > 0 then
+  begin
+    Anchors := CreateSecureTransportAnchorArray(
+      ParseTransportSecurityTrustAnchors(AOptions.TrustAnchors));
+    CFRelease(Anchors);
+  end;
+  if Length(AOptions.ClientPkcs12) > 0 then
+  begin
+    Identity := CreateSecureTransportServerSnapshot(AOptions.ClientPkcs12,
+      AOptions.ClientPkcs12Passphrase, tsivPermissive);
+    Identity.Release;
   end;
 end;
 
@@ -2136,6 +2225,8 @@ begin
         SSLClose(Data.Context);
         CFRelease(Data.Context);
       end;
+      if Data.AnchorArray <> nil then
+        CFRelease(Data.AnchorArray);
       if Assigned(Data.ClientIdentity) then
         Data.ClientIdentity.Release;
     finally
@@ -2277,6 +2368,9 @@ begin
     Exit;
   if AData.Context <> nil then
     CFRelease(AData.Context);
+  if AData.ClientAnchorArray <> nil then
+    CFRelease(AData.ClientAnchorArray);
+  AData.ClientAnchorArray := nil;
   if Assigned(AData.Snapshot) then
     AData.Snapshot.Release;
   AData.Context := nil;
@@ -2454,9 +2548,10 @@ begin
   if Data.RequireClientCertificate and
      (Status = ERR_SSL_PEER_AUTH_COMPLETED) then
   begin
-    { Test-only seam: accept any presented client certificate, refuse an
-      anonymous client, then resume the paused handshake. }
-    if Length(SecureTransportContextPeerCertificate(Data.Context)) = 0 then
+    { Test-only seam: accept only a client chain that reaches the seam's
+      anchors, then resume the paused handshake. }
+    if not SecureTransportClientTrustAccepted(Data.Context,
+       Data.ClientAnchorArray) then
       Status := ERR_SSL_CLOSED_ABORT
     else
       Status := SSLHandshake(Data.Context);
@@ -3700,18 +3795,13 @@ begin
   OpenSSLClientProceduresLoaded := True;
 end;
 
-procedure AddOpenSSLTrustAnchors(const AContext: PSSL_CTX;
+procedure AddOpenSSLTrustAnchorsToStore(const AStore: Pointer;
   const AAnchors: TTransportSecurityCertificateList);
 var
   Certificate: Pointer;
   Input: PByte;
   I: Integer;
-  Store: Pointer;
 begin
-  Store := OpenSSLClientGetCertificateStore(AContext);
-  if not Assigned(Store) then
-    raise ETransportSecurityError.Create(
-      'OpenSSL context has no certificate store for TLS trust anchors');
   for I := 0 to High(AAnchors) do
   begin
     Input := @AAnchors[I][0];
@@ -3730,7 +3820,7 @@ begin
     try
       { Anchors are de-duplicated before this point, so a failure here is a
         real store error rather than an already-present certificate. }
-      if OpenSSLClientStoreAddCertificate(Store, Certificate) <> 1 then
+      if OpenSSLClientStoreAddCertificate(AStore, Certificate) <> 1 then
       begin
         ErrClearError;
         raise ETransportSecurityError.CreateFmt(
@@ -3740,6 +3830,18 @@ begin
       X509Free(Certificate);
     end;
   end;
+end;
+
+procedure AddOpenSSLTrustAnchors(const AContext: PSSL_CTX;
+  const AAnchors: TTransportSecurityCertificateList);
+var
+  Store: Pointer;
+begin
+  Store := OpenSSLClientGetCertificateStore(AContext);
+  if not Assigned(Store) then
+    raise ETransportSecurityError.Create(
+      'OpenSSL context has no certificate store for TLS trust anchors');
+  AddOpenSSLTrustAnchorsToStore(Store, AAnchors);
 end;
 
 procedure FreeOpenSSLClientChain(const AChain: Pointer);
@@ -3869,6 +3971,26 @@ begin
   if Length(AOptions.ClientPkcs12) > 0 then
     ConfigureOpenSSLClientIdentity(AContext, AOptions.ClientPkcs12,
       AOptions.ClientPkcs12Passphrase);
+end;
+
+{ Native parse of the anchors and the identity (with its passphrase) on a
+  throwaway context, so a caller can reject bad material before dialing. }
+procedure ValidateOpenSSLClientMaterial(
+  const AOptions: TTransportSecurityClientOptions);
+var
+  Context: PSSL_CTX;
+begin
+  if (Length(AOptions.TrustAnchors) = 0) and
+     (Length(AOptions.ClientPkcs12) = 0) then
+    Exit;
+  if not TryLoadOpenSSL then
+    raise ETransportSecurityError.Create(OPENSSL_LOAD_ERROR);
+  Context := CreateOpenSSLContext;
+  try
+    ConfigureOpenSSLClientOptions(Context, AOptions);
+  finally
+    SslCtxFree(Context);
+  end;
 end;
 
 procedure ConfigureOpenSSLClientHostVerification(const ASSL: PSSL;
@@ -5137,8 +5259,12 @@ type
     DecryptedInput: TBytes;
     DecryptedOffset: Integer;
     { Owned client identity (a TSChannelServerCredentialData whose persisted
-      CNG key is deleted on release); nil without ClientPkcs12. }
+      CNG key is deleted and published issuers withdrawn on release); nil
+      without ClientPkcs12. }
     ClientIdentity: TObject;
+    { In-memory store of the parsed trust anchors, built before the
+      handshake; nil without anchors. }
+    ClientAnchorStore: Pointer;
   end;
 
 const
@@ -5317,11 +5443,13 @@ end;
   steps are forward-declared here and defined there. }
 procedure PrepareSChannelClientCredential(
   const AOptions: TTransportSecurityClientOptions;
-  var ACredential: TSchannelCred; var AIdentity: TObject); forward;
-procedure ReleaseSChannelClientIdentity(var AIdentity: TObject); forward;
+  var ACredential: TSchannelCred; var AIdentity: TObject;
+  var AAnchorStore: Pointer); forward;
+procedure ReleaseSChannelClientState(var AIdentity: TObject;
+  var AAnchorStore: Pointer); forward;
 procedure VerifySChannelClientPeer(const AContext: TSecHandle;
-  const AHost: string; const AOptions: TTransportSecurityClientOptions);
-  forward;
+  const AHost: string; const AOptions: TTransportSecurityClientOptions;
+  const AAnchorStore: Pointer); forward;
 
 procedure StartSChannel(var AConnection: TTransportSecurityConnection;
   const AHost: string; const AOptions: TTransportSecurityClientOptions;
@@ -5349,6 +5477,7 @@ begin
   Data.Socket := AConnection.Socket;
   Data.HasContext := False;
   Data.ClientIdentity := nil;
+  Data.ClientAnchorStore := nil;
 
   FillChar(Credential, SizeOf(Credential), 0);
   Credential.dwVersion := SCHANNEL_CRED_VERSION;
@@ -5358,9 +5487,9 @@ begin
   if AUseOptions then
   try
     PrepareSChannelClientCredential(AOptions, Credential,
-      Data.ClientIdentity);
+      Data.ClientIdentity, Data.ClientAnchorStore);
   except
-    ReleaseSChannelClientIdentity(Data.ClientIdentity);
+    ReleaseSChannelClientState(Data.ClientIdentity, Data.ClientAnchorStore);
     Data.Free;
     raise;
   end;
@@ -5370,7 +5499,7 @@ begin
     @Expiry);
   if Status <> SEC_E_OK then
   begin
-    ReleaseSChannelClientIdentity(Data.ClientIdentity);
+    ReleaseSChannelClientState(Data.ClientIdentity, Data.ClientAnchorStore);
     Data.Free;
     raise ETransportSecurityError.CreateFmt('Failed to acquire SChannel credentials: 0x%x',
       [LongWord(Status)]);
@@ -5476,7 +5605,8 @@ begin
         [LongWord(Status)]);
 
     if AUseOptions then
-      VerifySChannelClientPeer(Data.Context, AHost, AOptions);
+      VerifySChannelClientPeer(Data.Context, AHost, AOptions,
+        Data.ClientAnchorStore);
 
     AConnection.BackendData := Data;
     AConnection.Backend := TSB_SCHANNEL;
@@ -5485,7 +5615,7 @@ begin
     if Data.HasContext then
       DeleteSecurityContext(@Data.Context);
     FreeCredentialsHandle(@Data.Credential);
-    ReleaseSChannelClientIdentity(Data.ClientIdentity);
+    ReleaseSChannelClientState(Data.ClientIdentity, Data.ClientAnchorStore);
     Data.Free;
     raise;
   end;
@@ -5547,7 +5677,7 @@ begin
       DeleteSecurityContext(@Data.Context);
     end;
     FreeCredentialsHandle(@Data.Credential);
-    ReleaseSChannelClientIdentity(Data.ClientIdentity);
+    ReleaseSChannelClientState(Data.ClientIdentity, Data.ClientAnchorStore);
     Data.Free;
   end;
 end;
@@ -5835,15 +5965,27 @@ type
   PPCertContext = ^PCertContext;
   TCertContextArray = array of PCertContext;
 
+  { A CNG key container persisted by PFXImportCertStore and owned by one
+    credential holder. Handle is 0 when the key could not be opened through
+    its certificate; the container is then deleted by name. }
+  TSChannelImportedKey = record
+    ContainerName: UnicodeString;
+    Handle: PtrUInt;
+    ProviderName: UnicodeString;
+  end;
+
+  TSChannelImportedKeyArray = array of TSChannelImportedKey;
+
   TSChannelServerCredentialData = class
   public
     Certificate: PCertContext;
     Credential: TSecHandle;
     HasCredential: Boolean;
-    HasPrivateKey: Boolean;
+    { Every key container the import persisted, not only the selected
+      identity's: PFXImportCertStore persists one per keyed certificate. }
+    ImportedKeys: TSChannelImportedKeyArray;
     IssuerStore: HCERTSTORE;
     KeyContainerName: UnicodeString;
-    PrivateKey: PtrUInt;
     PublishedIssuers: TCertContextArray;
     References: LongInt;
     Store: HCERTSTORE;
@@ -5879,8 +6021,10 @@ type
     ShutdownStarted: Boolean;
     Snapshot: TSChannelServerCredentialData;
     StreamSizes: TSecPkgContextStreamSizes;
-    { Set only by the test-only client-certificate seam. }
+    { Set only by the test-only client-certificate seam, together with the
+      anchors the client's chain must reach. }
     RequireClientCertificate: Boolean;
+    ClientAnchorStore: HCERTSTORE;
   end;
 
   { Chain-engine and chain-policy structures for the client trust-anchor
@@ -6114,16 +6258,78 @@ function CertVerifyCertificateChainPolicy(APolicy: PAnsiChar;
   var APolicyStatus: TCertChainPolicyStatus): LongBool; stdcall;
   external 'crypt32.dll' name 'CertVerifyCertificateChainPolicy';
 
+const
+  NTE_BAD_KEYSET_LWPT = LongInt($80090016);
+
+{$IFNDEF PRODUCTION}
+var
+  SChannelTestImportedKeyContainers: TUnicodeStringArray;
+{$ENDIF}
+
+function NCryptOpenStorageProvider(out AProvider: PtrUInt;
+  AProviderName: PWideChar; AFlags: LongWord): LongInt; stdcall;
+  external 'ncrypt.dll' name 'NCryptOpenStorageProvider';
+function NCryptOpenKey(AProvider: PtrUInt; out AKey: PtrUInt;
+  AKeyName: PWideChar; ALegacyKeySpec, AFlags: LongWord): LongInt; stdcall;
+  external 'ncrypt.dll' name 'NCryptOpenKey';
+
+{ Opens a user-scope CNG key by container name. Returns the NCrypt status;
+  NTE_BAD_KEYSET means the container does not exist. }
+function OpenSChannelKeyContainer(const AProviderName,
+  AContainerName: UnicodeString; out AKey: PtrUInt): LongInt;
+var
+  Provider: PtrUInt;
+  ProviderName: PWideChar;
+begin
+  AKey := 0;
+  Provider := 0;
+  ProviderName := nil;
+  if AProviderName <> '' then
+    ProviderName := PWideChar(AProviderName);
+  Result := NCryptOpenStorageProvider(Provider, ProviderName, 0);
+  if Result <> 0 then
+    Exit;
+  try
+    Result := NCryptOpenKey(Provider, AKey, PWideChar(AContainerName), 0,
+      NCRYPT_SILENT_FLAG);
+  finally
+    NCryptFreeObject(Provider);
+  end;
+end;
+
+{ Deletes every recorded container. NCryptDeleteKey both removes the
+  container and frees the handle; NCryptFreeObject is the fallback so a
+  failed delete still releases the handle. A key recorded without a handle
+  is reopened by name so no container is left behind on any path. }
+procedure DeleteSChannelImportedKeys(var AKeys: TSChannelImportedKeyArray);
+var
+  I: Integer;
+  Key: PtrUInt;
+begin
+  for I := High(AKeys) downto 0 do
+  begin
+    Key := AKeys[I].Handle;
+    if (Key = 0) and (AKeys[I].ContainerName <> '') and
+       (OpenSChannelKeyContainer(AKeys[I].ProviderName,
+       AKeys[I].ContainerName, Key) <> 0) then
+      Key := 0;
+    if Key <> 0 then
+      if NCryptDeleteKey(Key, NCRYPT_SILENT_FLAG) <> 0 then
+        NCryptFreeObject(Key);
+    AKeys[I].Handle := 0;
+  end;
+  SetLength(AKeys, 0);
+end;
+
 constructor TSChannelServerCredentialData.Create;
 begin
   inherited Create;
   FillChar(Credential, SizeOf(Credential), 0);
   Certificate := nil;
   HasCredential := False;
-  HasPrivateKey := False;
+  SetLength(ImportedKeys, 0);
   IssuerStore := nil;
   KeyContainerName := '';
-  PrivateKey := 0;
   SetLength(PublishedIssuers, 0);
   References := 1;
   Store := nil;
@@ -6145,19 +6351,11 @@ begin
     FreeCredentialsHandle(@Credential);
     HasCredential := False;
   end;
-  { The imported private key is persisted, so the snapshot owns a container
+  { The imported private keys are persisted, so the holder owns containers
     that must not outlive it. Deletion happens only here, at the last
     reference, which is what lets a reloaded-away snapshot keep serving live
-    connections until they finish. NCryptDeleteKey both removes the container
-    and frees the handle; NCryptFreeObject is the fallback so a failed delete
-    still releases the handle. }
-  if HasPrivateKey then
-  begin
-    if NCryptDeleteKey(PrivateKey, NCRYPT_SILENT_FLAG) <> 0 then
-      NCryptFreeObject(PrivateKey);
-    PrivateKey := 0;
-    HasPrivateKey := False;
-  end;
+    connections until they finish. }
+  DeleteSChannelImportedKeys(ImportedKeys);
   KeyContainerName := '';
   { Withdraw the issuers this snapshot published. CertDeleteCertificateFromStore
     frees the context as well, on success and on failure alike. }
@@ -6517,14 +6715,16 @@ end;
   back rather than chosen: PFXImportCertStore names the CNG key itself, and
   the name is the identity of the persisted container this snapshot owns and
   will delete. Empty when the property is unreadable. }
-function SChannelServerKeyContainerName(
-  const ACertificate: PCertContext): UnicodeString;
+function SChannelKeyProviderNames(const ACertificate: PCertContext;
+  out AContainerName, AProviderName: UnicodeString): Boolean;
 var
   Buffer: TBytes;
   BufferLength: LongWord;
   ProviderInfo: PCryptKeyProviderInfo;
 begin
-  Result := '';
+  Result := False;
+  AContainerName := '';
+  AProviderName := '';
   BufferLength := 0;
   if not CertGetCertificateContextProperty(ACertificate,
     CERT_KEY_PROV_INFO_PROP_ID, nil, BufferLength) then
@@ -6537,7 +6737,19 @@ begin
     Exit;
   ProviderInfo := PCryptKeyProviderInfo(@Buffer[0]);
   if Assigned(ProviderInfo^.pwszContainerName) then
-    Result := UnicodeString(WideString(ProviderInfo^.pwszContainerName));
+    AContainerName := UnicodeString(WideString(
+      ProviderInfo^.pwszContainerName));
+  if Assigned(ProviderInfo^.pwszProvName) then
+    AProviderName := UnicodeString(WideString(ProviderInfo^.pwszProvName));
+  Result := AContainerName <> '';
+end;
+
+function SChannelServerKeyContainerName(
+  const ACertificate: PCertContext): UnicodeString;
+var
+  ProviderName: UnicodeString;
+begin
+  SChannelKeyProviderNames(ACertificate, Result, ProviderName);
 end;
 
 { Make the bundled issuers discoverable to the operating system's chain
@@ -6602,14 +6814,78 @@ end;
 { Imports a PKCS#12 identity into a credential holder that owns the store,
   the leaf context, and the persisted CNG key container, which Release
   deletes. Shared by server snapshots and outbound client identities. }
+{ Claims every key the import persisted, then selects the single identity.
+  PFXImportCertStore persists one container per keyed certificate, so each
+  is recorded before anything can fail: from here on every exit, including
+  a multi-identity rejection, strict-validation rejection, and
+  credential-acquisition failure, runs Release, which deletes them all. }
+procedure RecordSChannelImportedKeys(
+  const ASnapshot: TSChannelServerCredentialData);
+var
+  CallerOwnsKey: LongBool;
+  ContainerName: UnicodeString;
+  Found: PCertContext;
+  Index: Integer;
+  KeyHandle: PtrUInt;
+  KeySpecification: LongWord;
+  OwnedKeys: Integer;
+  ProviderName: UnicodeString;
+begin
+  OwnedKeys := 0;
+  Found := CertFindCertificateInStore(ASnapshot.Store, CERT_ENCODING_TYPES, 0,
+    CERT_FIND_HAS_PRIVATE_KEY, nil, nil);
+  try
+    while Assigned(Found) do
+    begin
+      SChannelKeyProviderNames(Found, ContainerName, ProviderName);
+      Index := Length(ASnapshot.ImportedKeys);
+      SetLength(ASnapshot.ImportedKeys, Index + 1);
+      ASnapshot.ImportedKeys[Index].ContainerName := ContainerName;
+      ASnapshot.ImportedKeys[Index].ProviderName := ProviderName;
+      ASnapshot.ImportedKeys[Index].Handle := 0;
+      {$IFNDEF PRODUCTION}
+      SetLength(SChannelTestImportedKeyContainers,
+        Length(SChannelTestImportedKeyContainers) + 1);
+      SChannelTestImportedKeyContainers[
+        High(SChannelTestImportedKeyContainers)] := ContainerName;
+      {$ENDIF}
+      KeyHandle := 0;
+      KeySpecification := 0;
+      CallerOwnsKey := False;
+      if CryptAcquireCertificatePrivateKey(Found,
+         CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG or CRYPT_ACQUIRE_SILENT_FLAG, nil,
+         KeyHandle, KeySpecification, CallerOwnsKey) and CallerOwnsKey then
+      begin
+        ASnapshot.ImportedKeys[Index].Handle := KeyHandle;
+        if KeySpecification = CERT_NCRYPT_KEY_SPEC then
+          Inc(OwnedKeys);
+      end;
+      if not Assigned(ASnapshot.Certificate) then
+        ASnapshot.Certificate := CertDuplicateCertificateContext(Found);
+      Found := CertFindCertificateInStore(ASnapshot.Store,
+        CERT_ENCODING_TYPES, 0, CERT_FIND_HAS_PRIVATE_KEY, nil, Found);
+    end;
+  finally
+    if Assigned(Found) then
+      CertFreeCertificateContext(Found);
+  end;
+  if Length(ASnapshot.ImportedKeys) = 0 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity must contain a certificate and private key');
+  if Length(ASnapshot.ImportedKeys) > 1 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity must contain exactly one certificate with a private key');
+  if OwnedKeys <> 1 then
+    raise ETransportSecurityError.Create(
+      'Configured TLS PKCS#12 identity did not import into an owned CNG key');
+  ASnapshot.KeyContainerName := ASnapshot.ImportedKeys[0].ContainerName;
+end;
+
 function ImportSChannelPkcs12Identity(const APkcs12Identity: TBytes;
   const APkcs12Passphrase: UnicodeString): TSChannelServerCredentialData;
 var
-  CallerOwnsKey: LongBool;
   Identity: TBytes;
   IdentityBlob: TCryptDataBlob;
-  KeyHandle: PtrUInt;
-  KeySpecification: LongWord;
   Passphrase: array of WideChar;
   Snapshot: TSChannelServerCredentialData;
 begin
@@ -6655,37 +6931,10 @@ begin
     if not Assigned(Snapshot.Store) then
       raise ETransportSecurityError.Create(
         SCHANNEL_SERVER_IDENTITY_PARSE_ERROR);
-    Snapshot.Certificate := CertFindCertificateInStore(Snapshot.Store,
-      CERT_ENCODING_TYPES, 0, CERT_FIND_HAS_PRIVATE_KEY, nil, nil);
-    if not Assigned(Snapshot.Certificate) then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity must contain a certificate and private key');
-
-    { Claim the key handle before anything can fail: from here on every exit —
-      including strict-validation rejection and credential-acquisition failure
-      — runs Release, which deletes the container. }
-    KeyHandle := 0;
-    KeySpecification := 0;
-    CallerOwnsKey := False;
-    if not CryptAcquireCertificatePrivateKey(Snapshot.Certificate,
-      CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG or CRYPT_ACQUIRE_SILENT_FLAG, nil,
-      KeyHandle, KeySpecification, CallerOwnsKey) then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity must contain a certificate and private key');
-    { Record before rejecting: an owned handle must reach Release even on the
-      rejection path, or its container would outlive the failed snapshot. A
-      handle we do not own is not ours to free, so there is nothing to record. }
-    if CallerOwnsKey then
-    begin
-      Snapshot.PrivateKey := KeyHandle;
-      Snapshot.HasPrivateKey := True;
-    end;
-    if not Snapshot.HasPrivateKey or
-       (KeySpecification <> CERT_NCRYPT_KEY_SPEC) then
-      raise ETransportSecurityError.Create(
-        'Configured TLS PKCS#12 identity did not import into an owned CNG key');
-    Snapshot.KeyContainerName :=
-      SChannelServerKeyContainerName(Snapshot.Certificate);
+    {$IFNDEF PRODUCTION}
+    SetLength(SChannelTestImportedKeyContainers, 0);
+    {$ENDIF}
+    RecordSChannelImportedKeys(Snapshot);
     Result := Snapshot;
     Snapshot := nil;
   finally
@@ -6787,9 +7036,40 @@ end;
   accepts the peer. InsecureSkipVerify also uses manual validation and then
   skips the check. Without anchors or insecure mode SChannel's automatic
   validation stays in charge, exactly as without options. }
+{ Parses the anchors with crypt32 into an in-memory store. Raises on the
+  first certificate crypt32 cannot decode. }
+function CreateSChannelAnchorStore(const AAnchors: TBytes): HCERTSTORE;
+const
+  CERT_STORE_PROV_MEMORY = 2;
+  CERT_STORE_ADD_USE_EXISTING = 2;
+var
+  Anchors: TTransportSecurityCertificateList;
+  I: Integer;
+begin
+  Anchors := ParseTransportSecurityTrustAnchors(AAnchors);
+  Result := CertOpenStore(PAnsiChar(PtrUInt(CERT_STORE_PROV_MEMORY)), 0, 0,
+    0, nil);
+  if not Assigned(Result) then
+    raise ETransportSecurityError.Create(
+      'Failed to create the TLS trust-anchor store');
+  try
+    for I := 0 to High(Anchors) do
+      if not CertAddEncodedCertificateToStore(Result, X509_ASN_ENCODING,
+        @Anchors[I][0], Length(Anchors[I]), CERT_STORE_ADD_USE_EXISTING,
+        nil) then
+        raise ETransportSecurityError.CreateFmt(
+          'Configured TLS trust anchor %d is not a valid X.509 certificate',
+          [I + 1]);
+  except
+    CertCloseStore(Result, 0);
+    raise;
+  end;
+end;
+
 procedure PrepareSChannelClientCredential(
   const AOptions: TTransportSecurityClientOptions;
-  var ACredential: TSchannelCred; var AIdentity: TObject);
+  var ACredential: TSchannelCred; var AIdentity: TObject;
+  var AAnchorStore: Pointer);
 var
   Identity: TSChannelServerCredentialData;
 begin
@@ -6797,20 +7077,35 @@ begin
   if AOptions.InsecureSkipVerify or (Length(AOptions.TrustAnchors) > 0) then
     ACredential.dwFlags := ACredential.dwFlags or
       SCH_CRED_MANUAL_CRED_VALIDATION;
+  { Anchors are parsed before the first handshake byte, so a malformed
+    anchor never reaches the network. }
+  if Length(AOptions.TrustAnchors) > 0 then
+    AAnchorStore := CreateSChannelAnchorStore(AOptions.TrustAnchors);
   if Length(AOptions.ClientPkcs12) > 0 then
   begin
     Identity := ImportSChannelPkcs12Identity(AOptions.ClientPkcs12,
       AOptions.ClientPkcs12Passphrase);
     AIdentity := Identity;
+    { SChannel builds the outgoing client Certificate message from the
+      Windows stores, exactly as for a server, so the bundle's
+      intermediates are published for the connection's lifetime and
+      withdrawn when the identity is released. }
+    PublishSChannelServerIssuers(Identity);
     ACredential.cCreds := 1;
     ACredential.paCred := @Identity.Certificate;
   end;
 end;
 
-procedure ReleaseSChannelClientIdentity(var AIdentity: TObject);
+procedure ReleaseSChannelClientState(var AIdentity: TObject;
+  var AAnchorStore: Pointer);
 var
   Identity: TSChannelServerCredentialData;
 begin
+  if Assigned(AAnchorStore) then
+  begin
+    CertCloseStore(AAnchorStore, 0);
+    AAnchorStore := nil;
+  end;
   if not Assigned(AIdentity) then
     Exit;
   Identity := TSChannelServerCredentialData(AIdentity);
@@ -6818,13 +7113,21 @@ begin
   Identity.Release;
 end;
 
+{ Builds APeer's chain in AEngine (nil for the current user's default
+  engine) using only certificates APeer's store supplies as intermediates
+  beyond the engine's own, then applies the SSL chain policy for the given
+  authentication direction. Returns 0 when the chain is acceptable. }
 function SChannelChainPolicyError(const AEngine: Pointer;
-  const APeer: PCertContext; const AHost: string): LongWord;
+  const APeer: PCertContext; const AHost: string;
+  const AServerAuthentication: Boolean; const AChainFlags: LongWord):
+  LongWord;
 const
   CERT_CHAIN_POLICY_SSL = 4;
+  AUTHTYPE_CLIENT = 1;
   AUTHTYPE_SERVER = 2;
   USAGE_MATCH_TYPE_AND = 0;
   CERT_E_CHAINING_LWPT = LongWord($800B010A);
+  OID_CLIENT_AUTHENTICATION = '1.3.6.1.5.5.7.3.2';
 var
   Chain: Pointer;
   ChainPara: TCertChainPara;
@@ -6834,7 +7137,10 @@ var
   SSLPara: TSSLExtraCertChainPolicyPara;
   Usages: array[0..0] of PAnsiChar;
 begin
-  Usages[0] := PAnsiChar(OID_SERVER_AUTHENTICATION);
+  if AServerAuthentication then
+    Usages[0] := PAnsiChar(OID_SERVER_AUTHENTICATION)
+  else
+    Usages[0] := PAnsiChar(OID_CLIENT_AUTHENTICATION);
   FillChar(ChainPara, SizeOf(ChainPara), 0);
   ChainPara.cbSize := SizeOf(ChainPara);
   ChainPara.RequestedUsage.dwType := USAGE_MATCH_TYPE_AND;
@@ -6842,14 +7148,19 @@ begin
   ChainPara.RequestedUsage.Usage.rgpszUsageIdentifier := @Usages[0];
   Chain := nil;
   if not CertGetCertificateChain(AEngine, APeer, nil, APeer^.hCertStore,
-    ChainPara, 0, nil, Chain) or not Assigned(Chain) then
+    ChainPara, AChainFlags, nil, Chain) or not Assigned(Chain) then
     Exit(CERT_E_CHAINING_LWPT);
   try
     ServerName := UnicodeString(AHost);
     FillChar(SSLPara, SizeOf(SSLPara), 0);
     SSLPara.cbSize := SizeOf(SSLPara);
-    SSLPara.dwAuthType := AUTHTYPE_SERVER;
-    SSLPara.pwszServerName := PWideChar(ServerName);
+    if AServerAuthentication then
+    begin
+      SSLPara.dwAuthType := AUTHTYPE_SERVER;
+      SSLPara.pwszServerName := PWideChar(ServerName);
+    end
+    else
+      SSLPara.dwAuthType := AUTHTYPE_CLIENT;
     FillChar(PolicyPara, SizeOf(PolicyPara), 0);
     PolicyPara.cbSize := SizeOf(PolicyPara);
     PolicyPara.pvExtraPolicyPara := @SSLPara;
@@ -6865,41 +7176,64 @@ begin
   end;
 end;
 
+{ Chain policy in an engine whose only roots are AAnchors. With
+  ARestrictIntermediates the engine also searches no system store for
+  intermediates and fetches nothing, so they can come only from the peer's
+  own certificate message. }
 function SChannelAnchorPolicyError(const AAnchors: HCERTSTORE;
-  const APeer: PCertContext; const AHost: string): LongWord;
+  const APeer: PCertContext; const AHost: string;
+  const AServerAuthentication, ARestrictIntermediates: Boolean): LongWord;
+const
+  CERT_STORE_PROV_MEMORY = 2;
+  CERT_CHAIN_DISABLE_AIA = $00002000;
 var
+  ChainFlags: LongWord;
   Config: TCertChainEngineConfig;
+  Empty: HCERTSTORE;
   Engine: Pointer;
 begin
   FillChar(Config, SizeOf(Config), 0);
   Config.cbSize := SizeOf(Config);
   Config.hExclusiveRoot := AAnchors;
-  Engine := nil;
-  if not CertCreateCertificateChainEngine(Config, Engine) or
-     not Assigned(Engine) then
-    raise ETransportSecurityError.Create(
-      'Failed to create the TLS trust-anchor chain engine');
+  Empty := nil;
+  ChainFlags := 0;
+  if ARestrictIntermediates then
+  begin
+    Empty := CertOpenStore(PAnsiChar(PtrUInt(CERT_STORE_PROV_MEMORY)), 0, 0,
+      0, nil);
+    if not Assigned(Empty) then
+      raise ETransportSecurityError.Create(
+        'Failed to create the TLS intermediate restriction store');
+    Config.hRestrictedOther := Empty;
+    ChainFlags := CERT_CHAIN_DISABLE_AIA;
+  end;
   try
-    Result := SChannelChainPolicyError(Engine, APeer, AHost);
+    Engine := nil;
+    if not CertCreateCertificateChainEngine(Config, Engine) or
+       not Assigned(Engine) then
+      raise ETransportSecurityError.Create(
+        'Failed to create the TLS trust-anchor chain engine');
+    try
+      Result := SChannelChainPolicyError(Engine, APeer, AHost,
+        AServerAuthentication, ChainFlags);
+    finally
+      CertFreeCertificateChainEngine(Engine);
+    end;
   finally
-    CertFreeCertificateChainEngine(Engine);
+    if Assigned(Empty) then
+      CertCloseStore(Empty, 0);
   end;
 end;
 
 procedure VerifySChannelClientPeer(const AContext: TSecHandle;
-  const AHost: string; const AOptions: TTransportSecurityClientOptions);
-const
-  CERT_STORE_PROV_MEMORY = 2;
-  CERT_STORE_ADD_USE_EXISTING = 2;
+  const AHost: string; const AOptions: TTransportSecurityClientOptions;
+  const AAnchorStore: Pointer);
 var
-  Anchors: TTransportSecurityCertificateList;
-  AnchorStore: HCERTSTORE;
   Context: TSecHandle;
   ErrorCode: LongWord;
-  I: Integer;
   Peer: PCertContext;
 begin
-  if AOptions.InsecureSkipVerify or (Length(AOptions.TrustAnchors) = 0) then
+  if AOptions.InsecureSkipVerify or not Assigned(AAnchorStore) then
     Exit;
   Context := AContext;
   Peer := nil;
@@ -6907,33 +7241,82 @@ begin
      @Peer) <> SEC_E_OK) or not Assigned(Peer) then
     raise ETransportSecurityError.CreateFmt(
       '%s: the server presented no certificate', [TLS_VERIFICATION_ERROR]);
-  AnchorStore := nil;
   try
-    Anchors := ParseTransportSecurityTrustAnchors(AOptions.TrustAnchors);
-    AnchorStore := CertOpenStore(PAnsiChar(PtrUInt(CERT_STORE_PROV_MEMORY)),
-      0, 0, 0, nil);
-    if not Assigned(AnchorStore) then
-      raise ETransportSecurityError.Create(
-        'Failed to create the TLS trust-anchor store');
-    for I := 0 to High(Anchors) do
-      if not CertAddEncodedCertificateToStore(AnchorStore, X509_ASN_ENCODING,
-        @Anchors[I][0], Length(Anchors[I]), CERT_STORE_ADD_USE_EXISTING,
-        nil) then
-        raise ETransportSecurityError.CreateFmt(
-          'Configured TLS trust anchor %d is not a valid X.509 certificate',
-          [I + 1]);
     ErrorCode := 1;
     if AOptions.TrustMode = tstmSystemAndAnchors then
-      ErrorCode := SChannelChainPolicyError(nil, Peer, AHost);
+      ErrorCode := SChannelChainPolicyError(nil, Peer, AHost, True, 0);
     if ErrorCode <> 0 then
-      ErrorCode := SChannelAnchorPolicyError(AnchorStore, Peer, AHost);
+      ErrorCode := SChannelAnchorPolicyError(AAnchorStore, Peer, AHost, True,
+        False);
     if ErrorCode <> 0 then
       raise ETransportSecurityError.CreateFmt('%s: 0x%x',
         [TLS_VERIFICATION_ERROR, ErrorCode]);
   finally
-    if Assigned(AnchorStore) then
-      CertCloseStore(AnchorStore, 0);
     CertFreeCertificateContext(Peer);
+  end;
+end;
+
+{ Native parse of the anchors and the identity without persisting a key:
+  the PKCS#12 is opened with its passphrase under PKCS12_NO_PERSIST_KEY and
+  must hold exactly one keyed certificate. }
+procedure ValidateSChannelClientMaterial(
+  const AOptions: TTransportSecurityClientOptions);
+const
+  PKCS12_NO_PERSIST_KEY = $00008000;
+var
+  AnchorStore: HCERTSTORE;
+  Found: PCertContext;
+  Identities: Integer;
+  Identity: TBytes;
+  IdentityBlob: TCryptDataBlob;
+  Passphrase: array of WideChar;
+  Store: HCERTSTORE;
+begin
+  if Length(AOptions.TrustAnchors) > 0 then
+  begin
+    AnchorStore := CreateSChannelAnchorStore(AOptions.TrustAnchors);
+    CertCloseStore(AnchorStore, 0);
+  end;
+  if Length(AOptions.ClientPkcs12) = 0 then
+    Exit;
+  SetLength(Identity, Length(AOptions.ClientPkcs12));
+  Move(AOptions.ClientPkcs12[0], Identity[0], Length(Identity));
+  SetLength(Passphrase, Length(AOptions.ClientPkcs12Passphrase) + 1);
+  Store := nil;
+  try
+    if Length(AOptions.ClientPkcs12Passphrase) > 0 then
+      Move(AOptions.ClientPkcs12Passphrase[1], Passphrase[0],
+        Length(AOptions.ClientPkcs12Passphrase) * SizeOf(WideChar));
+    Passphrase[High(Passphrase)] := WideChar(0);
+    IdentityBlob.cbData := Length(Identity);
+    IdentityBlob.pbData := @Identity[0];
+    Store := PFXImportCertStore(@IdentityBlob, @Passphrase[0],
+      PKCS12_ALWAYS_CNG_KSP or PKCS12_NO_PERSIST_KEY);
+    if not Assigned(Store) then
+      raise ETransportSecurityError.Create(
+        SCHANNEL_SERVER_IDENTITY_PARSE_ERROR);
+    Identities := 0;
+    Found := CertFindCertificateInStore(Store, CERT_ENCODING_TYPES, 0,
+      CERT_FIND_HAS_PRIVATE_KEY, nil, nil);
+    while Assigned(Found) do
+    begin
+      Inc(Identities);
+      Found := CertFindCertificateInStore(Store, CERT_ENCODING_TYPES, 0,
+        CERT_FIND_HAS_PRIVATE_KEY, nil, Found);
+    end;
+    if Identities = 0 then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must contain a certificate and private key');
+    if Identities > 1 then
+      raise ETransportSecurityError.Create(
+        'Configured TLS PKCS#12 identity must contain exactly one certificate with a private key');
+  finally
+    if Assigned(Store) then
+      CertCloseStore(Store, 0);
+    if Length(Passphrase) > 0 then
+      FillChar(Passphrase[0], Length(Passphrase) * SizeOf(WideChar), 0);
+    SetLength(Passphrase, 0);
+    WipeBytes(Identity);
   end;
 end;
 
@@ -6962,18 +7345,27 @@ begin
   end;
 end;
 
-{ Whether an accepted server connection received a client certificate; used
-  only by the test-only client-certificate seam. }
-function SChannelServerHasPeerCertificate(
+{ Whether an accepted server connection received a client certificate that
+  chains to the seam's anchors; used only by the test-only client-certificate
+  seam. }
+function SChannelServerClientCertificateAccepted(
   const AData: TSChannelServerData): Boolean;
 var
   Peer: PCertContext;
 begin
   Peer := nil;
-  Result := (QueryContextAttributesW(@AData.Context,
-    SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Peer) = SEC_E_OK) and Assigned(Peer);
-  if Assigned(Peer) then
+  Result := False;
+  if (QueryContextAttributesW(@AData.Context,
+     SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Peer) <> SEC_E_OK) or
+     not Assigned(Peer) then
+    Exit;
+  try
+    Result := Assigned(AData.ClientAnchorStore) and
+      (SChannelAnchorPolicyError(AData.ClientAnchorStore, Peer, '', False,
+       True) = 0);
+  finally
     CertFreeCertificateContext(Peer);
+  end;
 end;
 
 procedure FreeSChannelServerData(const AData: TSChannelServerData);
@@ -6984,6 +7376,11 @@ begin
   begin
     DeleteSecurityContext(@AData.Context);
     AData.HasContext := False;
+  end;
+  if Assigned(AData.ClientAnchorStore) then
+  begin
+    CertCloseStore(AData.ClientAnchorStore, 0);
+    AData.ClientAnchorStore := nil;
   end;
   if Assigned(AData.Snapshot) then
     AData.Snapshot.Release;
@@ -7378,7 +7775,7 @@ begin
       end;
       Data.Protocol := ConnectionInfo.dwProtocol;
       if Data.RequireClientCertificate and
-         not SChannelServerHasPeerCertificate(Data) then
+         not SChannelServerClientCertificateAccepted(Data) then
       begin
         PoisonSChannelServerConnection(AConnection);
         Result := tssError;
@@ -8171,6 +8568,21 @@ begin
   FreeAndNil(AContext);
 end;
 
+procedure ValidateTransportSecurityClientOptions(
+  const AOptions: TTransportSecurityClientOptions);
+begin
+  ValidateClientOptionsStructure(AOptions);
+  {$IFDEF DARWIN}
+  ValidateSecureTransportClientMaterial(AOptions);
+  {$ELSE}
+  {$IFDEF MSWINDOWS}
+  ValidateSChannelClientMaterial(AOptions);
+  {$ELSE}
+  ValidateOpenSSLClientMaterial(AOptions);
+  {$ENDIF}
+  {$ENDIF}
+end;
+
 procedure StartTransportSecurityInternal(
   var AConnection: TTransportSecurityConnection;
   const ASocket: TSocket; const AHost: string;
@@ -8181,8 +8593,10 @@ var
 begin
   { A zero-valued options record takes exactly the option-less path. }
   UseOptions := not TransportSecurityClientOptionsAreDefault(AOptions);
+  { The backends prepare (and so natively parse) every option before the
+    first handshake byte; only the structure is checked here. }
   if UseOptions then
-    ValidateTransportSecurityClientOptions(AOptions);
+    ValidateClientOptionsStructure(AOptions);
 
   FillChar(AConnection, SizeOf(AConnection), 0);
   AConnection.Socket := ASocket;
@@ -8605,22 +9019,23 @@ end;
 type
   TOpenSSLSetVerify = procedure(ASSL: PSSL; AMode: LongInt;
     ACallback: Pointer); cdecl;
-
-function AcceptAnyTestClientCertificate(APreverifyOK: LongInt;
-  AStoreContext: Pointer): LongInt; cdecl;
-begin
-  Result := 1;
-end;
+  TOpenSSLStoreNew = function: Pointer; cdecl;
+  TOpenSSLStoreFree = procedure(AStore: Pointer); cdecl;
 {$ENDIF}
 
 procedure TransportSecurityTestRequireClientCertificate(
-  var AConnection: TTransportSecurityConnection);
+  var AConnection: TTransportSecurityConnection;
+  const AClientAnchors: TBytes);
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 const
   SSL_VERIFY_FAIL_IF_NO_PEER_CERT_LWPT = $02;
+  SSL_CTRL_SET_VERIFY_CERT_STORE_LWPT = 106;
 var
   Data: TOpenSSLServerData;
   SetVerify: TOpenSSLSetVerify;
+  Store: Pointer;
+  StoreFree: TOpenSSLStoreFree;
+  StoreNew: TOpenSSLStoreNew;
 {$ENDIF}
 {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
 var
@@ -8631,24 +9046,52 @@ var
   Data: TSecureTransportServerData;
 {$ENDIF}
 begin
+  if Length(AClientAnchors) = 0 then
+    raise ETransportSecurityError.Create(
+      'TLS client-certificate seam needs client trust anchors');
   {$IFDEF TRANSPORT_SECURITY_OPENSSL}
   Data := OpenSSLServerData(AConnection);
   if not Assigned(Data) or Data.HandshakeDone then
     raise ETransportSecurityError.Create(
       'TLS client-certificate seam needs a fresh server connection');
+  LoadOpenSSLClientProcedures;
   SetVerify := TOpenSSLSetVerify(GetProcedureAddress(SSLLibHandle,
     'SSL_set_verify'));
-  if not Assigned(SetVerify) then
+  StoreNew := TOpenSSLStoreNew(GetProcedureAddress(SSLUtilHandle,
+    'X509_STORE_new'));
+  StoreFree := TOpenSSLStoreFree(GetProcedureAddress(SSLUtilHandle,
+    'X509_STORE_free'));
+  if not Assigned(SetVerify) or not Assigned(StoreNew) or
+     not Assigned(StoreFree) then
     raise ETransportSecurityError.Create(
-      'OpenSSL runtime does not provide SSL_set_verify');
+      'OpenSSL runtime does not provide the client-certificate seam');
+  { A connection-private verify store holding only the anchors: the
+    client's intermediates can come only from its Certificate message. }
+  Store := StoreNew();
+  if not Assigned(Store) then
+    raise ETransportSecurityError.Create(
+      'Failed to create the client-certificate verify store');
+  try
+    AddOpenSSLTrustAnchorsToStore(Store,
+      ParseTransportSecurityTrustAnchors(AClientAnchors));
+    if SslCtrl(Data.SSL, SSL_CTRL_SET_VERIFY_CERT_STORE_LWPT, 1, Store) <> 1
+      then
+      raise ETransportSecurityError.Create(
+        'Failed to install the client-certificate verify store');
+  finally
+    StoreFree(Store);
+  end;
   SetVerify(Data.SSL, SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT_LWPT,
-    @AcceptAnyTestClientCertificate);
+    nil);
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
   Data := SChannelServerData(AConnection);
   if not Assigned(Data) or Data.HandshakeDone or Data.HasContext then
     raise ETransportSecurityError.Create(
       'TLS client-certificate seam needs a fresh server connection');
+  if Assigned(Data.ClientAnchorStore) then
+    CertCloseStore(Data.ClientAnchorStore, 0);
+  Data.ClientAnchorStore := CreateSChannelAnchorStore(AClientAnchors);
   Data.RequireClientCertificate := True;
   {$ENDIF}
   {$IFDEF TRANSPORT_SECURITY_SECURE_TRANSPORT_SERVER}
@@ -8662,8 +9105,42 @@ begin
       K_SSL_SESSION_OPTION_BREAK_ON_CLIENT_AUTH, True) <> ERR_SEC_SUCCESS) then
     raise ETransportSecurityError.Create(
       'Failed to require a TLS client certificate');
+  if Data.ClientAnchorArray <> nil then
+    CFRelease(Data.ClientAnchorArray);
+  Data.ClientAnchorArray := nil;
+  Data.ClientAnchorArray := CreateSecureTransportAnchorArray(
+    ParseTransportSecurityTrustAnchors(AClientAnchors));
   Data.RequireClientCertificate := True;
   {$ENDIF}
+end;
+{$ENDIF}
+{$ENDIF}
+
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+{$IFNDEF PRODUCTION}
+function TransportSecurityTestLastImportedKeyContainers: TUnicodeStringArray;
+var
+  I: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(SChannelTestImportedKeyContainers));
+  for I := 0 to High(Result) do
+    Result[I] := SChannelTestImportedKeyContainers[I];
+end;
+
+function TransportSecurityTestKeyContainerExists(
+  const AContainerName: UnicodeString): Boolean;
+var
+  Key: PtrUInt;
+  Status: LongInt;
+begin
+  Status := OpenSChannelKeyContainer('', AContainerName, Key);
+  Result := Status = 0;
+  if Result then
+    NCryptFreeObject(Key)
+  else if Status <> NTE_BAD_KEYSET_LWPT then
+    raise ETransportSecurityError.CreateFmt(
+      'Could not probe the CNG key container: 0x%x', [LongWord(Status)]);
 end;
 {$ENDIF}
 {$ENDIF}

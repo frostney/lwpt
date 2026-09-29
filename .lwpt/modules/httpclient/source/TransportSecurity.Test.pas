@@ -86,6 +86,8 @@ const
     'packages/httpclient/source/fixtures/localhost-pathlen-identity.p12';
   SELF_SIGNED_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-self-signed-dev.p12';
+  MULTI_IDENTITY_PKCS12_PATH =
+    'packages/httpclient/source/fixtures/localhost-multi-identity.p12';
   WRONG_PURPOSE_PKCS12_PATH =
     'packages/httpclient/source/fixtures/localhost-wrong-purpose-identity.p12';
   PKCS12_PASSPHRASE = 'test-only';
@@ -113,6 +115,7 @@ type
     procedure TestAnchorEncodingsValidate;
     procedure TestMalformedAnchorsRejected;
     procedure TestInconsistentOptionsRejected;
+    procedure TestNativeMaterialRejectedBeforeConnecting;
   end;
 
   TTransportSecurityServerTests = class(TTestSuite)
@@ -156,6 +159,7 @@ type
     procedure TestSChannelPeerCloseNotifyReportsPeerClosed;
     procedure TestSChannelProtocolCeilingFollowsOperatingSystem;
     procedure TestSChannelReloadRetainsPreviousKeyContainer;
+    procedure TestSChannelMultiIdentityLeavesNoKeyContainers;
     procedure TestSChannelPendingCiphertextPointerAndPartialConsumption;
     procedure TestSChannelWriteWantRetryRetainsPlaintext;
     procedure TestStaleErrorQueueIsCleared;
@@ -4920,6 +4924,67 @@ begin
   {$ENDIF}
 end;
 
+{ PFXImportCertStore persists one CNG container per keyed certificate. A
+  bundle with two identities must be rejected, and both containers deleted,
+  on the server path and on the client path alike (the client's pre-dial
+  check imports without persisting). }
+procedure TTransportSecurityServerTests.TestSChannelMultiIdentityLeavesNoKeyContainers;
+{$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+var
+  Context: TTransportSecurityServerContext;
+  ErrorMessage: string;
+  I: Integer;
+  Names: TUnicodeStringArray;
+  Options: TTransportSecurityClientOptions;
+  SingleName: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF TRANSPORT_SECURITY_SCHANNEL_SERVER}
+  Context := TTransportSecurityServerContext.Create(PKCS12_PATH,
+    PKCS12_PASSPHRASE);
+  try
+    SingleName := TransportSecurityTestServerKeyContainer(Context);
+    Expect<Boolean>(TransportSecurityTestKeyContainerExists(SingleName))
+      .ToBe(True);
+  finally
+    CloseTransportSecurityServerContext(Context);
+  end;
+  Expect<Boolean>(TransportSecurityTestKeyContainerExists(SingleName))
+    .ToBe(False);
+
+  Context := nil;
+  ErrorMessage := '';
+  try
+    Context := TTransportSecurityServerContext.Create(
+      MULTI_IDENTITY_PKCS12_PATH, PKCS12_PASSPHRASE, tsivPermissive);
+  except
+    on E: ETransportSecurityError do
+      ErrorMessage := E.Message;
+  end;
+  CloseTransportSecurityServerContext(Context);
+  Expect<Boolean>(Pos('exactly one certificate with a private key',
+    ErrorMessage) > 0).ToBe(True);
+  Names := TransportSecurityTestLastImportedKeyContainers;
+  Expect<Integer>(Length(Names)).ToBe(2);
+  for I := 0 to High(Names) do
+    Expect<Boolean>(TransportSecurityTestKeyContainerExists(Names[I]))
+      .ToBe(False);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := LoadFixtureBytes(MULTI_IDENTITY_PKCS12_PATH);
+  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  ErrorMessage := '';
+  try
+    ValidateTransportSecurityClientOptions(Options);
+  except
+    on E: ETransportSecurityError do
+      ErrorMessage := E.Message;
+  end;
+  Expect<Boolean>(Pos('exactly one certificate with a private key',
+    ErrorMessage) > 0).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.ServerTest(const AName: string;
   const AMethod: TTestMethod);
 begin
@@ -5041,6 +5106,9 @@ begin
     DARWIN_SKIP_REASON);
   Skip('SChannel reload retains the previous key container',
     TestSChannelReloadRetainsPreviousKeyContainer,
+    DARWIN_SKIP_REASON);
+  Skip('SChannel multi-identity PKCS#12 leaves no key containers',
+    TestSChannelMultiIdentityLeavesNoKeyContainers,
     DARWIN_SKIP_REASON);
   {$ELSE}
   FServerBackendAvailable := TransportSecurityServerBackendAvailable;
@@ -5210,6 +5278,8 @@ begin
     TestSChannelIdentityImportsIsolatedKeyContainers);
   ServerTest('SChannel reload retains the previous key container',
     TestSChannelReloadRetainsPreviousKeyContainer);
+  ServerTest('SChannel multi-identity PKCS#12 leaves no key containers',
+    TestSChannelMultiIdentityLeavesNoKeyContainers);
   {$ELSE}
   Skip('SChannel handshake round-trips plaintext and reuses the context',
     TestSChannelHandshakeRoundtripAndContextReuse,
@@ -5240,6 +5310,9 @@ begin
     SCHANNEL_CLIENT_SKIP_REASON);
   Skip('SChannel reload retains the previous key container',
     TestSChannelReloadRetainsPreviousKeyContainer,
+    SCHANNEL_CLIENT_SKIP_REASON);
+  Skip('SChannel multi-identity PKCS#12 leaves no key containers',
+    TestSChannelMultiIdentityLeavesNoKeyContainers,
     SCHANNEL_CLIENT_SKIP_REASON);
   {$ENDIF}
   {$ENDIF}
@@ -5410,6 +5483,40 @@ begin
     tstmAnchorsOnly)), '4 MiB')).ToBe(True);
 end;
 
+procedure TTransportSecurityClientOptionTests.TestNativeMaterialRejectedBeforeConnecting;
+const
+  CLIENT_IDENTITY_PATH =
+    'packages/httpclient/source/fixtures/client-identity.p12';
+var
+  Empty: TBytes;
+  Options: TTransportSecurityClientOptions;
+begin
+  { Structurally one DER SEQUENCE, but no certificate: only the platform
+    parser can reject it. }
+  Empty := nil;
+  SetLength(Empty, 2);
+  Empty[0] := $30;
+  Empty[1] := $00;
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(Empty,
+    tstmAnchorsOnly)), 'not a valid X.509 certificate')).ToBe(True);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := LoadFixtureBytes(CLIENT_IDENTITY_PATH);
+  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  Expect<string>(ClientOptionsError(Options)).ToBe('');
+
+  Options.ClientPkcs12Passphrase := 'not-the-passphrase';
+  Expect<Boolean>(Mentions(ClientOptionsError(Options), 'passphrase'))
+    .ToBe(True);
+
+  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  SetLength(Options.ClientPkcs12, Length(Options.ClientPkcs12) div 2);
+  Expect<Boolean>(ClientOptionsError(Options) <> '').ToBe(True);
+
+  Options.ClientPkcs12 := TextBytes('not a PKCS#12 bundle');
+  Expect<Boolean>(ClientOptionsError(Options) <> '').ToBe(True);
+end;
+
 procedure TTransportSecurityClientOptionTests.SetupTests;
 begin
   Test('default client options select the option-less path',
@@ -5420,6 +5527,8 @@ begin
     TestMalformedAnchorsRejected);
   Test('inconsistent client options are rejected',
     TestInconsistentOptionsRejected);
+  Test('natively malformed anchors and identities are rejected before connecting',
+    TestNativeMaterialRejectedBeforeConnecting);
 end;
 
 begin

@@ -45,9 +45,18 @@ const
   SERVER_LEAF_PATH = FIXTURES + 'localhost-test-leaf-cert.pem';
   {$ENDIF}
   SELF_SIGNED_PKCS12_PATH = FIXTURES + 'localhost-self-signed-dev.p12';
-  { A clientAuth-only leaf under the test intermediate: exactly what a
-    client identity looks like. }
-  CLIENT_PKCS12_PATH = FIXTURES + 'localhost-wrong-purpose-identity.p12';
+  { A clientAuth leaf under its own client intermediate and root. The
+    bundle carries the intermediate but not the root, and the requiring
+    server trusts only the client root, so the intermediate must travel in
+    the client's Certificate message. }
+  CLIENT_PKCS12_PATH = FIXTURES + 'client-identity.p12';
+  CLIENT_ROOT_PATH = FIXTURES + 'client-root-cert.pem';
+  { A clientAuth leaf from the server hierarchy, which the requiring server
+    does not trust. }
+  FOREIGN_CLIENT_PKCS12_PATH =
+    FIXTURES + 'localhost-wrong-purpose-identity.p12';
+  { A public host LWPT's live-network tests already contact. }
+  LIVE_HTTPS_URL = 'https://github.com/';
   TEST_ROOT_PATH = FIXTURES + 'test-root-cert.pem';
   UNRELATED_ROOT_PATH = FIXTURES + 'unrelated-root-cert.pem';
   PKCS12_PASSPHRASE = 'test-only';
@@ -74,7 +83,7 @@ type
     FContext: TTransportSecurityServerContext;
     FListenSocket: TSocket;
     FPort: Word;
-    FRequireClientCertificate: Boolean;
+    FClientAnchors: TBytes;
     FResponses: array of AnsiString;
     FResults: array of TServedConnection;
     FServed: Integer;
@@ -115,6 +124,15 @@ type
     procedure TestHTTPClientSameOriginRedirectKeepsOptions;
     procedure TestHTTPClientCrossOriginRedirectDropsOptions;
     procedure TestHTTPClientRejectsInvalidOptionsBeforeConnecting;
+    procedure TestRequiringServerRefusesForeignClientIdentity;
+    procedure TestHTTPClientRejectsMalformedAnchorBeforeConnecting;
+    procedure TestHTTPClientRejectsCorruptIdentityBeforeConnecting;
+    procedure TestHTTPClientRejectsWrongPassphraseBeforeConnecting;
+    procedure TestLiveTrustModesDifferOnSystemStore;
+    procedure TestHTTPClientSameOriginRedirectKeepsInsecureMode;
+    procedure TestHTTPClientCrossOriginRedirectDropsInsecureMode;
+    procedure TestHTTPClientSameOriginRedirectKeepsClientIdentity;
+    procedure TestHTTPClientCrossOriginRedirectDropsClientIdentity;
   end;
 
 { ── platform sockets ─────────────────────────────────────────────── }
@@ -388,6 +406,13 @@ begin
   Result.InsecureSkipVerify := True;
 end;
 
+function ClientIdentityOptions: TTransportSecurityClientOptions;
+begin
+  Result := AnchorsOnly(TEST_ROOT_PATH);
+  Result.ClientPkcs12 := LoadFileBytes(CLIENT_PKCS12_PATH);
+  Result.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+end;
+
 function RedirectResponse(const ALocation: string): AnsiString;
 begin
   Result := AnsiString('HTTP/1.1 302 Found'#13#10'Location: ' + ALocation +
@@ -406,7 +431,9 @@ begin
   inherited Create(True);
   FreeOnTerminate := False;
   FListenSocket := INVALID_TEST_SOCKET;
-  FRequireClientCertificate := ARequireClientCertificate;
+  FClientAnchors := nil;
+  if ARequireClientCertificate then
+    FClientAnchors := LoadFileBytes(CLIENT_ROOT_PATH);
   SetLength(FResponses, Length(AResponses));
   for I := 0 to High(AResponses) do
     FResponses[I] := AResponses[I];
@@ -514,8 +541,9 @@ begin
   Deadline := GetTickCount64 + STEP_TIMEOUT_MILLISECONDS;
   BeginTransportSecurityServer(Connection, FContext);
   try
-    if FRequireClientCertificate then
-      TransportSecurityTestRequireClientCertificate(Connection);
+    if Length(FClientAnchors) > 0 then
+      TransportSecurityTestRequireClientCertificate(Connection,
+        FClientAnchors);
     repeat
       if Terminated or (GetTickCount64 > Deadline) then
         raise Exception.Create('server handshake timed out');
@@ -792,9 +820,7 @@ var
   Response: AnsiString;
   Served: TServedConnection;
 begin
-  Options := AnchorsOnly(TEST_ROOT_PATH);
-  Options.ClientPkcs12 := LoadFileBytes(CLIENT_PKCS12_PATH);
-  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  Options := ClientIdentityOptions;
   Expect<string>(RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
     Options, True, Response, Peer, Served)).ToBe('');
   Expect<string>(string(Response)).ToBe(OK_RESPONSE);
@@ -814,6 +840,25 @@ begin
     authoritative outcome either way. }
   RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
     AnchorsOnly(TEST_ROOT_PATH), True, Response, Peer, Served);
+  Expect<Boolean>(Served.HandshakeSucceeded).ToBe(False);
+  Expect<Boolean>(Served.Error <> '').ToBe(True);
+  Expect<Boolean>(Response = OK_RESPONSE).ToBe(False);
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.TestRequiringServerRefusesForeignClientIdentity;
+var
+  Options: TTransportSecurityClientOptions;
+  Peer: TBytes;
+  Response: AnsiString;
+  Served: TServedConnection;
+begin
+  { The server validates the chain instead of accepting any certificate: a
+    well-formed clientAuth identity from another hierarchy is refused. }
+  Options := AnchorsOnly(TEST_ROOT_PATH);
+  Options.ClientPkcs12 := LoadFileBytes(FOREIGN_CLIENT_PKCS12_PATH);
+  Options.ClientPkcs12Passphrase := PKCS12_PASSPHRASE;
+  RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost', Options, True,
+    Response, Peer, Served);
   Expect<Boolean>(Served.HandshakeSucceeded).ToBe(False);
   Expect<Boolean>(Served.Error <> '').ToBe(True);
   Expect<Boolean>(Response = OK_RESPONSE).ToBe(False);
@@ -889,6 +934,34 @@ begin
   Result.RequestTimeoutMilliseconds := STEP_TIMEOUT_MILLISECONDS;
   Result.ConnectAddress := '127.0.0.1';
   Result.TLS := ATLS;
+end;
+
+{ Runs HTTPGet against a server that expects one connection and returns the
+  EHTTPError message ('' on success) and the number of connections the
+  server accepted. }
+function HTTPClientErrorAndConnections(
+  const ATLS: TTransportSecurityClientOptions; out AAccepted: Integer):
+  string;
+var
+  Server: TLoopbackTLSServer;
+begin
+  Result := '';
+  Server := TLoopbackTLSServer.Create(SERVER_PKCS12_PATH, tsivStrict,
+    [OK_RESPONSE]);
+  try
+    try
+      HTTPGet('https://localhost:' + IntToStr(Server.Port) + '/', nil,
+        HTTPSOptions(ATLS));
+    except
+      on E: EHTTPError do
+        Result := E.Message;
+    end;
+    { Give a stray connection time to land before counting. }
+    Sleep(100);
+    AAccepted := Server.Served;
+  finally
+    Server.Free;
+  end;
 end;
 
 procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientTrustsPrivateCA;
@@ -993,6 +1066,215 @@ begin
   end;
 end;
 
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientRejectsMalformedAnchorBeforeConnecting;
+var
+  Accepted: Integer;
+  ErrorMessage: string;
+  Options: TTransportSecurityClientOptions;
+begin
+  { An empty SEQUENCE passes the structural DER check; only a native parse
+    rejects it. }
+  Options := DefaultTransportSecurityClientOptions;
+  SetLength(Options.TrustAnchors, 2);
+  Options.TrustAnchors[0] := $30;
+  Options.TrustAnchors[1] := $00;
+  Options.TrustMode := tstmAnchorsOnly;
+  ErrorMessage := HTTPClientErrorAndConnections(Options, Accepted);
+  Expect<Boolean>(Contains(ErrorMessage, 'not a valid X.509 certificate'))
+    .ToBe(True);
+  Expect<Integer>(Accepted).ToBe(0);
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientRejectsCorruptIdentityBeforeConnecting;
+var
+  Accepted: Integer;
+  ErrorMessage: string;
+  Options: TTransportSecurityClientOptions;
+begin
+  Options := ClientIdentityOptions;
+  SetLength(Options.ClientPkcs12, Length(Options.ClientPkcs12) div 2);
+  ErrorMessage := HTTPClientErrorAndConnections(Options, Accepted);
+  Expect<Boolean>(ErrorMessage <> '').ToBe(True);
+  Expect<Integer>(Accepted).ToBe(0);
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientRejectsWrongPassphraseBeforeConnecting;
+var
+  Accepted: Integer;
+  ErrorMessage: string;
+  Options: TTransportSecurityClientOptions;
+begin
+  Options := ClientIdentityOptions;
+  Options.ClientPkcs12Passphrase := 'not-the-passphrase';
+  ErrorMessage := HTTPClientErrorAndConnections(Options, Accepted);
+  Expect<Boolean>(Contains(ErrorMessage, 'passphrase')).ToBe(True);
+  Expect<Integer>(Accepted).ToBe(0);
+end;
+
+{ Live network: a publicly trusted host is the only way to show that
+  anchors-only ignores the platform store while system-plus-anchors keeps
+  it. Self-skips unless LWPT_ENABLE_NETWORK=1, and on a clean resolve or
+  connect failure, like the other live-network programs. }
+procedure TTransportSecurityClientOptionsE2ETests.TestLiveTrustModesDifferOnSystemStore;
+var
+  AnchorsOnlyError: string;
+  Options: THTTPRequestOptions;
+  Unreachable: string;
+begin
+  if GetEnvironmentVariable('LWPT_ENABLE_NETWORK') <> '1' then
+  begin
+    WriteLn('  [skip] LWPT_ENABLE_NETWORK=1 not set; live trust-mode check skipped');
+    Expect<Boolean>(True).ToBe(True);
+    Exit;
+  end;
+  Options := DefaultHTTPRequestOptions;
+  Options.RequestTimeoutMilliseconds := 30000;
+  Options.MaximumRedirects := 0;
+  Unreachable := '';
+  try
+    HTTPHead(LIVE_HTTPS_URL, nil, Options);
+  except
+    on E: EHTTPError do
+      if Contains(E.Message, 'resolve') or Contains(E.Message, 'connect') or
+         Contains(E.Message, 'deadline') then
+        Unreachable := E.Message
+      else
+        raise;
+  end;
+  if Unreachable <> '' then
+  begin
+    WriteLn('  [skip] ', LIVE_HTTPS_URL, ' unreachable: ', Unreachable);
+    Expect<Boolean>(True).ToBe(True);
+    Exit;
+  end;
+
+  Options.TLS := SystemAndAnchors(UNRELATED_ROOT_PATH);
+  HTTPHead(LIVE_HTTPS_URL, nil, Options);
+
+  AnchorsOnlyError := '';
+  Options.TLS := AnchorsOnly(UNRELATED_ROOT_PATH);
+  try
+    HTTPHead(LIVE_HTTPS_URL, nil, Options);
+  except
+    on E: EHTTPError do
+      AnchorsOnlyError := E.Message;
+  end;
+  Expect<Boolean>(Contains(AnchorsOnlyError, 'verification')).ToBe(True);
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientSameOriginRedirectKeepsInsecureMode;
+var
+  Response: THTTPResponse;
+  Server: TLoopbackTLSServer;
+begin
+  Server := TLoopbackTLSServer.Create(SELF_SIGNED_PKCS12_PATH, tsivPermissive,
+    [RedirectResponse('/next'), OK_RESPONSE]);
+  try
+    Response := HTTPGet('https://localhost:' + IntToStr(Server.Port) + '/',
+      nil, HTTPSOptions(InsecureOptions));
+    Server.Join;
+    Expect<Integer>(Response.StatusCode).ToBe(200);
+    Expect<Boolean>(Response.Redirected).ToBe(True);
+    Expect<string>(Server.Outcome(1).Error).ToBe('');
+  finally
+    Server.Free;
+  end;
+end;
+
+{ Cross-origin cases assert on the target server, which never receives a
+  request when the option was dropped. On OpenSSL the option-less client
+  completes the handshake before judging the peer, so the target's record
+  distinguishes a dropped option from a carried one. }
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientCrossOriginRedirectDropsInsecureMode;
+var
+  Failed: Boolean;
+  Origin, Target: TLoopbackTLSServer;
+begin
+  Target := TLoopbackTLSServer.Create(SELF_SIGNED_PKCS12_PATH, tsivPermissive,
+    [OK_RESPONSE]);
+  try
+    Origin := TLoopbackTLSServer.Create(SELF_SIGNED_PKCS12_PATH,
+      tsivPermissive,
+      [RedirectResponse('https://localhost:' + IntToStr(Target.Port) + '/')]);
+    try
+      Failed := False;
+      try
+        HTTPGet('https://localhost:' + IntToStr(Origin.Port) + '/', nil,
+          HTTPSOptions(InsecureOptions));
+      except
+        on EHTTPError do
+          Failed := True;
+      end;
+      Origin.Join;
+      Target.Join;
+      Expect<Boolean>(Failed).ToBe(True);
+      Expect<string>(Origin.Outcome(0).Error).ToBe('');
+      Expect<Integer>(Target.Served).ToBe(1);
+      Expect<Boolean>(Target.Outcome(0).Error <> '').ToBe(True);
+    finally
+      Origin.Free;
+    end;
+  finally
+    Target.Free;
+  end;
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientSameOriginRedirectKeepsClientIdentity;
+var
+  Response: THTTPResponse;
+  Server: TLoopbackTLSServer;
+begin
+  Server := TLoopbackTLSServer.Create(SERVER_PKCS12_PATH, tsivStrict,
+    [RedirectResponse('/next'), OK_RESPONSE], True);
+  try
+    Response := HTTPGet('https://localhost:' + IntToStr(Server.Port) + '/',
+      nil, HTTPSOptions(ClientIdentityOptions));
+    Server.Join;
+    Expect<Integer>(Response.StatusCode).ToBe(200);
+    Expect<Boolean>(Response.Redirected).ToBe(True);
+    Expect<Boolean>(Server.Outcome(1).HandshakeSucceeded).ToBe(True);
+  finally
+    Server.Free;
+  end;
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.TestHTTPClientCrossOriginRedirectDropsClientIdentity;
+var
+  Failed: Boolean;
+  Origin, Target: TLoopbackTLSServer;
+begin
+  Target := TLoopbackTLSServer.Create(SERVER_PKCS12_PATH, tsivStrict,
+    [OK_RESPONSE], True);
+  try
+    Origin := TLoopbackTLSServer.Create(SERVER_PKCS12_PATH, tsivStrict,
+      [RedirectResponse('https://localhost:' + IntToStr(Target.Port) + '/')],
+      True);
+    try
+      Failed := False;
+      try
+        HTTPGet('https://localhost:' + IntToStr(Origin.Port) + '/', nil,
+          HTTPSOptions(ClientIdentityOptions));
+      except
+        on EHTTPError do
+          Failed := True;
+      end;
+      Origin.Join;
+      Target.Join;
+      { A carried identity would let the target's handshake succeed on
+        every backend where the client finishes before judging the peer;
+        without it the requiring target refuses the handshake itself. }
+      Expect<Boolean>(Failed).ToBe(True);
+      Expect<Boolean>(Origin.Outcome(0).HandshakeSucceeded).ToBe(True);
+      Expect<Integer>(Target.Served).ToBe(1);
+      Expect<Boolean>(Target.Outcome(0).HandshakeSucceeded).ToBe(False);
+    finally
+      Origin.Free;
+    end;
+  finally
+    Target.Free;
+  end;
+end;
+
 procedure TTransportSecurityClientOptionsE2ETests.SetupTests;
 begin
   Test('anchors-only trust verifies a server issued by the configured CA',
@@ -1025,6 +1307,24 @@ begin
     TestHTTPClientCrossOriginRedirectDropsOptions);
   Test('HTTPClient rejects invalid TLS options before connecting',
     TestHTTPClientRejectsInvalidOptionsBeforeConnecting);
+  Test('a validating server refuses a client identity from another hierarchy',
+    TestRequiringServerRefusesForeignClientIdentity);
+  Test('HTTPClient rejects a natively malformed anchor before connecting',
+    TestHTTPClientRejectsMalformedAnchorBeforeConnecting);
+  Test('HTTPClient rejects a corrupt client identity before connecting',
+    TestHTTPClientRejectsCorruptIdentityBeforeConnecting);
+  Test('HTTPClient rejects a wrong identity passphrase before connecting',
+    TestHTTPClientRejectsWrongPassphraseBeforeConnecting);
+  Test('live: anchors-only ignores the system store, system-plus-anchors keeps it',
+    TestLiveTrustModesDifferOnSystemStore);
+  Test('HTTPClient keeps InsecureSkipVerify across a same-origin redirect',
+    TestHTTPClientSameOriginRedirectKeepsInsecureMode);
+  Test('HTTPClient drops InsecureSkipVerify on a cross-origin redirect',
+    TestHTTPClientCrossOriginRedirectDropsInsecureMode);
+  Test('HTTPClient keeps the client identity across a same-origin redirect',
+    TestHTTPClientSameOriginRedirectKeepsClientIdentity);
+  Test('HTTPClient drops the client identity on a cross-origin redirect',
+    TestHTTPClientCrossOriginRedirectDropsClientIdentity);
 end;
 
 {$IFDEF MSWINDOWS}

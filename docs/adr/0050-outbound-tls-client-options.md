@@ -56,8 +56,9 @@ function DefaultTransportSecurityClientOptions: TTransportSecurityClientOptions;
 function TransportSecurityClientOptionsAreDefault(const AOptions): Boolean;
 ```
 
-`ValidateTransportSecurityClientOptions` does no platform work, so callers
-can reject a bad configuration before connecting. It refuses:
+`ValidateTransportSecurityClientOptions` opens no socket and persists
+nothing, so callers can reject a bad configuration before connecting.
+HTTPClient calls it before the first dial. It refuses:
 
 - anchors-only trust without anchors;
 - `InsecureSkipVerify` combined with anchors or anchors-only trust;
@@ -65,12 +66,22 @@ can reject a bad configuration before connecting. It refuses:
 - anchors over 4 MiB or 1,024 certificates, and identities over 16 MiB (the
   server's PKCS#12 ceiling);
 - anchors that are neither PEM `CERTIFICATE` blocks nor one complete DER
-  certificate.
+  certificate;
+- any anchor the platform cannot parse as a certificate, a PKCS#12 bundle
+  the platform cannot open with the given passphrase, and, on Windows, a
+  bundle that holds more than one certificate with a private key.
 
-The unit removes the PEM armour and decodes the base64 body. It then checks
-only that each result is one complete DER `SEQUENCE`. Certificate parsing and
-all path validation stay with each platform's API. No certificate semantics
-or cryptography are implemented in LWPT.
+The unit removes the PEM armour and decodes the base64 body, and checks that
+each result is one complete DER `SEQUENCE`. The platform then parses it:
+OpenSSL builds a throwaway context with the anchors and the identity,
+Secure Transport runs the connection's own importers (the identity check
+creates and removes a temporary keychain), and SChannel parses the anchors
+into a memory store and opens the bundle with `PKCS12_NO_PERSIST_KEY`, so
+no key is persisted. Every backend also parses the anchors and imports the
+identity before its first handshake byte, so a caller that skips validation
+still never sends TLS traffic with malformed material. Certificate parsing
+and all path validation stay with each platform's API. No certificate
+semantics or cryptography are implemented in LWPT.
 
 Anchors are root CA certificates. A non-self-signed CA certificate used as an
 anchor is accepted by Secure Transport, but OpenSSL (without
@@ -111,7 +122,15 @@ an identity-only configuration.
 | --- | --- | --- |
 | OpenSSL | `PKCS12_parse` from memory, then `SSL_CTX_use_certificate`, `SSL_CTX_use_PrivateKey`, chain certificates, and `SSL_CTX_check_private_key`. | Owned by the connection's `SSL_CTX`; input copies and the passphrase are wiped. |
 | Secure Transport | The server importer: an isolated 0600 temporary keychain, never added to the search list, then `SSLSetCertificate` with the identity and its chain. | Released when the connection closes, with the same quarantine and dead-owner recovery rules as server snapshots. |
-| SChannel | The server importer: `PFXImportCertStore` into the user's CNG provider, persisted because SChannel signs in lsass, then passed as `paCred`. | The connection owns the container and deletes it with `NCryptDeleteKey` when it closes. A hard kill can leave the container behind, as for server snapshots. |
+| SChannel | The server importer: `PFXImportCertStore` into the user's CNG provider, persisted because SChannel signs in lsass, then passed as `paCred`. The bundle's intermediates are published into the current user's intermediate store, as for a server, because SChannel builds the outgoing client `Certificate` message from the Windows stores. | The connection owns the container and deletes it with `NCryptDeleteKey` when it closes, and withdraws the issuers it published. A hard kill can leave both behind, as for server snapshots. |
+
+`PFXImportCertStore` persists one container for every certificate with a
+key, not only the selected one. The importer therefore records every
+container before anything can fail, deletes them all on every exit
+(including rejection), and rejects a bundle with more than one keyed
+certificate. The rule applies to server contexts too, which share the
+importer. OpenSSL and Secure Transport keep no persistent key outside the
+connection, so they use the first identity as before.
 
 The client identity is not validated as a server identity (`tsivPermissive`).
 Judging it is the server's job. With options, SChannel sets
@@ -163,10 +182,16 @@ Exercising mTLS needs a server that requests a certificate. The production
 server never does, and this ADR does not change that. The test-only
 `TransportSecurityTestRequireClientCertificate` exists only when `PRODUCTION`
 is not defined. It makes one fresh server connection require a certificate
-and accept any certificate that is presented:
-`SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT` with an accepting
-callback, `kAlwaysAuthenticate` with a break on client authentication, or
-`ASC_REQ_MUTUAL_AUTH` followed by a remote-certificate check. The loopback
+that chains to caller-supplied client anchors for client authentication.
+Intermediates must arrive in the client's `Certificate` message: OpenSSL
+uses a connection-private verify store holding only the anchors with
+`SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT`; Secure Transport uses
+`kAlwaysAuthenticate`, breaks on client authentication, and evaluates with
+the client SSL policy, the anchors only, and network fetching disabled;
+SChannel adds `ASC_REQ_MUTUAL_AUTH` and builds the chain in an
+exclusive-anchor engine whose `hRestrictedOther` is empty and with AIA
+disabled. The test client identity uses its own root and intermediate, so
+a client that omits its bundled intermediate is refused. The loopback
 E2E suite `packages/httpclient/tests/e2e/TransportSecurityClientOptions.E2E.Test.pas`
 drives the production client against these server backends on every
 platform.

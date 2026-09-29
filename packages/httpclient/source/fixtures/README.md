@@ -35,6 +35,41 @@ openssl req -new -x509 -days 3650 -sha256 -key unrelated-root-key.pem \
   -config unrelated-root.cnf -out unrelated-root-cert.pem
 ```
 
+The mTLS cases use a separate client hierarchy so that a validating server
+needs the intermediate from the client's own bundle. `client-identity.p12`
+(passphrase `test-only`) holds a `clientAuth` leaf and the client
+intermediate, but not `client-root-cert.pem`, which the test server trusts.
+Each certificate has its own committed key and configuration:
+
+```sh
+openssl req -new -x509 -days 3650 -sha256 -key client-root-key.pem \
+  -config client-root.cnf -out client-root-cert.pem
+openssl req -new -key client-intermediate-key.pem \
+  -config client-intermediate.cnf -out intermediate.csr
+openssl x509 -req -in intermediate.csr -CA client-root-cert.pem \
+  -CAkey client-root-key.pem -set_serial 0x6001 -days 3650 -sha256 \
+  -extfile client-intermediate.cnf -extensions intermediate_extensions \
+  -out client-intermediate-cert.pem
+openssl req -new -key client-leaf-key.pem -config client-leaf.cnf \
+  -out leaf.csr
+openssl x509 -req -in leaf.csr -CA client-intermediate-cert.pem \
+  -CAkey client-intermediate-key.pem -set_serial 0x6002 -days 3650 -sha256 \
+  -extfile client-leaf.cnf -extensions leaf_extensions \
+  -out client-leaf-cert.pem
+openssl pkcs12 -export -inkey client-leaf-key.pem -in client-leaf-cert.pem \
+  -certfile client-intermediate-cert.pem \
+  -name transport-security-test-client -passout pass:test-only \
+  -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 \
+  -out client-identity.p12
+```
+
+`localhost-multi-identity.p12` (passphrase `test-only`) carries two
+certificate-and-key identities, the test leaf and the test root, to pin the
+Windows rule that a bundle holds exactly one keyed certificate and that no
+imported key container survives its rejection. `openssl pkcs12 -export`
+emits one key only, so regenerate it from the repository root with
+`instantfpc packages/httpclient/scripts/generate-multi-identity-pkcs12.pas`.
+
 The committed PEM keys and certificates are the reproducible source material.
 Regenerate the PKCS#12 bundles with OpenSSL 3 from this directory:
 
