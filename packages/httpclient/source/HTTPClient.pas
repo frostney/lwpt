@@ -93,6 +93,10 @@ type
     the limit is known to be exceeded (a declared Content-Length, a chunk
     size, or the received bytes), before the excess is read. }
   EHTTPResponseTooLarge = class(EHTTPError);
+  { TLS refused the peer: its certificate chain, validity, purpose, or host
+    name failed verification (ETransportSecurityVerificationError). Unlike
+    other transport failures, retrying the same request cannot succeed. }
+  EHTTPTLSVerificationError = class(EHTTPError);
 
   {$IF DEFINED(UNIX) AND DEFINED(HTTPCLIENT_TESTING)}
   { Test-only select seam. Production code must leave this nil. The hook can
@@ -2065,6 +2069,13 @@ end;
 // Public API
 // ---------------------------------------------------------------------------
 
+procedure RaiseTransportSecurityFailure(const AError: ETransportSecurityError);
+begin
+  if AError is ETransportSecurityVerificationError then
+    raise EHTTPTLSVerificationError.Create(AError.Message);
+  raise EHTTPError.Create(AError.Message);
+end;
+
 function DefaultHTTPRequestOptions: THTTPRequestOptions;
 begin
   Result.MaxResponseBodyBytes := DEFAULT_MAX_RESPONSE_BODY_BYTES;
@@ -2098,7 +2109,7 @@ begin
       AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 
@@ -2116,7 +2127,7 @@ begin
       AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 
@@ -2137,7 +2148,7 @@ begin
       AHeaders, AOptions, AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 
@@ -2158,7 +2169,7 @@ begin
       AHeaders, AOptions, AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 
@@ -2179,7 +2190,7 @@ begin
       AHeaders, AOptions, AOptions.MaximumRedirects);
   except
     on E: ETransportSecurityError do
-      raise EHTTPError.Create(E.Message);
+      RaiseTransportSecurityFailure(E);
   end;
 end;
 

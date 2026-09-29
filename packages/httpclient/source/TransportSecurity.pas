@@ -45,6 +45,11 @@ const
 
 type
   ETransportSecurityError = class(Exception);
+  { The client refused the peer: its certificate chain, validity, purpose,
+    or host name failed verification. Raised by every client backend, with
+    or without options, so a caller can tell a trust refusal, which a retry
+    cannot fix, from a transient transport failure. }
+  ETransportSecurityVerificationError = class(ETransportSecurityError);
 
   TTransportSecurityState = (
     tssDone,
@@ -927,6 +932,21 @@ function SSLSetCertificate(AContext: SSLContextRef;
   external name 'SSLSetCertificate';
 function SSLHandshake(AContext: SSLContextRef): OSStatus; cdecl;
   external name 'SSLHandshake';
+
+{ Certificate statuses Secure Transport's own evaluation ends a client
+  handshake with (errSSLXCertChainInvalid, errSSLBadCert,
+  errSSLUnknownRootCert, errSSLNoRootCert, errSSLCertExpired,
+  errSSLCertNotYetValid, errSSLHostNameMismatch). }
+function SecureTransportStatusIsVerificationFailure(const AStatus: OSStatus): Boolean;
+begin
+  case AStatus of
+    -9807, -9808, -9812, -9813, -9814, -9815, -9843:
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 function SSLRead(AContext: SSLContextRef; AData: Pointer;
   ADataLength: PtrUInt; var AProcessed: PtrUInt): OSStatus; cdecl;
   external name 'SSLRead';
@@ -2020,7 +2040,7 @@ begin
   try
     Status := SSLCopyPeerTrust(AContext, Trust);
     if (Status <> ERR_SEC_SUCCESS) or (Trust = nil) then
-      raise ETransportSecurityError.CreateFmt(
+      raise ETransportSecurityVerificationError.CreateFmt(
         '%s: the server presented no certificate', [TLS_VERIFICATION_ERROR]);
     EncodedHost := UTF8Encode(UnicodeString(AHost));
     HostName := CFStringCreateWithCString(nil, PAnsiChar(EncodedHost),
@@ -2060,9 +2080,9 @@ begin
         Exit;
     end;
     if ErrorReference <> nil then
-      raise ETransportSecurityError.CreateFmt('%s: %d',
+      raise ETransportSecurityVerificationError.CreateFmt('%s: %d',
         [TLS_VERIFICATION_ERROR, Int64(CFErrorGetCode(ErrorReference))]);
-    raise ETransportSecurityError.Create(TLS_VERIFICATION_ERROR);
+    raise ETransportSecurityVerificationError.Create(TLS_VERIFICATION_ERROR);
   finally
     if ErrorReference <> nil then
       CFRelease(ErrorReference);
@@ -2245,6 +2265,11 @@ begin
           Data.WantWrite);
     until Status <> ERR_SSL_WOULD_BLOCK;
 
+    { Without options Secure Transport evaluates the chain itself and
+      ends the handshake with one of its certificate statuses. }
+    if SecureTransportStatusIsVerificationFailure(Status) then
+      raise ETransportSecurityVerificationError.CreateFmt('%s: %d',
+        [TLS_HANDSHAKE_ERROR, Status]);
     if Status <> ERR_SEC_SUCCESS then
       raise ETransportSecurityError.CreateFmt('%s: %d',
         [TLS_HANDSHAKE_ERROR, Status]);
@@ -4103,9 +4128,9 @@ var
 begin
   Reason := OpenSSLClientVerifyErrorString(AVerifyResult);
   if Assigned(Reason) then
-    raise ETransportSecurityError.CreateFmt('%s: %s',
+    raise ETransportSecurityVerificationError.CreateFmt('%s: %s',
       [TLS_VERIFICATION_ERROR, string(AnsiString(Reason))]);
-  raise ETransportSecurityError.CreateFmt('%s: %d',
+  raise ETransportSecurityVerificationError.CreateFmt('%s: %d',
     [TLS_VERIFICATION_ERROR, AVerifyResult]);
 end;
 
@@ -4204,7 +4229,7 @@ begin
     if not AUseOptions then
     begin
       if SSLGetVerifyResult(Data.SSL) <> X509_V_OK then
-        raise ETransportSecurityError.Create('OpenSSL certificate verification failed');
+        raise ETransportSecurityVerificationError.Create('OpenSSL certificate verification failed');
     end
     else if not AOptions.InsecureSkipVerify then
     begin
@@ -5603,6 +5628,24 @@ begin
     Result := Result + ' ' + Name;
 end;
 
+{ Certificate statuses SChannel's own server validation ends a client
+  handshake with: an untrusted, unknown, expired, misused, or misnamed
+  server certificate, and every CERT_E_ trust-policy status. }
+function SChannelStatusIsVerificationFailure(const AStatus: LongWord): Boolean;
+begin
+  case AStatus of
+    $80090322, { SEC_E_WRONG_PRINCIPAL }
+    $80090325, { SEC_E_UNTRUSTED_ROOT }
+    $80090327, { SEC_E_CERT_UNKNOWN }
+    $80090328, { SEC_E_CERT_EXPIRED }
+    $80090349, { SEC_E_CERT_WRONG_USAGE }
+    $80090352: { SEC_E_ISSUING_CA_UNTRUSTED }
+      Result := True;
+  else
+    Result := (AStatus and $FFFFFF00) = $800B0100;
+  end;
+end;
+
 { A handshake that ends because the server closed the connection names the
   last status the client saw and whether it answered a certificate request
   anonymously, which is where a refused client identity shows up. }
@@ -5796,6 +5839,12 @@ begin
         Continue;
       end;
 
+      { Without options SChannel validates the server itself and fails
+        the handshake with a certificate status. }
+      if SChannelStatusIsVerificationFailure(LongWord(Status)) then
+        raise ETransportSecurityVerificationError.CreateFmt(
+          '%s: %s (client handshake)',
+          [TLS_HANDSHAKE_ERROR, SChannelStatusText(LongWord(Status))]);
       if Status <> SEC_E_OK then
         raise ETransportSecurityError.CreateFmt('%s: %s (client handshake)',
           [TLS_HANDSHAKE_ERROR, SChannelStatusText(LongWord(Status))]);
@@ -7561,7 +7610,7 @@ var
   ErrorCode: LongWord;
 begin
   if not Assigned(AAnchorStore) then
-    raise ETransportSecurityError.CreateFmt('%s: no trust anchors',
+    raise ETransportSecurityVerificationError.CreateFmt('%s: no trust anchors',
       [TLS_VERIFICATION_ERROR]);
   { The offline anchor evaluation runs first, so a server issued by a
     configured anchor is accepted without any network work in either mode.
@@ -7572,7 +7621,7 @@ begin
   if (ErrorCode <> 0) and (AOptions.TrustMode = tstmSystemAndAnchors) then
     ErrorCode := SChannelChainPolicyError(nil, APeer, AHost, True, 0);
   if ErrorCode <> 0 then
-    raise ETransportSecurityError.CreateFmt('%s: %s',
+    raise ETransportSecurityVerificationError.CreateFmt('%s: %s',
       [TLS_VERIFICATION_ERROR, SChannelStatusText(ErrorCode)]);
 end;
 
@@ -7589,7 +7638,7 @@ begin
   Peer := nil;
   if (QueryContextAttributesW(@Context, SECPKG_ATTR_REMOTE_CERT_CONTEXT,
      @Peer) <> SEC_E_OK) or not Assigned(Peer) then
-    raise ETransportSecurityError.CreateFmt(
+    raise ETransportSecurityVerificationError.CreateFmt(
       '%s: the server presented no certificate', [TLS_VERIFICATION_ERROR]);
   try
     VerifySChannelPeerCertificate(Peer, AHost, AOptions, AAnchorStore);

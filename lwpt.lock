@@ -18,7 +18,7 @@ resolvedCommit = ""
 sourceIdentity = "local|packages/httpclient/"
 constraintFingerprint = "sha256:5a56a5d7afa211636d2b842b66c70e40640d0427ecd50f2a338a920ee46a9028"
 resolvedURL = ""
-computedHash = "sha256:6b07c8a224ac117e445b8929a8652f08eb5fa400eb731f7666b7e7afd7b7c5a0"
+computedHash = "sha256:5c2bb3cbfa35ad441d9ffcae72f5c5dacd28291835982ffe9f9174784ecf8a74"
 archiveHash = ""
 
 [package.semver]
