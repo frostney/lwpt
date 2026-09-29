@@ -5776,7 +5776,8 @@ begin
 end;
 
 { One component of a table header as the writer emits it: a bare key, or a
-  basic string without escapes, quotes, or control characters. }
+  basic string without escapes, double quotes, or control characters. An
+  apostrophe is literal there, and registry URL paths may hold one. }
 function IsLockHeaderComponent(const AText: string): Boolean;
 var i: Integer; Inner: string;
 begin
@@ -5786,25 +5787,33 @@ begin
   if not Result then Exit;
   Inner := Copy(AText, 2, Length(AText) - 2);
   for i := 1 to Length(Inner) do
-    if (Inner[i] in ['"', '\', '''']) or (Ord(Inner[i]) < $20)
+    if (Inner[i] in ['"', '\']) or (Ord(Inner[i]) < $20)
        or (Ord(Inner[i]) = $7F) then
       Exit(False);
 end;
 
 { The header of a line in the writer's form without any trailing comment,
-  or '' when the line is not a well-formed single table header. }
+  or '' when the line is not a well-formed single table header. The
+  closing bracket is found outside quotes, so a quoted component may hold
+  any character the writer leaves unescaped. }
 function LockHeaderOf(const ATrimmed: string): string;
-var Body, Component: string; i, Start: Integer; Quoted: Boolean;
+var Body, Component, Rest: string; i, Close, Start: Integer; Quoted: Boolean;
 begin
   Result := '';
-  if Copy(ATrimmed, 1, 2) = '[[' then Exit;
-  i := Pos(']', ATrimmed);
-  { An identity never holds ']', so the first one closes the header. }
-  if (Copy(ATrimmed, 1, 1) <> '[') or (i = 0) then Exit;
-  if (Trim(Copy(ATrimmed, i + 1, MaxInt)) <> '')
-     and (Copy(Trim(Copy(ATrimmed, i + 1, MaxInt)), 1, 1) <> '#') then
-    Exit;
-  Body := Copy(ATrimmed, 2, i - 2);
+  if (Copy(ATrimmed, 1, 1) <> '[') or (Copy(ATrimmed, 1, 2) = '[[') then Exit;
+  Close := 0;
+  Quoted := False;
+  for i := 2 to Length(ATrimmed) do
+    if ATrimmed[i] = '"' then Quoted := not Quoted
+    else if (ATrimmed[i] = ']') and not Quoted then
+    begin
+      Close := i;
+      Break;
+    end;
+  if Close = 0 then Exit;
+  Rest := Trim(Copy(ATrimmed, Close + 1, MaxInt));
+  if (Rest <> '') and (Copy(Rest, 1, 1) <> '#') then Exit;
+  Body := Copy(ATrimmed, 2, Close - 2);
   Start := 1;
   Quoted := False;
   for i := 1 to Length(Body) + 1 do
@@ -5820,6 +5829,60 @@ begin
   Result := '[' + Body + ']';
 end;
 
+{ The problem with one single-line value as the writer emits it, or '':
+  strings are read lexically, so a triple quote inside a basic or literal
+  string is ordinary text. A value that opens a multiline string, holds an
+  inline table, or leaves a string or an array open at the end of its line
+  is refused; the structural check parses everything else. }
+function LockValueProblem(const AValue: string): string;
+var
+  i, Depth: Integer;
+  Token: string;
+  ValueEnded: Boolean;
+begin
+  Result := '';
+  if AValue = '' then Exit('has no value');
+  Depth := 0;
+  ValueEnded := False;
+  i := 1;
+  while i <= Length(AValue) do
+  begin
+    Token := Copy(AValue, i, 3);
+    if (Token = '"""') or (Token = '''''''') then
+      Exit('contains a multiline string');
+    case AValue[i] of
+      '#':
+        Break;
+      '{':
+        Exit('holds an inline table');
+      '"':
+        begin
+          Inc(i);
+          while (i <= Length(AValue)) and (AValue[i] <> '"') do
+          begin
+            if AValue[i] = '\' then Inc(i);
+            Inc(i);
+          end;
+          if i > Length(AValue) then Exit('leaves a string open');
+        end;
+      '''':
+        begin
+          Inc(i);
+          while (i <= Length(AValue)) and (AValue[i] <> '''') do Inc(i);
+          if i > Length(AValue) then Exit('leaves a string open');
+        end;
+      '[':
+        Inc(Depth);
+      ']':
+        Dec(Depth);
+    end;
+    if (Depth = 0) and not (AValue[i] in [' ', #9]) then ValueEnded := True;
+    Inc(i);
+  end;
+  if Depth <> 0 then Exit('leaves an array open');
+  if not ValueEnded then Exit('has no value');
+end;
+
 { Refuses every form the lock writer never emits (ADR-0052 section 5): the
   upgrade edits machine-written documents only. Every line must be blank, a
   comment, a single table header in the writer's form, or `bare-key =
@@ -5829,10 +5892,8 @@ procedure RequireMachineWrittenLockForm(const AText: string);
 var
   Lines: TStringList;
   i: Integer;
-  Trimmed, Key, Value: string;
+  Trimmed, Key, Value, Problem: string;
 begin
-  if (Pos('"""', AText) > 0) or (Pos('''''''', AText) > 0) then
-    RaiseUnsafeLockEdit('it contains a multiline string');
   Lines := TStringList.Create;
   try
     Lines.Text := AText;
@@ -5855,9 +5916,10 @@ begin
       if not IsLockBareKey(Key) then
         RaiseUnsafeLockEdit(Format('line %d has the key %s, which is not a '
           + 'bare key %s writes', [i + 1, Key, PROGRAM_NAME]));
-      if (Value = '') or (Value[1] = '{') then
-        RaiseUnsafeLockEdit(Format('line %d has a value %s never writes',
-          [i + 1, PROGRAM_NAME]));
+      Problem := LockValueProblem(Value);
+      if Problem <> '' then
+        RaiseUnsafeLockEdit(Format('line %d %s, which %s never writes',
+          [i + 1, Problem, PROGRAM_NAME]));
     end;
   finally
     Lines.Free;

@@ -127,6 +127,7 @@ type
     procedure TestRegistryRepairNeedsItsProofs;
     procedure TestRegistryRepairRecordsMergedAcceptedState;
     procedure TestRegistryRepairBoundsProofDocuments;
+    procedure TestRegistryApostropheIdentityMigrates;
     procedure TestFrozenLeavesArchiveStorageUntouched;
     procedure TestRepeatedRotationHashesAreRefused;
     procedure TestRotationCountIsBoundedBeforeReading;
@@ -1228,6 +1229,48 @@ begin
   FOrigin.Mode := scmServe;
 end;
 
+procedure TInstallRegistryLocked.TestRegistryApostropheIdentityMigrates;
+const
+  APOSTROPHE_IDENTITY = 'https://registry.example.test/team''s';
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, V4: string;
+begin
+  { A registry URL path may hold an apostrophe, and the writer emits it
+    literally in the table header: such a lock is writer output and must
+    migrate. }
+  CaseRoot := NewCase('v3-apostrophe');
+  Registry := TSyntheticRegistry.Create(APOSTROPHE_IDENTITY, 13);
+  Origin := TSyntheticContact.Create(Registry, '/apos');
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.Publish(RegistryStamp(-60), RegistryStamp(6 * DAY));
+    WriteTextFile(CaseRoot + '/project/lwpt.toml', '[package]'#10
+      + 'name = "consumer"'#10 + 'version = "1.0.0"'#10
+      + 'units = ["source"]'#10 + '[registries.corp]'#10
+      + 'identity = "' + APOSTROPHE_IDENTITY + '"'#10
+      + 'key-id = "' + Registry.KeyID + '"'#10
+      + 'public-key = "' + Registry.PublicKey + '"'#10
+      + 'origin = "' + Origin.BaseURL + '"'#10
+      + '[dependencies]'#10 + 'json = "registry:json"'#10);
+    ExpectSuccess('apostrophe install', Run(CaseRoot, ['install']));
+    V4 := LockText(CaseRoot);
+    Expect<Boolean>(Pos('[registry."' + APOSTROPHE_IDENTITY + '"]', V4) > 0)
+      .ToBe(True);
+    DowngradeLockToV3(CaseRoot + '/project');
+    DeleteFile(CaseRoot + '/transport.log');
+    Origin.Mode := scmFail;
+    ExpectSuccess('apostrophe repair', Run(CaseRoot, ['repair']));
+    Expect<string>(LockText(CaseRoot)).ToBe(V4);
+    ExpectSuccess('apostrophe frozen', Run(CaseRoot, ['install', '--frozen']));
+    Expect<string>(Journal(CaseRoot)).ToBe('');
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
 procedure TInstallRegistryLocked.SetArchivesReadOnly(const ACase: string;
   const AReadOnly: Boolean);
 var Entry: TSearchRec; Root: string;
@@ -1385,6 +1428,8 @@ begin
     TestRegistryRepairRecordsMergedAcceptedState);
   Test('ADR-0052: repair loads proofs within the verification budgets',
     TestRegistryRepairBoundsProofDocuments);
+  Test('ADR-0052: a registry identity with an apostrophe migrates',
+    TestRegistryApostropheIdentityMigrates);
   Test('review: --frozen never writes beside committed archives, even on failure',
     TestFrozenLeavesArchiveStorageUntouched);
   Test('review: repeated rotation hashes in the lock are refused',

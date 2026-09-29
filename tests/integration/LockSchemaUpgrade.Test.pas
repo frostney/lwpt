@@ -74,6 +74,7 @@ type
     procedure TestHistoricalV3LockChangesOnlyItsDigests;
     procedure TestMultilineValuesFailClosed;
     procedure TestUnsafeLockFormsFailClosed;
+    procedure TestTripleQuoteInSourceMigrates;
     procedure TestRepairReplacesASubstitutedModule;
     procedure TestRepairMissingArchiveFailsWithMigrationMessage;
     procedure TestRepairCorruptArchiveFailsWithMigrationMessage;
@@ -473,11 +474,11 @@ begin
   ExpectRefusedLock('multiline string', Root, HistoricalV3Lock(Root, #10, '',
     'notes = ''''''' + #10 + 'computedHash = "' + Legacy + '"' + #10
     + '[package.local-dep]' + #10 + '''''''' + #10),
-    'it contains a multiline string');
+    'contains a multiline string');
   ExpectRefusedLock('escaped triple quote', Root, HistoricalV3Lock(Root, #10,
     '', 'notes = """' + #10 + '\"""' + #10 + '[package.local-dep]' + #10
     + 'computedHash = "preserve this text"' + #10 + '# """' + #10),
-    'it contains a multiline string');
+    'contains a multiline string');
   ExpectRefusedLock('multi-line array', Root, HistoricalV3Lock(Root, #10, '',
     'history = [' + #10 + '  ["computedHash", "kept"],' + #10 + ']' + #10),
     'line ');
@@ -500,10 +501,10 @@ begin
     + #10 + '\"""' + #10 + '[package.shared]' + #10
     + 'computedHash = "preserve this text"' + #10 + '# """' + #10, []);
   ExpectRefusedLock('aliasing key', Root, Historical,
-    'it contains a multiline string');
-  { The same aliasing key with a single-line value: refused as a quoted key
-    before any edit, and the component-wise comparison could not alias it
-    either. }
+    'which is not a bare key');
+  { The same aliasing key with a single-line value: also refused as a
+    quoted key before any edit, and the component-wise comparison could not
+    alias it either. }
   Historical := StringReplace(HistoricalV3Lock(Root, #10),
     'version = 3' + #10, 'version = 3' + #10
     + '"package\u0001shared\u0001computedHash" = "preserve this text"' + #10,
@@ -512,13 +513,45 @@ begin
     'which is not a bare key');
   { An inline table the writer never emits. }
   ExpectRefusedLock('inline table', Root, HistoricalV3Lock(Root, #10, '',
-    'extra = { computedHash = "x" }' + #10), 'has a value');
+    'extra = { computedHash = "x" }' + #10), 'holds an inline table');
   { A dotted key is not a bare key either. }
   ExpectRefusedLock('dotted key', Root, HistoricalV3Lock(Root, #10, '',
     'meta.computedHash = "x"' + #10), 'which is not a bare key');
   { An array-of-tables header the writer never emits. }
   ExpectRefusedLock('array of tables', Root, HistoricalV3Lock(Root, #10) + #10
     + '[[extra]]' + #10 + 'note = "x"' + #10, 'is not a table header');
+end;
+
+procedure TLockSchemaUpgrade.TestTripleQuoteInSourceMigrates;
+var Root, V4, Manifest: string;
+begin
+  { A local source path may hold a triple quote; the writer keeps it inside
+    a single-line basic string, so the lock is writer output and must
+    migrate. }
+  Root := NewRoot('triple-quote-source');
+  WriteLocalPackage(Root + '/vendor/''''''/dep', 'odd-dep');
+  WriteExactFile(Root + '/source/main.pas',
+    'program main;'#10 + '{$mode delphi}{$H+}'#10 + 'begin end.'#10);
+  Manifest := '[package]'#10 + 'name = "odd"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10 + '[dependencies]'#10
+    + 'odd-dep = "./vendor/''''''/dep"'#10;
+  {$IFDEF UNIX}
+  { Double quotes are escaped by the writer, so an escaped triple double
+    quote is writer output too. Windows names cannot hold '"'. }
+  WriteLocalPackage(Root + '/vendor/"""/dep', 'quote-dep');
+  Manifest := Manifest + 'quote-dep = "./vendor/\"\"\"/dep"'#10;
+  {$ENDIF}
+  WriteExactFile(Root + '/lwpt.toml', Manifest);
+  ExpectSuccess('triple-quote install', Run(Root, ['install']));
+  V4 := LockText(Root);
+  Expect<Boolean>(Pos('source = "./vendor/''''''/dep"', V4) > 0).ToBe(True);
+  {$IFDEF UNIX}
+  Expect<Boolean>(Pos('source = "./vendor/\"\"\"/dep"', V4) > 0).ToBe(True);
+  {$ENDIF}
+  DowngradeLockToV3(Root);
+  ExpectSuccess('triple-quote repair', Run(Root, ['repair']));
+  Expect<string>(LockText(Root)).ToBe(V4);
+  ExpectSuccess('triple-quote frozen', Run(Root, ['install', '--frozen']));
 end;
 
 procedure TLockSchemaUpgrade.TestRepairReplacesASubstitutedModule;
@@ -781,6 +814,8 @@ begin
     TestMultilineValuesFailClosed);
   Test('repair refuses quoted, aliasing, dotted, and inline-table forms',
     TestUnsafeLockFormsFailClosed);
+  Test('repair migrates a source path holding a triple quote',
+    TestTripleQuoteInSourceMigrates);
   Test('repair replaces a substituted module a forged v3 digest matched',
     TestRepairReplacesASubstitutedModule);
   Test('repair names a missing archive with the migration message',
