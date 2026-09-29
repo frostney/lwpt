@@ -160,6 +160,11 @@ function ValidateRegistryCapabilities(const AContent, ARole: string;
 function RegistryURIIsCanonical(const AValue: string;
   const AAllowLocalhostHTTP: Boolean): Boolean;
 function RegistryHashIsCanonical(const AValue: string): Boolean;
+{ Protocol 1 package-name grammar: 1-128 bytes of [a-z0-9._-], starting
+  with a letter or digit. }
+function RegistryPackageNameIsCanonical(const AValue: string): Boolean;
+{ Canonical SemVer 2.0.0 with no 'v' prefix. }
+function RegistryVersionIsCanonical(const AValue: string): Boolean;
 { RFC 3339 UTC with whole seconds and the Z suffix. }
 function RegistryTimestampIsCanonical(const AValue: string): Boolean;
 function RegistryTrustRootIsValid(const AKeyId, APublicKey: string): Boolean;
@@ -182,10 +187,6 @@ function VerifyRegistryRotation(const ARotation: TLWPTRegistryRotationProof;
   const APreviousSequence, ACheckpointSequence: Int64): TLWPTUntrustedRegistryRotation;
 function ParseRegistryPackage(const AContent, AExpectedHash,
   AExpectedOrigin: string): TLWPTRegistryPackage;
-{ Protocol package-name grammar: one [a-z0-9] then up to 127 [a-z0-9._-]. }
-function RegistryPackageNameIsCanonical(const AValue: string): Boolean;
-{ Canonical SemVer 2.0.0 without a leading v. }
-function RegistryVersionIsCanonical(const AValue: string): Boolean;
 { Content identity of two records for one package identity: archive,
   archive size, and dependencies. published_at and yanked are excluded. }
 function RegistryPackageContentEqual(const ALeft,

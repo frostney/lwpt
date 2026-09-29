@@ -390,7 +390,14 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.GitPack.pas` (bounded commits-only packfile reader), `LWPT.SHA1.pas` (self-contained SHA-1 for git object ids; the cross toolchain ships no `sha1` unit),
 `LWPT.FetchPolicy.pas` (built-in forge origins and per-dependency fetch
 destination policy), `LWPT.Gzip.pas` (stream-based RFC 1952 decoding for archive
-extraction), and the `LWPT.Registry.*` origin storage, signing,
+extraction), `LWPT.Archive.pas` (archive-contract primitives shared by the
+installer's extraction preflight and the publication archive layer: traversal,
+link, component, and UTF-8 name rules, tar header readers, stable failure
+codes, and fixed bounds), `LWPT.TarWriter.pas` (the deterministic canonical
+tar.gz writer), `LWPT.Zip.pas` (the bounded in-tree zip container reader),
+`LWPT.ArchiveNormalize.pas` (publication input detection, the tar.gz scan, and
+zip normalization per [ADR-0049](./adr/0049-registry-remote-publication.md)),
+and the `LWPT.Registry.*` origin storage, signing,
 shared proof verification, mirror synchronization, HTTP routing, upload
 staging, publication tokens, audit records, publication handling, and native
 macOS listener units) plus a small remainder of utility units
