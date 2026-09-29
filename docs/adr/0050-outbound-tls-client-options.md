@@ -105,6 +105,10 @@ self-issued anchor. LWPT does not set either flag, so only roots are portable.
 
 ### Trust anchors per backend
 
+> The evaluation order and network behaviour below are amended by
+> [Offline anchor evaluation](#amendment-offline-anchor-evaluation): the
+> anchors are evaluated first and offline on every backend.
+
 | Backend | Anchors only | System plus anchors | Host name |
 | --- | --- | --- | --- |
 | OpenSSL | Anchors are added to the context store with `X509_STORE_add_cert`; default paths are not loaded. | `SSL_CTX_set_default_verify_paths`, then the anchors are added to the same store. One evaluation. | `SSL_set1_host`, as today. |
@@ -249,3 +253,76 @@ platform.
 - The HTTPClient package version moves to 0.7.0. `THTTPRequestOptions` gains
   a field, and HTTPClient's interface now uses `TransportSecurity`.
 - OCSP and CRL policy, ALPN, and SNI override remain out of scope.
+
+## Amendment: offline anchor evaluation
+
+After #339 merged, the i386 Windows runner took 12 to 16 s for the first two
+anchors-only handshakes and then failed one with `TLS read failed`, while
+later anchors-only cases and the system-plus-anchors cases took about
+100 ms. The certificates carry no AIA, CRL, or OCSP URLs, so the cost was
+Windows' own network work during chain building. It is either the
+automatic root-store update or a URL fetch bounded by the default 15 s
+`dwUrlRetrievalTimeout`. The first attempts timed out and were then
+negatively cached, which is why later identical evaluations were fast. The
+exclusive-anchor engine and `CertGetCertificateChain` were created with no
+retrieval flags, so nothing stopped that fetch. The client finished its
+evaluation after the E2E server's 10 s request deadline, so the server
+closed the connection.
+
+The decision:
+
+- **Anchors are evaluated offline.** A configured anchor set is a private
+  trust decision, so building its chain needs no fetched issuer and no
+  Microsoft root update. On SChannel the exclusive-anchor engine sets
+  `CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL` and a 1 s `dwUrlRetrievalTimeout`.
+  The chain call adds `CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL`,
+  `CERT_CHAIN_DISABLE_AIA`, and `CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE`.
+  On Secure Transport the anchor evaluation calls
+  `SecTrustSetNetworkFetchAllowed(false)`. OpenSSL never fetches
+  certificate URLs, so its evaluation was already offline and is
+  unchanged.
+- **A server must send its intermediates.** An anchored chain is complete
+  only when the server sends its intermediates or they are already local.
+  This matches OpenSSL, which never fetches issuers.
+- **LWPT adds no explicit revocation policy.** SChannel gets no
+  `CERT_CHAIN_REVOCATION_CHECK_*` chain flag and no
+  `SCH_CRED_REVOCATION_CHECK_*` credential flag, as in its option-less
+  client, and the offline anchor engine cannot fetch OCSP or CRLs. On
+  Secure Transport the anchor pass only disables network fetching: Apple's
+  trust engine may still apply revocation information it already has, such
+  as its revocation database, stapled responses, and cached responses. This
+  amendment makes no claim that revocation outcomes match the option-less
+  clients on every platform. Revocation policy remains a non-goal.
+- **Windows and macOS evaluate the anchors first in both modes.** System
+  plus anchors evaluates the anchors offline first. Only if that fails does
+  it evaluate against the system store with the platform's default network
+  behaviour. On SChannel that is the current user's default engine; on
+  Secure Transport it is a re-evaluation with the system anchors and
+  network fetching restored. The accepted set is the same union as before.
+  A server under a configured anchor is accepted without network work, and
+  a publicly trusted server keeps the platform's own AIA and root-update
+  behaviour. OpenSSL has no second pass: system plus anchors is one offline
+  evaluation against a single store holding the default verify paths and
+  the anchors, and anchors-only is the same evaluation without the default
+  paths.
+- **The test hook uses the same engine.** The test-only client-certificate
+  hook on SChannel builds its chain with the same offline engine.
+
+The policy is pinned by observation, not by timing. A fixture leaf, served
+or evaluated without its intermediate, points its AIA, OCSP, and CRL URLs
+at `http://127.0.0.1:47931/`, where the tests run a recorder that counts
+every request (`Tests.RetrievalRecorder`). An anchors-only evaluation must
+fail with zero requests. The positive control is system plus anchors,
+whose fallback evaluation is allowed to fetch: on Windows and macOS the
+recorder must then see at least one request, which shows that the
+endpoint detects retrieval, so restoring retrieval in the anchor pass
+fails the zero-request assertion. OpenSSL never fetches, so on
+Unix-not-Darwin both modes must show zero requests and no positive
+control exists. Windows runs the check without a server through
+`TransportSecurityTestVerifyServerChain`, which is compiled only when
+`PRODUCTION` is not defined (test and development builds). An SChannel
+server builds its own outgoing chain and could fetch the URL itself, so
+the handshake version of the check runs on Unix and macOS only. A second
+fixture pointing at never-routed TEST-NET-1 (`192.0.2.1`) and the
+anchors-only E2E cases keep 5 s and 8 s bounds as latency checks, not as
+proof.
