@@ -2,8 +2,9 @@
 program Bootstrap;
 
 { Bootstrap LWPT for the first build of a fresh clone (or after
-  `lwpt build --clean`). Produces build/lwpt, after which
-  ./build/lwpt build is the canonical build entry point.
+  `lwpt build --clean`). Produces build/lwpt (build/lwpt.exe on
+  Windows), after which ./build/lwpt build is the canonical build entry
+  point.
 
   Single responsibility: invoke fpc once to compile source/lwpt.pas
   -> build/lwpt, passing -Fu / -Fi for each workspace package's
@@ -31,11 +32,24 @@ uses
 
 const
   BUILD_DIR      = 'build';
-  OUTPUT_BINARY  = 'build/lwpt';
   SOURCE_DIR     = 'source';
   PROGRAM_SOURCE = 'source/lwpt.pas';
   MANIFEST_PATH  = 'lwpt.toml';
   VERSION_INC    = 'source/Version.inc';
+  { FPC writes -o verbatim, so the Windows image needs its extension here to
+    match bootstrap.bat's fallback and `lwpt build`'s published output. }
+  {$IFDEF MSWINDOWS}
+  EXECUTABLE_EXTENSION = '.exe';
+  {$ELSE}
+  EXECUTABLE_EXTENSION = '';
+  {$ENDIF}
+
+{ The executable takes the program source's base name. }
+function OutputBinary: string;
+begin
+  Result := BUILD_DIR + '/'
+    + ChangeFileExt(ExtractFileName(PROGRAM_SOURCE), EXECUTABLE_EXTENSION);
+end;
 
 { Inline copy of scripts/stamp-version.pas's logic. The cold bootstrap
   cannot shell out to InstantFPC for the generator (instantfpc might not
@@ -128,7 +142,7 @@ var
   Code: Integer;
 begin
   ForceDirectories(BUILD_DIR);
-  WriteLn('bootstrap: compiling ', PROGRAM_SOURCE, ' -> ', OUTPUT_BINARY);
+  WriteLn('bootstrap: compiling ', PROGRAM_SOURCE, ' -> ', OutputBinary);
   { Dev flags only. Mirrors TLWPTFPCCompilerDriver.BuildArguments' dev path;
     keep in sync until scripts/bootstrap-flags.inc is introduced. }
   Code := RunProcess('fpc',
@@ -148,7 +162,7 @@ begin
       '-Fupackages/semver/source',     '-Fipackages/semver/source',
       '-Fupackages/toml/source',       '-Fipackages/toml/source',
       '-Fupackages/testing/source',    '-Fipackages/testing/source',
-      '-o' + OUTPUT_BINARY,
+      '-o' + OutputBinary,
       PROGRAM_SOURCE ]);
   if Code <> 0 then
     raise Exception.CreateFmt(
@@ -159,7 +173,7 @@ begin
   try
     StampVersion;
     CompileLwpt;
-    WriteLn('bootstrap complete: ', OUTPUT_BINARY);
+    WriteLn('bootstrap complete: ', OutputBinary);
   except
     on E: Exception do
     begin

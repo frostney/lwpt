@@ -90,7 +90,11 @@ retaining sessions whose recorded process is alive.
   sanitisation collisions and excessive path lengths.
 - Publication requires a same-filesystem atomic replacement. If the platform
   refuses replacement, including a locked destination, LWPT leaves the prior
-  public artifact intact and retains the candidate for diagnosis.
+  public artifact intact and retains the candidate for diagnosis. On Windows
+  a destination that is still running (the self-hosted rebuild replacing
+  `build\lwpt.exe`) is replaced, and its undeletable old image is renamed to
+  a retired sibling that later publications and `lwpt repair` delete once
+  unused ([#331](https://github.com/frostney/lwpt/issues/331)).
 - The fingerprint binds the exact manifest bytes loaded before parsing to the
   parsed request. A manifest change during or after parsing refuses compilation
   or publication instead of combining new on-disk bytes with stale parsed
