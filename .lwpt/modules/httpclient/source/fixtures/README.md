@@ -19,7 +19,21 @@ intermediate but not the root.
 | `localhost-non-ca-issuer-identity.p12` | `test-only` | Rejection of an issuer with `CA:FALSE` |
 | `localhost-no-certsign-identity.p12` | `test-only` | Rejection of an issuer whose key usage omits `keyCertSign` |
 | `localhost-pathlen-identity.p12` | `test-only` | Rejection of an intermediate below a `pathlen:0` root |
-| `localhost-self-signed-dev.p12` | `test-only` | Explicit permissive-development mode |
+| `localhost-self-signed-dev.p12` | `test-only` | Explicit permissive-development mode; the self-signed server for client `InsecureSkipVerify` tests |
+
+The client-options E2E test (ADR-0050) also presents
+`localhost-wrong-purpose-identity.p12`, whose leaf carries only `clientAuth`,
+as the client identity for mTLS. It uses `test-root-cert.pem` as the trusted
+anchor, and `unrelated-root-cert.pem` as a CA that issued nothing the servers
+present. The unrelated root is self-signed with its own committed key,
+`unrelated-root-key.pem`, and `unrelated-root.cnf`:
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out unrelated-root-key.pem
+openssl req -new -x509 -days 3650 -sha256 -key unrelated-root-key.pem \
+  -config unrelated-root.cnf -out unrelated-root-cert.pem
+```
 
 The committed PEM keys and certificates are the reproducible source material.
 Regenerate the PKCS#12 bundles with OpenSSL 3 from this directory:

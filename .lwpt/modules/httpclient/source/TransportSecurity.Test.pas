@@ -51,6 +51,7 @@ uses
   DynLibs,
   OpenSSL,
   {$ENDIF}
+  base64,
   TestingPascalLibrary,
   TransportSecurity;
 
@@ -102,6 +103,18 @@ const
     'the raw in-memory SChannel loopback client is Windows-only';
 
 type
+  { Backend-neutral checks of the outbound client options record: no
+    sockets, no platform TLS work. The loopback E2E program covers the
+    per-backend behaviour. }
+  TTransportSecurityClientOptionTests = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestDefaultOptionsSelectOptionlessPath;
+    procedure TestAnchorEncodingsValidate;
+    procedure TestMalformedAnchorsRejected;
+    procedure TestInconsistentOptionsRejected;
+  end;
+
   TTransportSecurityServerTests = class(TTestSuite)
   private
     FServerBackendAvailable: Boolean;
@@ -5232,7 +5245,186 @@ begin
   {$ENDIF}
 end;
 
+{ ── client options ───────────────────────────────────────────────── }
+
+const
+  TEST_ROOT_CERTIFICATE_PATH =
+    'packages/httpclient/source/fixtures/test-root-cert.pem';
+  TEST_INTERMEDIATE_CERTIFICATE_PATH =
+    'packages/httpclient/source/fixtures/localhost-test-intermediate-cert.pem';
+
+function TextBytes(const AText: AnsiString): TBytes;
 begin
+  Result := nil;
+  SetLength(Result, Length(AText));
+  if Length(AText) > 0 then
+    Move(AText[1], Result[0], Length(AText));
+end;
+
+function JoinBytes(const AFirst, ASecond: TBytes): TBytes;
+begin
+  Result := nil;
+  SetLength(Result, Length(AFirst) + Length(ASecond));
+  if Length(AFirst) > 0 then
+    Move(AFirst[0], Result[0], Length(AFirst));
+  if Length(ASecond) > 0 then
+    Move(ASecond[0], Result[Length(AFirst)], Length(ASecond));
+end;
+
+function PEMCertificateDER(const APath: string): TBytes;
+const
+  PEM_BEGIN = '-----BEGIN CERTIFICATE-----';
+  PEM_END = '-----END CERTIFICATE-----';
+var
+  BodyEnd, BodyStart: Integer;
+  Raw: TBytes;
+  Text: AnsiString;
+begin
+  Raw := LoadFixtureBytes(APath);
+  SetString(Text, PAnsiChar(@Raw[0]), Length(Raw));
+  BodyStart := Pos(PEM_BEGIN, Text) + Length(PEM_BEGIN);
+  BodyEnd := Pos(PEM_END, Text);
+  Result := TextBytes(DecodeStringBase64(StringReplace(StringReplace(
+    Copy(Text, BodyStart, BodyEnd - BodyStart), #13, '', [rfReplaceAll]),
+    #10, '', [rfReplaceAll])));
+end;
+
+function AnchorOptions(const AAnchors: TBytes;
+  const AMode: TTransportSecurityTrustMode): TTransportSecurityClientOptions;
+begin
+  Result := DefaultTransportSecurityClientOptions;
+  Result.TrustAnchors := AAnchors;
+  Result.TrustMode := AMode;
+end;
+
+function ClientOptionsError(
+  const AOptions: TTransportSecurityClientOptions): string;
+begin
+  Result := '';
+  try
+    ValidateTransportSecurityClientOptions(AOptions);
+  except
+    on E: ETransportSecurityError do
+      Result := E.Message;
+  end;
+end;
+
+function Mentions(const AText, AFragment: string): Boolean;
+begin
+  Result := Pos(LowerCase(AFragment), LowerCase(AText)) > 0;
+end;
+
+procedure TTransportSecurityClientOptionTests.TestDefaultOptionsSelectOptionlessPath;
+var
+  Options: TTransportSecurityClientOptions;
+begin
+  Options := DefaultTransportSecurityClientOptions;
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(True);
+  Expect<string>(ClientOptionsError(Options)).ToBe('');
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.InsecureSkipVerify := True;
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+  Options := DefaultTransportSecurityClientOptions;
+  Options.TrustMode := tstmAnchorsOnly;
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := TextBytes('x');
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+  Options := DefaultTransportSecurityClientOptions;
+  Options.TrustAnchors := LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH);
+  Expect<Boolean>(TransportSecurityClientOptionsAreDefault(Options)).ToBe(False);
+end;
+
+procedure TTransportSecurityClientOptionTests.TestAnchorEncodingsValidate;
+var
+  Bundle: TBytes;
+begin
+  Expect<string>(ClientOptionsError(AnchorOptions(
+    LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH), tstmAnchorsOnly))).ToBe('');
+  Bundle := JoinBytes(LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH),
+    LoadFixtureBytes(TEST_INTERMEDIATE_CERTIFICATE_PATH));
+  Expect<string>(ClientOptionsError(AnchorOptions(Bundle,
+    tstmSystemAndAnchors))).ToBe('');
+  Expect<string>(ClientOptionsError(AnchorOptions(
+    PEMCertificateDER(TEST_ROOT_CERTIFICATE_PATH), tstmAnchorsOnly))).ToBe('');
+end;
+
+procedure TTransportSecurityClientOptionTests.TestMalformedAnchorsRejected;
+var
+  Pem: AnsiString;
+  Raw: TBytes;
+begin
+  Raw := LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH);
+  SetString(Pem, PAnsiChar(@Raw[0]), Length(Raw));
+
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes('not a certificate'), tstmAnchorsOnly)),
+    'neither PEM')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    JoinBytes(PEMCertificateDER(TEST_ROOT_CERTIFICATE_PATH), TextBytes('x')),
+    tstmAnchorsOnly)), 'neither PEM')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes(Copy(Pem, 1, Pos('-----END', Pem) - 1)), tstmAnchorsOnly)),
+    'unterminated')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes(StringReplace(Pem, 'M', '*', [])), tstmAnchorsOnly)),
+    'not a valid PEM certificate')).ToBe(True);
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(
+    TextBytes('-----BEGIN PRIVATE KEY-----'#10'AAAA'#10 +
+    '-----END PRIVATE KEY-----'#10), tstmAnchorsOnly)),
+    'no PEM CERTIFICATE')).ToBe(True);
+end;
+
+procedure TTransportSecurityClientOptionTests.TestInconsistentOptionsRejected;
+var
+  Oversized: TBytes;
+  Options: TTransportSecurityClientOptions;
+begin
+  Options := DefaultTransportSecurityClientOptions;
+  Options.TrustMode := tstmAnchorsOnly;
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'requires at least one trust anchor')).ToBe(True);
+
+  Options := AnchorOptions(LoadFixtureBytes(TEST_ROOT_CERTIFICATE_PATH),
+    tstmSystemAndAnchors);
+  Options.InsecureSkipVerify := True;
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'InsecureSkipVerify cannot be combined')).ToBe(True);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12Passphrase := 'secret';
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'requires a client identity')).ToBe(True);
+
+  Options := DefaultTransportSecurityClientOptions;
+  Options.ClientPkcs12 := TextBytes('x');
+  Options.ClientPkcs12Passphrase := 'a'#0'b';
+  Expect<Boolean>(Mentions(ClientOptionsError(Options),
+    'embedded NUL')).ToBe(True);
+
+  Oversized := nil;
+  SetLength(Oversized, 4 * 1024 * 1024 + 1);
+  FillChar(Oversized[0], Length(Oversized), Ord('A'));
+  Expect<Boolean>(Mentions(ClientOptionsError(AnchorOptions(Oversized,
+    tstmAnchorsOnly)), '4 MiB')).ToBe(True);
+end;
+
+procedure TTransportSecurityClientOptionTests.SetupTests;
+begin
+  Test('default client options select the option-less path',
+    TestDefaultOptionsSelectOptionlessPath);
+  Test('PEM, PEM bundle, and DER trust anchors validate',
+    TestAnchorEncodingsValidate);
+  Test('malformed trust anchors are rejected before any connection',
+    TestMalformedAnchorsRejected);
+  Test('inconsistent client options are rejected',
+    TestInconsistentOptionsRejected);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TTransportSecurityClientOptionTests.Create(
+    'TransportSecurity: client options'));
   TestRunnerProgram.AddSuite(TTransportSecurityServerTests.Create(
     'TransportSecurity: TLS server accept'));
   TestRunnerProgram.Run;
