@@ -124,9 +124,11 @@ function EntryField(const ALock, AName, AField: string): string;
 var Rest: string; Start: Integer;
 begin
   Result := '';
-  Start := Pos('[package.' + AName + ']'#10, ALock);
+  { The lock uses the platform line ending. }
+  Rest := StringReplace(ALock, #13#10, #10, [rfReplaceAll]);
+  Start := Pos('[package.' + AName + ']'#10, Rest);
   if Start = 0 then Exit;
-  Rest := Copy(ALock, Start, MaxInt);
+  Rest := Copy(Rest, Start, MaxInt);
   Start := Pos(#10 + AField + ' = "', Rest);
   if Start = 0 then Exit;
   Rest := Copy(Rest, Start + Length(AField) + 5, MaxInt);
@@ -1238,7 +1240,7 @@ var
   Origin: TSyntheticContact;
   First, Second: string;
   Search: TSearchRec;
-  StatePath: string;
+  StatePath, Corrupt: string;
 begin
   First := NewCase('shared-state-a');
   Second := NewCase('shared-state-b');
@@ -1266,10 +1268,11 @@ begin
     StatePath := First + '/state/origins/' + Search.Name;
     FindClose(Search);
     WriteTextFile(StatePath, 'schema = "garbage"'#10);
+    Corrupt := ReadText(StatePath);
     ExpectFailure(Install(First, ['install']), 'registry_state_corrupt');
     Expect<Boolean>(Pos(Search.Name, Output(Install(First, ['install']))) > 0)
       .ToBe(True);
-    Expect<string>(ReadText(StatePath)).ToBe('schema = "garbage"'#10);
+    Expect<string>(ReadText(StatePath)).ToBe(Corrupt);
   finally
     Origin.Free;
     Registry.Free;
