@@ -2645,13 +2645,538 @@ begin
   end;
 end;
 
+{ ===========================================================================
+  Locked registry selections (ADR-0051 decision 4)
+  =========================================================================== }
+
+{ One committed proof document, which must hash to its name, within the
+  per-document verification limit. }
+function ReadRegistryProofDocument(const AArchivesRoot, AHash: string): TBytes;
+begin
+  Result := ReadLockedRegistryDocument(AArchivesRoot, '', AHash,
+    DefaultRegistryVerificationLimits.DocumentBytes);
+end;
+
+{ Verifies a lock table's committed selection proof against the lock's
+  claims for ARecords (ADR-0051 decision 4) and returns the authenticated
+  records in the same order, with the exact proof bytes in ASelection. The
+  documents are loaded under the bounded policy of
+  LoadLockedRegistrySelection; AStateRoot lets a missing one come from the
+  per-user document store. }
+function VerifyCommittedRegistryProof(const AArchivesRoot, AStateRoot: string;
+  const ATable: TLWPTRegistryLockTable; const ATrust: TLWPTRegistryTrust;
+  const ARecords: TLWPTRegistryLockedRecordArray;
+  out AVerified: TLWPTVerifiedRegistrySelection;
+  out ASelection: TLWPTRegistryLockedSelection; out AReason: string): Boolean;
+var
+  Claims: TLWPTRegistryLockedClaims;
+  Hashes: TStringArray;
+  Index: Integer;
+begin
+  Result := False;
+  AReason := '';
+  AVerified := Default(TLWPTVerifiedRegistrySelection);
+  ASelection := Default(TLWPTRegistryLockedSelection);
+  try
+    if ATable.TrustKeyId <> ATrust.KeyId then
+      raise ELWPTRegistryError.CreateStable('registry_pin_changed',
+        'trust pin for ' + ATable.Identity + ' changed');
+    SetLength(Hashes, Length(ARecords));
+    for Index := 0 to High(ARecords) do
+      Hashes[Index] := ARecords[Index].RecordHash;
+    ASelection := LoadLockedRegistrySelection(AArchivesRoot, AStateRoot, ATable,
+      Hashes, DefaultRegistryVerificationLimits);
+    Claims := Default(TLWPTRegistryLockedClaims);
+    Claims.Checkpoint := ATable.Checkpoint;
+    Claims.Signature := ATable.Signature;
+    Claims.Snapshot := ATable.Snapshot;
+    Claims.KeyId := ATable.KeyId;
+    Claims.Sequence := ATable.Sequence;
+    Claims.PublishedAt := ATable.PublishedAt;
+    Claims.ExpiresAt := ATable.ExpiresAt;
+    Claims.Records := Copy(ARecords);
+    AVerified := VerifyRegistryLockedSelection(ASelection, ATrust, Claims);
+    Result := True;
+  except
+    on E: Exception do AReason := E.Message;
+  end;
+end;
+
+{ The lock's claims for AIdentity's registry entries, sorted by record hash
+  without repeats. }
+function RegistryClaimsFor(const AEntries: array of TResolved;
+  const AIdentity: string): TLWPTRegistryLockedRecordArray;
+var
+  Order: TStringList;
+  k: Integer;
+  Entry: TResolved;
+begin
+  Result := nil;
+  Order := TStringList.Create;
+  try
+    Order.Sorted := True;
+    Order.Duplicates := dupIgnore;
+    Order.CaseSensitive := True;
+    for k := 0 to High(AEntries) do
+      if (AEntries[k].SrcKind = skRegistry)
+         and (AEntries[k].RegistryOrigin = AIdentity)
+         and (AEntries[k].RegistryRecord <> '') then
+        Order.AddObject(AEntries[k].RegistryRecord, TObject(PtrInt(k)));
+    SetLength(Result, Order.Count);
+    for k := 0 to Order.Count - 1 do
+    begin
+      Entry := AEntries[PtrInt(Order.Objects[k])];
+      Result[k].RecordHash := Entry.RegistryRecord;
+      Result[k].Name := Entry.Name;
+      Result[k].Version := Entry.Version;
+      Result[k].ArchiveHash := Entry.ArchiveHash;
+    end;
+  finally
+    Order.Free;
+  end;
+end;
+
+{ A signed record dependency as a graph requirement. The online resolver
+  and the frozen walk build it identically, so both graphs, and therefore
+  both constraint fingerprints, agree. }
+function RegistryRecordRequirement(
+  const ADependency: TLWPTRegistryDependency): TDependency;
+begin
+  Result := Default(TDependency);
+  Result.Name := ADependency.Name;
+  Result.SrcOriginal := REGISTRY_SOURCE_PREFIX + ':' + ADependency.Name;
+  Result.SrcKind := skRegistry;
+  Result.SrcLocator := ADependency.Name;
+  Result.RegistryOrigin := ADependency.Origin;
+  Result.VersionSpec := ADependency.Version;
+  if Valid(Result.VersionSpec, DefaultSemverOptions) = Result.VersionSpec then
+    Result.VersionKind := vkSemverExact
+  else
+    Result.VersionKind := vkSemverRange;
+end;
+
+procedure RequireInstallableRegistryName(const ARequirer, AName: string);
+begin
+  if not ValidRegistryPackageName(AName) then
+    raise EManifestError.CreateFmt(
+      '"%s" requires registry package "%s", whose name cannot be '
+      + 'installed: consumers accept only [a-z0-9][a-z0-9_-]{0,127}',
+      [ARequirer, AName]);
+end;
+
+{ The extracted manifest must name the signed record's package and version
+  before any of its bytes are used. }
+procedure RequireRegistryManifestIdentity(const AName, AVersion,
+  ATree: string);
+var RelDir, Path: string; Manifest: TManifest;
+begin
+  if not FindModuleManifest(ATree, RelDir) then
+    raise ELWPTRegistryError.CreateStable(
+      'registry_manifest_identity_mismatch', 'archive of ' + AName
+      + '@' + AVersion + ' contains no ' + MANIFEST_FILE);
+  Path := IncludeTrailingPathDelimiter(ATree);
+  if RelDir <> '' then Path := Path + RelDir + '/';
+  Manifest := LoadManifest(Path + MANIFEST_FILE, False);
+  if (Manifest.Name <> AName) or (Manifest.Version <> AVersion) then
+    raise ELWPTRegistryError.CreateStable(
+      'registry_manifest_identity_mismatch', 'archive manifest declares '
+      + Manifest.Name + '@' + Manifest.Version + ', but the signed record '
+      + 'is ' + AName + '@' + AVersion);
+end;
+
+{ ADR-0051 decision 5: only the root and workspace members, whose trust
+  roots the root owns, declare registry dependencies in this version. }
+procedure RefuseNestedRegistryDependency(const ANode: TDependency;
+  const AChild: TDependency);
+begin
+  if AChild.SrcKind = skRegistry then
+    raise EManifestError.CreateFmt(
+      'dependency "%s" (%s source) declares registry dependency '
+      + '"%s" in its %s; registry dependencies may be declared '
+      + 'only in the root manifest and workspace members. '
+      + 'Declare "%s" in the root %s instead',
+      [ANode.Name, SourceKindToStr(ANode.SrcKind), AChild.Name,
+       MANIFEST_FILE, AChild.Name, MANIFEST_FILE]);
+end;
+
+{ An alias a workspace member shares with the root names the same identity
+  and pin (ADR-0051); the member's own table is otherwise used only when it
+  is published. }
+procedure CheckMemberRegistries(const ARootMan, AMember: TManifest;
+  const AMemberName: string; AConsumer: TLWPTRegistryConsumer);
+var
+  k: Integer;
+  RootDeclaration: TLWPTRegistryDeclaration;
+begin
+  for k := 0 to High(AMember.Registries) do
+  begin
+    if not FindRegistryDeclaration(ARootMan.Registries,
+         AMember.Registries[k].Alias, RootDeclaration) then Continue;
+    if (AMember.Registries[k].KeyId <> RootDeclaration.KeyId)
+       or (AMember.Registries[k].PublicKey <> RootDeclaration.PublicKey)
+       or ((AMember.Registries[k].Identity <> '')
+         and (RootDeclaration.Identity <> '')
+         and (AMember.Registries[k].Identity <> RootDeclaration.Identity)) then
+      raise EManifestError.CreateFmt(
+        'workspace member "%s" declares [registries.%s] with a different '
+        + 'identity or pin than the root %s; an alias shared with the root '
+        + 'must name the same identity and pin',
+        [AMemberName, AMember.Registries[k].Alias, MANIFEST_FILE]);
+    { The root omits identity: the member's identity constrains the one the
+      root declaration locks or establishes, now or later. }
+    if (AMember.Registries[k].Identity <> '')
+       and (RootDeclaration.Identity = '') then
+      AConsumer.SessionForAlias(RootDeclaration.Alias).RequireIdentity(
+        AMember.Registries[k].Identity, AMemberName);
+  end;
+end;
+
+type
+  { Network-free verification of locked registry selections for --frozen and
+    --offline (ADR-0051 decision 4). Origins resolve from the manifest and
+    the lock, never from a contact; each selection is proven from its
+    committed proof and the manifest pin, and its signed record supplies the
+    node's edges. No registry client or transport is ever constructed. }
+  TLockedRegistry = class
+  private
+    FConsumer: TLWPTRegistryConsumer;
+    FRootMan: TManifest;
+    FLock: TResolvedArray;
+    FArchivesRoot, FStateRoot, FMode: string;
+    { Verified claim sets, parallel to FPackages. }
+    FVerifiedClaims: TStringList;
+    FPackages: TLWPTRegistryPackageArray;
+    FNotes: TStringList;
+    procedure Fail(const AMessage: string);
+    procedure NoteOnce(const AKey, AMessage: string);
+  public
+    { AStateRoot <> '' lets a missing committed proof document come from the
+      per-user document store (--offline). AMode prefixes diagnostics. }
+    constructor Create(AConsumer: TLWPTRegistryConsumer;
+      const ARootMan: TManifest; const ALock: TResolvedArray;
+      const AArchivesRoot, AStateRoot, AMode: string);
+    destructor Destroy; override;
+    { The origin identity of a registry requirement: a record dependency's
+      own origin, else its alias's declared or locked identity. }
+    function Origin(const ADep: TDependency; const ARequiredBy: string): string;
+    { The authenticated record of AName's locked selection from AOrigin.
+      Every call checks the entry, its origin's table, and the manifest pin,
+      and binds the record to this entry's own claims; only the proof bytes
+      of an identical claim set are verified once. Two entries can
+      therefore never share one record. }
+    function Verify(const AName, AOrigin: string): TLWPTRegistryPackage;
+    { The trust root that pins AIdentity in the root manifest. }
+    function TrustFor(const AIdentity, AName: string): TLWPTRegistryTrust;
+    property Mode: string read FMode;
+  end;
+
+constructor TLockedRegistry.Create(AConsumer: TLWPTRegistryConsumer;
+  const ARootMan: TManifest; const ALock: TResolvedArray;
+  const AArchivesRoot, AStateRoot, AMode: string);
+begin
+  inherited Create;
+  FConsumer := AConsumer;
+  FRootMan := ARootMan;
+  FLock := ALock;
+  FArchivesRoot := AArchivesRoot;
+  FStateRoot := AStateRoot;
+  FMode := AMode;
+  FNotes := TStringList.Create;
+  FVerifiedClaims := TStringList.Create;
+  FVerifiedClaims.CaseSensitive := True;
+end;
+
+destructor TLockedRegistry.Destroy;
+begin
+  FVerifiedClaims.Free;
+  FNotes.Free;
+  inherited Destroy;
+end;
+
+procedure TLockedRegistry.Fail(const AMessage: string);
+begin
+  raise EVerifyError.Create(FMode + ' ' + AMessage + '. Run `' + PROGRAM_NAME
+    + ' install` online to resolve and prove it again.');
+end;
+
+procedure TLockedRegistry.NoteOnce(const AKey, AMessage: string);
+begin
+  if FNotes.IndexOf(AKey) >= 0 then Exit;
+  FNotes.Add(AKey);
+  WriteLn(ErrOutput, 'note: ', AMessage);
+end;
+
+function TLockedRegistry.Origin(const ADep: TDependency;
+  const ARequiredBy: string): string;
+var Session: TLWPTRegistrySession;
+begin
+  Result := ADep.RegistryOrigin;
+  if Result <> '' then Exit;
+  Session := FConsumer.SessionForAlias(RegistryAliasFor(FRootMan, ADep));
+  Result := Session.Identity;
+  if Result = '' then Result := Session.LockedIdentity;
+  if Result = '' then
+    Fail(Format('registry %s (used by "%s", required by %s) declares no '
+      + 'identity, and %s records none for it', [Session.Alias, ADep.Name,
+      ARequiredBy, LWPT.Core.LOCKFILE]));
+end;
+
+function TLockedRegistry.TrustFor(const AIdentity,
+  AName: string): TLWPTRegistryTrust;
+var Session: TLWPTRegistrySession; k: Integer;
+begin
+  for k := 0 to High(FRootMan.Registries) do
+  begin
+    Session := FConsumer.SessionForAlias(FRootMan.Registries[k].Alias);
+    if (Session.Identity = AIdentity)
+       or ((Session.Identity = '') and (Session.LockedIdentity = AIdentity)) then
+      Exit(Session.Trust);
+  end;
+  Fail(Format('origin %s of "%s" is not declared by any [registries.<alias>] '
+    + 'of the root %s, nor bound to one by %s', [AIdentity, AName,
+    MANIFEST_FILE, LWPT.Core.LOCKFILE]));
+end;
+
+function TLockedRegistry.Verify(const AName,
+  AOrigin: string): TLWPTRegistryPackage;
+var
+  Entry: TResolved;
+  Found: Boolean;
+  k: Integer;
+  Table: TLWPTRegistryLockTable;
+  Trust: TLWPTRegistryTrust;
+  Claims: TLWPTRegistryLockedRecordArray;
+  Verified: TLWPTVerifiedRegistrySelection;
+  Selection: TLWPTRegistryLockedSelection;
+  Reason, ClaimKey: string;
+begin
+  Found := False;
+  Entry := Default(TResolved);
+  for k := 0 to High(FLock) do
+    if SameText(FLock[k].Name, AName) then
+    begin
+      Entry := FLock[k];
+      Found := True;
+      Break;
+    end;
+  if not Found then
+    Fail(Format('manifest graph reaches registry dependency "%s" but %s has '
+      + 'no entry for it', [AName, LWPT.Core.LOCKFILE]));
+  if (Entry.SrcKind <> skRegistry) or (Entry.RegistryOrigin = '')
+     or not RegistryHashIsCanonical(Entry.RegistryRecord) then
+    Fail(Format('lock entry for "%s" records no registry selection; it is '
+      + 'incompatible with a registry dependency', [AName]));
+  if Entry.RegistryOrigin <> AOrigin then
+    Fail(Format('registry origin of "%s" changed: the manifest resolves to '
+      + '%s, but %s records %s', [AName, AOrigin, LWPT.Core.LOCKFILE,
+      Entry.RegistryOrigin]));
+  Found := False;
+  Table := Default(TLWPTRegistryLockTable);
+  for k := 0 to High(FConsumer.LockTables) do
+    if FConsumer.LockTables[k].Identity = AOrigin then
+    begin
+      Table := FConsumer.LockTables[k];
+      Found := True;
+      Break;
+    end;
+  if not Found then
+    Fail(Format('%s has no [registry."%s"] table proving "%s"',
+      [LWPT.Core.LOCKFILE, AOrigin, AName]));
+  Trust := TrustFor(AOrigin, AName);
+  if Table.TrustKeyId <> Trust.KeyId then
+    Fail(Format('trust pin for %s changed', [AOrigin]));
+  { The signed record must name this node, not merely the lock key. }
+  SetLength(Claims, 1);
+  Claims[0].RecordHash := Entry.RegistryRecord;
+  Claims[0].Name := AName;
+  Claims[0].Version := Entry.Version;
+  Claims[0].ArchiveHash := Entry.ArchiveHash;
+  ClaimKey := AOrigin + #10 + Trust.KeyId + #10 + Trust.PublicKey + #10
+    + Table.Checkpoint + #10 + Table.Signature + #10 + Claims[0].RecordHash
+    + #10 + Claims[0].Name + #10 + Claims[0].Version + #10
+    + Claims[0].ArchiveHash;
+  k := FVerifiedClaims.IndexOf(ClaimKey);
+  if k >= 0 then Exit(FPackages[k]);
+  if not VerifyCommittedRegistryProof(FArchivesRoot, FStateRoot, Table, Trust,
+       Claims, Verified, Selection, Reason) then
+    Fail(Format('committed selection proof for "%s" from %s does not verify '
+      + 'from the manifest pin: %s', [AName, AOrigin, Reason]));
+  Result := Verified.Packages[0];
+  FVerifiedClaims.Add(ClaimKey);
+  SetLength(FPackages, Length(FPackages) + 1);
+  FPackages[High(FPackages)] := Result;
+  if Verified.ExpiresAt <= RegistryTimestampNow then
+    NoteOnce('expired:' + AOrigin, 'the committed proof for ' + AOrigin
+      + ' expired at ' + Verified.ExpiresAt + '; locked verification applies '
+      + 'no expiry, and an online install renews it');
+  if Result.Yanked then
+    NoteOnce('yanked:' + AName, 'locked version ' + AName + '@'
+      + Result.Version + ' is yanked upstream; it stays locked');
+end;
+
+{ Every regular file below ARoot as "file:<relative path>", and every link
+  as "link:<relative path>". Directories are walked, not listed: a Git
+  checkout keeps no empty directory. }
+procedure CollectRegistryTreeEntries(const ARoot, ARel: string;
+  AList: TStringList);
+var SR: TSearchRec; Rel: string;
+begin
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ARoot) + ARel + '*',
+       faAnyFile or faSymLink, SR) = 0 then
+    try
+      repeat
+        if (SR.Name = '.') or (SR.Name = '..') then Continue;
+        Rel := ARel + SR.Name;
+        if (SR.Attr and faSymLink) <> 0 then
+          AList.Add('link:' + Rel)
+        else if (SR.Attr and faDirectory) <> 0 then
+          CollectRegistryTreeEntries(ARoot, Rel + '/', AList)
+        else
+          AList.Add('file:' + Rel);
+      until SysUtils.FindNext(SR) <> 0;
+    finally
+      SysUtils.FindClose(SR);
+    end;
+end;
+
+{ The SHA-256 of one file's content, normalized as tree hashing normalizes
+  it, so a CRLF checkout compares equal to its LF extraction. }
+function NormalizedFileDigest(const APath: string): string;
+var Stream: TLWPTProtectedFileStream; Bytes: TBytes;
+begin
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Bytes, Stream.Size);
+    if Length(Bytes) > 0 then Stream.ReadBuffer(Bytes[0], Length(Bytes));
+  finally
+    Stream.Free;
+  end;
+  Result := SHA256Hex(NormalizeTreeHashContent(Bytes));
+end;
+
+{ '' when AActual holds exactly the regular files of AExpected, at the same
+  relative paths, with the same normalized contents, and no link; otherwise
+  the first difference. HashTree folds "path LF contents" without framing,
+  so equal tree hashes do not prove equal layouts; this comparison does
+  (ADR-0051 decision 4). }
+function RegistryTreeDifference(const AExpected, AActual: string): string;
+var Expected, Actual: TStringList; k: Integer;
+
+  function Named(const AEntry: string): string;
+  begin
+    Result := Copy(AEntry, Pos(':', AEntry) + 1, MaxInt);
+  end;
+
+begin
+  Result := '';
+  Expected := TStringList.Create;
+  Actual := TStringList.Create;
+  try
+    Expected.CaseSensitive := True;
+    Actual.CaseSensitive := True;
+    Expected.Sorted := True;
+    Actual.Sorted := True;
+    CollectRegistryTreeEntries(AExpected, '', Expected);
+    CollectRegistryTreeEntries(AActual, '', Actual);
+    for k := 0 to Actual.Count - 1 do
+      if Copy(Actual[k], 1, 5) = 'link:' then
+        Exit('link ' + Named(Actual[k]));
+    for k := 0 to Expected.Count - 1 do
+    begin
+      if Copy(Expected[k], 1, 5) = 'link:' then
+        Exit('link ' + Named(Expected[k]) + ' in the archive');
+      if Actual.IndexOf(Expected[k]) < 0 then
+        Exit('missing ' + Named(Expected[k]));
+    end;
+    for k := 0 to Actual.Count - 1 do
+      if Expected.IndexOf(Actual[k]) < 0 then
+        Exit('unexpected ' + Named(Actual[k]));
+    for k := 0 to Expected.Count - 1 do
+      if NormalizedFileDigest(IncludeTrailingPathDelimiter(AExpected)
+           + Named(Expected[k]))
+         <> NormalizedFileDigest(IncludeTrailingPathDelimiter(AActual)
+           + Named(Expected[k])) then
+        Exit('changed ' + Named(Expected[k]));
+  finally
+    Actual.Free;
+    Expected.Free;
+  end;
+end;
+
+{ --frozen: re-derives a registry module from its proof-authenticated
+  archive under the declared extraction policy and requires the result to
+  equal the lock's computedHash and, file for file, the installed tree.
+  Everything happens in a private scratch directory below ATmpRoot that is
+  removed on every path: the archive is copied there and verified against
+  the signed record before extraction, so the extractor's intermediate tar
+  never touches committed archive storage, which may be read-only. }
+procedure VerifyRederivedRegistryTree(const AArchive, ATmpRoot, AInstalled,
+  ALockHash: string; const APackage: TLWPTRegistryPackage;
+  const ADep: TDependency);
+var
+  Stream: TFileStream;
+  Scratch, Copied, Tree, Rederived, Difference: string;
+begin
+  if not FileExists(AArchive) then
+    raise EVerifyError.CreateFmt('[frozen] committed archive for "%s" is '
+      + 'missing at %s. Restore it from version control or run `%s install`.',
+      [APackage.Name, AArchive, PROGRAM_NAME]);
+  { Short names keep the scratch tree inside the legacy Windows path limit
+    in deep projects. }
+  Scratch := MakeTmpPath(ATmpRoot, 'fz');
+  try
+    ForceDirectories(Scratch);
+    Copied := Scratch + '/a.tgz';
+    Tree := Scratch + '/t';
+    if not CopyFileContent(AArchive, Copied) then
+      raise EVerifyError.CreateFmt('[frozen] cannot read the committed '
+        + 'archive for "%s" at %s', [APackage.Name, AArchive]);
+    Stream := TFileStream.Create(Copied, fmOpenRead or fmShareDenyNone);
+    try
+      VerifyRegistryArtifact(APackage, Stream);
+    finally
+      Stream.Free;
+    end;
+    {$IFDEF INSTALL_TESTING}
+    { A file where the tree goes: extraction fails after decompression. }
+    if TestSeamValue('FAIL_REGISTRY_REDERIVE') = '1' then
+      TFileStream.Create(Tree, fmCreate).Free;
+    {$ENDIF}
+    try
+      ExtractArchive(Copied, Tree, '');
+    except
+      on E: Exception do
+        raise EExtractError.CreateFmt(
+          '[frozen] extract failed for "%s" from %s: %s',
+          [APackage.Name, AArchive, E.Message]);
+    end;
+    RequireRegistryManifestIdentity(APackage.Name, APackage.Version, Tree);
+    ApplyIncludeExclude(Tree, ADep.IncludeGlobs, ADep.ExcludeGlobs);
+    Rederived := HashTree(Tree);
+    Difference := '';
+    if Rederived <> ALockHash then
+      Difference := 'tree hash ' + Rederived + ', lockfile ' + ALockHash
+    else
+      Difference := RegistryTreeDifference(Tree, AInstalled);
+    if Difference <> '' then
+      raise EVerifyError.CreateFmt(
+        '[frozen] module tree of "%s" differs from the tree re-derived from '
+        + 'its proof-authenticated archive (%s). Restore %s from version '
+        + 'control, or run `%s install --offline` to restore it from the '
+        + 'archive.', [APackage.Name, Difference, AInstalled, PROGRAM_NAME]);
+  finally
+    if DirectoryExists(Scratch) then WipeDir(Scratch);
+  end;
+end;
+
 { Frozen graph walk. If the dep's modules dir is already present
   (zero-install committed state), proceed using
   it as-is — caller (CmdInstall) then does the hash verification pass.
   Missing modules dir → EFetchError naming the dep + recovery hint. }
 procedure ResolveGraphFrozen(const ARootMan: TManifest; var R: TResolution;
   const AModulesRoot, AProjectRoot: string;
-  const AWorkspaces: TWorkspaceArray);
+  const AWorkspaces: TWorkspaceArray; ALocked: TLockedRegistry;
+  AConsumer: TLWPTRegistryConsumer);
 type
   TWorkItem = record
     Dep: TDependency;
@@ -2669,6 +3194,9 @@ var
   UnitDir, Archive, ArchiveHash, ResolvedURL, ChildManifestPath,
     ManifestRelDir: string;
   ChildMan : TManifest;
+  Package: TLWPTRegistryPackage;
+  Member: TWorkspace;
+  IsMember: Boolean;
 
   procedure CopyCustomSources(const ASrc: TCustomSourceArray;
     out ADst: TCustomSourceArray);
@@ -2684,14 +3212,6 @@ var
     const ACustomSources: TCustomSourceArray);
   var q: Integer;
   begin
-    { The locked selection proof of a registry dependency is verified by a
-      later slice of ADR-0051; until then frozen verification fails closed
-      rather than trusting unsigned lock fields. }
-    if D.SrcKind = skRegistry then
-      raise EVerifyError.CreateFmt(
-        '[frozen] registry dependency "%s" (required by %s) cannot yet be '
-        + 'verified by --frozen; run `%s install` online',
-        [D.Name, ABy, PROGRAM_NAME]);
     q := Length(Queue);
     SetLength(Queue, q + 1);
     Queue[q].Dep := D;
@@ -2713,6 +3233,10 @@ begin
     NormalizeWorkspaceDependency(Item.Dep, Item.RequiredBy,
       AWorkspaces, NormalizedDep);
     Item.Dep := NormalizedDep;
+    { A registry requirement's identity is its origin: declared, or bound
+      by the lock; no contact is consulted. }
+    if Item.Dep.SrcKind = skRegistry then
+      Item.Dep.RegistryOrigin := ALocked.Origin(Item.Dep, Item.RequiredBy);
     ItemSourceIdentity := CanonicalDependencyIdentity(Item.Dep,
       Item.CustomSources, AProjectRoot);
     idx := TouchNode(R, Item.Dep, Item.RequiredBy,
@@ -2753,6 +3277,18 @@ begin
     if DirectoryExists(UnitDir) then
       R.Nodes[idx].Hash := HashTree(UnitDir);
 
+    { A registry node is proven from its committed selection proof and the
+      manifest pin, and its edges come from its signed record, exactly as
+      online (ADR-0051 decision 4). }
+    Package := Default(TLWPTRegistryPackage);
+    if Item.Dep.SrcKind = skRegistry then
+    begin
+      Package := ALocked.Verify(Item.Dep.Name, Item.Dep.RegistryOrigin);
+      R.Nodes[idx].RegistryOrigin := Item.Dep.RegistryOrigin;
+      R.Nodes[idx].RegistryRecord := Package.RecordHash;
+      R.Nodes[idx].Version := Package.Version;
+    end;
+
     { read the fetched package's own manifest and enqueue ITS deps.
       The manifest is the shallowest lwpt.toml in the module tree —
       include-filtered deps keep their repo-relative prefix, so it
@@ -2782,87 +3318,32 @@ begin
         else
           R.Nodes[idx].UnitSubdirs[i] :=
             ManifestRelDir + '/' + ChildMan.Units[i];
-      for i := 0 to High(ChildMan.Deps) do
-        Enqueue(ChildMan.Deps[i], Item.Dep.Name, ChildMan.CustomSources);
+      { A registry package's archive manifest contributes units only. }
+      if Item.Dep.SrcKind <> skRegistry then
+      begin
+        IsMember := (Item.Dep.SrcKind = skLocal)
+          and FindWorkspace(AWorkspaces, Item.Dep.Name, Member)
+          and SameFileName(ExcludeTrailingPathDelimiter(ResolveProjectPath(
+            AProjectRoot, Item.Dep.SrcLocator)),
+            ExcludeTrailingPathDelimiter(ExpandFileName(Member.Path)));
+        if IsMember then
+          CheckMemberRegistries(ARootMan, ChildMan, Item.Dep.Name, AConsumer);
+        for i := 0 to High(ChildMan.Deps) do
+        begin
+          if not IsMember then
+            RefuseNestedRegistryDependency(Item.Dep, ChildMan.Deps[i]);
+          Enqueue(ChildMan.Deps[i], Item.Dep.Name, ChildMan.CustomSources);
+        end;
+      end;
     end;
-  end;
-end;
-
-{ One committed proof document, which must hash to its name. }
-function ReadRegistryProofDocument(const AArchivesRoot, AHash: string): TBytes;
-var Path: string; Stream: TFileStream;
-begin
-  Result := nil;
-  if not RegistryHashIsCanonical(AHash) then
-    raise ELWPTRegistryError.CreateStable('registry_proof_missing',
-      'lock names an invalid proof document hash "' + AHash + '"');
-  Path := RegistryProofPath(AArchivesRoot, AHash);
-  if not FileExists(Path) then
-    raise ELWPTRegistryError.CreateStable('registry_proof_missing',
-      'committed proof document ' + Path + ' is missing');
-  Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
-  try
-    if Stream.Size > MAX_REGISTRY_CONTROL_DOCUMENT_BYTES * 4 then
-      raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
-        'committed proof document ' + Path + ' is oversized');
-    SetLength(Result, Stream.Size);
-    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
-  finally
-    Stream.Free;
-  end;
-  if SHA256BytesPrefixed(Result) <> AHash then
-    raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
-      'committed proof document ' + Path + ' does not match its hash');
-end;
-
-{ Verifies a lock table's committed selection proof and returns the
-  authenticated records for ARecords, in order (ADR-0051 decision 4). }
-function VerifyCommittedRegistryProof(const AArchivesRoot: string;
-  const ATable: TLWPTRegistryLockTable; const ATrust: TLWPTRegistryTrust;
-  const ARecords: array of string;
-  out AVerified: TLWPTVerifiedRegistrySelection; out AReason: string): Boolean;
-var
-  Selection: TLWPTRegistryLockedSelection;
-  Index: Integer;
-begin
-  Result := False;
-  AReason := '';
-  AVerified := Default(TLWPTVerifiedRegistrySelection);
-  try
-    if ATable.TrustKeyId <> ATrust.KeyId then
-      raise ELWPTRegistryError.CreateStable('registry_pin_changed',
-        'trust pin for ' + ATable.Identity + ' changed');
-    if (Length(ATable.Rotations) mod 3) <> 0 then
-      raise ELWPTRegistryError.CreateStable('registry_proof_corrupt',
-        'lock rotation hashes are incomplete');
-    Selection := Default(TLWPTRegistryLockedSelection);
-    Selection.Checkpoint := ReadRegistryProofDocument(AArchivesRoot, ATable.Checkpoint);
-    Selection.Signature := ReadRegistryProofDocument(AArchivesRoot, ATable.Signature);
-    Selection.Snapshot := ReadRegistryProofDocument(AArchivesRoot, ATable.Snapshot);
-    SetLength(Selection.Rotations, Length(ATable.Rotations) div 3);
-    for Index := 0 to High(Selection.Rotations) do
-    begin
-      Selection.Rotations[Index].Document :=
-        ReadRegistryProofDocument(AArchivesRoot, ATable.Rotations[3 * Index]);
-      Selection.Rotations[Index].OldSignature :=
-        ReadRegistryProofDocument(AArchivesRoot, ATable.Rotations[3 * Index + 1]);
-      Selection.Rotations[Index].NewSignature :=
-        ReadRegistryProofDocument(AArchivesRoot, ATable.Rotations[3 * Index + 2]);
-    end;
-    SetLength(Selection.Records, Length(ARecords));
-    for Index := 0 to High(ARecords) do
-      Selection.Records[Index] := ReadRegistryProofDocument(AArchivesRoot,
-        ARecords[Index]);
-    AVerified := VerifyRegistryLockedSelection(Selection, ATrust,
-      ATable.Checkpoint);
-    if (AVerified.Sequence <> ATable.Sequence)
-       or (AVerified.Snapshot <> ATable.Snapshot)
-       or (AVerified.KeyId <> ATable.KeyId) then
-      raise ELWPTRegistryError.CreateStable('locked_proof_state_mismatch',
-        'committed checkpoint differs from the recorded selection proof');
-    Result := True;
-  except
-    on E: Exception do AReason := E.Message;
+    if Item.Dep.SrcKind = skRegistry then
+      for i := 0 to High(Package.Dependencies) do
+      begin
+        RequireInstallableRegistryName(Item.Dep.Name + '@' + Package.Version,
+          Package.Dependencies[i].Name);
+        Enqueue(RegistryRecordRequirement(Package.Dependencies[i]),
+          Item.Dep.Name, nil);
+      end;
   end;
 end;
 
@@ -2879,7 +3360,7 @@ procedure ResolveGraphFixedPoint(const ARootMan: TManifest;
   const APriorLock: TResolvedArray;
   const AObjectStore: TLWPTImmutableObjectStore;
   const AOffline, AAcceptMovedTags: Boolean;
-  const AConsumer: TLWPTRegistryConsumer);
+  const AConsumer: TLWPTRegistryConsumer; ALocked: TLockedRegistry);
 type
   TSelectionState = record
     Name, SourceIdentity, RefName, CommitSHA, RefKind, ReachableFrom: string;
@@ -3002,6 +3483,28 @@ var
     Result := not (ANode.Dep.SrcKind in [skLocal, skWorkspace]);
   end;
 
+  function FindRegistryPackage(const ARecord: string;
+    out APackage: TLWPTRegistryPackage): Boolean;
+  var k: Integer;
+  begin
+    for k := 0 to High(RegistryPackages) do
+      if RegistryPackages[k].RecordHash = ARecord then
+      begin
+        APackage := RegistryPackages[k];
+        Exit(True);
+      end;
+    APackage := Default(TLWPTRegistryPackage);
+    Result := False;
+  end;
+
+  procedure RememberRegistryPackage(const APackage: TLWPTRegistryPackage);
+  var Existing: TLWPTRegistryPackage;
+  begin
+    if FindRegistryPackage(APackage.RecordHash, Existing) then Exit;
+    SetLength(RegistryPackages, Length(RegistryPackages) + 1);
+    RegistryPackages[High(RegistryPackages)] := APackage;
+  end;
+
   procedure SelectLockedNode(const ANode: TResolveNode;
     var AState: TSelectionState);
   var Entry: TResolved;
@@ -3027,6 +3530,16 @@ var
     AState.ReachableFrom := Entry.ReachableFrom;
     WarnUnprovenPin('[offline]', ANode.Name, ANode.Kinds, ANode.Dep.SrcKind,
       Entry);
+    { A registry selection is reused only after its committed proof verifies
+      from the manifest pin; its signed record supplies the node's edges. }
+    if ANode.Dep.SrcKind = skRegistry then
+    begin
+      RememberRegistryPackage(ALocked.Verify(ANode.Name,
+        ANode.Dep.RegistryOrigin));
+      AState.CommitSHA := '';
+      AState.RegistryOrigin := ANode.Dep.RegistryOrigin;
+      AState.RegistryRecord := Entry.RegistryRecord;
+    end;
   end;
 
   procedure StageLockedArchive(const ANode: TResolveNode;
@@ -3142,28 +3655,6 @@ var
     WriteLn(ErrOutput, 'warning: ', AMessage);
   end;
 
-  function FindRegistryPackage(const ARecord: string;
-    out APackage: TLWPTRegistryPackage): Boolean;
-  var k: Integer;
-  begin
-    for k := 0 to High(RegistryPackages) do
-      if RegistryPackages[k].RecordHash = ARecord then
-      begin
-        APackage := RegistryPackages[k];
-        Exit(True);
-      end;
-    APackage := Default(TLWPTRegistryPackage);
-    Result := False;
-  end;
-
-  procedure RememberRegistryPackage(const APackage: TLWPTRegistryPackage);
-  var Existing: TLWPTRegistryPackage;
-  begin
-    if FindRegistryPackage(APackage.RecordHash, Existing) then Exit;
-    SetLength(RegistryPackages, Length(RegistryPackages) + 1);
-    RegistryPackages[High(RegistryPackages)] := APackage;
-  end;
-
   function RegistrySession(const ANode: TResolveNode): TLWPTRegistrySession;
   begin
     Result := AConsumer.SessionForIdentity(ANode.Dep.RegistryOrigin,
@@ -3178,13 +3669,13 @@ var
     const ARequiredBy: string);
   var Session: TLWPTRegistrySession;
   begin
-    { --offline must reach its locked path before any registry client
-      exists; restoring registry dependencies offline is a later slice. }
+    { --offline takes its locked path before any registry client exists:
+      the identity is declared or bound by the lock, never acquired. }
     if AOffline then
-      raise EVerifyError.CreateFmt(
-        '[offline] registry dependency "%s" (required by %s) cannot yet be '
-        + 'restored by --offline; run `%s install` online',
-        [ADep.Name, ARequiredBy, PROGRAM_NAME]);
+    begin
+      ADep.RegistryOrigin := ALocked.Origin(ADep, ARequiredBy);
+      Exit;
+    end;
     if ADep.RegistryOrigin <> '' then Exit;
     Session := AConsumer.SessionForAlias(RegistryAliasFor(ARootMan, ADep));
     if (Session.Identity = '') and (Session.LockedIdentity = '') then
@@ -3198,44 +3689,6 @@ var
         'registry %s declares no identity and none is recorded in %s, and '
         + 'every contact is unreachable:%s', [Session.Alias,
         LWPT.Core.LOCKFILE, Session.Failures]);
-  end;
-
-  { An alias a workspace member shares with the root names the same
-    identity and pin (ADR-0051); the member's own table is otherwise used
-    only when it is published. }
-  procedure CheckMemberRegistries(const AMember: TManifest;
-    const AMemberName: string);
-  var
-    k: Integer;
-    RootDeclaration: TLWPTRegistryDeclaration;
-
-    procedure Mismatch;
-    begin
-      raise EManifestError.CreateFmt(
-        'workspace member "%s" declares [registries.%s] with a different '
-        + 'identity or pin than the root %s; an alias shared with the root '
-        + 'must name the same identity and pin',
-        [AMemberName, AMember.Registries[k].Alias, MANIFEST_FILE]);
-    end;
-
-  begin
-    for k := 0 to High(AMember.Registries) do
-    begin
-      if not FindRegistryDeclaration(ARootMan.Registries,
-           AMember.Registries[k].Alias, RootDeclaration) then Continue;
-      if (AMember.Registries[k].KeyId <> RootDeclaration.KeyId)
-         or (AMember.Registries[k].PublicKey <> RootDeclaration.PublicKey)
-         or ((AMember.Registries[k].Identity <> '')
-           and (RootDeclaration.Identity <> '')
-           and (AMember.Registries[k].Identity <> RootDeclaration.Identity)) then
-        Mismatch;
-      { The root omits identity: the member's identity constrains the one
-        the root declaration locks or establishes, now or later. }
-      if (AMember.Registries[k].Identity <> '')
-         and (RootDeclaration.Identity = '') then
-        AConsumer.SessionForAlias(RootDeclaration.Alias).RequireIdentity(
-          AMember.Registries[k].Identity, AMemberName);
-    end;
   end;
 
   function AddRequirement(var AResolution: TResolution;
@@ -3530,6 +3983,8 @@ var
     Table: TLWPTRegistryLockTable;
     Found: Boolean;
     Verified: TLWPTVerifiedRegistrySelection;
+    Selection: TLWPTRegistryLockedSelection;
+    Claims: TLWPTRegistryLockedRecordArray;
     Package: TLWPTRegistryPackage;
   begin
     Result := '';
@@ -3551,13 +4006,15 @@ var
       end;
     if not Found then
       Exit('the lock has no [registry."' + Entry.RegistryOrigin + '"] table');
-    if not VerifyCommittedRegistryProof(AArchivesRoot, Table, ASession.Trust,
-         [Entry.RegistryRecord], Verified, Result) then
+    SetLength(Claims, 1);
+    Claims[0].RecordHash := Entry.RegistryRecord;
+    Claims[0].Name := ANode.Name;
+    Claims[0].Version := Entry.Version;
+    Claims[0].ArchiveHash := Entry.ArchiveHash;
+    if not VerifyCommittedRegistryProof(AArchivesRoot, '', Table,
+         ASession.Trust, Claims, Verified, Selection, Result) then
       Exit;
     Package := Verified.Packages[0];
-    if (Package.Name <> ANode.Name) or (Package.Version <> Entry.Version)
-       or (Package.ArchiveHash <> Entry.ArchiveHash) then
-      Exit('the committed record differs from the lock entry');
     RememberRegistryPackage(Package);
     AState.RefName := Entry.Version;
     AState.RegistryRecord := Entry.RegistryRecord;
@@ -3633,26 +4090,6 @@ var
       WarnOnce('yanked:' + ANode.Name, 'locked version ' + ANode.Name + '@'
         + Package.Version + ' is yanked upstream; it stays locked, but it is '
         + 'never newly selected');
-  end;
-
-  { The extracted manifest must name the signed record's package and
-    version before any of its bytes are used. }
-  procedure RequireRegistryManifestIdentity(const ANode: TResolveNode;
-    const ATree: string);
-  var RelDir, Path: string; Manifest: TManifest;
-  begin
-    if not FindModuleManifest(ATree, RelDir) then
-      raise ELWPTRegistryError.CreateStable(
-        'registry_manifest_identity_mismatch', 'archive of ' + ANode.Name
-        + '@' + ANode.Version + ' contains no ' + MANIFEST_FILE);
-    Path := IncludeTrailingPathDelimiter(ATree);
-    if RelDir <> '' then Path := Path + RelDir + '/';
-    Manifest := LoadManifest(Path + MANIFEST_FILE, False);
-    if (Manifest.Name <> ANode.Name) or (Manifest.Version <> ANode.Version) then
-      raise ELWPTRegistryError.CreateStable(
-        'registry_manifest_identity_mismatch', 'archive manifest declares '
-        + Manifest.Name + '@' + Manifest.Version + ', but the signed record '
-        + 'is ' + ANode.Name + '@' + ANode.Version);
   end;
 
   { Archive sources, in order: this install's candidate, the committed
@@ -3742,6 +4179,26 @@ var
       AResolvedURL := Session.ArchiveURL(Package)
     else
       AResolvedURL := '';
+  end;
+
+  procedure RequireSignedRegistryArchive(const ANode: TResolveNode;
+    const AArchive: string);
+  var Package: TLWPTRegistryPackage; Stream: TFileStream;
+  begin
+    if not FindRegistryPackage(ANode.RegistryRecord, Package)
+       or (Package.Name <> ANode.Name) then
+      raise EVerifyError.CreateFmt(
+        '[offline] registry dependency "%s": locked record %s was not '
+        + 'verified for it', [ANode.Name, ANode.RegistryRecord]);
+    if not FileExists(AArchive) then
+      raise EFetchError.CreateFmt(
+        '[offline] verified archive for "%s" is unavailable', [ANode.Name]);
+    Stream := TFileStream.Create(AArchive, fmOpenRead or fmShareDenyNone);
+    try
+      VerifyRegistryArtifact(Package, Stream);
+    finally
+      Stream.Free;
+    end;
   end;
 
   function SelectNode(const ANode: TResolveNode): TSelectionState;
@@ -3898,26 +4355,10 @@ var
     Requirer := R.Nodes[AIndex].Name + '@' + R.Nodes[AIndex].Version;
     for k := 0 to High(Package.Dependencies) do
     begin
-      if not ValidRegistryPackageName(Package.Dependencies[k].Name) then
-        raise EManifestError.CreateFmt(
-          '"%s" requires registry package "%s", whose name cannot be '
-          + 'installed: consumers accept only [a-z0-9][a-z0-9_-]{0,127}',
-          [Requirer, Package.Dependencies[k].Name]);
+      RequireInstallableRegistryName(Requirer, Package.Dependencies[k].Name);
       AConsumer.SessionForIdentity(Package.Dependencies[k].Origin,
         Package.Dependencies[k].Name, Requirer, Package.Origin);
-      Requirement := Default(TDependency);
-      Requirement.Name := Package.Dependencies[k].Name;
-      Requirement.SrcOriginal := REGISTRY_SOURCE_PREFIX + ':'
-        + Package.Dependencies[k].Name;
-      Requirement.SrcKind := skRegistry;
-      Requirement.SrcLocator := Package.Dependencies[k].Name;
-      Requirement.RegistryOrigin := Package.Dependencies[k].Origin;
-      Requirement.VersionSpec := Package.Dependencies[k].Version;
-      if Valid(Requirement.VersionSpec, DefaultSemverOptions)
-         = Requirement.VersionSpec then
-        Requirement.VersionKind := vkSemverExact
-      else
-        Requirement.VersionKind := vkSemverRange;
+      Requirement := RegistryRecordRequirement(Package.Dependencies[k]);
       Target := AddRequirement(R, Requirement, R.Nodes[AIndex].Name, nil);
       EnqueueNode(Target);
     end;
@@ -4147,7 +4588,7 @@ begin
           + SHA256Hex(BytesOf(SourceKey(R.Nodes[idx].Dep,
           R.Nodes[idx].CustomSources) + '|'
           + FetchRef)) + '.tar.gz';
-        if R.Nodes[idx].Dep.SrcKind = skRegistry then
+        if (R.Nodes[idx].Dep.SrcKind = skRegistry) and not AOffline then
           StageRegistryNode(R.Nodes[idx], CacheArchive, UnitDir, Archive,
             ArchiveHash, ResolvedURL)
         else if AOffline and IsNetworkBacked(R.Nodes[idx]) then
@@ -4241,6 +4682,10 @@ begin
                 [R.Nodes[idx].Name]);
           end;
         end;
+        { An offline registry archive, from the committed project or the
+          per-user CAS, must also be the signed record's before extraction. }
+        if AOffline and (R.Nodes[idx].Dep.SrcKind = skRegistry) then
+          RequireSignedRegistryArchive(R.Nodes[idx], Archive);
         if (Archive <> '') and FileExists(Archive) then
         begin
           ExtractTmp := MakeTmpPath(PlanScratch,
@@ -4249,7 +4694,8 @@ begin
           try
             ExtractArchive(Archive, ExtractTmp, '');
             if R.Nodes[idx].Dep.SrcKind = skRegistry then
-              RequireRegistryManifestIdentity(R.Nodes[idx], ExtractTmp);
+              RequireRegistryManifestIdentity(R.Nodes[idx].Name,
+                R.Nodes[idx].Version, ExtractTmp);
             ApplyIncludeExclude(ExtractTmp,
               R.Nodes[idx].Dep.IncludeGlobs,
               R.Nodes[idx].Dep.ExcludeGlobs);
@@ -4299,21 +4745,13 @@ begin
           begin
             IsMember := NodeWorkspaceVersion(R.Nodes[idx], MemberVersion);
             if IsMember and (AConsumer <> nil) then
-              CheckMemberRegistries(ChildMan, R.Nodes[idx].Name);
+              CheckMemberRegistries(ARootMan, ChildMan, R.Nodes[idx].Name,
+                AConsumer);
             for i := 0 to High(ChildMan.Deps) do
             begin
-              { ADR-0051 decision 5: only the root and workspace members,
-                whose trust roots the root owns, declare registry
-                dependencies in this version. }
-              if (ChildMan.Deps[i].SrcKind = skRegistry) and not IsMember then
-                raise EManifestError.CreateFmt(
-                  'dependency "%s" (%s source) declares registry dependency '
-                  + '"%s" in its %s; registry dependencies may be declared '
-                  + 'only in the root manifest and workspace members. '
-                  + 'Declare "%s" in the root %s instead',
-                  [R.Nodes[idx].Name, SourceKindToStr(R.Nodes[idx].Dep.SrcKind),
-                   ChildMan.Deps[i].Name, MANIFEST_FILE,
-                   ChildMan.Deps[i].Name, MANIFEST_FILE]);
+              if not IsMember then
+                RefuseNestedRegistryDependency(R.Nodes[idx].Dep,
+                  ChildMan.Deps[i]);
               j := AddRequirement(R, ChildMan.Deps[i], R.Nodes[idx].Name,
                 ChildMan.CustomSources);
               EnqueueNode(j);
@@ -4619,7 +5057,9 @@ begin
         [AResolved[i].Name]);
     LockCommit := LockedCommitIdentity(Lock);
     if (AResolved[i].Version <> Lock.Version)
-       or not SameText(AResolved[i].CommitSHA, LockCommit) then
+       or not SameText(AResolved[i].CommitSHA, LockCommit)
+       or (AResolved[i].RegistryOrigin <> Lock.RegistryOrigin)
+       or (AResolved[i].RegistryRecord <> Lock.RegistryRecord) then
       raise EVerifyError.CreateFmt(
         '[offline] locked resolution identity changed for "%s". Run '
         + '`lwpt install` online to resolve the changed graph.',
@@ -4839,6 +5279,7 @@ var
   OldTable, Table: TLWPTRegistryLockTable;
   HasOld, Carry: Boolean;
   Verified: TLWPTVerifiedRegistrySelection;
+  Selection: TLWPTRegistryLockedSelection;
   Checkpoint: TLWPTUntrustedRegistryCheckpoint;
   UserState, Merged: TLWPTRegistryConsumerState;
   Bytes: TBytes;
@@ -4882,9 +5323,12 @@ begin
         HasOld := True;
         Break;
       end;
+    { The new entries' claims: a carried proof must still name exactly the
+      selected records, versions, and archives. }
     Carry := HasOld and SameStringArrays(Records, OldRecords)
-      and VerifyCommittedRegistryProof(AArchivesRoot, OldTable, Session.Trust,
-        Records, Verified, Reason);
+      and VerifyCommittedRegistryProof(AArchivesRoot, '', OldTable,
+        Session.Trust, RegistryClaimsFor(AResolved, Identity), Verified,
+        Selection, Reason);
     if Carry then
     begin
       Table := OldTable;
@@ -4956,6 +5400,47 @@ begin
   end;
 end;
 
+{ --offline: exactly the proof documents the unchanged lock references, read
+  from the committed proofs or, when one is absent, the per-user document
+  store, and verified from the manifest pin again before publication. }
+function LockedRegistryProofDocuments(ALocked: TLockedRegistry;
+  AConsumer: TLWPTRegistryConsumer; const ALock: TResolvedArray;
+  const AArchivesRoot, AStateRoot: string): TRegistryProofDocumentArray;
+var
+  k, n: Integer;
+  Table: TLWPTRegistryLockTable;
+  Claims: TLWPTRegistryLockedRecordArray;
+  Verified: TLWPTVerifiedRegistrySelection;
+  Selection: TLWPTRegistryLockedSelection;
+  Reason: string;
+begin
+  Result := nil;
+  for k := 0 to High(AConsumer.LockTables) do
+  begin
+    Table := AConsumer.LockTables[k];
+    Claims := RegistryClaimsFor(ALock, Table.Identity);
+    if Length(Claims) = 0 then Continue;
+    if not VerifyCommittedRegistryProof(AArchivesRoot, AStateRoot, Table,
+         ALocked.TrustFor(Table.Identity, Claims[0].Name), Claims, Verified,
+         Selection, Reason) then
+      raise EVerifyError.CreateFmt(
+        '%s committed selection proof for %s does not verify from the '
+        + 'manifest pin: %s. Run `%s install` online to prove it again.',
+        [ALocked.Mode, Table.Identity, Reason, PROGRAM_NAME]);
+    AddRegistryProofDocument(Result, Selection.Checkpoint);
+    AddRegistryProofDocument(Result, Selection.Signature);
+    for n := 0 to High(Selection.Rotations) do
+    begin
+      AddRegistryProofDocument(Result, Selection.Rotations[n].Document);
+      AddRegistryProofDocument(Result, Selection.Rotations[n].OldSignature);
+      AddRegistryProofDocument(Result, Selection.Rotations[n].NewSignature);
+    end;
+    AddRegistryProofDocument(Result, Selection.Snapshot);
+    for n := 0 to High(Selection.Records) do
+      AddRegistryProofDocument(Result, Selection.Records[n]);
+  end;
+end;
+
 { True when ARoot holds exactly ADocuments, each under its own hash. }
 function RegistryProofsCurrent(const ARoot: string;
   const ADocuments: TRegistryProofDocumentArray): Boolean;
@@ -5005,7 +5490,7 @@ begin
     the legacy Windows path limit. The outputs are set only once the copy
     is validated: a failed retention has nothing to restore. }
   Backup := '';
-  if not AtomicRetainPath(Root, ARollbackRoot, 'proofs', Backup) then
+  if not AtomicRetainPath(Root, ARollbackRoot, 'p', Backup) then
     raise EExtractError.Create('failed to retain registry proof rollback copy');
   ABackup := Backup;
   APublishedPath := Root;
@@ -5015,7 +5500,7 @@ begin
       raise EExtractError.Create('failed to remove unreferenced registry proofs');
     Exit;
   end;
-  Staged := MakeTmpPath(ATmpRoot, 'proofs');
+  Staged := MakeTmpPath(ATmpRoot, 'p');
   ForceDirectories(Staged + '/sha256');
   for k := 0 to High(ADocuments) do
     AtomicWriteBytes(Staged + '/sha256/' + RegistryDigestHex(ADocuments[k].Hash)
@@ -5196,6 +5681,8 @@ var
   RegistryDocuments: TRegistryProofDocumentArray;
   ProofsBackup, ProofsPublished: string;
   LockChanged: Boolean;
+  Locked: TLockedRegistry;
+  RegistryPackage: TLWPTRegistryPackage;
   {$IFDEF INSTALL_TESTING}
   TestCorruption: TStringList;
   {$ENDIF}
@@ -5215,6 +5702,7 @@ begin
   Lock := TInstallLock.Create(LockPath);
   ObjectStore := nil;
   Consumer := nil;
+  Locked := nil;
   try
     PublicationPending := False;
     ProofsBackup := '';
@@ -5265,12 +5753,19 @@ begin
         '[offline] lockfile not found at %s. Run `lwpt install` online '
         + 'to resolve and lock dependencies first.', [LockfilePath]);
 
-    if not Frozen then
-    begin
-      Consumer := TLWPTRegistryConsumer.Create(Man,
-        LoadRegistryLockTables(LockfilePath), ArchivesRoot);
-      AssignLockedRegistryIdentities(Consumer, Man, OldLock);
-    end;
+    { --frozen and --offline bind registry identities from the manifest
+      and the lock only: no contact is selected and no registry client or
+      transport is constructed (ADR-0051). }
+    Consumer := TLWPTRegistryConsumer.Create(Man,
+      LoadRegistryLockTables(LockfilePath), ArchivesRoot);
+    Consumer.NetworkFree := Frozen or Offline;
+    AssignLockedRegistryIdentities(Consumer, Man, OldLock);
+    if Frozen then
+      Locked := TLockedRegistry.Create(Consumer, Man, OldLock, ArchivesRoot,
+        '', '[frozen]')
+    else if Offline then
+      Locked := TLockedRegistry.Create(Consumer, Man, OldLock, ArchivesRoot,
+        RegistryStateRoot, '[offline]');
 
     if not Frozen then
       try
@@ -5289,14 +5784,14 @@ begin
     if Frozen then
     begin
       ResolveGraphFrozen(Man, R, ModulesRoot, AContext.ProjectRoot,
-                         Man.Workspaces);
+                         Man.Workspaces, Locked, Consumer);
     end
     else
     begin
       ResolveGraphFixedPoint(Man, R, ModulesRoot, ArchivesRoot, TmpRoot,
                              RollbackRoot, AContext.ProjectRoot,
                              Man.Workspaces, OldLock, ObjectStore, Offline,
-                             AAcceptMovedTags, Consumer);
+                             AAcceptMovedTags, Consumer, Locked);
       PublicationPending := True;
     end;
     WriteLn('resolved ', Length(R.Nodes), ' packages, no conflicts.');
@@ -5409,6 +5904,25 @@ begin
           FillFrozenArchiveHash(Resolved[i], LockEntries, ArchivesRoot);
       end;
       VerifyAgainstLockfile(Resolved, LockEntries);
+      { A registry node's installed tree is authenticated, not only its
+        archive: the tree re-derived from the proof-authenticated archive
+        under the declared extraction policy must equal both the installed
+        tree and computedHash, which is unsigned (ADR-0051 decision 4). }
+      for i := 0 to High(Resolved) do
+      begin
+        if Resolved[i].SrcKind <> skRegistry then Continue;
+        { Every check again for this node, never a record lookup alone. }
+        RegistryPackage := Locked.Verify(Resolved[i].Name,
+          Resolved[i].RegistryOrigin);
+        FrozenLock := Default(TResolved);
+        for k := 0 to High(LockEntries) do
+          if SameText(LockEntries[k].Name, Resolved[i].Name) then
+            FrozenLock := LockEntries[k];
+        VerifyRederivedRegistryTree(ArchivePathForRef(ArchivesRoot,
+          Resolved[i].Name, skRegistry, RegistryPackage.Version), TmpRoot,
+          R.Nodes[i].UnitDir, FrozenLock.Hash, RegistryPackage,
+          R.Nodes[i].Dep);
+      end;
       WriteLn('[frozen] ', Length(Resolved),
               ' packages verified against ', LWPT.Core.LOCKFILE,
               ' (archive + tree hashes both match).');
@@ -5420,7 +5934,14 @@ begin
     end;
 
     if Offline then
-      VerifyOfflineAgainstLockfile(Resolved, OldLock)
+    begin
+      VerifyOfflineAgainstLockfile(Resolved, OldLock);
+      { Missing proof documents are restored from verified locked content
+        with the modules and cfg; the lock stays byte-identical. }
+      PublishRegistryProofs(ArchivesRoot, TmpRoot, RollbackRoot,
+        LockedRegistryProofDocuments(Locked, Consumer, OldLock, ArchivesRoot,
+          RegistryStateRoot), ProofsBackup, ProofsPublished);
+    end
     else
     begin
       PlanRegistryLockState(Consumer, Resolved, OldLock, ArchivesRoot,
@@ -5540,6 +6061,7 @@ begin
       end;
     end;
   finally
+    Locked.Free;
     Consumer.Free;
     ObjectStore.Free;
     Lock.Free;

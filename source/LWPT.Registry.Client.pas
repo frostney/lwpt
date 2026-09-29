@@ -95,10 +95,42 @@ procedure RememberRegistryRetrieval(var AProof: TLWPTRegistryProof;
 { True when AError is a request-layer failure. }
 function IsRegistryTransportFailure(const AError: Exception): Boolean;
 
+{$IFDEF INSTALL_TESTING}
+const
+  { Test-build-only transport journal (ADR-0044). When set, every registry
+    client constructed and every registry request attempted appends one line
+    to this file, so tests prove network-free modes at the transport
+    boundary rather than by counting what a server happened to receive. }
+  REGISTRY_TRANSPORT_LOG_SEAM = 'REGISTRY_TRANSPORT_LOG';
+{$ENDIF}
+
 implementation
 
 uses
   StrUtils;
+
+{$IFDEF INSTALL_TESTING}
+procedure JournalRegistryTransport(const AEvent: string);
+var
+  Path: string;
+  Stream: TFileStream;
+  Line: RawByteString;
+begin
+  Path := TestSeamValue(REGISTRY_TRANSPORT_LOG_SEAM);
+  if Path = '' then Exit;
+  if FileExists(Path) then
+    Stream := TFileStream.Create(Path, fmOpenReadWrite or fmShareDenyNone)
+  else
+    Stream := TFileStream.Create(Path, fmCreate);
+  try
+    Stream.Seek(0, soEnd);
+    Line := RawByteString(AEvent) + #10;
+    Stream.WriteBuffer(Line[1], Length(Line));
+  finally
+    Stream.Free;
+  end;
+end;
+{$ENDIF}
 
 function RegistryConnectAddress(const AURL: string): string;
 begin
@@ -160,6 +192,9 @@ var
   Header: THTTPHeader;
   ContentType: string;
 begin
+  {$IFDEF INSTALL_TESTING}
+  JournalRegistryTransport('request ' + AURL);
+  {$ENDIF}
   RequireRegistryRequestURI(AURL);
   Options := DefaultHTTPRequestOptions;
   Options.MaxResponseBodyBytes := AMaximumBytes;
@@ -216,6 +251,9 @@ end;
 constructor TLWPTRegistryAcquisition.Create(ABudget: TLWPTRegistryMetadataBudget);
 begin
   inherited Create;
+  {$IFDEF INSTALL_TESTING}
+  JournalRegistryTransport('client');
+  {$ENDIF}
   FBudget := ABudget;
   Proof := Default(TLWPTRegistryProof);
 end;
