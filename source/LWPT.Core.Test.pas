@@ -329,6 +329,7 @@ type
     procedure TestExtendedPathSpelling;
     procedure TestExtendedPathKeepsWin32Meaning;
     procedure TestRootRelativeUnderUncCurrentDirectory;
+    procedure TestExtendedSpellingStaysLiteral;
     {$ENDIF}
   end;
 
@@ -3807,6 +3808,29 @@ begin
   WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'meaning');
 end;
 
+{ CR-7: an extended spelling is literal for every helper. Recursive creation
+  must keep a trailing dot that the ordinary parse would fold away, and must
+  not create the folded sibling instead. }
+procedure TLongPathHelpers.TestExtendedSpellingStaysLiteral;
+var Parent, Literal, Inner: string;
+begin
+  Parent := '\\?\' + ExcludeTrailingPathDelimiter(
+    StringReplace(FScratch, '/', '\', [rfReplaceAll])) + '\dotted';
+  Literal := Parent + '\literal.';
+  Inner := Literal + '\inner';
+  Expect<Boolean>(LongPathForceDirectories(Inner)).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(Inner)).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(Literal)).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(Parent + '\literal')).ToBe(False);
+  Expect<Integer>(Length(ListDirectoryEntries(Parent, '*', faAnyFile)))
+    .ToBe(1);
+  Expect<string>(ListDirectoryEntries(Parent, '*', faAnyFile)[0].Name)
+    .ToBe('literal.');
+  { Cleanup addresses the literal name through the extended parent. }
+  WipeDir(Parent);
+  Expect<Boolean>(LongPathDirectoryExists(Parent)).ToBe(False);
+end;
+
 { Root-relative paths under a UNC current directory resolve on its share,
   not on a pseudo-drive built from the directory's first character. }
 procedure TLongPathHelpers.TestRootRelativeUnderUncCurrentDirectory;
@@ -3841,6 +3865,8 @@ begin
     TestExtendedPathSpelling);
   Test('keeps the Win32 meaning of dots, devices and separators',
     TestExtendedPathKeepsWin32Meaning);
+  Test('keeps an extended spelling literal when creating directories',
+    TestExtendedSpellingStaysLiteral);
   { The administrative share is the only UNC directory a CI runner is
     guaranteed to reach; Wine and locked-down hosts expose none. }
   if DirectoryExists(UNC_PROBE_DIRECTORY) then

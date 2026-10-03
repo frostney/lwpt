@@ -1052,7 +1052,9 @@ const
   EXTENDED_UNC_PREFIX = '\\?\UNC\';
   DEVICE_PATH_PREFIX = '\\.\';
 
-{ Win32's own parse of an ordinary path (GetFullPathNameW): relative and
+{ Win32's own parse of an ordinary path (GetFullPathNameW). Only for
+  ordinary spellings: it normalises `\\?\` input too, so callers pass an
+  extended or device-namespace path through untouched instead. Relative and
   root-relative paths resolve against the current directory, including a
   UNC one; separators fold; '.' and '..' fold; trailing dots and spaces of a
   component are dropped; reserved DOS device names become `\\.\<name>`; a
@@ -1239,7 +1241,14 @@ begin
     E.ErrorCode := 3;
     raise E;
   end;
-  FullPath := string(WindowsFullPath(APath));
+  { An extended or device-namespace spelling is the caller's literal name,
+    exactly as WindowsExtendedPath keeps it: GetFullPathNameW would fold a
+    trailing dot or space and create a different sibling. }
+  if (Copy(APath, 1, 4) = EXTENDED_PATH_PREFIX)
+    or (Copy(APath, 1, 4) = DEVICE_PATH_PREFIX) then
+    FullPath := APath
+  else
+    FullPath := string(WindowsFullPath(APath));
   if FullPath = '' then Exit(False);
   Result := Force(ExcludeTrailingPathDelimiter(FullPath));
 end;
