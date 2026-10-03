@@ -58,10 +58,12 @@ type
     procedure Start(const ATesting: Boolean = False);
     { Start with AEnvironment ("KEY=value") added to the child's
       environment, e.g. a test-build seam. Readiness requires the child's
-      own bind announcement, then this registry's discovery document. When
-      the base URL and listener share a port, a port another process took
-      after it was chosen moves the origin to a fresh one (Base changes,
-      Identity does not). }
+      own bind announcement, then this registry's discovery document. A
+      port another process took after it was chosen moves the origin to a
+      fresh one. When the base URL and listener share a port, Base moves
+      and Identity does not. Behind a relay only the listener moves:
+      ListenPort changes, Base and Identity do not, and the caller points
+      its relay at ListenPort after the start. }
     procedure StartWith(const ATesting: Boolean;
       const AEnvironment: array of string);
     procedure Stop;
@@ -536,7 +538,6 @@ var
   Variables: TStringArray;
   Index: Integer;
   Executable, BaseURL, LastProbe, Discovery: string;
-  Relocatable: Boolean;
 begin
   if FServe <> nil then raise Exception.Create('origin already serving');
   if ATesting then Executable := ExpectedExe(LwptTestingBinaryPath)
@@ -547,17 +548,22 @@ begin
     SetLength(Variables, Length(Variables) + 1);
     Variables[High(Variables)] := AEnvironment[Index];
   end;
-  { A relay may own the advertised port; only a direct origin can move. }
-  Relocatable := EndsStr(':' + IntToStr(FListenPort), FBase);
-  BaseURL := FBase;
-  FServe := LaunchRegistryCLI(FData, BaseURL, Variables, FScratch, Relocatable,
-    Executable);
-  if BaseURL <> FBase then
+  { A relay may own the advertised port; then only the listener moves. }
+  if EndsStr(':' + IntToStr(FListenPort), FBase) then
   begin
-    FBase := BaseURL;
-    FListenPort := StrToInt(Copy(BaseURL, LastDelimiter(':', BaseURL) + 1,
-      MaxInt));
-  end;
+    BaseURL := FBase;
+    FServe := LaunchRegistryCLI(FData, BaseURL, Variables, FScratch, True,
+      Executable);
+    if BaseURL <> FBase then
+    begin
+      FBase := BaseURL;
+      FListenPort := StrToInt(Copy(BaseURL, LastDelimiter(':', BaseURL) + 1,
+        MaxInt));
+    end;
+  end
+  else
+    FServe := LaunchRegistryCLIBehindRelay(FData, FBase, FListenPort,
+      Variables, FScratch, Executable);
   { The child owns the port now; its discovery must name this registry. }
   Started := GetTickCount64;
   Ready := False;

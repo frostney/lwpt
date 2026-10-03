@@ -114,6 +114,10 @@ type
     procedure SetupTests; override;
     procedure TestMissingChecksumsFileFails;
     procedure TestMissingChecksumEntryFails;
+    procedure ExpectStalledDownloadTerminated;
+    procedure TestStalledDownloadIsTerminatedWithItsDescendants;
+    procedure TestStalledDownloadUnderASubreaper;
+    procedure TestZombieOnlyGroupIsFinished;
   end;
 
   TInstallScriptE2E = class(TTestSuite)
@@ -163,37 +167,185 @@ begin
     Result := Copy(Result, 2, Length(Result));
 end;
 
-{ Drain a stream into a string. Assumes the child has exited. }
-function DrainStream(AStream: TStream): string;
-const CHUNK = 4 * 1024;
-var Buf: array of Byte; N, Total: Integer;
+const
+  { install.sh downloads a release archive; this leaves room for a slow
+    network while keeping a hung curl from outliving the test. }
+  SH_RUN_TIMEOUT_MILLISECONDS = 300000;
+
+{$IFDEF UNIX}
+function SetProcessGroup(APid, AGroup: TPid): LongInt; cdecl;
+  external 'c' name 'setpgid';
+
+type
+  { Puts a forked shell in a process group of its own before exec, so its
+    descendants (curl, sleep) share a group that can be signalled as a
+    whole: the shell forwards no signal to them. }
+  TShellGroupBinder = class
+  public
+    procedure ChildForked(ASender: TObject);
+  end;
+
+procedure TShellGroupBinder.ChildForked(ASender: TObject);
 begin
-  Result := '';
-  SetLength(Buf, CHUNK);
-  Total := 0;
-  while True do
-  begin
-    N := AStream.Read(Buf[0], CHUNK);
-    if N <= 0 then Break;
-    SetLength(Result, Total + N);
-    Move(Buf[0], Result[Total + 1], N);
-    Inc(Total, N);
+  SetProcessGroup(0, 0);
+end;
+
+var
+  ShellGroupBinder: TShellGroupBinder;
+
+{$IFDEF LINUX}
+const
+  PR_SET_CHILD_SUBREAPER = 36;
+
+function prctl(AOption: LongInt; AArgument: PtrUInt): LongInt; cdecl;
+  external 'c' name 'prctl';
+
+{ Reads a process's state, parent, and process group from procfs. False
+  when it no longer exists. procfs reports a zero size, so the file is
+  read as text rather than by length. }
+function ReadProcessStat(const APid: LongInt; out AState: Char;
+  out AParent, AGroup: LongInt): Boolean;
+var
+  Stat: string;
+  StatFile: TextFile;
+  Fields: TStringList;
+begin
+  Result := False;
+  AState := #0;
+  AParent := 0;
+  AGroup := 0;
+  Stat := '';
+  AssignFile(StatFile, '/proc/' + IntToStr(APid) + '/stat');
+  {$I-}
+  Reset(StatFile);
+  {$I+}
+  if IOResult <> 0 then Exit;
+  {$I-}
+  ReadLn(StatFile, Stat);
+  {$I+}
+  { A process that exits mid-read leaves an empty or failed read. }
+  if IOResult <> 0 then Stat := '';
+  CloseFile(StatFile);
+  { pid (comm) state ppid pgrp ...: the fields follow the last ')'. }
+  Fields := TStringList.Create;
+  try
+    Fields.Delimiter := ' ';
+    Fields.StrictDelimiter := True;
+    Fields.DelimitedText := Trim(Copy(Stat, LastDelimiter(')', Stat) + 1,
+      MaxInt));
+    if (Fields.Count < 3) or (Length(Fields[0]) <> 1) then Exit;
+    AState := Fields[0][1];
+    AParent := StrToIntDef(Fields[1], 0);
+    AGroup := StrToIntDef(Fields[2], 0);
+    Result := True;
+  finally
+    Fields.Free;
   end;
 end;
 
+{ An exited process waits in state Z (or X while being removed) for its
+  parent to reap it; it no longer runs. }
+function ProcessStateIsLive(const AState: Char): Boolean;
+begin
+  Result := (AState <> 'Z') and (AState <> 'X');
+end;
+
+{ True while any member of AGroup still runs. Members that have exited
+  but wait for an adopting parent that defers reaping (a subreaper) are
+  zombies: SIGKILL cannot change them, so they do not count. Those that
+  are this process's own children, other than the shell AShell that
+  TProcess reaps, are reaped here. }
+function ShellGroupHasLiveMembers(const AGroup, AShell: LongInt): Boolean;
+var
+  Search: TSearchRec;
+  Pid, Parent, Group: LongInt;
+  State: Char;
+begin
+  Result := False;
+  if FindFirst('/proc/*', faDirectory, Search) <> 0 then Exit;
+  try
+    repeat
+      Pid := StrToIntDef(Search.Name, 0);
+      if (Pid <= 0)
+        or not ReadProcessStat(Pid, State, Parent, Group)
+        or (Group <> AGroup) then Continue;
+      if ProcessStateIsLive(State) then Exit(True);
+      if (Parent = FpGetpid) and (Pid <> AShell) then
+        FpWaitpid(Pid, nil, WNOHANG);
+    until FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+{$ENDIF}
+
+{ Polls, bounded, until the shell is reaped and no process remains in its
+  group, draining the shell's pipes meanwhile. }
+function WaitForShellGroup(P: TProcess; const AGroup: TPid;
+  var AStdout, AStderr: string; const ATimeoutMilliseconds: QWord): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  repeat
+    AStdout := AStdout + DrainAvailableStream(P.Output);
+    AStderr := AStderr + DrainAvailableStream(P.Stderr);
+    { Running reaps the shell. On Linux the group is then finished when
+      every remaining member is a zombie. Elsewhere (macOS) orphans go to
+      launchd, which reaps them promptly, so kill(-group, 0) fails with
+      ESRCH soon after every descendant has exited. }
+    {$IFDEF LINUX}
+    Result := not P.Running
+      and not ShellGroupHasLiveMembers(AGroup, P.ProcessID);
+    {$ELSE}
+    Result := not P.Running and (FpKill(-AGroup, 0) <> 0);
+    {$ENDIF}
+    if Result or (GetTickCount64 - StartedAt >= ATimeoutMilliseconds) then
+      Exit;
+    Sleep(10);
+  until False;
+end;
+
+{ Ends the shell and every descendant in its group: SIGTERM, a bounded
+  wait, SIGKILL, a bounded wait. True when the group is empty. }
+function TerminateShellGroup(P: TProcess; const AGroup: TPid;
+  var AStdout, AStderr: string): Boolean;
+begin
+  FpKill(-AGroup, SIGTERM);
+  Result := WaitForShellGroup(P, AGroup, AStdout, AStderr,
+    CHILD_TERMINATION_GRACE_MILLISECONDS);
+  if Result then Exit;
+  FpKill(-AGroup, SIGKILL);
+  Result := WaitForShellGroup(P, AGroup, AStdout, AStderr,
+    CHILD_KILL_MILLISECONDS);
+end;
+{$ENDIF}
+
 { Run a /bin/sh program (script file or `-c` command), capturing exit
   code + stderr + stdout. Self-contained (does not go through RunLwpt,
-  which targets the lwpt binary). AArgs are the args after /bin/sh. }
+  which targets the lwpt binary). AArgs are the args after /bin/sh. The
+  run is bounded: output is drained in available-byte snapshots, so a
+  stalled writer never blocks the deadline check, and past
+  ATimeoutMilliseconds the shell and its descendants are ended and the
+  run raises with its output. On Unix the shell leads its own process
+  group, so its curl is signalled with it; that group is outside the test
+  runner's own, so if this program itself is killed the group is not
+  (process-tree ownership for spawning callers is tracked in #365). }
 function RunSh(const AArgs: array of string; const AInDir: string;
-  const AExtraEnv: array of string; out AStdout, AStderr: string): Integer;
+  const AExtraEnv: array of string; out AStdout, AStderr: string;
+  const ATimeoutMilliseconds: QWord = SH_RUN_TIMEOUT_MILLISECONDS): Integer;
 var
   P: TProcess;
   i: Integer;
   Outp, Errp: string;
+  StartedAt: QWord;
+  TimedOut, Terminated: Boolean;
 begin
   Result := -1;
   Outp := '';
   Errp := '';
+  TimedOut := False;
+  Terminated := True;
   P := TProcess.Create(nil);
   try
     P.Executable := '/bin/sh';
@@ -202,22 +354,49 @@ begin
     if AInDir <> '' then P.CurrentDirectory := AInDir;
 
     ConfigureProcessEnvironment(P, AExtraEnv);
+    {$IFDEF UNIX}
+    P.OnForkEvent := ShellGroupBinder.ChildForked;
+    {$ENDIF}
 
     P.Execute;
-    while P.Running do
+    {$IFDEF UNIX}
+    { Both sides set the group, so it exists before either proceeds;
+      failure after the child's exec is harmless. }
+    SetProcessGroup(P.ProcessID, P.ProcessID);
+    {$ENDIF}
+    StartedAt := GetTickCount64;
+    while P.Running
+      and (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
     begin
-      if P.Output.NumBytesAvailable > 0 then Outp := Outp + DrainStream(P.Output);
-      if P.Stderr.NumBytesAvailable > 0 then Errp := Errp + DrainStream(P.Stderr);
+      Outp := Outp + DrainAvailableStream(P.Output);
+      Errp := Errp + DrainAvailableStream(P.Stderr);
       Sleep(10);
     end;
-    if P.Output.NumBytesAvailable > 0 then Outp := Outp + DrainStream(P.Output);
-    if P.Stderr.NumBytesAvailable > 0 then Errp := Errp + DrainStream(P.Stderr);
-    Result := P.ExitCode;
+    TimedOut := P.Running;
+    if TimedOut then
+    begin
+      {$IFDEF UNIX}
+      Terminated := TerminateShellGroup(P, P.ProcessID, Outp, Errp);
+      {$ELSE}
+      Terminated := TerminateChildProcess(P, Outp, Errp);
+      {$ENDIF}
+    end
+    else
+    begin
+      Outp := Outp + DrainAvailableStream(P.Output);
+      Errp := Errp + DrainAvailableStream(P.Stderr);
+      Result := P.ExitCode;
+    end;
   finally
     P.Free;
   end;
   AStdout := Outp;
   AStderr := Errp;
+  if TimedOut then
+    raise Exception.Create('/bin/sh ' + AArgs[0] + ' exceeded its '
+      + IntToStr(ATimeoutMilliseconds) + ' ms deadline and was '
+      + BoolToStr(Terminated, 'terminated with its process group',
+        'NOT terminated') + '; stdout: ' + Outp + '; stderr: ' + Errp);
 end;
 
 { Extract tag_name only from a complete JSON object. Parsing the whole
@@ -651,6 +830,13 @@ begin
     '    *) URL="$1"; shift ;;'#10 +
     '  esac'#10 +
     'done'#10 +
+    { A stalled transfer: report this curl and its child, then block. }
+    'if [ "$INSTALL_CHECKSUM_MODE" = stalled ]; then'#10 +
+    '  sleep 300 &'#10 +
+    '  printf ''stalled-pid %s\nstalled-pid %s\n'' "$$" "$!" >&2'#10 +
+    '  wait'#10 +
+    '  exit 1'#10 +
+    'fi'#10 +
     'case "$URL" in'#10 +
     '  *-checksums.txt)'#10 +
     '    case "$INSTALL_CHECKSUM_MODE" in'#10 +
@@ -690,12 +876,163 @@ begin
     InstallStderr) > 0).ToBe(True);
 end;
 
+{ Linux reports an exited but unreaped process as state Z; it no longer
+  runs. Elsewhere kill(pid, 0) is the probe. }
+function ProcessIsLive(const APid: LongInt): Boolean;
+{$IFDEF LINUX}
+var
+  State: Char;
+  Parent, Group: LongInt;
+{$ENDIF}
+begin
+  {$IFDEF LINUX}
+  Result := ReadProcessStat(APid, State, Parent, Group)
+    and ProcessStateIsLive(State);
+  {$ELSE}
+  {$IFDEF UNIX}
+  Result := FpKill(APid, 0) = 0;
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+  {$ENDIF}
+end;
+
+{ install.sh prints "Downloading" and then waits on curl, which forwards
+  nothing: a stalled transfer must not hold the test past its deadline,
+  and neither the shell nor the curl it started may survive it. }
+procedure TInstallScriptVerificationTests.ExpectStalledDownloadTerminated;
+const
+  DEADLINE_MILLISECONDS = 1500;
+var
+  InstallOut, InstallStderr, Failure, Line: string;
+  Lines: TStringList;
+  StartedAt, Elapsed: QWord;
+  Pids: array of LongInt;
+  Pid: LongInt;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  Failure := '';
+  StartedAt := GetTickCount64;
+  try
+    RunSh([FInstallPath], FScratch,
+      ['PATH=' + FBinDir + ':/usr/bin:/bin', 'LWPT_VERSION=v1.2.3',
+       'INSTALL_DIR=' + FScratch + '/install',
+       'INSTALL_CHECKSUM_MODE=stalled'],
+      InstallOut, InstallStderr, DEADLINE_MILLISECONDS);
+  except
+    on E: Exception do Failure := E.Message;
+  end;
+  Elapsed := GetTickCount64 - StartedAt;
+  Expect<Boolean>(Pos('exceeded its ' + IntToStr(DEADLINE_MILLISECONDS)
+    + ' ms deadline and was terminated with its process group', Failure) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('Downloading', Failure) > 0).ToBe(True);
+  Expect<Boolean>(Elapsed < DEADLINE_MILLISECONDS
+    + CHILD_TERMINATION_GRACE_MILLISECONDS + CHILD_KILL_MILLISECONDS + 3000)
+    .ToBe(True);
+  Pids := nil;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := StringReplace(Failure, '; ', LineEnding, [rfReplaceAll]);
+    for Line in Lines do
+      if Pos('stalled-pid ', Line) > 0 then
+      begin
+        SetLength(Pids, Length(Pids) + 1);
+        Pids[High(Pids)] := StrToInt(Trim(Copy(Line,
+          Pos('stalled-pid ', Line) + 12, MaxInt)));
+      end;
+  finally
+    Lines.Free;
+  end;
+  { The fake curl and the sleep it started. }
+  Expect<Boolean>(Length(Pids) >= 2).ToBe(True);
+  for Pid in Pids do Expect<Boolean>(ProcessIsLive(Pid)).ToBe(False);
+end;
+
+procedure TInstallScriptVerificationTests.TestStalledDownloadIsTerminatedWithItsDescendants;
+begin
+  ExpectStalledDownloadTerminated;
+end;
+
+{ An adopting subreaper that defers reaping keeps exited descendants as
+  zombies in the shell's group, which kill(-group, 0) still reports. This
+  program becomes that subreaper: the killed curl and sleep are its
+  zombies until the group wait reaps them, and the wait must still end. }
+procedure TInstallScriptVerificationTests.TestStalledDownloadUnderASubreaper;
+begin
+  if FSkipped then begin Expect<Boolean>(True).ToBe(True); Exit; end;
+  {$IFDEF LINUX}
+  Expect<Integer>(prctl(PR_SET_CHILD_SUBREAPER, 1)).ToBe(0);
+  try
+    ExpectStalledDownloadTerminated;
+  finally
+    prctl(PR_SET_CHILD_SUBREAPER, 0);
+  end;
+  {$ENDIF}
+end;
+
+{ A group whose only member is a zombie that is not this program's to reap
+  counts as finished, although kill(-group, 0) still succeeds for it. A
+  forked child that leads its own group and exits stands in for a zombie
+  whose adopting parent defers reaping. }
+procedure TInstallScriptVerificationTests.TestZombieOnlyGroupIsFinished;
+{$IFDEF LINUX}
+var
+  Child: TPid;
+  State: Char;
+  Parent, Group: LongInt;
+  StartedAt: QWord;
+{$ENDIF}
+begin
+  {$IFDEF LINUX}
+  Child := FpFork;
+  if Child = 0 then
+  begin
+    SetProcessGroup(0, 0);
+    FpExit(0);
+  end;
+  Expect<Boolean>(Child > 0).ToBe(True);
+  try
+    SetProcessGroup(Child, Child);
+    StartedAt := GetTickCount64;
+    repeat
+      if ReadProcessStat(Child, State, Parent, Group) and (State = 'Z')
+        and (Group = Child) then Break;
+      Sleep(5);
+    until GetTickCount64 - StartedAt >= 5000;
+    Expect<Boolean>(State = 'Z').ToBe(True);
+    Expect<Integer>(Group).ToBe(Child);
+    Expect<Integer>(FpKill(-Child, 0)).ToBe(0);
+    { The zombie is passed as the shell, which the wait never reaps. }
+    Expect<Boolean>(ShellGroupHasLiveMembers(Child, Child)).ToBe(False);
+    Expect<Boolean>(ProcessIsLive(Child)).ToBe(False);
+  finally
+    FpWaitpid(Child, nil, 0);
+  end;
+  {$ELSE}
+  Expect<Boolean>(True).ToBe(True);
+  {$ENDIF}
+end;
+
 procedure TInstallScriptVerificationTests.SetupTests;
 begin
   Test('missing checksums file fails closed',
     TestMissingChecksumsFileFails);
   Test('missing asset entry fails closed',
     TestMissingChecksumEntryFails);
+  Test('a stalled download is terminated with its descendants',
+    TestStalledDownloadIsTerminatedWithItsDescendants);
+  {$IFDEF LINUX}
+  Test('a stalled download ends under a subreaper that keeps zombies',
+    TestStalledDownloadUnderASubreaper);
+  Test('a process group of unreaped zombies counts as finished',
+    TestZombieOnlyGroupIsFinished);
+  {$ELSE}
+  Skip('a stalled download ends under a subreaper that keeps zombies',
+    TestStalledDownloadUnderASubreaper, 'child subreapers are Linux-only');
+  Skip('a process group of unreaped zombies counts as finished',
+    TestZombieOnlyGroupIsFinished, 'procfs process states are Linux-only');
+  {$ENDIF}
 end;
 
 procedure TInstallScriptE2E.BeforeAll;
@@ -848,6 +1185,9 @@ begin
 end;
 
 begin
+  {$IFDEF UNIX}
+  ShellGroupBinder := TShellGroupBinder.Create;
+  {$ENDIF}
   TestRunnerProgram.AddSuite(TLatestTagResolutionTests.Create(
     'latest-release resolution classification (E2E)'));
   TestRunnerProgram.AddSuite(TInstallScriptVerificationTests.Create(

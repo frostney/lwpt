@@ -57,6 +57,7 @@ type
     procedure TestSilentServeUsesPersistedConfiguration;
     procedure TestSlowClientsAreBoundedByOneDeadline;
     procedure TestClientResetDoesNotTerminateServer;
+    procedure TestCLIRunPastItsDeadlineIsTerminated;
   end;
 
 { The port of a base URL of the form scheme://localhost:port[/path]. }
@@ -225,9 +226,11 @@ begin
   ProcessInstance := TProcess.Create(nil);
   try
     ProcessInstance.Executable := '/usr/bin/true';
-    ProcessInstance.Options := [poWaitOnExit];
     ProcessInstance.Execute;
     Result := ProcessInstance.ProcessID;
+    { Running reaps the child on Unix, so its PID is dead once it reports
+      the exit. }
+    Expect<Boolean>(WaitForRegistryExit(ProcessInstance, 5000)).ToBe(True);
     Expect<Integer>(ProcessInstance.ExitStatus).ToBe(0);
     Expect<Boolean>((FpKill(Result, 0) <> 0)
       and (FpGetErrNo = ESysESRCH)).ToBe(True);
@@ -252,9 +255,16 @@ function TRegistryE2EContract.CurlAttempt(const AURL: string;
   const AInsecure: Boolean; out AExitStatus: Integer;
   out AStandardError: string; out AOutputTruncated,
   AStandardErrorTruncated: Boolean): string;
+const
+  { curl's own --max-time normally ends it far sooner than this bound. }
+  CURL_BOUND_MILLISECONDS = 15000;
 var
   ProcessInstance: TProcess;
+  Started: QWord;
+  Stopped: TRegistryStopResult;
+  TimedOut: Boolean;
 begin
+  TimedOut := False;
   ProcessInstance := TProcess.Create(nil);
   try
     {$IFDEF MSWINDOWS}
@@ -274,7 +284,9 @@ begin
     AOutputTruncated := False;
     AStandardErrorTruncated := False;
     ProcessInstance.Execute;
-    while ProcessInstance.Running do
+    Started := GetTickCount64;
+    while ProcessInstance.Running
+      and (GetTickCount64 - Started <= CURL_BOUND_MILLISECONDS) do
     begin
       DrainCurlDiagnosticStream(ProcessInstance.Output, Result,
         AOutputTruncated);
@@ -282,16 +294,27 @@ begin
         AStandardErrorTruncated);
       Sleep(10);
     end;
+    TimedOut := ProcessInstance.Running;
     DrainCurlDiagnosticStream(ProcessInstance.Output, Result,
       AOutputTruncated);
     DrainCurlDiagnosticStream(ProcessInstance.Stderr, AStandardError,
       AStandardErrorTruncated);
-    ProcessInstance.WaitOnExit;
-    AExitStatus := ProcessInstance.ExitStatus;
-    if AExitStatus <> 0 then Result := '';
   finally
-    ProcessInstance.Free;
+    { The bounded stop path owns and frees the process: a signal only when
+      curl is still running, a forced kill after the grace period, and a
+      bounded wait until its handles are released. }
+    Stopped := StopRegistryProcess(ProcessInstance, 2000, 2000);
   end;
+  if not Stopped.Stopped then
+    raise Exception.Create('curl did not exit and release its handles');
+  AExitStatus := Stopped.ExitStatus;
+  if TimedOut then
+  begin
+    AExitStatus := -1;
+    AStandardError := AStandardError + ' [curl exceeded its '
+      + IntToStr(CURL_BOUND_MILLISECONDS) + ' ms bound and was stopped]';
+  end;
+  if AExitStatus <> 0 then Result := '';
 end;
 
 function TRegistryE2EContract.StopServerAndReturnExit(
@@ -577,17 +600,22 @@ begin
 end;
 
 procedure TRegistryE2EContract.TestForegroundServerSurvivesRestartAndConcurrentReaders;
+const
+  READERS_BOUND_MILLISECONDS = 15000;
 var
   BaseURL, DataDirectory, DiscoveryURL, ResourceURL: string;
   Init: TLwptResult;
   Index: Integer;
   Readers: array[0..7] of TProcess;
   Server: TProcess;
+  StartedAt, Elapsed: QWord;
+  Exited: Boolean;
+  Stopped: TRegistryStopResult;
   {$IFDEF MSWINDOWS}
   SecondServer: TProcess;
-  StartedAt: QWord;
   {$ENDIF}
 begin
+  for Index := 0 to High(Readers) do Readers[Index] := nil;
   DataDirectory := FScratch + '/plain-origin';
   BaseURL := FreshBaseURL('http', '/registry%2Fstable//instance');
   Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
@@ -607,7 +635,9 @@ begin
       Expect<Boolean>(SecondServer.Running).ToBe(False);
       if not SecondServer.Running then
       begin
-        SecondServer.WaitOnExit;
+        { Windows signals the handle only after the child's rundown. }
+        Expect<Boolean>(WaitForRegistryHandleRelease(SecondServer, 5000))
+          .ToBe(True);
         Expect<Boolean>(SecondServer.ExitStatus <> 0).ToBe(True);
       end;
       Expect<Boolean>(Pos('lwpt-registry-discovery-v1', Curl(DiscoveryURL,
@@ -637,13 +667,23 @@ begin
       Readers[Index].Parameters.Add(ResourceURL);
       Readers[Index].Execute;
     end;
+    { Each reader's --max-time ends it well inside this shared bound. }
+    StartedAt := GetTickCount64;
     for Index := 0 to High(Readers) do
     begin
-      Readers[Index].WaitOnExit;
-      Expect<Integer>(Readers[Index].ExitStatus).ToBe(0);
-      Readers[Index].Free;
+      Elapsed := GetTickCount64 - StartedAt;
+      if Elapsed > READERS_BOUND_MILLISECONDS then
+        Elapsed := READERS_BOUND_MILLISECONDS;
+      Exited := WaitForRegistryExit(Readers[Index],
+        READERS_BOUND_MILLISECONDS - Elapsed);
+      Stopped := StopRegistryProcess(Readers[Index], 2000, 2000);
+      Expect<Boolean>(Exited).ToBe(True);
+      Expect<Boolean>(Stopped.Stopped).ToBe(True);
+      Expect<Integer>(Stopped.ExitStatus).ToBe(0);
     end;
   finally
+    for Index := 0 to High(Readers) do
+      StopRegistryProcess(Readers[Index], 2000, 2000);
     StopServer(Server);
   end;
   Server := LaunchServer(DataDirectory, BaseURL, False);
@@ -798,7 +838,7 @@ begin
     Expect<QWord>(Status.st_uid).ToBe(FpGetUID);
     CrashedPID := Server.ProcessID;
     Expect<Integer>(FpKill(CrashedPID, SIGKILL)).ToBe(0);
-    Server.WaitOnExit;
+    Expect<Boolean>(WaitForRegistryExit(Server, 5000)).ToBe(True);
     Expect<Boolean>(Server.Running).ToBe(False);
     Expect<Integer>(TemporaryKeychainPathCount(CrashedPID)).ToBe(1);
     StopServer(Server);
@@ -880,6 +920,43 @@ begin
   end;
 end;
 
+{ A CLI run that never exits on its own, `registry serve`, outlives a short
+  deadline: RunLwpt must end it within its bounded grace and kill periods
+  and fail with the command and the output it captured, never hang. }
+procedure TRegistryE2EContract.TestCLIRunPastItsDeadlineIsTerminated;
+const
+  RUN_DEADLINE_MILLISECONDS = 1500;
+var
+  BaseURL, DataDirectory, Failure: string;
+  Init, Unexpected: TLwptResult;
+  StartedAt, Elapsed: QWord;
+begin
+  DataDirectory := FScratch + '/deadline-origin';
+  BaseURL := FreshBaseURL('http', '');
+  Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
+    '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL))]);
+  Expect<Integer>(Init.ExitCode).ToBe(0);
+  Failure := '';
+  StartedAt := GetTickCount64;
+  try
+    Unexpected := RunLwpt(['registry', 'serve', '--data-dir', DataDirectory],
+      FScratch, [], RUN_DEADLINE_MILLISECONDS);
+    Failure := 'returned exit ' + IntToStr(Unexpected.ExitCode);
+  except
+    on E: ELwptRunTimeout do Failure := E.Message;
+  end;
+  Elapsed := GetTickCount64 - StartedAt;
+  Expect<Boolean>(Pos('exceeded its ' + IntToStr(RUN_DEADLINE_MILLISECONDS)
+    + ' ms deadline', Failure) > 0).ToBe(True);
+  Expect<Boolean>(Pos('was terminated', Failure) > 0).ToBe(True);
+  Expect<Boolean>(Pos('''serve''', Failure) > 0).ToBe(True);
+  { The output the child produced before its deadline is reported. }
+  Expect<Boolean>(Pos('listening at ' + BaseURL, Failure) > 0).ToBe(True);
+  Expect<Boolean>(Elapsed < RUN_DEADLINE_MILLISECONDS
+    + CHILD_TERMINATION_GRACE_MILLISECONDS + CHILD_KILL_MILLISECONDS + 3000)
+    .ToBe(True);
+end;
+
 procedure TRegistryE2EContract.SetupTests;
 begin
   Test('CLI init preserves identity and rejects remote plain HTTP',
@@ -896,6 +973,8 @@ begin
     TestSilentServeUsesPersistedConfiguration);
   Test('slow clients are bounded by one deadline',
     TestSlowClientsAreBoundedByOneDeadline);
+  Test('a CLI run past its deadline is terminated and reported',
+    TestCLIRunPastItsDeadlineIsTerminated);
   {$IFDEF UNIX}
   Test('client resets cannot terminate the registry process',
     TestClientResetDoesNotTerminateServer);
