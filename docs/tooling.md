@@ -290,6 +290,12 @@ On the same filesystem, `rename(2)` is one syscall. Across filesystems (a Docker
 
 If EXDEV failures are persistent and the fallback is too slow, ensure `.lwpt/` lives on the same filesystem as the project root (don't bind-mount it).
 
+### Windows paths past MAX_PATH
+
+Toolkit state nests 64-character hash names: committed registry proofs, and rollback copies of proofs and modules below the journaled `.lwpt/tmp/install-transaction.*` root. In a deep checkout those paths pass the 260-character Win32 `MAX_PATH`, which the plain-path Win32 APIs and the FPC RTL file routines built on them enforce. On Windows the atomic helpers, and everything they call (directory creation, enumeration, deletion, file open, copy, hashing, retention and restore), therefore address every path by its extended-length spelling (`\\?\C:\...`, or `\\?\UNC\server\share\...`), built by `WindowsExtendedPath` from the absolute, normalized path ([#347](https://github.com/frostney/lwpt/issues/347)). Code that touches project-owned toolkit state uses the `LongPath*` primitives and `ListDirectoryEntries` from `LWPT.Core` rather than `FileExists`, `DirectoryExists`, `ForceDirectories`, `DeleteFile`, `RemoveDir`, `RenameFile`, `FindFirst` or `TFileStream`; on Unix they delegate to those SysUtils routines unchanged.
+
+Two limits remain by design. Archive extraction keeps the legacy budget (259 characters for a file, 247 for a directory) and fails before writing when an entry would exceed it, because an extracted module tree must stay usable by the compiler and by tools that are not long-path aware. The compiler's own 255-character path limit for staging and linking ([#309](https://github.com/frostney/lwpt/issues/309)) still applies to builds.
+
 ## Install lock + crash recovery
 
 `lwpt install` acquires a cross-process lock at `.lwpt/install.lock` before doing any work. On Unix, the file is created with `O_CREAT|O_EXCL` — the kernel guarantees only one process wins the create. A second concurrent `lwpt install` fails fast with `EConcurrencyError` naming the lock holder's PID. The lock is deleted by the normally-completing install; a crashed install leaves the lock file behind, and `lwpt repair` clears it only after using the validated pending journal to restore pre-transaction committed state.
