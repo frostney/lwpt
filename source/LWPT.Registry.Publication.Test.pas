@@ -285,14 +285,20 @@ begin
     FBase := 'http://localhost:' + IntToStr(FPort) + APath;
     if DirectoryExists(FRoot) then RecursiveDelete(FRoot);
     Config := RegistryConfiguration(AIdentity, FBase, 'localhost', FPort, '', '');
-    FStore := TLWPTRegistryStore.Initialize(FRoot, Config, APublishedAt);
-    { Its bytes name a fresh key and time, so they identify this origin;
-      read before the listener thread shares the store. }
-    Signed := Default(TRawHTTPResponse);
-    Signed.Body := FStore.LoadResource(FStore.LoadCurrentState.CheckpointPath);
-    Checkpoint := RawHTTPBodyText(Signed);
-    FServer := TLWPTRegistryServer.Create(FStore);
-    FThread := TServeThread.Create(FServer);
+    try
+      FStore := TLWPTRegistryStore.Initialize(FRoot, Config, APublishedAt);
+      { Its bytes name a fresh key and time, so they identify this origin;
+        read before the listener thread shares the store. }
+      Signed := Default(TRawHTTPResponse);
+      Signed.Body := FStore.LoadResource(FStore.LoadCurrentState.CheckpointPath);
+      Checkpoint := RawHTTPBodyText(Signed);
+      FServer := TLWPTRegistryServer.Create(FStore);
+      FThread := TServeThread.Create(FServer);
+    except
+      { A partially constructed origin never outlives its failed start. }
+      StopOrigin;
+      raise;
+    end;
     Started := GetTickCount64;
     Ready := False;
     LastProbe := 'no probe';
@@ -538,6 +544,9 @@ end;
 
 procedure TRegistryPublicationContract.BeforeEach;
 begin
+  { A failed assertion skips AfterEach; stop an origin the previous case
+    left serving before its scratch is removed. }
+  StopOrigin;
   if FScratch <> '' then RecursiveDelete(FScratch);
   FScratch := CreateScratchRoot('registry-publication');
   FFirstPort := 0;
@@ -559,6 +568,7 @@ end;
 
 procedure TRegistryPublicationContract.AfterAll;
 begin
+  StopOrigin;
   if FScratch <> '' then RecursiveDelete(FScratch);
 end;
 
@@ -1817,6 +1827,7 @@ begin
     Expect<Integer>(Publish('moved-lib', '1.0.0', Archive).Status).ToBe(201);
     Expect<Int64>(Sequence).ToBe(2);
   finally
+    StopOrigin;
     Occupier.Free;
   end;
 end;

@@ -57,6 +57,7 @@ type
     procedure TestSilentServeUsesPersistedConfiguration;
     procedure TestSlowClientsAreBoundedByOneDeadline;
     procedure TestClientResetDoesNotTerminateServer;
+    procedure TestCLIRunPastItsDeadlineIsTerminated;
   end;
 
 { The port of a base URL of the form scheme://localhost:port[/path]. }
@@ -919,6 +920,43 @@ begin
   end;
 end;
 
+{ A CLI run that never exits on its own, `registry serve`, outlives a short
+  deadline: RunLwpt must end it within its bounded grace and kill periods
+  and fail with the command and the output it captured, never hang. }
+procedure TRegistryE2EContract.TestCLIRunPastItsDeadlineIsTerminated;
+const
+  RUN_DEADLINE_MILLISECONDS = 1500;
+var
+  BaseURL, DataDirectory, Failure: string;
+  Init, Unexpected: TLwptResult;
+  StartedAt, Elapsed: QWord;
+begin
+  DataDirectory := FScratch + '/deadline-origin';
+  BaseURL := FreshBaseURL('http', '');
+  Init := RunLwpt(['registry', 'init', '--data-dir', DataDirectory,
+    '--base-url', BaseURL, '--port', IntToStr(URLPort(BaseURL))]);
+  Expect<Integer>(Init.ExitCode).ToBe(0);
+  Failure := '';
+  StartedAt := GetTickCount64;
+  try
+    Unexpected := RunLwpt(['registry', 'serve', '--data-dir', DataDirectory],
+      FScratch, [], RUN_DEADLINE_MILLISECONDS);
+    Failure := 'returned exit ' + IntToStr(Unexpected.ExitCode);
+  except
+    on E: ELwptRunTimeout do Failure := E.Message;
+  end;
+  Elapsed := GetTickCount64 - StartedAt;
+  Expect<Boolean>(Pos('exceeded its ' + IntToStr(RUN_DEADLINE_MILLISECONDS)
+    + ' ms deadline', Failure) > 0).ToBe(True);
+  Expect<Boolean>(Pos('was terminated', Failure) > 0).ToBe(True);
+  Expect<Boolean>(Pos('''serve''', Failure) > 0).ToBe(True);
+  { The output the child produced before its deadline is reported. }
+  Expect<Boolean>(Pos('listening at ' + BaseURL, Failure) > 0).ToBe(True);
+  Expect<Boolean>(Elapsed < RUN_DEADLINE_MILLISECONDS
+    + CHILD_TERMINATION_GRACE_MILLISECONDS + CHILD_KILL_MILLISECONDS + 3000)
+    .ToBe(True);
+end;
+
 procedure TRegistryE2EContract.SetupTests;
 begin
   Test('CLI init preserves identity and rejects remote plain HTTP',
@@ -935,6 +973,8 @@ begin
     TestSilentServeUsesPersistedConfiguration);
   Test('slow clients are bounded by one deadline',
     TestSlowClientsAreBoundedByOneDeadline);
+  Test('a CLI run past its deadline is terminated and reported',
+    TestCLIRunPastItsDeadlineIsTerminated);
   {$IFDEF UNIX}
   Test('client resets cannot terminate the registry process',
     TestClientResetDoesNotTerminateServer);

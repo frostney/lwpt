@@ -76,8 +76,19 @@ end;
 
 procedure TLWPTThreadRun.Execute;
 begin
-  FResult := RunLwpt(['test', '--verbose', '--jobs=1'], FProjectRoot,
-    FEnvironment);
+  try
+    FResult := RunLwpt(['test', '--verbose', '--jobs=1'], FProjectRoot,
+      FEnvironment);
+  except
+    { A thread swallows exceptions; report a timed-out run as a failure
+      the caller's exit-code check cannot mistake for success. }
+    on E: Exception do
+    begin
+      FResult.ExitCode := -1;
+      FResult.TimedOut := E is ELwptRunTimeout;
+      FResult.Stderr := FResult.Stderr + E.Message;
+    end;
+  end;
 end;
 
 function CountSubstring(const AText, ANeedle: string): Integer;

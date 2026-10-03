@@ -183,17 +183,27 @@ end;
 
 { Run a /bin/sh program (script file or `-c` command), capturing exit
   code + stderr + stdout. Self-contained (does not go through RunLwpt,
-  which targets the lwpt binary). AArgs are the args after /bin/sh. }
+  which targets the lwpt binary). AArgs are the args after /bin/sh. The
+  run is bounded: past SH_RUN_TIMEOUT_MILLISECONDS the shell is ended
+  through TerminateChildProcess and the run raises with its output. }
 function RunSh(const AArgs: array of string; const AInDir: string;
   const AExtraEnv: array of string; out AStdout, AStderr: string): Integer;
+const
+  { install.sh downloads a release archive; this leaves room for a slow
+    network while keeping a hung curl from outliving the test. }
+  SH_RUN_TIMEOUT_MILLISECONDS = 300000;
 var
   P: TProcess;
   i: Integer;
   Outp, Errp: string;
+  StartedAt: QWord;
+  TimedOut, Terminated: Boolean;
 begin
   Result := -1;
   Outp := '';
   Errp := '';
+  TimedOut := False;
+  Terminated := True;
   P := TProcess.Create(nil);
   try
     P.Executable := '/bin/sh';
@@ -204,20 +214,32 @@ begin
     ConfigureProcessEnvironment(P, AExtraEnv);
 
     P.Execute;
-    while P.Running do
+    StartedAt := GetTickCount64;
+    while P.Running
+      and (GetTickCount64 - StartedAt < SH_RUN_TIMEOUT_MILLISECONDS) do
     begin
       if P.Output.NumBytesAvailable > 0 then Outp := Outp + DrainStream(P.Output);
       if P.Stderr.NumBytesAvailable > 0 then Errp := Errp + DrainStream(P.Stderr);
       Sleep(10);
     end;
-    if P.Output.NumBytesAvailable > 0 then Outp := Outp + DrainStream(P.Output);
-    if P.Stderr.NumBytesAvailable > 0 then Errp := Errp + DrainStream(P.Stderr);
-    Result := P.ExitCode;
+    TimedOut := P.Running;
+    if TimedOut then Terminated := TerminateChildProcess(P, Outp, Errp)
+    else
+    begin
+      if P.Output.NumBytesAvailable > 0 then Outp := Outp + DrainStream(P.Output);
+      if P.Stderr.NumBytesAvailable > 0 then Errp := Errp + DrainStream(P.Stderr);
+      Result := P.ExitCode;
+    end;
   finally
     P.Free;
   end;
   AStdout := Outp;
   AStderr := Errp;
+  if TimedOut then
+    raise Exception.Create('/bin/sh ' + AArgs[0] + ' exceeded its '
+      + IntToStr(SH_RUN_TIMEOUT_MILLISECONDS) + ' ms deadline and was '
+      + BoolToStr(Terminated, 'terminated', 'NOT terminated') + '; stdout: '
+      + Outp + '; stderr: ' + Errp);
 end;
 
 { Extract tag_name only from a complete JSON object. Parsing the whole

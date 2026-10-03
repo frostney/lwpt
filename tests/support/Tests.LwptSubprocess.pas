@@ -27,6 +27,10 @@
       runs. A child or descendant can retain a pipe writer after the direct
       process exits, so reading until EOF would make timeout and termination
       handling unreachable.
+    - Every run has a deadline. A zero timeout selects
+      LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS; there is no unbounded run. A
+      run past its deadline is ended through TerminateChildProcess and
+      raises ELwptRunTimeout naming the command and its captured output.
 
   Surface — kept minimal:
 
@@ -50,7 +54,22 @@ uses
 
   Pipes;
 
+const
+  { The deadline of a RunLwpt call that names none. The slowest ordinary
+    call measured across the full Linux suite is recorded in
+    docs/testing.md; this leaves room for slower Windows and macOS runners
+    and stays well inside a CI job's bound. Calls that legitimately need
+    longer pass their own timeout. }
+  LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS = 300000;
+  { How long a child gets to exit after SIGTERM (Windows: TerminateProcess)
+    before SIGKILL, and how long after SIGKILL before cleanup gives up. }
+  CHILD_TERMINATION_GRACE_MILLISECONDS = 2000;
+  CHILD_KILL_MILLISECONDS = 2000;
+
 type
+  { A RunLwpt child outlived its deadline and was terminated. }
+  ELwptRunTimeout = class(Exception);
+
   TLwptResult = record
     ExitCode: Integer;
     ProcessExitCode: Integer;
@@ -64,7 +83,10 @@ type
   captured separately. AInDir defaults to '' which means "inherit the
   caller's CWD". AExtraEnv is an array of "KEY=value" strings; each is
   added to the inherited environment, replacing any existing value
-  with the same key. }
+  with the same key. ATimeoutMilliseconds bounds the run; zero (and the
+  overloads without it) selects LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS. A
+  run past its deadline raises ELwptRunTimeout after its child has been
+  terminated, so a caller in a thread must catch it. }
 function RunLwpt(const AArgs: array of string;
   const AInDir: string = ''): TLwptResult; overload;
 function RunLwpt(const AArgs: array of string;
@@ -104,6 +126,21 @@ procedure ConfigureProcessEnvironment(const AProcess: TProcess;
 function DrainAvailableStream(AStream: TInputPipeStream;
   const AMaximumBytes: Integer = High(Integer)): string;
 
+{ Ends a started child without TProcess.Terminate, whose Unix
+  implementation finishes in an unbounded WaitOnExit. The direct child gets
+  SIGTERM (Windows: TerminateProcess), AGraceMilliseconds to exit, then
+  SIGKILL and AKillMilliseconds more; Running reaps it on Unix, and on
+  Windows a bounded wait covers the handle rundown. A child created with
+  poUsePipes has its pipes drained into AStdout and AStderr meanwhile.
+  The child stays in this test program's process group, so the test
+  runner's own cancellation still reaches it, and an LWPT child forwards
+  SIGTERM to the process groups it owns (ADR-0025). Returns False when the
+  child still had not exited; the caller owns and frees AProcess. }
+function TerminateChildProcess(AProcess: TProcess; var AStdout,
+  AStderr: string;
+  const AGraceMilliseconds: QWord = CHILD_TERMINATION_GRACE_MILLISECONDS;
+  const AKillMilliseconds: QWord = CHILD_KILL_MILLISECONDS): Boolean;
+
 { When a nested LWPT run exits with an unexpected code, its captured
   output is the only evidence of why. Call this before the exit-code
   assertion: on mismatch it appends the captured stdout/stderr to
@@ -139,6 +176,27 @@ function IsNetworkUnavailable(const AResult: TLwptResult): Boolean;
 
 implementation
 
+{$IFDEF UNIX}
+uses
+  BaseUnix;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+{ Declared here rather than through the Windows unit, which would shadow
+  SysUtils routines this unit uses. }
+function TerminateWindowsProcess(AProcess: THandle;
+  AExitCode: LongWord): LongBool; stdcall;
+  external 'kernel32.dll' name 'TerminateProcess';
+function PeekWindowsPipe(APipe: THandle; ABuffer: Pointer;
+  ABufferSize: LongWord; ABytesRead, ATotalBytesAvailable,
+  ABytesLeftThisMessage: PLongWord): LongBool; stdcall;
+  external 'kernel32.dll' name 'PeekNamedPipe';
+
+const
+  { Bound on the normal-completion EOF barrier for inherited pipe writers. }
+  EXITED_DRAIN_MILLISECONDS = 10000;
+{$ENDIF}
+
 var
   GLwptBinaryPath: string = '';
   { The test program's starting directory, which lwpt test sets to the
@@ -166,7 +224,8 @@ function RunLwptTesting(const AArgs: array of string;
   const AInDir: string;
   const AExtraEnv: array of string): TLwptResult;
 begin
-  Result := RunLwptTesting(AArgs, AInDir, AExtraEnv, 0);
+  Result := RunLwptTesting(AArgs, AInDir, AExtraEnv,
+    LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS);
 end;
 
 function RunLwptTesting(const AArgs: array of string;
@@ -258,26 +317,41 @@ end;
   the final EOF barrier until inherited pipe writers have exited. Keep that
   established Windows cleanup behavior without using it in the running or
   timeout paths, where an EOF read would make polling and termination
-  unreachable. Darwin and other Unix hosts must never use this helper: an
-  orphaned writer is the scheduling hang fixed by DrainAvailableStream. }
-function DrainExitedStream(AStream: TStream): string;
+  unreachable. The barrier is bounded: it polls for data or the writer's
+  close and gives up at ADeadline, so a descendant that keeps the pipe open
+  cannot hang the caller. Darwin and other Unix hosts must never use this
+  helper: an orphaned writer is the scheduling hang fixed by
+  DrainAvailableStream. }
+function DrainExitedStream(AStream: TInputPipeStream;
+  const ADeadline: QWord): string;
 const
   CHUNK = 4 * 1024;
 var
   Buf: array[0..CHUNK - 1] of Byte;
-  N, Total: Integer;
+  Available: LongWord;
+  N, ReadSize, Total: Integer;
 begin
   Result := '';
   Total := 0;
   repeat
-    N := AStream.Read(Buf[0], CHUNK);
-    if N > 0 then
+    Available := 0;
+    { Fails with a broken pipe once every writer has closed: EOF. }
+    if not PeekWindowsPipe(AStream.Handle, nil, 0, nil, @Available, nil) then
+      Break;
+    if Available = 0 then
     begin
-      SetLength(Result, Total + N);
-      Move(Buf[0], Result[Total + 1], N);
-      Inc(Total, N);
+      if GetTickCount64 >= ADeadline then Break;
+      Sleep(10);
+      Continue;
     end;
-  until N <= 0;
+    ReadSize := CHUNK;
+    if Available < LongWord(ReadSize) then ReadSize := Available;
+    N := AStream.Read(Buf[0], ReadSize);
+    if N <= 0 then Break;
+    SetLength(Result, Total + N);
+    Move(Buf[0], Result[Total + 1], N);
+    Inc(Total, N);
+  until False;
 end;
 {$ENDIF}
 
@@ -363,7 +437,79 @@ function RunLwpt(const AArgs: array of string;
   const AInDir: string;
   const AExtraEnv: array of string): TLwptResult;
 begin
-  Result := RunLwpt(AArgs, AInDir, AExtraEnv, 0);
+  Result := RunLwpt(AArgs, AInDir, AExtraEnv,
+    LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS);
+end;
+
+procedure DrainChildPipes(AProcess: TProcess; var AStdout, AStderr: string);
+begin
+  if not (poUsePipes in AProcess.Options) then Exit;
+  if AProcess.Output.NumBytesAvailable > 0 then
+    AStdout := AStdout + DrainAvailableStream(AProcess.Output);
+  if AProcess.Stderr.NumBytesAvailable > 0 then
+    AStderr := AStderr + DrainAvailableStream(AProcess.Stderr);
+end;
+
+function WaitForChildExit(AProcess: TProcess; var AStdout, AStderr: string;
+  const ATimeoutMilliseconds: QWord): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while AProcess.Running
+    and (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
+  begin
+    DrainChildPipes(AProcess, AStdout, AStderr);
+    Sleep(10);
+  end;
+  DrainChildPipes(AProcess, AStdout, AStderr);
+  Result := not AProcess.Running;
+end;
+
+procedure SignalChild(AProcess: TProcess; const AForce: Boolean);
+begin
+  {$IFDEF UNIX}
+  if AForce then FpKill(AProcess.ProcessID, SIGKILL)
+  else FpKill(AProcess.ProcessID, SIGTERM);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  TerminateWindowsProcess(AProcess.Handle, 1);
+  {$ENDIF}
+end;
+
+function TerminateChildProcess(AProcess: TProcess; var AStdout,
+  AStderr: string; const AGraceMilliseconds,
+  AKillMilliseconds: QWord): Boolean;
+begin
+  if AProcess.Running then SignalChild(AProcess, False);
+  Result := WaitForChildExit(AProcess, AStdout, AStderr, AGraceMilliseconds);
+  if not Result then
+  begin
+    SignalChild(AProcess, True);
+    Result := WaitForChildExit(AProcess, AStdout, AStderr, AKillMilliseconds);
+  end;
+  {$IFDEF MSWINDOWS}
+  { The handle is signalled only after the exited child's rundown. }
+  if Result then Result := AProcess.WaitOnExit(AKillMilliseconds);
+  {$ENDIF}
+end;
+
+function QuotedCommandLine(AProcess: TProcess): string;
+var
+  Index: Integer;
+begin
+  Result := AProcess.Executable;
+  for Index := 0 to AProcess.Parameters.Count - 1 do
+    Result := Result + ' ' + AnsiQuotedStr(AProcess.Parameters[Index], '''');
+end;
+
+function OutputTail(const AText: string): string;
+const
+  TAIL_BYTES = 8192;
+begin
+  if Length(AText) <= TAIL_BYTES then Exit(AText);
+  Result := '[' + IntToStr(Length(AText) - TAIL_BYTES) + ' earlier bytes omitted]'
+    + Copy(AText, Length(AText) - TAIL_BYTES + 1, TAIL_BYTES);
 end;
 
 function RunLwpt(const AArgs: array of string;
@@ -375,11 +521,14 @@ var
   i: Integer;
   SavedDir: string;
   WorkerLeaseTokenEnvironment: string;
-  ForwardedWorkerLease: Boolean;
-  StartedAt, TerminatedAt: QWord;
-const
-  TERMINATION_GRACE_MILLISECONDS = 2000;
+  ForwardedWorkerLease, Terminated: Boolean;
+  StartedAt, Deadline: QWord;
+  {$IFDEF MSWINDOWS}
+  ExitedDrainDeadline: QWord;
+  {$ENDIF}
 begin
+  Deadline := ATimeoutMilliseconds;
+  if Deadline = 0 then Deadline := LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS;
   Result.ExitCode := -1;
   Result.ProcessExitCode := -1;
   Result.ProcessExitStatus := -1;
@@ -417,63 +566,40 @@ begin
       Linux+macOS that pair can deadlock when the child blocks
       writing past the pipe buffer because the parent isn't reading.
       Instead: Execute, then drain both streams while the child runs,
-      then WaitOnExit. }
+      polling its exit until the deadline. }
     SavedDir := GetCurrentDir;
     try
       P.Execute;
       StartedAt := GetTickCount64;
-      while P.Running do
-      begin
-        if P.Output.NumBytesAvailable > 0 then
-          Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
-        if P.Stderr.NumBytesAvailable > 0 then
-          Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
-        if (ATimeoutMilliseconds > 0)
-           and (GetTickCount64 - StartedAt >= ATimeoutMilliseconds) then
-        begin
-          Result.TimedOut := True;
-          P.Terminate(1);
-          Break;
-        end;
-        Sleep(10);
-      end;
+      Result.TimedOut := not WaitForChildExit(P, Result.Stdout,
+        Result.Stderr, Deadline);
       if Result.TimedOut then
       begin
-        TerminatedAt := GetTickCount64;
-        while P.Running
-          and (GetTickCount64 - TerminatedAt <
-            TERMINATION_GRACE_MILLISECONDS) do
-        begin
-          if P.Output.NumBytesAvailable > 0 then
-            Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
-          if P.Stderr.NumBytesAvailable > 0 then
-            Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
-          Sleep(10);
-        end;
-        if P.Running then
-          raise Exception.CreateFmt(
-            'timed-out lwpt subprocess did not terminate within %d ms',
-            [TERMINATION_GRACE_MILLISECONDS]);
+        Terminated := TerminateChildProcess(P, Result.Stdout, Result.Stderr);
+        raise ELwptRunTimeout.Create('lwpt subprocess exceeded its '
+          + UIntToStr(Deadline) + ' ms deadline after '
+          + UIntToStr(GetTickCount64 - StartedAt) + ' ms and was '
+          + BoolToStr(Terminated, 'terminated', 'NOT terminated (still running '
+          + 'after SIGKILL)') + ': ' + QuotedCommandLine(P) + ' (in '
+          + AInDir + ')' + LineEnding + '--- captured stdout ---' + LineEnding
+          + OutputTail(Result.Stdout) + LineEnding + '--- captured stderr ---'
+          + LineEnding + OutputTail(Result.Stderr) + LineEnding
+          + '--- end captured output ---');
       end;
-      { Final drain after exit. A requested timeout must remain bounded even
-        when a descendant retains a writer. Normal Windows completion keeps
-        its historical EOF barrier because live descendants can lock fixture
-        working directories; Unix completion stays nonblocking because an
-        orphaned writer is the Darwin scheduling failure this helper fixes. }
+      { Final drain after exit. Normal Windows completion keeps its
+        historical EOF barrier, bounded, because live descendants can lock
+        fixture working directories; Unix completion stays nonblocking
+        because an orphaned writer is the Darwin scheduling failure this
+        helper fixes. }
       {$IFDEF MSWINDOWS}
-      if not Result.TimedOut then
-      begin
-        Result.Stdout := Result.Stdout + DrainExitedStream(P.Output);
-        Result.Stderr := Result.Stderr + DrainExitedStream(P.Stderr);
-      end
-      else
+      ExitedDrainDeadline := GetTickCount64 + EXITED_DRAIN_MILLISECONDS;
+      Result.Stdout := Result.Stdout + DrainExitedStream(P.Output,
+        ExitedDrainDeadline);
+      Result.Stderr := Result.Stderr + DrainExitedStream(P.Stderr,
+        ExitedDrainDeadline);
+      {$ELSE}
+      DrainChildPipes(P, Result.Stdout, Result.Stderr);
       {$ENDIF}
-      begin
-        if P.Output.NumBytesAvailable > 0 then
-          Result.Stdout := Result.Stdout + DrainAvailableStream(P.Output);
-        if P.Stderr.NumBytesAvailable > 0 then
-          Result.Stderr := Result.Stderr + DrainAvailableStream(P.Stderr);
-      end;
       { Mirrors LWPT.Command.Common.NormalisedExitCode (this unit must
         not link LWPT units): on Unix, ExitCode decodes correctly only
         when the Running poll reaped the raw waitpid(2) status; if
