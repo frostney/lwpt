@@ -109,7 +109,7 @@ var
 begin
   Result := False;
   AHash := '';
-  if not FileExists(ASrc) then Exit;
+  if not LongPathFileExists(ASrc) then Exit;
   CopyCompleted := False;
   try
     Source := OpenProtectedFileStream(ASrc, fmOpenRead or fmShareDenyNone);
@@ -464,7 +464,7 @@ begin
   Staged := '';
   TmpRoot := '';
   Expected := CanonicalDigest(AExpectedDigest);
-  if not FileExists(ASourcePath) then
+  if not LongPathFileExists(ASourcePath) then
     raise ELWPTObjectStoreError.CreateFmt(
       'object admission source does not exist: %s', [ASourcePath]);
   Actual := 'sha256:' + SHA256File(ASourcePath);
@@ -629,7 +629,7 @@ begin
     try
       try
         if not LookupWithObjectGuard(Expected, SourcePath, AFailure) then Exit;
-        ForceDirectories(ATmpRoot);
+        LongPathForceDirectories(ATmpRoot);
         Staged := MakeTmpPath(ATmpRoot, 'cache-object');
         {$IFDEF OBJECTSTORE_TESTING}
         if Assigned(ObjectStoreBeforeMaterializeCopyTestHook) then
@@ -639,14 +639,14 @@ begin
           if not CopyFileContentAndHash(SourcePath, Staged, Expected,
             Actual) then
           begin
-            if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+            if LongPathFileExists(Staged) then LongPathDeleteFile(Staged);
             AFailure := omfCopyFailed;
             Exit;
           end;
           Actual := 'sha256:' + Actual;
           if Actual <> Expected then
           begin
-            SysUtils.DeleteFile(Staged);
+            LongPathDeleteFile(Staged);
             AFailure := omfStagedHashMismatch;
             Exit;
           end;
@@ -657,7 +657,7 @@ begin
           AFailure := omfNone;
           Result := True;
         except
-          if FileExists(Staged) then SysUtils.DeleteFile(Staged);
+          if LongPathFileExists(Staged) then LongPathDeleteFile(Staged);
           raise;
         end;
       finally
