@@ -11,7 +11,7 @@
   the current accepted history of a stored origin state:
     - the accepted checkpoint, and each signature envelope naming it;
     - the accepted snapshot and every predecessor reached through its
-      `previous` links among stored, hash-verified snapshots;
+      `previous` links;
     - every record those snapshots name; and
     - the accepted rotation triplets.
   A committed selection proof of a lock lies on that history (the head must
@@ -19,20 +19,25 @@
   superseded checkpoint and its signature are not.
 
   Every other document is evictable: superseded checkpoints and their
-  signatures, documents of deleted or re-pinned states, and documents behind
-  a missing or corrupt chain link. Evictable bytes are capped by
+  signatures, and documents of deleted states. Evictable bytes are capped by
   LWPT_REGISTRY_STATE_MAX_BYTES; beyond it, the least recently used go first.
   Recency is an access stamp kept in one index file, written atomically
   under the store lease by each successful online install for the
   documents it verified or its lock references. A document without a stamp
   is stamped when a pass first sees it.
 
-  Passes are bounded: at most RegistryStoreScanEntries documents are listed,
-  each chain is read within the verifier's snapshot, per-document, and total
-  byte limits, and only small evictable documents are opened to recognise
-  signatures. A pass that cannot determine the live set completely removes
-  nothing. Foreign entries (other names, directories, links) are never
-  counted or removed, and state files are never touched. }
+  Any uncertainty about the live set removes nothing: a directory that
+  cannot be listed completely, a state file that cannot be read, a missing,
+  unreadable, corrupt, or unparsable snapshot on an accepted history, an
+  unreadable small document that could be a live signature, and an
+  exceeded bound each make the pass incomplete. Passes are bounded: at most
+  RegistryStoreScanEntries entries are listed per directory, each chain is
+  read within the verifier's snapshot, per-document, and total byte limits,
+  and only small evictable documents are opened to recognise signatures.
+  Only regular files are documents: links, directories, devices, FIFOs, and
+  other names are foreign, never opened, counted, or removed, and state
+  files are never touched. The new recency index is published before any
+  removal, so a failed index write removes nothing. }
 unit LWPT.Registry.ConsumerStore;
 
 {$I Shared.inc}
@@ -94,13 +99,33 @@ type
     EvictableBytes: Int64;
     EvictedDocuments: Integer;
     EvictedBytes: Int64;
-    { Evictable documents a removal failed for (for example still open). }
+    { Evictable documents a removal failed for (for example still open on
+      Windows); they stay, and a later pass tries again. }
     RetainedDocuments: Integer;
+    RetainedBytes: Int64;
   end;
+
+  { One directory entry, described without following links. }
+  TLWPTRegistryStoreEntry = record
+    Name: string;
+    { A regular file: not a link, reparse point, directory, or device. }
+    Regular: Boolean;
+    Size: Int64;
+  end;
+  TLWPTRegistryStoreEntryArray = array of TLWPTRegistryStoreEntry;
 
 function RegistryStateDocumentPath(const ARoot, AHash: string): string;
 function RegistryStateDocumentsDirectory(const ARoot: string): string;
 function RegistryDocumentRecencyPath(const ARoot: string): string;
+{ Lists ADirectory without following links (lstat on Unix, find data
+  attributes on Windows). True with no entries when it does not exist. False,
+  with AError, when it exists but cannot be listed completely, or holds more
+  than AMaximum entries. }
+function ListRegistryStoreDirectory(const ADirectory: string;
+  const AMaximum: Integer; out AEntries: TLWPTRegistryStoreEntryArray;
+  out AError: string): Boolean;
+{ True when APath is a regular file, checked without following a link. }
+function RegistryStoreFileIsRegular(const APath: string): Boolean;
 { The budget from AValue: empty selects the default; otherwise an integer
   from 0 through High(Int64). Raises registry_state_budget_invalid. }
 function ResolveRegistryStateMaxBytesFromValue(const AValue: string): Int64;
@@ -128,11 +153,18 @@ procedure StampRegistryDocuments(const ARoot: string;
   const AHashes: TStringArray; const AStamp: Int64);
 
 
+
 implementation
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   DateUtils,
-  StrUtils;
+  StrUtils
+  {$IFDEF MSWINDOWS},
+  Windows
+  {$ENDIF};
 
 const
   DOCUMENT_EXTENSION = '.toml';
@@ -150,16 +182,21 @@ end;
 
 function RegistryDocumentRecencyPath(const ARoot: string): string;
 begin
-  Result := IncludeTrailingPathDelimiter(ARoot) + 'documents/recency';
+  { Outside documents/, so a document directory that refuses removals still
+    takes the index. }
+  Result := IncludeTrailingPathDelimiter(ARoot) + 'recency';
 end;
 
 function ResolveRegistryStateMaxBytesFromValue(const AValue: string): Int64;
-var Parsed: QWord; Value: string;
+var Parsed: QWord; Value: string; Index: Integer; Decimal: Boolean;
 begin
   Value := Trim(AValue);
   if Value = '' then Exit(RegistryStateDefaultMaxBytes);
-  { TryStrToQWord also accepts "$" hexadecimal and signs. }
-  if not (Value[1] in ['0'..'9']) or not TryStrToQWord(Value, Parsed)
+  { TryStrToQWord also accepts signs and $, 0x, and & prefixes. }
+  Decimal := True;
+  for Index := 1 to Length(Value) do
+    if not (Value[Index] in ['0'..'9']) then Decimal := False;
+  if not Decimal or not TryStrToQWord(Value, Parsed)
      or (Parsed > QWord(High(Int64))) then
     raise ELWPTRegistryError.CreateStable('registry_state_budget_invalid',
       REGISTRY_STATE_MAX_BYTES_ENV + ' must be an integer from 0 through '
@@ -180,6 +217,171 @@ begin
   Result := DateTimeToUnix(Current, False) * 1000
     + MilliSecondOfTheSecond(Current);
 end;
+
+{$IFDEF UNIX}
+function DescribeUnixEntry(const APath: string; out ARegular: Boolean;
+  out ASize: Int64): cint;
+var Info: TStat;
+begin
+  ARegular := False;
+  ASize := 0;
+  if fpLStat(PChar(APath), Info) <> 0 then Exit(fpgeterrno);
+  ARegular := fpS_ISREG(Info.st_mode);
+  ASize := Info.st_size;
+  Result := 0;
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+const
+  NON_REGULAR_ATTRIBUTES = FILE_ATTRIBUTE_DIRECTORY
+    or FILE_ATTRIBUTE_REPARSE_POINT or FILE_ATTRIBUTE_DEVICE;
+{$ENDIF}
+
+function RegistryStoreFileIsRegular(const APath: string): Boolean;
+{$IFDEF UNIX}
+var Size: Int64;
+begin
+  Result := (DescribeUnixEntry(APath, Result, Size) = 0) and Result;
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var Attributes: DWORD;
+begin
+  Attributes := GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  Result := (Attributes <> INVALID_FILE_ATTRIBUTES)
+    and ((Attributes and NON_REGULAR_ATTRIBUTES) = 0);
+end;
+{$ENDIF}
+
+function ListRegistryStoreDirectory(const ADirectory: string;
+  const AMaximum: Integer; out AEntries: TLWPTRegistryStoreEntryArray;
+  out AError: string): Boolean;
+var
+  Count: Integer;
+
+  function Add(const AName: string; const ARegular: Boolean;
+    const ASize: Int64): Boolean;
+  begin
+    if Count >= AMaximum then
+    begin
+      AError := ADirectory + ' holds more than ' + IntToStr(AMaximum)
+        + ' entries';
+      Exit(False);
+    end;
+    if Count > High(AEntries) then SetLength(AEntries, 2 * Count + 64);
+    AEntries[Count].Name := AName;
+    AEntries[Count].Regular := ARegular;
+    AEntries[Count].Size := ASize;
+    Inc(Count);
+    Result := True;
+  end;
+
+{$IFDEF UNIX}
+var
+  Directory: pDir;
+  Entry: pDirent;
+  Name: string;
+  Regular: Boolean;
+  Size: Int64;
+  Error: cint;
+begin
+  AEntries := nil;
+  AError := '';
+  Count := 0;
+  Result := False;
+  Directory := fpOpenDir(PChar(ADirectory));
+  if Directory = nil then
+  begin
+    Error := fpgeterrno;
+    if (Error = ESysENOENT) and not DirectoryExists(ADirectory) then
+      Exit(True);
+    AError := ADirectory + ' cannot be listed (error ' + IntToStr(Error) + ')';
+    Exit;
+  end;
+  try
+    repeat
+      fpSetErrno(0);
+      Entry := fpReadDir(Directory^);
+      if Entry = nil then
+      begin
+        Error := fpgeterrno;
+        if Error <> 0 then
+        begin
+          AError := ADirectory + ' could not be listed completely (error '
+            + IntToStr(Error) + ')';
+          Exit;
+        end;
+        Break;
+      end;
+      Name := StrPas(PChar(@Entry^.d_name[0]));
+      if (Name = '.') or (Name = '..') then Continue;
+      Error := DescribeUnixEntry(ADirectory + '/' + Name, Regular, Size);
+      { An entry replaced or removed since it was listed is no longer
+        there; any other failure leaves the listing uncertain. }
+      if Error = ESysENOENT then Continue;
+      if Error <> 0 then
+      begin
+        AError := ADirectory + '/' + Name + ' cannot be examined (error '
+          + IntToStr(Error) + ')';
+        Exit;
+      end;
+      if not Add(Name, Regular, Size) then Exit;
+    until False;
+  finally
+    fpCloseDir(Directory^);
+  end;
+  SetLength(AEntries, Count);
+  Result := True;
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Handle: THandle;
+  Data: TWin32FindDataW;
+  Name: string;
+  Error: DWORD;
+begin
+  AEntries := nil;
+  AError := '';
+  Count := 0;
+  Result := False;
+  Handle := FindFirstFileW(PWideChar(UnicodeString(ADirectory + '\*')), Data);
+  if Handle = INVALID_HANDLE_VALUE then
+  begin
+    Error := GetLastError;
+    if ((Error = ERROR_FILE_NOT_FOUND) or (Error = ERROR_PATH_NOT_FOUND))
+       and not DirectoryExists(ADirectory) then
+      Exit(True);
+    AError := ADirectory + ' cannot be listed (error ' + IntToStr(Error) + ')';
+    Exit;
+  end;
+  try
+    repeat
+      Name := string(UnicodeString(PWideChar(@Data.cFileName[0])));
+      if (Name <> '.') and (Name <> '..') then
+        if not Add(Name, (Data.dwFileAttributes and NON_REGULAR_ATTRIBUTES) = 0,
+             (Int64(Data.nFileSizeHigh) shl 32) or Int64(Data.nFileSizeLow)) then
+          Exit;
+      if not FindNextFileW(Handle, Data) then
+      begin
+        Error := GetLastError;
+        if Error <> ERROR_NO_MORE_FILES then
+        begin
+          AError := ADirectory + ' could not be listed completely (error '
+            + IntToStr(Error) + ')';
+          Exit;
+        end;
+        Break;
+      end;
+    until False;
+  finally
+    Windows.FindClose(Handle);
+  end;
+  SetLength(AEntries, Count);
+  Result := True;
+end;
+{$ENDIF}
 
 function IsLowerHexDigest(const AValue: string): Boolean;
 var Index: Integer;
@@ -205,13 +407,14 @@ begin
   else Result := '';
 end;
 
-{ The bytes of APath when it holds at most AMaximum bytes; nil when absent,
-  unreadable (for example removed concurrently), or larger. }
+{ The bytes of the regular file APath when it holds at most AMaximum bytes;
+  nil when absent, not a regular file (never opened), unreadable, or
+  larger. }
 function ReadSmallFile(const APath: string; const AMaximum: Int64): TBytes;
 var Stream: TFileStream;
 begin
   Result := nil;
-  if not FileExists(APath) then Exit;
+  if not RegistryStoreFileIsRegular(APath) then Exit;
   try
     Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   except
@@ -418,36 +621,33 @@ var
   end;
 
   procedure ListDocuments;
-  var Entry: TSearchRec; Digest: string; Count: Integer;
+  var
+    Entries: TLWPTRegistryStoreEntryArray;
+    Error, Digest: string;
+    Index, Count: Integer;
   begin
+    if not ListRegistryStoreDirectory(Directory, RegistryStoreScanEntries,
+         Entries, Error) then
+    begin
+      MarkIncomplete(Error);
+      Exit;
+    end;
+    SetLength(Documents, Length(Entries));
     Count := 0;
-    if FindFirst(Directory + '/*', faAnyFile, Entry) = 0 then
-    try
-      repeat
-        if (Entry.Name = '.') or (Entry.Name = '..') then Continue;
-        Digest := DocumentNameDigest(Entry.Name);
-        if (Digest = '') or ((Entry.Attr and faDirectory) <> 0)
-           {$IFDEF UNIX} or ((Entry.Attr and faSymLink) <> 0) {$ENDIF} then
-        begin
-          Inc(Result.IgnoredEntries);
-          Continue;
-        end;
-        if Count >= RegistryStoreScanEntries then
-        begin
-          MarkIncomplete('the document store lists more than '
-            + IntToStr(RegistryStoreScanEntries) + ' documents');
-          Break;
-        end;
-        if Count > High(Documents) then SetLength(Documents, 2 * Count + 64);
-        Documents[Count].Digest := Digest;
-        Documents[Count].Size := Entry.Size;
-        Documents[Count].Live := False;
-        Present.AddOrSetValue(Digest, Count);
-        Inc(Result.DocumentBytes, Int64(Entry.Size));
-        Inc(Count);
-      until SysUtils.FindNext(Entry) <> 0;
-    finally
-      SysUtils.FindClose(Entry);
+    for Index := 0 to High(Entries) do
+    begin
+      Digest := DocumentNameDigest(Entries[Index].Name);
+      if (Digest = '') or not Entries[Index].Regular then
+      begin
+        Inc(Result.IgnoredEntries);
+        Continue;
+      end;
+      Documents[Count].Digest := Digest;
+      Documents[Count].Size := Entries[Index].Size;
+      Documents[Count].Live := False;
+      Present.AddOrSetValue(Digest, Count);
+      Inc(Result.DocumentBytes, Entries[Index].Size);
+      Inc(Count);
     end;
     SetLength(Documents, Count);
     Result.Documents := Count;
@@ -479,15 +679,26 @@ var
     Total := 0;
     while (Current <> '') and Result.Complete do
     begin
-      MarkLive(Current);
       Digest := HashDigest(Current);
+      if Digest = '' then
+      begin
+        MarkIncomplete('an accepted history names the invalid snapshot "'
+          + Current + '"');
+        Exit;
+      end;
+      MarkLive(Current);
       { A chain shared with an earlier root was followed already. }
-      if (Digest = '') or Walked.ContainsKey(Digest) then Exit;
+      if Walked.ContainsKey(Digest) then Exit;
       Walked.Add(Digest, True);
       Index := DocumentIndex(Digest);
-      { A missing link ends the chain: the next acquisition transfers what
-        lies behind it again. }
-      if Index < 0 then Exit;
+      { Every acquisition stores its whole history, so a gap means the live
+        set behind it is unknown. }
+      if Index < 0 then
+      begin
+        MarkIncomplete('accepted snapshot ' + Current + ' is missing from '
+          + Directory + '; the next online install stores it again');
+        Exit;
+      end;
       if Steps >= ALimits.Snapshots then
       begin
         MarkIncomplete('an accepted history exceeds '
@@ -504,11 +715,20 @@ var
       Bytes := ReadSmallFile(DocumentPath(Digest), ALimits.DocumentBytes);
       Inc(Steps);
       Inc(Total, Int64(Length(Bytes)));
-      { A corrupt or unreadable link stays live by name; the chain behind it
-        is not followed. }
-      if (Bytes = nil) or (SHA256BytesPrefixed(Bytes) <> Current) then Exit;
-      if not ParseSnapshotLinks(RegistryBytesText(Bytes), Previous, Records) then
+      if (Bytes = nil) and (Documents[Index].Size > 0) then
+      begin
+        MarkIncomplete('accepted snapshot ' + DocumentPath(Digest)
+          + ' cannot be read');
         Exit;
+      end;
+      if (SHA256BytesPrefixed(Bytes) <> Current)
+         or not ParseSnapshotLinks(RegistryBytesText(Bytes), Previous, Records) then
+      begin
+        MarkIncomplete('accepted snapshot ' + DocumentPath(Digest)
+          + ' is corrupt; delete it so the next online install stores a '
+          + 'verified copy');
+        Exit;
+      end;
       for Item := 0 to High(Records) do MarkLive(Records[Item]);
       Current := Previous;
     end;
@@ -521,20 +741,34 @@ var
     if Checkpoints.Count = 0 then Exit;
     for Index := 0 to High(Documents) do
     begin
+      if not Result.Complete then Exit;
       if Documents[Index].Live
          or (Documents[Index].Size > RegistryStoreSignatureProbeBytes) then
         Continue;
       Bytes := ReadSmallFile(DocumentPath(Documents[Index].Digest),
         RegistryStoreSignatureProbeBytes);
-      if (Bytes = nil)
+      if (Bytes = nil) and (Documents[Index].Size > 0) then
+      begin
+        MarkIncomplete(DocumentPath(Documents[Index].Digest)
+          + ' cannot be read, so whether it is a live signature is unknown');
+        Exit;
+      end;
+      { Bytes that do not hash to the name are not that document, and no
+        other document's liveness depends on a signature: it stays
+        evictable. }
+      if (SHA256BytesPrefixed(Bytes) <> 'sha256:' + Documents[Index].Digest)
          or not StartsStr('schema = "' + PROGRAM_NAME
-           + '-registry-signature-v1"', RegistryBytesText(Bytes))
-         or (SHA256BytesPrefixed(Bytes) <> 'sha256:' + Documents[Index].Digest) then
+           + '-registry-signature-v1"', RegistryBytesText(Bytes)) then
         Continue;
       try
         Payload := InspectRegistrySignaturePayload(Bytes);
       except
-        on E: Exception do Continue;
+        on E: Exception do
+        begin
+          MarkIncomplete(DocumentPath(Documents[Index].Digest)
+            + ' is a signature envelope that cannot be parsed');
+          Exit;
+        end;
       end;
       if Checkpoints.ContainsKey(HashDigest(Payload)) then
         Documents[Index].Live := True;
@@ -555,8 +789,8 @@ var
         MarkLive(ARoots[Index].Rotations[Item]);
       WalkHistory(ARoots[Index].Snapshot);
     end;
+    if Result.Complete then MarkSignatures;
     if not Result.Complete then Exit;
-    MarkSignatures;
     Result.Analyzed := True;
     for Index := 0 to High(Documents) do
       if Documents[Index].Live then
@@ -573,14 +807,15 @@ var
 
   procedure UpdateAndEvict;
   var
-    Recency, Survivors: TLWPTRegistryRecency;
+    Recency, Published: TLWPTRegistryRecency;
     Stamps: array of Int64;
     Order: TStringArray;
+    Victims: array of Integer;
     Index, Position, Count: Integer;
-    Stamp: Int64;
+    Stamp, Remaining: Int64;
   begin
     Recency := LoadRegistryDocumentRecency(ARoot);
-    Survivors := TLWPTRegistryRecency.Create;
+    Published := TLWPTRegistryRecency.Create;
     try
       SetLength(Stamps, Length(Documents));
       { A document without a stamp is first seen now. }
@@ -589,19 +824,20 @@ var
         if not Recency.TryGetValue(Documents[Index].Digest, Stamp) then
           Stamp := ANow;
         Stamps[Index] := Stamp;
-        Survivors.AddOrSetValue(Documents[Index].Digest, Stamp);
       end;
       for Index := 0 to High(AUsed) do
       begin
         Position := DocumentIndex(HashDigest(AUsed[Index]));
-        if Position < 0 then Continue;
-        Stamps[Position] := ANow;
-        Survivors.AddOrSetValue(Documents[Position].Digest, ANow);
+        if Position >= 0 then Stamps[Position] := ANow;
       end;
-      if Result.Analyzed and (Result.EvictableBytes > ABudget) then
+      for Index := 0 to High(Documents) do
+        Published.AddOrSetValue(Documents[Index].Digest, Stamps[Index]);
+      { Victims are chosen first: oldest stamp, then digest. Stamps are
+        non-negative, so the zero-padded decimal sorts numerically. }
+      Victims := nil;
+      if Result.Analyzed and Result.Complete
+         and (Result.EvictableBytes > ABudget) then
       begin
-        { Oldest stamp first; the digest breaks ties. Stamps are
-          non-negative, so the zero-padded decimal sorts numerically. }
         SetLength(Order, Result.EvictableDocuments);
         Count := 0;
         for Index := 0 to High(Documents) do
@@ -613,22 +849,39 @@ var
             Inc(Count);
           end;
         SortOrdinal(Order);
+        Remaining := Result.EvictableBytes;
+        SetLength(Victims, Length(Order));
+        Count := 0;
         for Position := 0 to High(Order) do
         begin
-          if Result.EvictableBytes - Result.EvictedBytes <= ABudget then Break;
+          if Remaining <= ABudget then Break;
           Index := DocumentIndex(Copy(Order[Position], 20, 64));
-          if SysUtils.DeleteFile(DocumentPath(Documents[Index].Digest)) then
-          begin
-            Survivors.Remove(Documents[Index].Digest);
-            Inc(Result.EvictedDocuments);
-            Inc(Result.EvictedBytes, Documents[Index].Size);
-          end
-          else Inc(Result.RetainedDocuments);
+          Victims[Count] := Index;
+          Inc(Count);
+          Dec(Remaining, Documents[Index].Size);
+        end;
+        SetLength(Victims, Count);
+      end;
+      { The index is published before any removal: a failed write raises
+        with every document still in place. A victim keeps its entry, so a
+        removal that fails keeps its stamp; the next pass prunes the rest. }
+      WriteRecency(ARoot, Published);
+      for Position := 0 to High(Victims) do
+      begin
+        Index := Victims[Position];
+        if SysUtils.DeleteFile(DocumentPath(Documents[Index].Digest)) then
+        begin
+          Inc(Result.EvictedDocuments);
+          Inc(Result.EvictedBytes, Documents[Index].Size);
+        end
+        else
+        begin
+          Inc(Result.RetainedDocuments);
+          Inc(Result.RetainedBytes, Documents[Index].Size);
         end;
       end;
-      WriteRecency(ARoot, Survivors);
     finally
-      Survivors.Free;
+      Published.Free;
       Recency.Free;
     end;
   end;

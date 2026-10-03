@@ -374,7 +374,8 @@ function ReadBoundedDocument(const APath, AHash: string;
 var Stream: TFileStream;
 begin
   Result := nil;
-  if not FileExists(APath) then Exit;
+  { Never open a link, FIFO, or device planted under a document name. }
+  if not RegistryStoreFileIsRegular(APath) then Exit;
   { An evictable document may be removed between the check and the open. }
   try
     Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
@@ -937,13 +938,13 @@ end;
 function CollectRegistryStoreRoots(const ARoot: string;
   out ARoots: TLWPTRegistryStoreRootArray; out AReason: string): Boolean;
 var
-  Entry: TSearchRec;
-  Directory, Path, Text, Identity, TrustKeyId: string;
+  Directory, Path, Identity, TrustKeyId, Error: string;
+  Entries: TLWPTRegistryStoreEntryArray;
   Bytes: TBytes;
   Parser: TTOMLParser;
   Root: TTOMLNode;
   State: TLWPTRegistryConsumerState;
-  Index: Integer;
+  Index, Count: Integer;
 
   function IsStateFileName(const AName: string): Boolean;
   var Position: Integer;
@@ -954,75 +955,71 @@ var
       if not (AName[Position] in ['0'..'9', 'a'..'f']) then Exit(False);
   end;
 
-  procedure Fail(const AName, AWhy: string);
+  function Fail(const AName, AWhy: string): Boolean;
   begin
     AReason := 'per-user registry state ' + Directory + '/' + AName
       + ' cannot be read (' + AWhy + '), so its accepted history is unknown';
+    ARoots := nil;
+    Result := False;
   end;
 
 begin
   ARoots := nil;
   AReason := '';
   Directory := IncludeTrailingPathDelimiter(ARoot) + 'origins';
-  if FindFirst(Directory + '/*', faAnyFile, Entry) = 0 then
-  try
-    repeat
-      if ((Entry.Attr and faDirectory) <> 0) or not IsStateFileName(Entry.Name) then
-        Continue;
-      Path := Directory + '/' + Entry.Name;
-      SetLength(Bytes, 0);
-      try
-        Bytes := ReadStateFileBytes(Path);
-      except
-        on E: Exception do
-        begin
-          Fail(Entry.Name, E.Message);
-          Exit(False);
-        end;
-      end;
-      Text := RegistryBytesText(Bytes);
-      Parser := TTOMLParser.Create;
-      Root := nil;
-      try
-        try
-          Root := Parser.ParseDocument(Text);
-          Identity := TomlStr(Root, 'origin', '');
-          TrustKeyId := TomlStr(Root, 'trust_key_id', '');
-        except
-          on E: Exception do
-          begin
-            Fail(Entry.Name, E.Message);
-            Exit(False);
-          end;
-        end;
-      finally
-        Root.Free;
-        Parser.Free;
-      end;
-      if (Identity = '') or (RegistryStatePathAt(ARoot, Identity, TrustKeyId)
-           <> IncludeTrailingPathDelimiter(ARoot) + 'origins/' + Entry.Name) then
-      begin
-        Fail(Entry.Name, 'its origin and pinned key do not name this file');
-        Exit(False);
-      end;
-      try
-        LoadRegistryConsumerStateAt(ARoot, Identity, TrustKeyId, State);
-      except
-        on E: Exception do
-        begin
-          Fail(Entry.Name, E.Message);
-          Exit(False);
-        end;
-      end;
-      Index := Length(ARoots);
-      SetLength(ARoots, Index + 1);
-      ARoots[Index].Checkpoint := State.State.CheckpointHash;
-      ARoots[Index].Snapshot := State.State.Snapshot;
-      ARoots[Index].Rotations := State.Rotations;
-    until SysUtils.FindNext(Entry) <> 0;
-  finally
-    SysUtils.FindClose(Entry);
+  { An origins directory that cannot be listed completely hides accepted
+    histories: that is never an empty directory. }
+  if not ListRegistryStoreDirectory(Directory, RegistryStoreScanEntries,
+       Entries, Error) then
+  begin
+    AReason := 'per-user registry state ' + Error
+      + ', so the accepted histories are unknown';
+    Exit(False);
   end;
+  SetLength(ARoots, Length(Entries));
+  Count := 0;
+  for Index := 0 to High(Entries) do
+  begin
+    if not IsStateFileName(Entries[Index].Name) then Continue;
+    if not Entries[Index].Regular then
+      Exit(Fail(Entries[Index].Name, 'not a regular file'));
+    Path := Directory + '/' + Entries[Index].Name;
+    try
+      Bytes := ReadStateFileBytes(Path);
+    except
+      on E: Exception do Exit(Fail(Entries[Index].Name, E.Message));
+    end;
+    Parser := TTOMLParser.Create;
+    Root := nil;
+    try
+      try
+        Root := Parser.ParseDocument(RegistryBytesText(Bytes));
+        Identity := TomlStr(Root, 'origin', '');
+        TrustKeyId := TomlStr(Root, 'trust_key_id', '');
+      except
+        on E: Exception do Exit(Fail(Entries[Index].Name, E.Message));
+      end;
+    finally
+      Root.Free;
+      Parser.Free;
+    end;
+    if (Identity = '') or (RegistryStatePathAt(ARoot, Identity, TrustKeyId)
+         <> IncludeTrailingPathDelimiter(ARoot) + 'origins/'
+           + Entries[Index].Name) then
+      Exit(Fail(Entries[Index].Name,
+        'its origin and pinned key do not name this file'));
+    try
+      if not LoadRegistryConsumerStateAt(ARoot, Identity, TrustKeyId, State) then
+        Exit(Fail(Entries[Index].Name, 'it disappeared while being read'));
+    except
+      on E: Exception do Exit(Fail(Entries[Index].Name, E.Message));
+    end;
+    ARoots[Count].Checkpoint := State.State.CheckpointHash;
+    ARoots[Count].Snapshot := State.State.Snapshot;
+    ARoots[Count].Rotations := State.Rotations;
+    Inc(Count);
+  end;
+  SetLength(ARoots, Count);
   Result := True;
 end;
 
@@ -1835,6 +1832,11 @@ begin
       WriteLn('  evicted ', Report.EvictedDocuments, ' per-user registry ',
         'document(s) (', Report.EvictedBytes, ' bytes) outside every accepted ',
         'history beyond the ', Report.BudgetBytes, '-byte budget');
+    if Report.RetainedDocuments > 0 then
+      WriteLn(ErrOutput, 'warning: ', Report.RetainedDocuments, ' evictable ',
+        'per-user registry document(s) (', Report.RetainedBytes, ' bytes) ',
+        'could not be removed, for example because another process has them ',
+        'open; a later install tries again');
     if not Report.Complete then
       WriteLn(ErrOutput, 'warning: per-user registry documents were not ',
         'evicted: ', Report.Incomplete);

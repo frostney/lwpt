@@ -142,6 +142,12 @@ begin
   else
     WriteLn('repair: nothing in the registry document store is evictable: ',
       Report.Incomplete);
+  { Documents an install could not remove, for example while another
+    process held them open, show up here as bytes over the budget. }
+  if Report.Analyzed and (Report.EvictableBytes > Report.BudgetBytes) then
+    WriteLn('repair: ', Report.EvictableBytes - Report.BudgetBytes,
+      ' evictable byte(s) exceed the budget; the next online install evicts ',
+      'them unless another process holds them open');
   if Report.IgnoredEntries > 0 then
     WriteLn('repair: ignored ', Report.IgnoredEntries, ' foreign entry(ies) in ',
       'the registry document store');

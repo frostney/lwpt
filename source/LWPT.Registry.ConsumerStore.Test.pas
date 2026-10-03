@@ -11,6 +11,7 @@ program LWPT.Registry.ConsumerStore.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -23,7 +24,10 @@ uses
   TestingPascalLibrary,
   Tests.RegistryConsumer,
   Tests.Scratch,
-  Tests.TarSynth;
+  Tests.TarSynth
+  {$IFDEF MSWINDOWS},
+  Windows
+  {$ENDIF};
 
 const
   IDENTITY = 'https://packages.example.com';
@@ -59,6 +63,12 @@ type
     procedure TestRecencyStampsUseAndFirstSight;
     procedure TestForeignEntriesAreNeverTouched;
     procedure TestCorruptDocumentsAndIndexAreHandledSafely;
+    procedure TestBrokenHistoryRemovesNothing;
+    procedure TestUnlistableDirectoriesRemoveNothing;
+    procedure TestLinksAndSpecialFilesAreForeign;
+    procedure TestUnreadableSmallDocumentRemovesNothing;
+    procedure TestFailedRemovalIsRetainedAndReported;
+    procedure TestIndexWriteFailureRemovesNothing;
     procedure TestUnreadableStateBlocksEviction;
     procedure TestHistoryWalkIsBounded;
     procedure TestReadingPassWritesNothing;
@@ -78,7 +88,7 @@ begin
   try
     Result := Search.Size;
   finally
-    FindClose(Search);
+    SysUtils.FindClose(Search);
   end;
 end;
 
@@ -373,8 +383,16 @@ begin
   finally
     Recency.Free;
   end;
-  { Evicted documents leave the index. }
+  { The index is published before removals, so evicted documents leave it
+    on the next pass. }
   Pass(Store.Root, 0, 1000);
+  Recency := LoadRegistryDocumentRecency(Store.Root);
+  try
+    Expect<Integer>(Recency.Count).ToBe(11);
+  finally
+    Recency.Free;
+  end;
+  Pass(Store.Root, 0, 1100);
   Recency := LoadRegistryDocumentRecency(Store.Root);
   try
     Expect<Integer>(Recency.Count).ToBe(6);
@@ -422,7 +440,8 @@ var
   Recency: TLWPTRegistryRecency;
 begin
   Store := BuildStore;
-  { A file under an evictable name whose bytes do not match it. }
+  { A small file under an evictable name whose bytes do not match it is not
+    that document, and nothing else depends on it. }
   Forged := Orphan(Store.Root, 'forged', 200);
   WriteTextFile(RegistryStateDocumentPath(Store.Root, Forged), 'tampered');
   WriteTextFile(RegistryDocumentRecencyPath(Store.Root), 'not an index'#10
@@ -433,27 +452,268 @@ begin
   finally
     Recency.Free;
   end;
-  { The accepted snapshot is corrupted: it stays, by name, but the chain
-    behind it is not followed. }
-  WriteTextFile(RegistryStateDocumentPath(Store.Root, Store.Snapshot2),
-    'corrupt snapshot');
   Report := Pass(Store.Root, 0, 100);
   Expect<Boolean>(Report.Complete).ToBe(True);
-  Expect<Boolean>(Present(Store.Root, Store.Snapshot2)).ToBe(True);
-  Expect<Boolean>(Present(Store.Root, Store.Checkpoints[2])).ToBe(True);
-  Expect<Boolean>(Present(Store.Root, Store.Signatures[2])).ToBe(True);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(5);
   Expect<Boolean>(Present(Store.Root, Forged)).ToBe(False);
-  { What lies behind the corrupt link costs only re-transfer. }
-  Expect<Boolean>(Present(Store.Root, Store.Snapshot1)).ToBe(False);
-  Expect<Boolean>(Present(Store.Root, Store.RecordAlpha)).ToBe(False);
-  Expect<string>(ReadBinaryFile(Store.StatePath)).ToBe(Store.StateBytes);
+  ExpectLive(Store);
   Recency := LoadRegistryDocumentRecency(Store.Root);
   try
-    Expect<Integer>(Recency.Count).ToBe(Report.Documents
-      - Report.EvictedDocuments);
+    Expect<Integer>(Recency.Count).ToBe(Report.Documents);
   finally
     Recency.Free;
   end;
+end;
+
+procedure TRegistryStoreTests.TestBrokenHistoryRemovesNothing;
+var
+  Store: TStoreFixture;
+  Report: TLWPTRegistryStoreReport;
+  Before, SnapshotPath: string;
+begin
+  Store := BuildStore;
+  SnapshotPath := RegistryStateDocumentPath(Store.Root, Store.Snapshot2);
+  { A corrupt accepted snapshot hides the history behind it. }
+  Before := ReadBinaryFile(SnapshotPath);
+  WriteTextFile(SnapshotPath, 'corrupt snapshot');
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Boolean>(Pos('is corrupt; delete it', Report.Incomplete) > 0).ToBe(True);
+  Expect<Boolean>(Pos(RegistryDigestHex(Store.Snapshot2), Report.Incomplete) > 0)
+    .ToBe(True);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  Expect<Boolean>(Present(Store.Root, Store.Checkpoints[0])).ToBe(True);
+  { So does a snapshot that is not there at all. }
+  WriteBytesToFile(SnapshotPath, BytesOf(Before));
+  Expect<Boolean>(SysUtils.DeleteFile(RegistryStateDocumentPath(Store.Root,
+    Store.Snapshot1))).ToBe(True);
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Boolean>(Pos('is missing', Report.Incomplete) > 0).ToBe(True);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  Expect<Boolean>(Present(Store.Root, Store.RecordAlpha)).ToBe(True);
+  Expect<Boolean>(Present(Store.Root, Store.Signatures[1])).ToBe(True);
+  Expect<string>(ReadBinaryFile(Store.StatePath)).ToBe(Store.StateBytes);
+end;
+
+{ Running as root defeats permission-based failures; those cases then only
+  check that nothing breaks. }
+function PermissionsApply: Boolean;
+begin
+  {$IFDEF UNIX}
+  Result := fpGetEUid <> 0;
+  {$ELSE}
+  Result := True;
+  {$ENDIF}
+end;
+
+procedure TRegistryStoreTests.TestUnlistableDirectoriesRemoveNothing;
+var
+  Store: TStoreFixture;
+  Report: TLWPTRegistryStoreReport;
+  Roots: TLWPTRegistryStoreRootArray;
+  Reason, Origins: string;
+begin
+  Store := BuildStore;
+  Origins := Store.Root + '/origins';
+  { An origins path that is not a directory is never an empty directory. }
+  Expect<Boolean>(RenameFile(Origins, Store.Root + '/origins.away')).ToBe(True);
+  WriteTextFile(Origins, 'not a directory');
+  Expect<Boolean>(CollectRegistryStoreRoots(Store.Root, Roots, Reason)).ToBe(False);
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  Expect<Boolean>(Present(Store.Root, Store.Checkpoints[0])).ToBe(True);
+  SysUtils.DeleteFile(Origins);
+  Expect<Boolean>(RenameFile(Store.Root + '/origins.away', Origins)).ToBe(True);
+  {$IFDEF UNIX}
+  if PermissionsApply then
+  begin
+    { A directory that exists but cannot be listed. }
+    fpChmod(PChar(Origins), &000);
+    try
+      Report := Pass(Store.Root, 0, 100);
+    finally
+      fpChmod(PChar(Origins), &755);
+    end;
+    Expect<Boolean>(Report.Complete).ToBe(False);
+    Expect<Boolean>(Pos('cannot be listed', Report.Incomplete) > 0).ToBe(True);
+    Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+    fpChmod(PChar(RegistryStateDocumentsDirectory(Store.Root)), &000);
+    try
+      Report := Pass(Store.Root, 0, 100);
+    finally
+      fpChmod(PChar(RegistryStateDocumentsDirectory(Store.Root)), &755);
+    end;
+    Expect<Boolean>(Report.Complete).ToBe(False);
+    Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  end;
+  {$ENDIF}
+  Expect<Boolean>(Present(Store.Root, Store.Signatures[0])).ToBe(True);
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(4);
+end;
+
+{$IFDEF MSWINDOWS}
+function CreateSymbolicLinkW(ALink, ATarget: PWideChar; AFlags: DWORD): BOOLEAN;
+  stdcall; external 'kernel32' name 'CreateSymbolicLinkW';
+{$ENDIF}
+
+procedure TRegistryStoreTests.TestLinksAndSpecialFilesAreForeign;
+var
+  Store: TStoreFixture;
+  Report: TLWPTRegistryStoreReport;
+  Outside, OutsideHash, LinkPath, Expected: string;
+  Ignored: Integer;
+begin
+  Store := BuildStore;
+  { A hash-named link to a file outside the store. }
+  Outside := Store.Root + '/outside.toml';
+  WriteTextFile(Outside, 'outside the store');
+  OutsideHash := SHA256BytesPrefixed(BytesOf(ReadBinaryFile(Outside)));
+  LinkPath := RegistryStateDocumentPath(Store.Root, OutsideHash);
+  Expected := ReadBinaryFile(Outside);
+  Ignored := 0;
+  {$IFDEF UNIX}
+  Expect<Integer>(fpSymlink(PChar(Outside), PChar(LinkPath))).ToBe(0);
+  Inc(Ignored);
+  { A FIFO under a document name would block a reader forever. }
+  Expect<Integer>(fpMkFifo(PChar(RegistryStateDocumentPath(Store.Root,
+    'sha256:' + StringOfChar('f', 64))), &600)).ToBe(0);
+  Inc(Ignored);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  { 2 = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE; without developer mode
+    or privilege the link cannot be made, and the case checks the rest. }
+  if CreateSymbolicLinkW(PWideChar(UnicodeString(StringReplace(LinkPath, '/',
+       '\', [rfReplaceAll]))), PWideChar(UnicodeString(StringReplace(Outside,
+       '/', '\', [rfReplaceAll]))), 2) then
+    Inc(Ignored)
+  else
+    WriteLn('  (file symbolic links unavailable; reparse-point case skipped)');
+  {$ENDIF}
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Boolean>(Report.Complete).ToBe(True);
+  Expect<Integer>(Report.IgnoredEntries).ToBe(Ignored);
+  Expect<Integer>(Report.Documents).ToBe(10);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(4);
+  Expect<string>(ReadBinaryFile(Outside)).ToBe(Expected);
+  {$IFDEF UNIX}
+  Expect<Boolean>(fpReadLink(LinkPath) = Outside).ToBe(True);
+  Expect<Boolean>(FileExists(RegistryStateDocumentPath(Store.Root,
+    'sha256:' + StringOfChar('f', 64)))).ToBe(True);
+  {$ENDIF}
+  ExpectLive(Store);
+end;
+
+procedure TRegistryStoreTests.TestUnreadableSmallDocumentRemovesNothing;
+var
+  Store: TStoreFixture;
+  Report: TLWPTRegistryStoreReport;
+  Small: string;
+  {$IFDEF MSWINDOWS}
+  Holder: TFileStream;
+  {$ENDIF}
+begin
+  Store := BuildStore;
+  { It could be a live signature, so the pass cannot rule it out. }
+  Small := Orphan(Store.Root, 'small', 300);
+  if not PermissionsApply then Exit;
+  {$IFDEF UNIX}
+  fpChmod(PChar(RegistryStateDocumentPath(Store.Root, Small)), &000);
+  try
+    Report := Pass(Store.Root, 0, 100);
+  finally
+    fpChmod(PChar(RegistryStateDocumentPath(Store.Root, Small)), &644);
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Holder := TFileStream.Create(RegistryStateDocumentPath(Store.Root, Small),
+    fmOpenRead or fmShareExclusive);
+  try
+    Report := Pass(Store.Root, 0, 100);
+  finally
+    Holder.Free;
+  end;
+  {$ENDIF}
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Boolean>(Pos('whether it is a live signature is unknown',
+    Report.Incomplete) > 0).ToBe(True);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  Expect<Boolean>(Present(Store.Root, Small)).ToBe(True);
+  Expect<Boolean>(Present(Store.Root, Store.Checkpoints[0])).ToBe(True);
+end;
+
+procedure TRegistryStoreTests.TestFailedRemovalIsRetainedAndReported;
+var
+  Store: TStoreFixture;
+  Report: TLWPTRegistryStoreReport;
+  Victim: string;
+  Recency: TLWPTRegistryRecency;
+  {$IFDEF MSWINDOWS}
+  Holder: TFileStream;
+  {$ENDIF}
+begin
+  Store := BuildStore;
+  Victim := Orphan(Store.Root, 'held', 5000);
+  StampRegistryDocuments(Store.Root, Hashes([Victim]), 1);
+  if not PermissionsApply then Exit;
+  { Only the orphan is over a budget that holds the superseded documents. }
+  {$IFDEF UNIX}
+  fpChmod(PChar(RegistryStateDocumentsDirectory(Store.Root)), &555);
+  try
+    Report := Pass(Store.Root, SupersededBytes(Store), 100);
+  finally
+    fpChmod(PChar(RegistryStateDocumentsDirectory(Store.Root)), &755);
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  { A reader's handle shares reading and writing, never deletion. }
+  Holder := TFileStream.Create(RegistryStateDocumentPath(Store.Root, Victim),
+    fmOpenRead or fmShareDenyNone);
+  try
+    Report := Pass(Store.Root, SupersededBytes(Store), 100);
+  finally
+    Holder.Free;
+  end;
+  {$ENDIF}
+  Expect<Boolean>(Report.Complete).ToBe(True);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  Expect<Integer>(Report.RetainedDocuments).ToBe(1);
+  Expect<Int64>(Report.RetainedBytes).ToBe(5000);
+  Expect<Boolean>(Present(Store.Root, Victim)).ToBe(True);
+  { The retained document keeps its stamp for the next pass. }
+  Recency := LoadRegistryDocumentRecency(Store.Root);
+  try
+    Expect<Boolean>(Recency.ContainsKey(RegistryDigestHex(Victim))).ToBe(True);
+  finally
+    Recency.Free;
+  end;
+  Report := Pass(Store.Root, SupersededBytes(Store), 100);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(1);
+  Expect<Boolean>(Present(Store.Root, Victim)).ToBe(False);
+end;
+
+procedure TRegistryStoreTests.TestIndexWriteFailureRemovesNothing;
+var
+  Store: TStoreFixture;
+  Message: string;
+begin
+  Store := BuildStore;
+  { The index cannot replace a directory. }
+  ForceDirectories(RegistryDocumentRecencyPath(Store.Root) + '/blocked');
+  Message := '';
+  try
+    Pass(Store.Root, 0, 100);
+  except
+    on E: Exception do Message := E.Message;
+  end;
+  Expect<Boolean>(Message <> '').ToBe(True);
+  Expect<Boolean>(Present(Store.Root, Store.Checkpoints[0])).ToBe(True);
+  Expect<Boolean>(Present(Store.Root, Store.Signatures[0])).ToBe(True);
+  Expect<Boolean>(Present(Store.Root, Store.Checkpoints[1])).ToBe(True);
+  Expect<Boolean>(Present(Store.Root, Store.Signatures[1])).ToBe(True);
+  ExpectLive(Store);
 end;
 
 procedure TRegistryStoreTests.TestUnreadableStateBlocksEviction;
@@ -478,12 +738,12 @@ begin
   Expect<Boolean>(Present(Store.Root, Store.Checkpoints[0])).ToBe(True);
   Expect<string>(ReadBinaryFile(Corrupt)).ToBe(CorruptBytes);
   { A valid state file under another file's name is not trusted either. }
-  DeleteFile(Corrupt);
+  SysUtils.DeleteFile(Corrupt);
   WriteTextFile(Corrupt, Store.StateBytes);
   Report := Pass(Store.Root, 0, 100);
   Expect<Boolean>(Report.Complete).ToBe(False);
   Expect<Integer>(Report.EvictedDocuments).ToBe(0);
-  DeleteFile(Corrupt);
+  SysUtils.DeleteFile(Corrupt);
   Report := Pass(Store.Root, 0, 100);
   Expect<Integer>(Report.EvictedDocuments).ToBe(4);
 end;
@@ -555,6 +815,10 @@ begin
   Expect<Boolean>(Pos(REGISTRY_STATE_MAX_BYTES_ENV, Failure('abc')) > 0).ToBe(True);
   Expect<Boolean>(Failure('1.5') <> '').ToBe(True);
   Expect<Boolean>(Failure('$10') <> '').ToBe(True);
+  Expect<Boolean>(Failure('0x10') <> '').ToBe(True);
+  Expect<Boolean>(Failure('0X10') <> '').ToBe(True);
+  Expect<Boolean>(Failure('+5') <> '').ToBe(True);
+  Expect<Boolean>(Failure('1 0') <> '').ToBe(True);
   Expect<Boolean>(Failure('64MiB') <> '').ToBe(True);
   Expect<Boolean>(Pos('"9223372036854775808"', Failure('9223372036854775808')) > 0)
     .ToBe(True);
@@ -571,12 +835,24 @@ begin
     TestEqualStampsEvictTheLowerDigestFirst);
   Test('evictable bytes equal to the budget stay; one byte over evicts one',
     TestBudgetBoundaryIsExact);
-  Test('use and first sight stamp recency; evicted documents leave the index',
+  Test('use and first sight stamp recency; evicted documents leave the index '
+    + 'on the next pass',
     TestRecencyStampsUseAndFirstSight);
   Test('foreign names, directories, and non-state files are never touched',
     TestForeignEntriesAreNeverTouched);
-  Test('corrupt documents and a corrupt index never cost a live document',
+  Test('a forged small document is evicted and a corrupt index is rebuilt',
     TestCorruptDocumentsAndIndexAreHandledSafely);
+  Test('a corrupt or missing accepted snapshot removes nothing',
+    TestBrokenHistoryRemovesNothing);
+  Test('a directory that cannot be listed removes nothing',
+    TestUnlistableDirectoriesRemoveNothing);
+  Test('links and special files are foreign, never opened or removed',
+    TestLinksAndSpecialFilesAreForeign);
+  Test('an unreadable document that could be a live signature removes nothing',
+    TestUnreadableSmallDocumentRemovesNothing);
+  Test('a removal that fails is retained, reported, and retried',
+    TestFailedRemovalIsRetainedAndReported);
+  Test('a failed index write removes nothing', TestIndexWriteFailureRemovesNothing);
   Test('an unreadable or misnamed state file blocks eviction',
     TestUnreadableStateBlocksEviction);
   Test('the history walk stays within the verifier''s limits',

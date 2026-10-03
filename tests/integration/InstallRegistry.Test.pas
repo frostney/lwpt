@@ -1925,10 +1925,17 @@ end;
   Per-user document store: shared merges and eviction (#345)
   --------------------------------------------------------------------------- }
 
+const
+  { The subprocess watchdog: RunLwptTesting terminates a child that runs
+    longer, so every wait below is bounded. }
+  CONCURRENT_INSTALL_MILLISECONDS = 3 * 60 * 1000;
+  CONCURRENT_WAIT_MILLISECONDS = CONCURRENT_INSTALL_MILLISECONDS + 30 * 1000;
+
 procedure TInstallProcess.Execute;
 begin
   try
-    Run := RunLwptTesting(['install'], Project, Environment);
+    Run := RunLwptTesting(['install'], Project, Environment,
+      CONCURRENT_INSTALL_MILLISECONDS);
   except
     on E: Exception do Error := E.Message;
   end;
@@ -1944,6 +1951,18 @@ begin
   for Index := 0 to High(AEnvironment) do
     Result.Environment[Index] := AEnvironment[Index];
   Result.Start;
+end;
+
+{ True when AProcess ended within the bounded wait. A process that did not
+  is left running rather than freed. }
+function AwaitFinished(AProcess: TInstallProcess): Boolean;
+var StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while not AProcess.Finished
+     and (GetTickCount64 - StartedAt < CONCURRENT_WAIT_MILLISECONDS) do
+    Sleep(20);
+  Result := AProcess.Finished;
 end;
 
 { Waits for APath's completion marker, or for AProcess to end first. }
@@ -2063,24 +2082,18 @@ begin
       Expect<Boolean>(Holder.Finished).ToBe(False);
       PublishPayloadCompletion(Signals + '/first/release');
       Released := True;
-      Holder.WaitFor;
-      Waiter.WaitFor;
+      Expect<Boolean>(AwaitFinished(Holder)).ToBe(True);
+      Expect<Boolean>(AwaitFinished(Waiter)).ToBe(True);
       Expect<string>(Holder.Error).ToBe('');
       Expect<string>(Waiter.Error).ToBe('');
+      Expect<Boolean>(Holder.Run.TimedOut).ToBe(False);
+      Expect<Boolean>(Waiter.Run.TimedOut).ToBe(False);
       ExpectSuccess('holding install', Holder.Run);
       ExpectSuccess('waiting install', Waiter.Run);
     finally
       if not Released then PublishPayloadCompletion(Signals + '/first/release');
-      if Holder <> nil then
-      begin
-        Holder.WaitFor;
-        Holder.Free;
-      end;
-      if Waiter <> nil then
-      begin
-        Waiter.WaitFor;
-        Waiter.Free;
-      end;
+      if (Holder <> nil) and AwaitFinished(Holder) then Holder.Free;
+      if (Waiter <> nil) and AwaitFinished(Waiter) then Waiter.Free;
     end;
     Expect<Boolean>(LoadRegistryConsumerStateAt(State, IDENTITY, First.KeyID,
       Loaded)).ToBe(True);
