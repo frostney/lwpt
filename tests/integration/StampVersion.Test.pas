@@ -83,14 +83,15 @@ const
   TERMINATION_GRACE_MILLISECONDS = 10000;
   BARRIER_MILLISECONDS = 60000;
   CHILD_MILLISECONDS = 120000;
-  { A gate's whole life, barrier included, ends by one absolute deadline
-    its parent passes as an argument. In FPC 3.2.2 GetTickCount64 reads
+  { A gate's whole life, barrier included, is budgeted against one absolute
+    deadline its parent passes as an argument. In FPC 3.2.2 GetTickCount64 reads
     CLOCK_MONOTONIC on Linux, the system-wide tick count on Windows, and
     gettimeofday on macOS, so parent and gate read the same clock; on macOS
     that clock is the wall clock and a clock adjustment during a run shifts
     the deadline. The gate starts killing its script this margin
-    before the deadline, more than a kill and reap may take, and the
-    parent kills a gate only after the deadline plus the grace. }
+    before the deadline, a budget of twice the configured kill-and-reap
+    grace, and the parent kills a gate only after the deadline plus the
+    grace. These are configured budgets, not guaranteed completion bounds. }
   GATE_LIFETIME_MILLISECONDS = BARRIER_MILLISECONDS + CHILD_MILLISECONDS;
   GATE_CLEANUP_MARGIN_MILLISECONDS = 2 * TERMINATION_GRACE_MILLISECONDS;
   BUILD_MILLISECONDS = 600000;
@@ -330,9 +331,11 @@ end;
   the script starts at the deadline minus the cleanup margin; reaping then
   takes up to the termination grace.
 
-  On Windows a killed gate cannot take its script with it; this ordering is
-  what keeps the script from outliving the test there. Owning descendants
-  through a Job object is out of scope here (#365). }
+  On Windows a killed gate cannot take its script with it. This ordering
+  gives the gate the first opportunity to clean up its script, but a gate
+  the scheduler delays badly can still be killed before it does, leaving
+  the script running. Owning descendants through a Job object is out of
+  scope here (#365). }
 function RunGate: Integer;
 var
   KillAt: QWord;
