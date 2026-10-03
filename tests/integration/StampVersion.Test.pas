@@ -11,9 +11,10 @@
   carries content, so neither is a payload handoff. Every child is awaited
   to real completion under a deadline. An overrun child is killed with a
   native signal (on Unix with its whole process group, which holds a
-  gate's script) and reaped within a bounded grace period. Each gate gets
-  one absolute deadline from its parent and kills its own script a fixed
-  margin before it; the parent kills a gate only after that deadline plus
+  gate's script), then awaited for a bounded grace period; if it is still
+  running when the grace expires, the test fails rather than waiting on.
+  Each gate gets one absolute deadline from its parent and starts killing
+  its own script a fixed margin before it; the parent kills a gate only after that deadline plus
   the grace. These are ordered thresholds, not a guarantee of completion
   order: a gate that is badly delayed by the scheduler can still be killed
   before its own cleanup finishes. TProcess.Terminate and the untimed WaitOnExit are never used:
@@ -242,7 +243,7 @@ begin
 end;
 {$ENDIF}
 
-{ Signals without waiting; the caller reaps within its own bound. }
+{ Signals without waiting; the caller then waits under its own budget. }
 procedure TChild.Kill;
 begin
   if FProcess.ProcessID <= 0 then Exit;
@@ -271,8 +272,9 @@ end;
 { Waits until the child has exited and, on Windows, until its process
   handle is signalled: GetExitCodeProcess reports the exit before the kernel
   runs down the child's handles, including its working directory. Past
-  ADeadline the child (with its process group) is killed, reaped within a
-  grace period, and the overrun raises. }
+  ADeadline the child (with its process group) is killed and awaited for a
+  grace period; the overrun raises, and so does a child still running when
+  the grace expires. }
 procedure TChild.Finish(const ADeadline: QWord);
 var
   TimedOut: Boolean;
@@ -299,8 +301,9 @@ begin
     Sleep(POLL_MILLISECONDS);
   end;
   {$IFDEF UNIX}
-  { A killed group's other members are reaped by init; wait until they
-    are gone so none outlives the test's directories. }
+  { A killed group's other members are reaped by init; wait, within the
+    grace budget, until they are gone so none outlives the test's
+    directories. }
   if TimedOut and FOwnGroup then
     while GroupAlive do
     begin
@@ -328,8 +331,8 @@ end;
 
 { Child mode: ParamStr(2) is the ready file, 3 the release file, 4 the
   script executable, 5 the absolute GetTickCount64 deadline. Termination of
-  the script starts at the deadline minus the cleanup margin; reaping then
-  takes up to the termination grace.
+  the script starts at the deadline minus the cleanup margin, followed by a
+  wait budget of the termination grace that can end in failure.
 
   On Windows a killed gate cannot take its script with it. This ordering
   gives the gate the first opportunity to clean up its script, but a gate
