@@ -14,16 +14,20 @@
   gate's script), then awaited for a bounded grace period; if it is still
   running when the grace expires, the test fails rather than waiting on.
   Each gate gets one absolute deadline from its parent and starts killing
-  its own script a fixed margin before it; the parent kills a gate only after that deadline plus
-  the grace. These are ordered thresholds, not a guarantee of completion
-  order: a gate that is badly delayed by the scheduler can still be killed
-  before its own cleanup finishes. TProcess.Terminate and the untimed WaitOnExit are never used:
+  its own script a fixed margin before it. In the normal observation loop
+  the parent kills a gate only after that deadline plus the grace; when a
+  test fails earlier (a barrier timeout, for instance), cleanup kills the
+  remaining children at once. These are ordered thresholds, not a
+  guarantee of completion order: a gate that is badly delayed by the
+  scheduler can still be killed before its own cleanup finishes.
+  TProcess.Terminate and the untimed WaitOnExit are never used:
   FPC 3.2.2 waits without a bound in both. Six assertions:
 
     1. Concurrent runs across changing versions all exit 0. This program
        reads the include continuously from before the release until every
-       gate has exited; every read sees the complete previous or new text,
-       never a truncated or partial file, and the final file holds exactly
+       gate has exited or the observation deadline is reached; every read
+       sees the complete previous or new text, never a truncated or partial
+       file, and the final file holds exactly
        the new text, with SaveToFile's bytes (each line followed by
        LineEnding). Neither source/ nor .lwpt/tmp keeps a temporary file.
        That reads overlap a publication is not asserted, because the
@@ -91,8 +95,10 @@ const
     that clock is the wall clock and a clock adjustment during a run shifts
     the deadline. The gate starts killing its script this margin
     before the deadline, a budget of twice the configured kill-and-reap
-    grace, and the parent kills a gate only after the deadline plus the
-    grace. These are configured budgets, not guaranteed completion bounds. }
+    grace, and in the normal observation loop the parent kills a gate only
+    after the deadline plus the grace (cleanup after an earlier failure
+    kills at once). These are configured budgets, not guaranteed
+    completion bounds. }
   GATE_LIFETIME_MILLISECONDS = BARRIER_MILLISECONDS + CHILD_MILLISECONDS;
   GATE_CLEANUP_MARGIN_MILLISECONDS = 2 * TERMINATION_GRACE_MILLISECONDS;
   BUILD_MILLISECONDS = 600000;
@@ -139,7 +145,8 @@ type
     { The old text (AAllowed[0]) was read after the release. }
     SawOld: Boolean;
     { After that, the new text (AAllowed[1]) was read while a gate still
-      ran. Diagnostic only: a gate outlives its script. }
+      ran. Diagnostic only: a gate can remain running after its script
+      exits. }
     Straddled: Boolean;
     Torn: Integer;
     TornSample: string;
@@ -301,9 +308,10 @@ begin
     Sleep(POLL_MILLISECONDS);
   end;
   {$IFDEF UNIX}
-  { A killed group's other members are reaped by init; wait, within the
-    grace budget, until they are gone so none outlives the test's
-    directories. }
+  { A killed group's other members are reaped by init. Attempt to await
+    the group's disappearance within the grace budget, so that none
+    outlives the test's directories; if it is still alive when the budget
+    expires, this raises. }
   if TimedOut and FOwnGroup then
     while GroupAlive do
     begin
@@ -540,7 +548,8 @@ begin
 end;
 
 { Starts WRITER_COUNT gated runs, releases them together, and reads the
-  include until all have exited. Returns the finished writers. }
+  include until all have exited or the observation deadline is reached.
+  Returns the writers, which the caller then finishes. }
 function TStampVersionTest.RunWriters(const AAllowed: array of string;
   out AStats: TReadStats): TChildren;
 var
