@@ -19,6 +19,10 @@ build/
 *.rsj
 *.compiled
 
+# A stamp-version run killed between writing and renaming its private
+# sibling of source/Version.inc leaves it behind (issue #361).
+source/.Version.inc.*.tmp
+
 # OS noise.
 .DS_Store
 Thumbs.db
