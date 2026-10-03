@@ -692,10 +692,13 @@ begin
   repeat
     FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
       + DrainAvailableStream(FServe.Stderr, 65536);
-    if FileExists(DiscoveryPath) then SysUtils.DeleteFile(DiscoveryPath);
+    SysUtils.DeleteFile(DiscoveryPath);
+    { CurlRequest returns only after curl has exited and released its
+      handles, so its exit, not the file's existence, completes the body;
+      a 200 means curl wrote it. }
     LastProbe := CurlRequest([Base + '/.well-known/' + RegistryProgramName
       + '-registry'], DiscoveryPath, StandardError);
-    Ready := (LastProbe = '200') and FileExists(DiscoveryPath)
+    Ready := (LastProbe = '200')
       and (Pos('base_url = "' + Base + '"', ReadBinaryFile(DiscoveryPath)) > 0);
     LastProbe := 'status ' + LastProbe + '; curl stderr: '
       + Copy(StandardError, 1, 512);
