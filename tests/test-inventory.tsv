@@ -124,6 +124,7 @@ program	*	tests/integration/Repair.Test.pas	1	10
 program	windows/*	tests/integration/Repair.Test.pas	1	9
 program	*	tests/integration/Run.Test.pas	1	9
 program	*	tests/integration/Scratch.Test.pas	1	2
+program	*	tests/integration/StampVersion.Test.pas	1	6
 program	*	tests/integration/TCPRelay.Test.pas	1	7
 program	*	tests/integration/TestCache.Test.pas	1	10
 program	*	tests/integration/TestFlags.Test.pas	1	3
