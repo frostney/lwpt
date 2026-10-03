@@ -11,20 +11,27 @@
   carries content, so neither is a payload handoff. Every child is awaited
   to real completion under a deadline. An overrun child is killed with a
   native signal (on Unix with its whole process group, which holds a
-  gate's script) and reaped within a bounded grace period; a gate kills
-  its own script on an earlier deadline. TProcess.Terminate and the
-  untimed WaitOnExit are never used: FPC 3.2.2 waits without a bound in
-  both. Six assertions:
+  gate's script) and reaped within a bounded grace period. Each gate gets
+  one absolute deadline from its parent and kills its own script a fixed
+  margin before it; the parent kills a gate only after that deadline plus
+  the grace, so a gate's cleanup always runs first, however late the gate
+  started. TProcess.Terminate and the untimed WaitOnExit are never used:
+  FPC 3.2.2 waits without a bound in both. Six assertions:
 
     1. Concurrent runs across changing versions all exit 0. This program
        reads the include continuously from before the release until every
-       writer has exited; every read sees the complete previous or new
-       text, never a truncated or partial file. In at least one round the
-       reader saw the round's old text after the release and then its new
-       text while a writer had not yet exited, so reads straddled a
-       publication. The final file holds exactly the new text, with
-       SaveToFile's bytes (each line followed by LineEnding), and neither
-       source/ nor .lwpt/tmp keeps a temporary file.
+       gate has exited; every read sees the complete previous or new text,
+       never a truncated or partial file, and the final file holds exactly
+       the new text, with SaveToFile's bytes (each line followed by
+       LineEnding). Neither source/ nor .lwpt/tmp keeps a temporary file.
+       That reads overlap a publication is not asserted, because the
+       reader cannot see the scripts themselves, only their gates; the
+       number of rounds whose reads saw the old text after the release and
+       then the new text while a gate still ran is printed as a
+       diagnostic. As evidence rather than a guaranteed property: on Linux
+       a mutation that rewrites the file in place produced hundreds of
+       torn reads per run, and the pre-#361 script failed outright with
+       "Unable to create file" when its runs collided.
     2. Concurrent runs whose expected text is already present leave the
        file untouched: its modification time stays at a value set in the
        past.
@@ -72,14 +79,18 @@ const
   BUILD_COUNT = 3;
   BUILD_ROUND_COUNT = 3;
   { Deadlines are generous for slow Windows runners; none is unbounded. }
+  TERMINATION_GRACE_MILLISECONDS = 10000;
   BARRIER_MILLISECONDS = 60000;
   CHILD_MILLISECONDS = 120000;
-  { A gate's own deadline for its script expires first, so the outer
-    deadline only ever has to stop a gate that is already cleaning up. }
-  GATE_SLACK_MILLISECONDS = 30000;
-  WRITER_MILLISECONDS = CHILD_MILLISECONDS + GATE_SLACK_MILLISECONDS;
+  { A gate's whole life, barrier included, ends by one absolute deadline
+    its parent passes as an argument. GetTickCount64 counts machine-wide
+    (CLOCK_MONOTONIC on Unix, the system tick count on Windows), so parent
+    and gate read the same clock. The gate kills its script this margin
+    before the deadline, more than a kill and reap may take, and the
+    parent kills a gate only after the deadline plus the grace. }
+  GATE_LIFETIME_MILLISECONDS = BARRIER_MILLISECONDS + CHILD_MILLISECONDS;
+  GATE_CLEANUP_MARGIN_MILLISECONDS = 2 * TERMINATION_GRACE_MILLISECONDS;
   BUILD_MILLISECONDS = 600000;
-  TERMINATION_GRACE_MILLISECONDS = 10000;
   POLL_MILLISECONDS = 1;
   { A past modification time that no run can reproduce by rewriting. }
   PAST_AGE_DAYS = 2;
@@ -122,8 +133,8 @@ type
     Observations: Integer;
     { The old text (AAllowed[0]) was read after the release. }
     SawOld: Boolean;
-    { After that, the new text (AAllowed[1]) was read while a writer had
-      not yet exited: the reads straddled a publication. }
+    { After that, the new text (AAllowed[1]) was read while a gate still
+      ran. Diagnostic only: a gate outlives its script. }
     Straddled: Boolean;
     Torn: Integer;
     TornSample: string;
@@ -312,18 +323,23 @@ begin
 end;
 
 { Child mode: ParamStr(2) is the ready file, 3 the release file, 4 the
-  script executable. }
+  script executable, 5 the absolute GetTickCount64 deadline. The script is
+  killed and reaped by the deadline minus the cleanup margin.
+
+  On Windows a killed gate cannot take its script with it; this ordering is
+  what keeps the script from outliving the test there. Owning descendants
+  through a Job object is out of scope here (#365). }
 function RunGate: Integer;
 var
-  Deadline: QWord;
+  KillAt: QWord;
   Child: TChild;
 begin
   try
+    KillAt := StrToQWord(ParamStr(5)) - GATE_CLEANUP_MARGIN_MILLISECONDS;
     WriteTextFile(ParamStr(2), '');
-    Deadline := GetTickCount64 + BARRIER_MILLISECONDS;
     while not FileExists(ParamStr(3)) do
     begin
-      if GetTickCount64 >= Deadline then
+      if GetTickCount64 >= KillAt then
       begin
         WriteLn('gate: never released');
         Exit(3);
@@ -333,7 +349,7 @@ begin
     { The script stays in the gate's process group. }
     Child := TChild.Create(ParamStr(4), GetCurrentDir, [], [], False);
     try
-      Child.Finish(GetTickCount64 + CHILD_MILLISECONDS);
+      Child.Finish(KillAt);
       Write(Child.Output);
       Result := Child.ExitCode;
     finally
@@ -523,7 +539,7 @@ var
   Ready: array of string;
   AllReady, AnyRunning: Boolean;
   Seen: Integer;
-  Deadline: QWord;
+  Deadline, GateDeadline: QWord;
 begin
   AStats.Observations := 0;
   AStats.SawOld := False;
@@ -537,12 +553,14 @@ begin
   Result := nil;
   SetLength(Result, WRITER_COUNT);
   for Index := 0 to High(Result) do Result[Index] := nil;
+  GateDeadline := GetTickCount64 + GATE_LIFETIME_MILLISECONDS;
   try
     for Index := 0 to High(Result) do
     begin
       Ready[Index] := GatePrefix + '-ready-' + IntToStr(Index);
       Result[Index] := TChild.Create(ExpandFileName(ParamStr(0)), FTarget,
-        [GATE_ARGUMENT, Ready[Index], Release, FStampExe],
+        [GATE_ARGUMENT, Ready[Index], Release, FStampExe,
+         IntToStr(GateDeadline)],
         [VersionOverrideCleared], True);
     end;
 
@@ -567,7 +585,8 @@ begin
     { The reader is running before any writer starts. }
     Observe(AAllowed, AStats);
     WriteTextFile(Release, '');
-    Deadline := GetTickCount64 + WRITER_MILLISECONDS;
+    { Only after the gates' own cleanup window has passed. }
+    Deadline := GateDeadline + TERMINATION_GRACE_MILLISECONDS;
     repeat
       Seen := Observe(AAllowed, AStats);
       AnyRunning := False;
@@ -656,8 +675,10 @@ begin
   end;
   if Torn <> 0 then
     WriteLn(ErrOutput, 'torn reads: ', Torn, '; first: ', FirstTornSample);
+  WriteLn('diagnostic: ', Straddled, ' of ', ROUND_COUNT, ' rounds read '
+    + 'the old text after the release and then the new text while a gate '
+    + 'still ran');
   Expect<Integer>(Torn).ToBe(0);
-  Expect<Boolean>(Straddled > 0).ToBe(True);
 end;
 
 procedure TStampVersionTest.TestCurrentTextIsLeftUntouched;
