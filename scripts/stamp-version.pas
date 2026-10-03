@@ -84,10 +84,11 @@ const
   {$IFDEF MSWINDOWS}
   MOVEFILE_REPLACE_EXISTING_STAMP = $00000001;
   MOVEFILE_WRITE_THROUGH_STAMP = $00000008;
-  { At most MAX_REPLACE_ATTEMPTS attempts, with configured sleeps totalling
-    about 3.5 seconds, meant to outlast a compiler or a sibling run briefly
+  { At most MAX_REPLACE_ATTEMPTS (40) attempts, with configured sleeps
+    totalling 3,555 ms, meant to outlast a compiler or a sibling run briefly
     holding the destination open. The attempt count is the bound, not the
-    elapsed time, and the attempts can be exhausted, which fails the run. }
+    elapsed time. Exhausting the attempts fails the run unless the
+    destination already holds the expected text. }
   MAX_REPLACE_ATTEMPTS = 40;
   REPLACE_RETRY_FIRST_DELAY_MS = 5;
   REPLACE_RETRY_MAX_DELAY_MS = 100;

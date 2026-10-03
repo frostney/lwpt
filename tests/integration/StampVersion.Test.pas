@@ -16,12 +16,15 @@
   Each gate gets one absolute deadline from its parent and starts killing
   its own script a fixed margin before it. In the normal observation loop
   the parent kills a gate only after that deadline plus the grace; when a
-  test fails earlier (a barrier timeout, for instance), cleanup kills the
-  remaining children at once. These are ordered thresholds, not a
+  test fails earlier (a barrier timeout, for instance), exceptional
+  cleanup processes the children sequentially, using an immediate deadline
+  for each unfinished child. These are ordered thresholds, not a
   guarantee of completion order: a gate that is badly delayed by the
   scheduler can still be killed before its own cleanup finishes.
-  TProcess.Terminate and the untimed WaitOnExit are never used:
-  FPC 3.2.2 waits without a bound in both. Six assertions:
+  TProcess.Terminate and the untimed WaitOnExit are never used: in FPC
+  3.2.2 the untimed WaitOnExit waits without a bound, and on Unix so does
+  Terminate, which ends with one (on Windows Terminate calls
+  TerminateProcess without waiting). Six assertions:
 
     1. Concurrent runs across changing versions all exit 0. This program
        reads the include continuously from before the release until every
@@ -96,8 +99,10 @@ const
     the deadline. The gate starts killing its script this margin
     before the deadline, a budget of twice the configured kill-and-reap
     grace, and in the normal observation loop the parent kills a gate only
-    after the deadline plus the grace (cleanup after an earlier failure
-    kills at once). These are configured budgets, not guaranteed
+    after the deadline plus the grace (exceptional cleanup after an
+    earlier failure processes the children sequentially, using an
+    immediate deadline for each unfinished child). These are configured
+    budgets, not guaranteed
     completion bounds. }
   GATE_LIFETIME_MILLISECONDS = BARRIER_MILLISECONDS + CHILD_MILLISECONDS;
   GATE_CLEANUP_MARGIN_MILLISECONDS = 2 * TERMINATION_GRACE_MILLISECONDS;
@@ -308,8 +313,9 @@ begin
     Sleep(POLL_MILLISECONDS);
   end;
   {$IFDEF UNIX}
-  { A killed group's other members are reaped by init. Attempt to await
-    the group's disappearance within the grace budget, so that none
+  { Reaping orphaned descendants is the adopting process's responsibility;
+    this helper only attempts to await the group's disappearance within
+    the grace budget, so that none
     outlives the test's directories; if it is still alive when the budget
     expires, this raises. }
   if TimedOut and FOwnGroup then
@@ -549,7 +555,8 @@ end;
 
 { Starts WRITER_COUNT gated runs, releases them together, and reads the
   include until all have exited or the observation deadline is reached.
-  Returns the writers, which the caller then finishes. }
+  Finishes the writers before returning them; on failure, frees them and
+  raises. }
 function TStampVersionTest.RunWriters(const AAllowed: array of string;
   out AStats: TReadStats): TChildren;
 var
