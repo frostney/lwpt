@@ -392,7 +392,9 @@ var
 begin
   Store := BuildStore;
   Directory := RegistryStateDocumentsDirectory(Store.Root);
-  Upper := UpperCase(RegistryDigestHex(Store.Snapshot1)) + '.toml';
+  { Not a stored digest: on a case-insensitive file system an upper-case
+    twin of a stored name would be that document. }
+  Upper := StringOfChar('B', 64) + '.toml';
   WriteTextFile(Directory + '/README', 'notes');
   WriteTextFile(Directory + '/' + Upper, 'upper-case name');
   WriteTextFile(Directory + '/short.toml', 'short name');
