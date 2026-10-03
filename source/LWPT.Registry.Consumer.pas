@@ -21,6 +21,7 @@ uses
   LWPT.Core,
   LWPT.Manifest,
   LWPT.Registry.Client,
+  LWPT.Registry.ConsumerStore,
   LWPT.Registry.Store,
   LWPT.Registry.Verification;
 
@@ -37,6 +38,10 @@ const
   RegistryMaximumArchiveBytes = Int64(256) * 1024 * 1024;
   RegistryStateLeaseWaitMilliseconds = 60 * 1000;
   RegistryStateDocumentBytes = 64 * 1024;
+  { Taken by every per-user state merge and by document eviction, so an
+    eviction pass never runs while another install admits documents that
+    its state file does not name yet. }
+  REGISTRY_STORE_LEASE_KEY = 'registry-store';
 
 type
   { Accepted state plus the rotation triplet hashes that reach its key. }
@@ -134,6 +139,7 @@ type
     FLockTables: TLWPTRegistryLockTableArray;
     FArchivesRoot: string;
     FNetworkFree: Boolean;
+    FUsedDocuments: TStringArray;
     function SessionAt(AIndex: Integer): TLWPTRegistrySession;
   public
     constructor Create(const ARoot: TManifest;
@@ -150,6 +156,12 @@ type
     { Merges every acquisition into per-user state. Part of a successful
       install: a failure raises. }
     procedure PersistAcceptedState;
+    { After a successful install: records the use of every document this
+      install verified or its lock references, and evicts least-recently-used
+      documents outside every stored accepted history beyond
+      LWPT_REGISTRY_STATE_MAX_BYTES. Never raises: a failure only warns,
+      because losing a document costs only re-transfer. }
+    procedure EnforceStateBudget;
     property ArchivesRoot: string read FArchivesRoot;
     { --frozen and --offline: sessions only bind identities from the manifest
       and the lock. Acquisition raises instead of selecting a contact, and
@@ -204,6 +216,20 @@ procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: stri
 { One document of the per-user store, or nil when it is absent or its bytes
   do not hash to AHash. }
 function LoadRegistryStateDocument(const ARoot, AHash: string): TBytes;
+{ The accepted-history roots of every state file below ARoot/origins.
+  False, with AReason, when a state file there cannot be read: its live
+  documents are then unknown and nothing may be evicted. Entries whose names
+  are not state-file names are ignored. }
+function CollectRegistryStoreRoots(const ARoot: string;
+  out ARoots: TLWPTRegistryStoreRootArray; out AReason: string): Boolean;
+{ Takes the store lease, stamps AUsed, and evicts beyond the configured
+  budget (ConsumerStore). Raises when the budget is invalid or the lease is
+  not acquired in time. }
+function EnforceRegistryStateBudgetAt(const ARoot: string;
+  const AUsed: TStringArray): TLWPTRegistryStoreReport;
+{ The store's size, live set, and evictable documents, for lwpt repair.
+  Takes no lease and writes nothing. Raises when the budget is invalid. }
+function InspectRegistryStateStoreAt(const ARoot: string): TLWPTRegistryStoreReport;
 { A document by hash from the per-user store, then the committed proofs.
   Nil when absent, larger than AMaximumBytes (checked before reading), or
   not hashing to AHash. }
@@ -343,19 +369,19 @@ begin
   Result := RegistryStatePathAt(RegistryStateRoot, AIdentity, ATrustKeyId);
 end;
 
-function RegistryStateDocumentPath(const ARoot, AHash: string): string;
-begin
-  Result := IncludeTrailingPathDelimiter(ARoot) + 'documents/sha256/'
-    + RegistryDigestHex(AHash) + '.toml';
-end;
-
 function ReadBoundedDocument(const APath, AHash: string;
   const AMaximumBytes: Int64): TBytes;
 var Stream: TFileStream;
 begin
   Result := nil;
-  if not FileExists(APath) then Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  { Never open a link, FIFO, or device planted under a document name. }
+  if not RegistryStoreFileIsRegular(APath) then Exit;
+  { An evictable document may be removed between the check and the open. }
+  try
+    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  except
+    on E: EFOpenError do Exit;
+  end;
   try
     if (Stream.Size > AMaximumBytes)
        or (Stream.Size > MaximumRegistryDocumentBytes) then Exit;
@@ -749,6 +775,72 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF INSTALL_TESTING}
+var
+  StateContentionPublished: Boolean = False;
+  StateHoldDone: Boolean = False;
+
+{ The writer half of Tests.PayloadHandoff: the payload is written and its
+  handle closed before the existence-only <path>.complete marker appears. }
+procedure PublishSeamPayload(const APath, AContent: string);
+var Stream: TFileStream; Bytes: TBytes;
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  Bytes := BytesOf(AContent);
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    if Length(Bytes) > 0 then Stream.WriteBuffer(Bytes[0], Length(Bytes));
+  finally
+    Stream.Free;
+  end;
+  TFileStream.Create(APath + '.complete', fmCreate).Free;
+end;
+
+{ <dir>/waiting names this process the first time a state lease it needs is
+  held by another producer. }
+procedure PublishStateContention;
+begin
+  if StateContentionPublished
+     or (TestSeamValue('REGISTRY_STATE_CONTENDED') = '') then Exit;
+  StateContentionPublished := True;
+  PublishSeamPayload(TestSeamValue('REGISTRY_STATE_CONTENDED') + '/waiting',
+    IntToStr(GetProcessID));
+end;
+
+{ Holds the first merge's leases, after publishing <dir>/held, until the
+  test publishes <dir>/release or two minutes pass. }
+procedure HoldStateLeases;
+var Directory: string; StartedAt: QWord;
+begin
+  Directory := TestSeamValue('REGISTRY_STATE_HOLD');
+  if StateHoldDone or (Directory = '') then Exit;
+  StateHoldDone := True;
+  PublishSeamPayload(Directory + '/held', IntToStr(GetProcessID));
+  StartedAt := GetTickCount64;
+  while not FileExists(Directory + '/release.complete')
+     and (GetTickCount64 - StartedAt < 120 * 1000) do
+    Sleep(20);
+end;
+{$ENDIF}
+
+function AcquireStateLease(ACoordinator: TLWPTProducerLeaseCoordinator;
+  const AKey, ADescription, AWhat: string): TLWPTProducerLease;
+var StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  repeat
+    Result := ACoordinator.TryAcquire(AKey, ADescription);
+    if Assigned(Result) then Exit;
+    {$IFDEF INSTALL_TESTING}
+    PublishStateContention;
+    {$ENDIF}
+    if GetTickCount64 - StartedAt > StateLeaseWaitMilliseconds then
+      raise ELWPTRegistryError.CreateStable('registry_state_locked',
+        'another process holds the per-user registry state for ' + AWhat);
+    Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
+  until False;
+end;
+
 procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
   const AState: TLWPTRegistryConsumerState;
   const ARotations: TLWPTRegistryRotationProofArray;
@@ -756,9 +848,8 @@ procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: stri
 var
   Root, Path: string;
   Coordinator: TLWPTProducerLeaseCoordinator;
-  Lease: TLWPTProducerLease;
+  Lease, StoreLease: TLWPTProducerLease;
   Current, Merged: TLWPTRegistryConsumerState;
-  StartedAt: QWord;
   Index: Integer;
 
   procedure StoreDocument(const ABytes: TBytes);
@@ -778,18 +869,17 @@ begin
   ForceDirectories(Root + '/tmp');
   Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
   Lease := nil;
+  StoreLease := nil;
   try
-    StartedAt := GetTickCount64;
-    repeat
-      Lease := Coordinator.TryAcquire('registry-state:' + ExtractFileName(Path),
-        'registry consumer state for ' + AIdentity);
-      if Assigned(Lease) then Break;
-      if GetTickCount64 - StartedAt > StateLeaseWaitMilliseconds then
-        raise ELWPTRegistryError.CreateStable('registry_state_locked',
-          'another process holds the per-user registry state for ' + AIdentity);
-      Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
-    until False;
+    { The per-origin lease first, then the store lease; eviction takes only
+      the store lease, so the order cannot deadlock. }
+    Lease := AcquireStateLease(Coordinator, 'registry-state:'
+      + ExtractFileName(Path), 'registry consumer state for ' + AIdentity,
+      AIdentity);
+    StoreLease := AcquireStateLease(Coordinator, REGISTRY_STORE_LEASE_KEY,
+      'registry document store merge for ' + AIdentity, AIdentity);
     {$IFDEF INSTALL_TESTING}
+    HoldStateLeases;
     if (TestSeamValue('FAIL_REGISTRY_STATE_WRITE') = '1')
        or (TestSeamValue('FAIL_REGISTRY_STATE_WRITE') = AIdentity) then
       raise ELWPTRegistryError.CreateStable('registry_state_write_failed',
@@ -820,9 +910,157 @@ begin
     AtomicWriteBytes(Path, Root + '/tmp', StateDocument(AIdentity,
       ATrustKeyId, Merged));
   finally
+    StoreLease.Free;
     Lease.Free;
     Coordinator.Free;
   end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Document store budget
+  --------------------------------------------------------------------------- }
+
+function ReadStateFileBytes(const APath: string): TBytes;
+var Stream: TFileStream;
+begin
+  Result := nil;
+  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  try
+    if Stream.Size > RegistryStateDocumentBytes then
+      raise ELWPTRegistryError.CreateStable('registry_state_corrupt', 'oversized');
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
+  finally
+    Stream.Free;
+  end;
+end;
+
+function CollectRegistryStoreRoots(const ARoot: string;
+  out ARoots: TLWPTRegistryStoreRootArray; out AReason: string): Boolean;
+var
+  Directory, Path, Identity, TrustKeyId, Error: string;
+  Entries: TLWPTRegistryStoreEntryArray;
+  Bytes: TBytes;
+  Parser: TTOMLParser;
+  Root: TTOMLNode;
+  State: TLWPTRegistryConsumerState;
+  Index, Count: Integer;
+
+  function IsStateFileName(const AName: string): Boolean;
+  var Position: Integer;
+  begin
+    Result := (Length(AName) = 69) and EndsStr('.toml', AName);
+    if not Result then Exit;
+    for Position := 1 to 64 do
+      if not (AName[Position] in ['0'..'9', 'a'..'f']) then Exit(False);
+  end;
+
+  function Fail(const AName, AWhy: string): Boolean;
+  begin
+    AReason := 'per-user registry state ' + Directory + '/' + AName
+      + ' cannot be read (' + AWhy + '), so its accepted history is unknown';
+    ARoots := nil;
+    Result := False;
+  end;
+
+begin
+  ARoots := nil;
+  AReason := '';
+  Directory := IncludeTrailingPathDelimiter(ARoot) + 'origins';
+  { An origins directory that cannot be listed completely hides accepted
+    histories: that is never an empty directory. }
+  if not ListRegistryStoreDirectory(Directory, RegistryStoreScanEntries,
+       Entries, Error) then
+  begin
+    AReason := 'per-user registry state ' + Error
+      + ', so the accepted histories are unknown';
+    Exit(False);
+  end;
+  SetLength(ARoots, Length(Entries));
+  Count := 0;
+  for Index := 0 to High(Entries) do
+  begin
+    if not IsStateFileName(Entries[Index].Name) then Continue;
+    if not Entries[Index].Regular then
+      Exit(Fail(Entries[Index].Name, 'not a regular file'));
+    Path := Directory + '/' + Entries[Index].Name;
+    try
+      Bytes := ReadStateFileBytes(Path);
+    except
+      on E: Exception do Exit(Fail(Entries[Index].Name, E.Message));
+    end;
+    Parser := TTOMLParser.Create;
+    Root := nil;
+    try
+      try
+        Root := Parser.ParseDocument(RegistryBytesText(Bytes));
+        Identity := TomlStr(Root, 'origin', '');
+        TrustKeyId := TomlStr(Root, 'trust_key_id', '');
+      except
+        on E: Exception do Exit(Fail(Entries[Index].Name, E.Message));
+      end;
+    finally
+      Root.Free;
+      Parser.Free;
+    end;
+    if (Identity = '') or (RegistryStatePathAt(ARoot, Identity, TrustKeyId)
+         <> IncludeTrailingPathDelimiter(ARoot) + 'origins/'
+           + Entries[Index].Name) then
+      Exit(Fail(Entries[Index].Name,
+        'its origin and pinned key do not name this file'));
+    try
+      if not LoadRegistryConsumerStateAt(ARoot, Identity, TrustKeyId, State) then
+        Exit(Fail(Entries[Index].Name, 'it disappeared while being read'));
+    except
+      on E: Exception do Exit(Fail(Entries[Index].Name, E.Message));
+    end;
+    ARoots[Count].Checkpoint := State.State.CheckpointHash;
+    ARoots[Count].Snapshot := State.State.Snapshot;
+    ARoots[Count].Rotations := State.Rotations;
+    Inc(Count);
+  end;
+  SetLength(ARoots, Count);
+  Result := True;
+end;
+
+function EnforceRegistryStateBudgetAt(const ARoot: string;
+  const AUsed: TStringArray): TLWPTRegistryStoreReport;
+var
+  Root, Reason: string;
+  Budget: Int64;
+  Roots: TLWPTRegistryStoreRootArray;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+begin
+  Result := Default(TLWPTRegistryStoreReport);
+  Budget := ResolveRegistryStateMaxBytes;
+  Result.BudgetBytes := Budget;
+  Root := ExcludeTrailingPathDelimiter(ARoot);
+  if not DirectoryExists(RegistryStateDocumentsDirectory(Root)) then Exit;
+  ForceDirectories(Root + '/locks');
+  ForceDirectories(Root + '/tmp');
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
+  Lease := nil;
+  try
+    Lease := AcquireStateLease(Coordinator, REGISTRY_STORE_LEASE_KEY,
+      'registry document store eviction', 'the document store');
+    CollectRegistryStoreRoots(Root, Roots, Reason);
+    Result := RunRegistryDocumentStorePass(Root, Roots, Reason, AUsed, Budget,
+      RegistryStoreNowMilliseconds, DefaultRegistryVerificationLimits, True);
+  finally
+    Lease.Free;
+    Coordinator.Free;
+  end;
+end;
+
+function InspectRegistryStateStoreAt(const ARoot: string): TLWPTRegistryStoreReport;
+var Root, Reason: string; Budget: Int64; Roots: TLWPTRegistryStoreRootArray;
+begin
+  Budget := ResolveRegistryStateMaxBytes;
+  Root := ExcludeTrailingPathDelimiter(ARoot);
+  CollectRegistryStoreRoots(Root, Roots, Reason);
+  Result := RunRegistryDocumentStorePass(Root, Roots, Reason, nil, Budget, 0,
+    DefaultRegistryVerificationLimits, False);
 end;
 
 { ---------------------------------------------------------------------------
@@ -1335,6 +1573,9 @@ begin
       + 'verification never selects a contact');
   if FLockAmbiguity <> '' then
     raise EManifestError.Create(FLockAmbiguity);
+  { An invalid document budget fails before any request, not after the
+    install has done its work. }
+  ResolveRegistryStateMaxBytes;
   FAttempted := True;
   Now := RegistryTimestampNow;
   { With a known identity the floor is checked before any request. }
@@ -1500,16 +1741,62 @@ end;
   authenticated and monotonic, and undoing them could lower state another
   concurrent install already relies on. The install still fails and rolls
   project state back (see MergeRegistryConsumerStateAt). }
+{ The hash a verified document's resource path names, which the verifier
+  checked against its bytes; other documents are hashed. }
+function DocumentHashOf(const ADocument: TLWPTRegistryDocument): string;
+var Position: Integer;
+begin
+  Position := Pos('/sha256/', ADocument.Path);
+  if (Position > 0) and EndsStr('.toml', ADocument.Path) then
+  begin
+    Result := 'sha256:' + Copy(ADocument.Path, Position + Length('/sha256/'), 64);
+    if RegistryHashIsCanonical(Result)
+       and (Length(ADocument.Path) = Position + Length('/sha256/') + 64 + 4) then
+      Exit;
+  end;
+  Result := SHA256BytesPrefixed(ADocument.Bytes);
+end;
+
 procedure TLWPTRegistryConsumer.PersistAcceptedState;
 var
   Index, Count: Integer;
   Session: TLWPTRegistrySession;
   Documents: TLWPTRegistryDocumentArray;
+  Table: TLWPTRegistryLockTable;
+
+  procedure Use(const AHash: string);
+  begin
+    if not RegistryHashIsCanonical(AHash) then Exit;
+    SetLength(FUsedDocuments, Length(FUsedDocuments) + 1);
+    FUsedDocuments[High(FUsedDocuments)] := AHash;
+  end;
+
+  procedure UseAll(const AHashes: TStringArray);
+  var Item: Integer;
+  begin
+    for Item := 0 to High(AHashes) do Use(AHashes[Item]);
+  end;
+
 begin
+  FUsedDocuments := nil;
   for Index := 0 to FSessions.Count - 1 do
   begin
     Session := SessionAt(Index);
     if not Session.Acquired then Continue;
+    { Recency for eviction: what this install verified, and the selection
+      proof its lock references, which may lag the verified head. }
+    for Count := 0 to High(Session.Verified.Documents) do
+      Use(DocumentHashOf(Session.Verified.Documents[Count]));
+    Use(SHA256BytesPrefixed(Session.Verified.Proof.Checkpoint));
+    Use(SHA256BytesPrefixed(Session.Verified.Proof.Signature));
+    UseAll(RegistryRotationHashes(Session.ProofRotations));
+    if Session.LockTableFor(Session.Identity, Table) then
+    begin
+      Use(Table.Checkpoint);
+      Use(Table.Signature);
+      Use(Table.Snapshot);
+      UseAll(Table.Rotations);
+    end;
     { The checkpoint and its signature join the verified history, so
       --offline can restore every committed proof document by hash. }
     Documents := Copy(Session.Verified.Documents);
@@ -1533,6 +1820,32 @@ begin
           + REGISTRY_STATE_DIR_ENV + ', then run the install again');
     end;
   end;
+end;
+
+procedure TLWPTRegistryConsumer.EnforceStateBudget;
+var Report: TLWPTRegistryStoreReport;
+begin
+  if FUsedDocuments = nil then Exit;
+  try
+    Report := EnforceRegistryStateBudgetAt(RegistryStateRoot, FUsedDocuments);
+    if Report.EvictedDocuments > 0 then
+      WriteLn('  evicted ', Report.EvictedDocuments, ' per-user registry ',
+        'document(s) (', Report.EvictedBytes, ' bytes) outside every accepted ',
+        'history beyond the ', Report.BudgetBytes, '-byte budget');
+    if Report.RetainedDocuments > 0 then
+      WriteLn(ErrOutput, 'warning: ', Report.RetainedDocuments, ' evictable ',
+        'per-user registry document(s) (', Report.RetainedBytes, ' bytes) ',
+        'could not be removed, for example because another process has them ',
+        'open; a later install tries again');
+    if not Report.Complete then
+      WriteLn(ErrOutput, 'warning: per-user registry documents were not ',
+        'evicted: ', Report.Incomplete);
+  except
+    on E: Exception do
+      WriteLn(ErrOutput, 'warning: per-user registry documents in ',
+        RegistryStateRoot, ' were not evicted: ', E.Message);
+  end;
+  FUsedDocuments := nil;
 end;
 
 destructor TLWPTRegistryConsumer.Destroy;
