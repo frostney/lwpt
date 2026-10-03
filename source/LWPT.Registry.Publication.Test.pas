@@ -39,6 +39,9 @@ type
   protected
     procedure Execute; override;
   public
+    { The exception that ended Run, e.g. a listen_failed bind; read only
+      after Finished. }
+    Failure: string;
     constructor Create(AServer: TLWPTRegistryServer);
   end;
 
@@ -74,11 +77,22 @@ type
   private
     FScratch, FRoot, FBase, FPrefix, FToken: string;
     FPort: Word;
+    { A port the next StartOrigin tries first, so a test can make its
+      first bind collide; zero selects a kernel-chosen port. }
+    FFirstPort: Word;
     FStore: TLWPTRegistryStore;
     FServer: TLWPTRegistryServer;
     FThread: TServeThread;
+    { Serves a freshly initialized origin from a listener thread and
+      returns once that listener answers with this store's discovery and
+      checkpoint. A bind that fails because another process took the
+      chosen port reinitializes the origin on a fresh port, a bounded
+      number of times. }
     procedure StartOrigin(const AIdentity, APath, APublishedAt: string;
       const AIssueToken: Boolean = True);
+    { The listener on FPort serves this store: its discovery names FBase
+      and its checkpoint has exactly the bytes this store signed. }
+    function ServesThisOrigin(const ACheckpoint: string): Boolean;
     procedure StopOrigin;
     function Request(const AMethod, ATarget: string; const AToken: string;
       const ABody: TBytes; const AExtraHeaders: array of string): TRawHTTPResponse; overload;
@@ -139,6 +153,7 @@ type
     procedure TestSlowBodiesHitTheDeadline;
     procedure TestIncompleteMutatingHeadsAreAudited;
     procedure TestLongAdmissionStillAnswersRetryably;
+    procedure TestStartRelocatesFromAHeldPort;
   private
     FFinalHolder: TGuardHolder;
     procedure SlowAdmissionHook(const APoint: string);
@@ -191,6 +206,7 @@ begin
   try
     FServer.Run;
   except
+    on E: Exception do Failure := E.ClassName + ': ' + E.Message;
   end;
 end;
 
@@ -238,30 +254,69 @@ begin
   if ASize > 0 then FillChar(Result[0], ASize, AByte);
 end;
 
+function TRegistryPublicationContract.ServesThisOrigin(
+  const ACheckpoint: string): Boolean;
+begin
+  Result := (Pos('base_url = "' + FBase + '"', RawHTTPBodyText(
+    Get('/.well-known/' + PROGRAM_NAME + '-registry'))) > 0)
+    and (RawHTTPBodyText(Get('/v1/checkpoints/latest.toml')) = ACheckpoint);
+end;
+
 procedure TRegistryPublicationContract.StartOrigin(const AIdentity, APath,
   APublishedAt: string; const AIssueToken: Boolean);
+const
+  START_ATTEMPTS = 5;
+  READY_MILLISECONDS = 5000;
 var
   Config: TLWPTRegistryConfig;
   Started: QWord;
+  Attempt: Integer;
+  Checkpoint, LastProbe, Failure: string;
+  Ready: Boolean;
+  Signed: TRawHTTPResponse;
 begin
-  FPort := FreePort;
   FPrefix := APath;
-  FBase := 'http://localhost:' + IntToStr(FPort) + APath;
   FRoot := FScratch + '/origin';
-  Config := RegistryConfiguration(AIdentity, FBase, 'localhost', FPort, '', '');
-  FStore := TLWPTRegistryStore.Initialize(FRoot, Config, APublishedAt);
-  FServer := TLWPTRegistryServer.Create(FStore);
-  FThread := TServeThread.Create(FServer);
-  Started := GetTickCount64;
-  repeat
-    try
-      if Get('/.well-known/' + PROGRAM_NAME + '-registry').Status = 200 then Break;
-    except
-    end;
-    if GetTickCount64 - Started > 5000 then
-      raise Exception.Create('in-process registry did not start');
-    Sleep(10);
-  until False;
+  for Attempt := 1 to START_ATTEMPTS do
+  begin
+    if FFirstPort <> 0 then FPort := FFirstPort
+    else FPort := FreePort;
+    FFirstPort := 0;
+    FBase := 'http://localhost:' + IntToStr(FPort) + APath;
+    if DirectoryExists(FRoot) then RecursiveDelete(FRoot);
+    Config := RegistryConfiguration(AIdentity, FBase, 'localhost', FPort, '', '');
+    FStore := TLWPTRegistryStore.Initialize(FRoot, Config, APublishedAt);
+    { Its bytes name a fresh key and time, so they identify this origin;
+      read before the listener thread shares the store. }
+    Signed := Default(TRawHTTPResponse);
+    Signed.Body := FStore.LoadResource(FStore.LoadCurrentState.CheckpointPath);
+    Checkpoint := RawHTTPBodyText(Signed);
+    FServer := TLWPTRegistryServer.Create(FStore);
+    FThread := TServeThread.Create(FServer);
+    Started := GetTickCount64;
+    Ready := False;
+    LastProbe := 'no probe';
+    repeat
+      try
+        { Another listener on a collided port cannot serve this checkpoint. }
+        Ready := ServesThisOrigin(Checkpoint) and not FThread.Finished;
+        if not Ready then LastProbe := 'listener did not serve this origin';
+      except
+        on E: Exception do LastProbe := Copy(E.Message, 1, 512);
+      end;
+      if Ready or FThread.Finished then Break;
+      Sleep(10);
+    until GetTickCount64 - Started > READY_MILLISECONDS;
+    if Ready then Break;
+    Failure := '';
+    if FThread.Finished then Failure := FThread.Failure;
+    StopOrigin;
+    { Only a port another process took after it was chosen is retried. }
+    if (Pos('listen_failed:', Failure) = 0) or (Attempt = START_ATTEMPTS) then
+      raise Exception.Create('in-process registry did not start after '
+        + IntToStr(Attempt) + ' attempt(s); listener: ' + Failure
+        + '; last probe: ' + LastProbe);
+  end;
   if AIssueToken then
     FToken := IssueToken(['*'], [rtaPublish, rtaYank], 365, APublishedAt);
 end;
@@ -485,6 +540,7 @@ procedure TRegistryPublicationContract.BeforeEach;
 begin
   if FScratch <> '' then RecursiveDelete(FScratch);
   FScratch := CreateScratchRoot('registry-publication');
+  FFirstPort := 0;
   SetRegistryClockForTesting('');
   SetRegistryFailurePointForTesting('');
   SetRegistryRateLimitsForTesting(0, 0);
@@ -1727,6 +1783,44 @@ begin
   Expect<Integer>(Upload(Bytes('patient upload')).Status).ToBe(201);
 end;
 
+{ Another listener holds the first chosen port and answers discovery for
+  that base URL. A start that trusted any 200 there would drive the wrong
+  server; this one must see its own bind fail, move to a fresh port, and
+  serve its own checkpoint there. }
+procedure TRegistryPublicationContract.TestStartRelocatesFromAHeldPort;
+var
+  Occupier: TRegistryTestServer;
+  Routes: TRegistryHTTPRouteArray;
+  Collided: string;
+  Archive: TBytes;
+begin
+  { The occupier binds a kernel-chosen port first and the origin tries it
+    first, so the collision is certain rather than raced. }
+  Occupier := TRegistryTestServer.Create(nil, True);
+  try
+    Collided := 'http://localhost:' + IntToStr(Occupier.Port);
+    Routes := nil;
+    SetLength(Routes, 1);
+    Routes[0] := RegistryRoute('/.well-known/' + PROGRAM_NAME + '-registry',
+      'application/vnd.' + PROGRAM_NAME + '.registry-discovery+toml',
+      Bytes('base_url = "' + Collided + '"' + #10));
+    Occupier.SetRoutes(Routes);
+    Occupier.Start;
+    FFirstPort := Occupier.Port;
+    StartOrigin('', '', RegistryTimestampNow);
+    Expect<Boolean>(FPort <> Occupier.Port).ToBe(True);
+    Expect<Boolean>(FBase <> Collided).ToBe(True);
+    Expect<Boolean>(Pos('base_url = "' + FBase + '"', RawHTTPBodyText(
+      Get('/.well-known/' + PROGRAM_NAME + '-registry'))) > 0).ToBe(True);
+    Archive := Bytes('relocated archive');
+    Expect<Integer>(Upload(Archive).Status).ToBe(201);
+    Expect<Integer>(Publish('moved-lib', '1.0.0', Archive).Status).ToBe(201);
+    Expect<Int64>(Sequence).ToBe(2);
+  finally
+    Occupier.Free;
+  end;
+end;
+
 procedure TRegistryPublicationContract.SetupTests;
 begin
   Test('a token holder uploads and publishes over HTTP', TestPublicationRoundTrip);
@@ -1776,7 +1870,8 @@ begin
   Test('incomplete mutating heads are audited once on EOF and deadline',
     TestIncompleteMutatingHeadsAreAudited);
   Test('an admission that waits past the header deadline still answers 503',
-    TestLongAdmissionStillAnswersRetryably);
+    TestLongAdmissionStillAnswersRetryably);  Test('a start whose port another listener holds relocates to its own',
+    TestStartRelocatesFromAHeldPort);
 end;
 
 begin
