@@ -805,7 +805,6 @@ var
   procedure ComputeLiveSet;
   var Index, Item: Integer;
   begin
-    if ARootsIncomplete <> '' then MarkIncomplete(ARootsIncomplete);
     for Index := 0 to High(ARoots) do
     begin
       if not Result.Complete then Break;
@@ -924,8 +923,16 @@ begin
   Checkpoints := TDictionary<string, Boolean>.Create;
   Walked := TDictionary<string, Boolean>.Create;
   try
+    { A state set that could not be read is uncertain whatever the budget,
+      and the report says so even when the shortcut below skips the walk. }
+    if ARootsIncomplete <> '' then MarkIncomplete(ARootsIncomplete);
     ListDocuments;
-    if not Result.Complete then Exit;
+    if not Result.Complete then
+    begin
+      { Recency is still recorded; nothing is removed. }
+      if AWrite and (Length(Documents) > 0) then UpdateAndEvict;
+      Exit;
+    end;
     { Under budget nothing can be evictable beyond it, so a writing pass
       only records recency. }
     if not AWrite or (Result.DocumentBytes > ABudget) then ComputeLiveSet;

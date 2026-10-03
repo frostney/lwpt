@@ -523,6 +523,14 @@ begin
   Report := Pass(Store.Root, 0, 100);
   Expect<Boolean>(Report.Complete).ToBe(False);
   Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  { Within the budget the walk is skipped, but the report is still
+    incomplete, with the reason. }
+  Report := Pass(Store.Root, High(Int64), 100);
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Boolean>(Report.Analyzed).ToBe(False);
+  Expect<Boolean>(Pos('so the accepted histories are unknown',
+    Report.Incomplete) > 0).ToBe(True);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
   Expect<Boolean>(Present(Store.Root, Store.Checkpoints[0])).ToBe(True);
   SysUtils.DeleteFile(Origins);
   {$IFDEF UNIX}
