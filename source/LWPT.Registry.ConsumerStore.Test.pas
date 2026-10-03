@@ -587,7 +587,10 @@ begin
     or privilege the link cannot be made, and the case checks the rest. }
   if CreateSymbolicLinkW(PWideChar(UnicodeString(StringReplace(LinkPath, '/',
        '\', [rfReplaceAll]))), PWideChar(UnicodeString(StringReplace(Outside,
-       '/', '\', [rfReplaceAll]))), 2) then
+       '/', '\', [rfReplaceAll]))), 2)
+     { Some emulators report success without creating anything. }
+     and (GetFileAttributesW(PWideChar(UnicodeString(LinkPath)))
+       <> INVALID_FILE_ATTRIBUTES) then
     Inc(Ignored)
   else
     WriteLn('  (file symbolic links unavailable; reparse-point case skipped)');
