@@ -29,6 +29,14 @@ procedure BindRegistryChildToParent(AProcess: TProcess);
   wait timed out. }
 function WaitForRegistryHandleRelease(AProcess: TProcess;
   const ATimeoutMilliseconds: Cardinal): Boolean;
+{ Polls, bounded, until AProcess reports an exit; Running is a nonblocking
+  status query. Use it instead of the parameterless WaitOnExit, which never
+  returns for a hung child. True does not mean the child's handles are
+  released: follow it with WaitForRegistryHandleRelease or
+  StopRegistryProcess before reading the exit status or removing the
+  child's working directory. }
+function WaitForRegistryExit(AProcess: TProcess;
+  const ATimeoutMilliseconds: QWord): Boolean;
 
 function StopRegistryProcess(var AProcess: TProcess;
   const AGraceMilliseconds: QWord = 12000;
