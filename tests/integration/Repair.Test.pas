@@ -109,7 +109,8 @@ begin
   Result := RunLwpt(['repair'], FScratch, [
     'LWPT_CACHE_DIR=' + FCacheRoot,
     'LWPT_WORKER_STATE_DIR=' + FWorkerState,
-    'LWPT_WORKER_BUDGET=1'
+    'LWPT_WORKER_BUDGET=1',
+    PROJECT_NAME + '_REGISTRY_STATE_DIR=' + FScratch + '/registry-state'
   ]);
 end;
 
@@ -169,6 +170,9 @@ var R: TLwptResult;
 begin
   R := RunRepair;
   Expect<Integer>(R.ExitCode).ToBe(0);
+  { Without a per-user registry document store there is nothing to report. }
+  Expect<Boolean>(Pos('repair: no per-user registry document store at ',
+    R.Stdout) > 0).ToBe(True);
 end;
 
 procedure TRepairE2E.TestRepairClearsStaleInstallLock;

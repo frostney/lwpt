@@ -6928,6 +6928,9 @@ begin
     if ManifestBackup <> '' then
       AtomicDiscardRetainedPath(ManifestBackup);
     if DirectoryExists(RollbackRoot) then WipeDir(RollbackRoot);
+    { Per-user document eviction runs after the project transaction and
+      only warns on failure: losing a document costs only re-transfer. }
+    if Consumer <> nil then Consumer.EnforceStateBudget;
     except
       on E: Exception do
       begin
