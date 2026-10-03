@@ -3757,6 +3757,8 @@ begin
     .ToBe('\\?\UNC\server\share\x');
   Expect<string>(string(WindowsExtendedPath('\\?\C:\already')))
     .ToBe('\\?\C:\already');
+  Expect<string>(string(WindowsExtendedPath('\\.\pipe\name')))
+    .ToBe('\\.\pipe\name');
   Current := ExcludeTrailingPathDelimiter(GetCurrentDir);
   Expect<string>(string(WindowsExtendedPath('rel\x')))
     .ToBe('\\?\' + Current + '\rel\x');

@@ -127,8 +127,8 @@ function  ListDirectoryEntries(const ADirectory, AMask: string;
 {$IFDEF MSWINDOWS}
 { The extended-length spelling of APath: absolute, backslash-separated,
   without empty, '.' or '..' components, and without a trailing separator
-  except on a drive root. An already-extended path is returned unchanged and
-  '' stays ''. }
+  except on a drive root. An already-extended or device-namespace path is
+  returned unchanged and '' stays ''. }
 function  WindowsExtendedPath(const APath: string): UnicodeString;
 {$ENDIF}
 
@@ -1042,6 +1042,7 @@ end;
 const
   EXTENDED_PATH_PREFIX = '\\?\';
   EXTENDED_UNC_PREFIX = '\\?\UNC\';
+  DEVICE_PATH_PREFIX = '\\.\';
 
 function WindowsExtendedPath(const APath: string): UnicodeString;
 var
@@ -1052,6 +1053,9 @@ begin
   { ExpandFileName does not understand the extended prefix; a caller that
     already holds an extended path keeps it verbatim. }
   if Copy(APath, 1, 4) = EXTENDED_PATH_PREFIX then
+    Exit(UnicodeString(APath));
+  { Device namespace paths (`\\.\pipe\...`) are not file system paths. }
+  if Copy(APath, 1, 4) = DEVICE_PATH_PREFIX then
     Exit(UnicodeString(APath));
   { ExpandFileName resolves relative paths against the current directory
     and folds '.' and '..'; the extended spelling would otherwise pass them
