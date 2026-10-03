@@ -285,17 +285,30 @@ var
   Regular: Boolean;
   Size: Int64;
   Error: cint;
+  Info: TStat;
 begin
   AEntries := nil;
   AError := '';
   Count := 0;
   Result := False;
+  { The entry itself, not a link's target: only a truly missing entry is
+    empty. A link, dangling or not, or any other non-directory is not. }
+  if fpLStat(PChar(ADirectory), Info) <> 0 then
+  begin
+    Error := fpgeterrno;
+    if Error = ESysENOENT then Exit(True);
+    AError := ADirectory + ' cannot be examined (error ' + IntToStr(Error) + ')';
+    Exit;
+  end;
+  if not fpS_ISDIR(Info.st_mode) then
+  begin
+    AError := ADirectory + ' is not a directory (a link or another kind of file)';
+    Exit;
+  end;
   Directory := fpOpenDir(PChar(ADirectory));
   if Directory = nil then
   begin
     Error := fpgeterrno;
-    if (Error = ESysENOENT) and not DirectoryExists(ADirectory) then
-      Exit(True);
     AError := ADirectory + ' cannot be listed (error ' + IntToStr(Error) + ')';
     Exit;
   end;
@@ -340,19 +353,33 @@ var
   Handle: THandle;
   Data: TWin32FindDataW;
   Name: string;
-  Error: DWORD;
+  Error, Attributes: DWORD;
 begin
   AEntries := nil;
   AError := '';
   Count := 0;
   Result := False;
+  { The attributes of the path itself: only a truly missing entry is empty.
+    A reparse point (link or junction) or any non-directory is not. }
+  Attributes := GetFileAttributesW(PWideChar(UnicodeString(ADirectory)));
+  if Attributes = INVALID_FILE_ATTRIBUTES then
+  begin
+    Error := GetLastError;
+    if (Error = ERROR_FILE_NOT_FOUND) or (Error = ERROR_PATH_NOT_FOUND) then
+      Exit(True);
+    AError := ADirectory + ' cannot be examined (error ' + IntToStr(Error) + ')';
+    Exit;
+  end;
+  if ((Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0)
+     or ((Attributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0) then
+  begin
+    AError := ADirectory + ' is not a directory (a link or another kind of file)';
+    Exit;
+  end;
   Handle := FindFirstFileW(PWideChar(UnicodeString(ADirectory + '\*')), Data);
   if Handle = INVALID_HANDLE_VALUE then
   begin
     Error := GetLastError;
-    if ((Error = ERROR_FILE_NOT_FOUND) or (Error = ERROR_PATH_NOT_FOUND))
-       and not DirectoryExists(ADirectory) then
-      Exit(True);
     AError := ADirectory + ' cannot be listed (error ' + IntToStr(Error) + ')';
     Exit;
   end;

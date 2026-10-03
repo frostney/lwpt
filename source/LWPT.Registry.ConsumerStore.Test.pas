@@ -525,6 +525,34 @@ begin
   Expect<Integer>(Report.EvictedDocuments).ToBe(0);
   Expect<Boolean>(Present(Store.Root, Store.Checkpoints[0])).ToBe(True);
   SysUtils.DeleteFile(Origins);
+  {$IFDEF UNIX}
+  { A dangling link where origins/ belongs hides every accepted history; so
+    does a link to a real directory, and a link in place of documents/. }
+  Expect<Integer>(fpSymlink(PChar(Store.Root + '/missing'), PChar(Origins)))
+    .ToBe(0);
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Boolean>(Pos('is not a directory', Report.Incomplete) > 0).ToBe(True);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  Expect<Boolean>(Present(Store.Root, Store.Snapshot1)).ToBe(True);
+  fpUnlink(PChar(Origins));
+  Expect<Integer>(fpSymlink(PChar(Store.Root + '/origins.away'), PChar(Origins)))
+    .ToBe(0);
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  fpUnlink(PChar(Origins));
+  Expect<Boolean>(RenameFile(RegistryStateDocumentsDirectory(Store.Root),
+    Store.Root + '/documents/away')).ToBe(True);
+  Expect<Integer>(fpSymlink(PChar(Store.Root + '/documents/away'),
+    PChar(RegistryStateDocumentsDirectory(Store.Root)))).ToBe(0);
+  Report := Pass(Store.Root, 0, 100);
+  Expect<Boolean>(Report.Complete).ToBe(False);
+  Expect<Integer>(Report.EvictedDocuments).ToBe(0);
+  fpUnlink(PChar(RegistryStateDocumentsDirectory(Store.Root)));
+  Expect<Boolean>(RenameFile(Store.Root + '/documents/away',
+    RegistryStateDocumentsDirectory(Store.Root))).ToBe(True);
+  {$ENDIF}
   Expect<Boolean>(RenameFile(Store.Root + '/origins.away', Origins)).ToBe(True);
   {$IFDEF UNIX}
   if PermissionsApply then
@@ -565,7 +593,14 @@ var
   Report: TLWPTRegistryStoreReport;
   Outside, OutsideHash, LinkPath, Expected: string;
   Ignored: Integer;
+  {$IFDEF UNIX}
+  Fifo: string;
+  FifoHandle: cint;
+  {$ENDIF}
 begin
+  {$IFDEF UNIX}
+  FifoHandle := -1;
+  {$ENDIF}
   Store := BuildStore;
   { A hash-named link to a file outside the store. }
   Outside := Store.Root + '/outside.toml';
@@ -578,9 +613,13 @@ begin
   Expect<Integer>(fpSymlink(PChar(Outside), PChar(LinkPath))).ToBe(0);
   Inc(Ignored);
   { A FIFO under a document name would block a reader forever. }
-  Expect<Integer>(fpMkFifo(PChar(RegistryStateDocumentPath(Store.Root,
-    'sha256:' + StringOfChar('f', 64))), &600)).ToBe(0);
+  Fifo := RegistryStateDocumentPath(Store.Root, 'sha256:' + StringOfChar('f', 64));
+  Expect<Integer>(fpMkFifo(PChar(Fifo), &600)).ToBe(0);
   Inc(Ignored);
+  { Held open for the pass, so a regression that opened it could never
+    block: an open succeeds at once. }
+  FifoHandle := fpOpen(PChar(Fifo), O_RDWR or O_NONBLOCK);
+  Expect<Boolean>(FifoHandle >= 0).ToBe(True);
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   { 2 = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE; without developer mode
@@ -595,7 +634,13 @@ begin
   else
     WriteLn('  (file symbolic links unavailable; reparse-point case skipped)');
   {$ENDIF}
-  Report := Pass(Store.Root, 0, 100);
+  try
+    Report := Pass(Store.Root, 0, 100);
+  finally
+    {$IFDEF UNIX}
+    if FifoHandle >= 0 then fpClose(FifoHandle);
+    {$ENDIF}
+  end;
   Expect<Boolean>(Report.Complete).ToBe(True);
   Expect<Integer>(Report.IgnoredEntries).ToBe(Ignored);
   Expect<Integer>(Report.Documents).ToBe(10);
