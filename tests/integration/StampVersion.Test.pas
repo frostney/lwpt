@@ -14,8 +14,9 @@
   gate's script) and reaped within a bounded grace period. Each gate gets
   one absolute deadline from its parent and kills its own script a fixed
   margin before it; the parent kills a gate only after that deadline plus
-  the grace, so a gate's cleanup always runs first, however late the gate
-  started. TProcess.Terminate and the untimed WaitOnExit are never used:
+  the grace. These are ordered thresholds, not a guarantee of completion
+  order: a gate that is badly delayed by the scheduler can still be killed
+  before its own cleanup finishes. TProcess.Terminate and the untimed WaitOnExit are never used:
   FPC 3.2.2 waits without a bound in both. Six assertions:
 
     1. Concurrent runs across changing versions all exit 0. This program
@@ -83,9 +84,11 @@ const
   BARRIER_MILLISECONDS = 60000;
   CHILD_MILLISECONDS = 120000;
   { A gate's whole life, barrier included, ends by one absolute deadline
-    its parent passes as an argument. GetTickCount64 counts machine-wide
-    (CLOCK_MONOTONIC on Unix, the system tick count on Windows), so parent
-    and gate read the same clock. The gate kills its script this margin
+    its parent passes as an argument. In FPC 3.2.2 GetTickCount64 reads
+    CLOCK_MONOTONIC on Linux, the system-wide tick count on Windows, and
+    gettimeofday on macOS, so parent and gate read the same clock; on macOS
+    that clock is the wall clock and a clock adjustment during a run shifts
+    the deadline. The gate starts killing its script this margin
     before the deadline, more than a kill and reap may take, and the
     parent kills a gate only after the deadline plus the grace. }
   GATE_LIFETIME_MILLISECONDS = BARRIER_MILLISECONDS + CHILD_MILLISECONDS;
@@ -323,8 +326,9 @@ begin
 end;
 
 { Child mode: ParamStr(2) is the ready file, 3 the release file, 4 the
-  script executable, 5 the absolute GetTickCount64 deadline. The script is
-  killed and reaped by the deadline minus the cleanup margin.
+  script executable, 5 the absolute GetTickCount64 deadline. Termination of
+  the script starts at the deadline minus the cleanup margin; reaping then
+  takes up to the termination grace.
 
   On Windows a killed gate cannot take its script with it; this ordering is
   what keeps the script from outliving the test there. Owning descendants
