@@ -28,21 +28,25 @@ program StampVersion;
     - when it already holds exactly the expected text it is left
       untouched (mtime included), which is the common concurrent case;
     - otherwise the text goes to a uniquely named, exclusively created
-      temporary file in the project's toolkit tmp directory (.lwpt/tmp,
-      or an `[lwpt] tmp-dir` override found by the same naive scan),
-      which then replaces the destination atomically: rename(2) on Unix,
-      MoveFileExW with MOVEFILE_REPLACE_EXISTING on Windows. Staging there
-      keeps the transient file out of source/, which builds fingerprint.
-      Windows sharing violations (a reader holding the destination) are
-      retried a bounded number of times;
-    - when the tmp directory cannot be created or sits on another file
-      system (EXDEV, ERROR_NOT_SAME_DEVICE), the temporary file is staged
-      beside the destination instead (source/.Version.inc.<pid>-<tick>-
-      <n>.tmp), never copied non-atomically;
+      temporary file in the project's own .lwpt/tmp directory (beside
+      lwpt.toml, created when missing), which then replaces the
+      destination atomically: rename(2) on Unix, MoveFileExW with
+      MOVEFILE_REPLACE_EXISTING on Windows. Staging there keeps the
+      transient file out of source/, which builds fingerprint. Windows
+      sharing violations (a reader holding the destination) are retried a
+      bounded number of times;
+    - an `[lwpt] tmp-dir` override is deliberately not read: this naive
+      line scan cannot parse TOML faithfully, and a misread path could
+      point outside the project. .lwpt/tmp sits inside the project, so it
+      shares the destination's file system;
+    - there is no other staging place. When .lwpt/tmp cannot be created
+      or written, or the rename crosses file systems (EXDEV,
+      ERROR_NOT_SAME_DEVICE), the run fails with a message naming the
+      path and Version.inc is left as it was;
     - a failed replacement whose destination already holds the expected
       text (a concurrent writer won) counts as success, and a temporary
-      file removed under the script (lwpt install wipes the tmp
-      directory) is written again, a bounded number of times;
+      file removed under the script (lwpt install wipes .lwpt/tmp) is
+      written again, a bounded number of times;
     - every temporary file that is not published is deleted; one that
       cannot be deleted is reported on stderr.
   The bytes are those TStringList.SaveToFile wrote before: every line,
@@ -63,8 +67,8 @@ uses
 const
   MANIFEST_PATH = 'lwpt.toml';
   OUTPUT_PATH   = 'source/Version.inc';
-  { The toolkit's default tmp directory; [lwpt] tmp-dir overrides it. }
-  DEFAULT_TMP_DIR = '.lwpt/tmp';
+  { Relative to the directory holding the manifest. }
+  STAGING_DIR = '.lwpt/tmp';
   TEMP_PREFIX = 'stamp-version-';
   { A temporary file deleted under the script is written again at most this
     many times in total. }
@@ -127,36 +131,6 @@ begin
     Value := StringReplace(Value, '''', '', [rfReplaceAll]);
     Result := Trim(Value);
     Exit;
-  end;
-end;
-
-{ [lwpt] tmp-dir, by the same naive line scan; '' when absent. }
-function ExtractTmpDir(const ALines: TStringList): string;
-var
-  i, EqPos, Closing: Integer;
-  Trimmed, Value: string;
-  InLwpt: Boolean;
-begin
-  Result := '';
-  InLwpt := False;
-  for i := 0 to ALines.Count - 1 do
-  begin
-    Trimmed := Trim(ALines[i]);
-    if (Trimmed = '') or (Trimmed[1] = '#') then Continue;
-    if (Length(Trimmed) >= 2) and (Trimmed[1] = '[') then
-    begin
-      InLwpt := SameText(Trimmed, '[lwpt]');
-      Continue;
-    end;
-    if not InLwpt then Continue;
-    EqPos := Pos('=', Trimmed);
-    if EqPos = 0 then Continue;
-    if not SameText(Trim(Copy(Trimmed, 1, EqPos - 1)), 'tmp-dir') then Continue;
-    Value := Trim(Copy(Trimmed, EqPos + 1, MaxInt));
-    if (Value = '') or not (Value[1] in ['"', '''']) then Exit;
-    Closing := Pos(Value[1], Copy(Value, 2, MaxInt));
-    if Closing = 0 then Exit;
-    Exit(Copy(Value, 2, Closing - 1));
   end;
 end;
 
@@ -346,7 +320,12 @@ begin
   if Result then Exit;
   Err := FpGetErrNo;
   AError := Format('cannot rename %s to %s (errno %d)', [ATemp, ADest, Err]);
-  if Err = ESysEXDEV then AFailure := rfCrossDevice
+  if Err = ESysEXDEV then
+  begin
+    AFailure := rfCrossDevice;
+    AError := Format('cannot rename %s to %s: they are on different file '
+      + 'systems', [ATemp, ADest]);
+  end
   else if (Err = ESysENOENT) and not FileExists(ATemp) then
     AFailure := rfTempVanished;
 end;
@@ -370,6 +349,8 @@ begin
     if Err = Windows.ERROR_NOT_SAME_DEVICE then
     begin
       AFailure := rfCrossDevice;
+      AError := Format('cannot move %s to %s: they are on different '
+        + 'volumes', [ATemp, ADest]);
       Exit(False);
     end;
     if ((Err = Windows.ERROR_FILE_NOT_FOUND)
@@ -396,52 +377,51 @@ begin
 end;
 {$ENDIF}
 
-{ The directory a temporary file for ADest is staged in: the toolkit tmp
-  directory when it exists or can be created, else ADest's own directory. }
-function StagingDirectory(const ATmpDir: string; out ABeside: Boolean): string;
+{ Creates ADir and its parents. Unlike SysUtils.ForceDirectories it
+  tolerates a concurrent run creating the same directory between the
+  existence check and the mkdir. }
+function EnsureDirectory(const ADir: string): Boolean;
+var
+  Dir, Parent: string;
 begin
-  ABeside := False;
-  Result := ExcludeTrailingPathDelimiter(ATmpDir);
-  try
-    if (Result <> '') and ForceDirectories(Result) then Exit;
-  except
-    on Exception do ;
-  end;
-  ABeside := True;
-  Result := '';
+  Dir := ExcludeTrailingPathDelimiter(ADir);
+  if Dir = '' then Exit(False);
+  if DirectoryExists(Dir) then Exit(True);
+  Parent := ExtractFileDir(Dir);
+  if (Parent <> '') and (Parent <> Dir) and not EnsureDirectory(Parent) then
+    Exit(False);
+  Result := CreateDir(Dir) or DirectoryExists(Dir);
+end;
+
+{ The project's own staging directory, created when missing. }
+function StagingDirectory: string;
+begin
+  Result := ConcatPaths([ExtractFileDir(ExpandFileName(MANIFEST_PATH)),
+    STAGING_DIR]);
+  if EnsureDirectory(Result) then Exit;
+  raise Exception.CreateFmt('cannot create staging directory %s; %s is '
+    + 'unchanged', [Result, OUTPUT_PATH]);
 end;
 
 { Publishes AText at ADest. False when ADest already held it. }
-function PublishText(const ADest, AText, ATmpDir: string): Boolean;
+function PublishText(const ADest, AText: string): Boolean;
 var
-  Temp, Error, Dir, Prefix: string;
+  Temp, Error, Dir: string;
   Attempt: Integer;
-  Beside, Published: Boolean;
+  Published: Boolean;
   Failure: TReplaceFailure;
 begin
   Error := 'cannot publish ' + ADest;
-  Dir := StagingDirectory(ATmpDir, Beside);
   for Attempt := 1 to MAX_PUBLISH_ATTEMPTS do
   begin
     if HoldsText(ADest, AText) then Exit(False);
-    if Beside then
-    begin
-      Dir := ExtractFileDir(ADest);
-      Prefix := '.' + ExtractFileName(ADest) + '.';
-    end
-    else
-      Prefix := TEMP_PREFIX + ExtractFileName(ADest) + '.';
+    Dir := StagingDirectory;
     try
-      Temp := WriteTempFile(Dir, Prefix, AText);
+      Temp := WriteTempFile(Dir, TEMP_PREFIX + ExtractFileName(ADest) + '.',
+        AText);
     except
-      { An unwritable tmp directory: stage beside ADest instead. }
       on E: Exception do
-      begin
-        if Beside then raise;
-        Error := E.Message;
-        Beside := True;
-        Continue;
-      end;
+        raise Exception.CreateFmt('%s; %s is unchanged', [E.Message, ADest]);
     end;
     Published := False;
     try
@@ -452,39 +432,20 @@ begin
     if Published then Exit(True);
     { A concurrent writer won the replacement with the same text. }
     if HoldsText(ADest, AText) then Exit(False);
-    case Failure of
-      { Renaming across file systems is not atomic: stage beside ADest. }
-      rfCrossDevice:
-        if Beside then Break else Beside := True;
-      { Something (lwpt install) wiped the tmp directory: write again. }
-      rfTempVanished:
-        if not Beside then Dir := StagingDirectory(ATmpDir, Beside);
-    else
-      Break;
-    end;
+    { Only a temporary file wiped under the script (lwpt install empties
+      .lwpt/tmp) is worth writing again. }
+    if Failure <> rfTempVanished then Break;
   end;
-  raise Exception.Create(Error);
+  raise Exception.CreateFmt('%s; %s is unchanged', [Error, ADest]);
 end;
 
 var
   Lines  : TStringList;
-  Version, Override_, SourceNote, TmpDir: string;
+  Version, Override_, SourceNote: string;
   Out    : TStringList;
   Wrote  : Boolean;
 begin
   try
-    TmpDir := DEFAULT_TMP_DIR;
-    if FileExists(MANIFEST_PATH) then
-    begin
-      Lines := TStringList.Create;
-      try
-        Lines.LoadFromFile(MANIFEST_PATH);
-        if ExtractTmpDir(Lines) <> '' then TmpDir := ExtractTmpDir(Lines);
-      finally
-        Lines.Free;
-      end;
-    end;
-
     Override_ := Trim(GetEnvironmentVariable('LWPT_VERSION_OVERRIDE'));
     if Override_ <> '' then
     begin
@@ -524,7 +485,7 @@ begin
       Out.Add('');
       Out.Add('  PROGRAM_VERSION = ' + QuotedStr(Version) + ';');
       { Text is exactly what SaveToFile wrote: each line + LineEnding. }
-      Wrote := PublishText(OUTPUT_PATH, Out.Text, TmpDir);
+      Wrote := PublishText(OUTPUT_PATH, Out.Text);
     finally
       Out.Free;
     end;

@@ -19,11 +19,6 @@ build/
 *.rsj
 *.compiled
 
-# stamp-version stages beside source/Version.inc only when the toolkit
-# tmp directory is unusable or on another file system; a run killed before
-# its rename leaves that file behind (issue #361).
-source/.Version.inc.*.tmp
-
 # OS noise.
 .DS_Store
 Thumbs.db

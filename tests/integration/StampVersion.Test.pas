@@ -9,28 +9,34 @@
   that announces itself with an existence-only ready file and starts the
   script only once the existence-only release file appears. Neither file
   carries content, so neither is a payload handoff. Every child is awaited
-  to real completion under a deadline, then terminated and reaped if it
-  overruns. Six assertions:
+  to real completion under a deadline. An overrun child is killed with a
+  native signal (on Unix with its whole process group, which holds a
+  gate's script) and reaped within a bounded grace period; a gate kills
+  its own script on an earlier deadline. TProcess.Terminate and the
+  untimed WaitOnExit are never used: FPC 3.2.2 waits without a bound in
+  both. Six assertions:
 
     1. Concurrent runs across changing versions all exit 0. This program
        reads the include continuously from before the release until every
        writer has exited; every read sees the complete previous or new
-       text, never a truncated or partial file, and reads must overlap
-       running writers. The final file holds exactly the new text, with
+       text, never a truncated or partial file. In at least one round the
+       reader saw the round's old text after the release and then its new
+       text while a writer had not yet exited, so reads straddled a
+       publication. The final file holds exactly the new text, with
        SaveToFile's bytes (each line followed by LineEnding), and neither
-       source/ nor the tmp directory keeps a temporary file.
+       source/ nor .lwpt/tmp keeps a temporary file.
     2. Concurrent runs whose expected text is already present leave the
        file untouched: its modification time stays at a value set in the
        past.
-    3. Concurrent `lwpt build` runs of a project whose [prebuild] hook is
-       the script all succeed: the hook's temporary file never enters the
-       fingerprinted source/ tree, so no build is rejected for changed
-       inputs, and the built program reports the new version.
-    4. A `[lwpt] tmp-dir` that cannot be created makes the script stage
-       beside the destination, still publishing exactly and leaving no
-       temporary file.
-    5. A target without a source/ directory fails without leaving any file
-       behind.
+    3. An end-to-end smoke: concurrent `lwpt build` runs of a project
+       whose [prebuild] hook is the script all succeed, none reports
+       changed inputs, and the built program reports the new version. It
+       does not prove that the hooks overlapped.
+    4. An unusable .lwpt/tmp (a regular file named .lwpt) fails with a
+       message naming the staging path, leaves Version.inc unchanged, and
+       leaves nothing behind.
+    5. A target without a source/ directory fails after the temporary file
+       is written and removes it.
     6. A destination that is a directory fails after the temporary file is
        written, and the temporary file is removed. }
 
@@ -40,10 +46,14 @@ program StampVersion.Test;
 
 uses
   {$IFDEF UNIX}
+  BaseUnix,
   cthreads,
   {$ENDIF}
   Classes,
   Process,
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   SysUtils,
 
   LWPT.Core,
@@ -64,6 +74,10 @@ const
   { Deadlines are generous for slow Windows runners; none is unbounded. }
   BARRIER_MILLISECONDS = 60000;
   CHILD_MILLISECONDS = 120000;
+  { A gate's own deadline for its script expires first, so the outer
+    deadline only ever has to stop a gate that is already cleaning up. }
+  GATE_SLACK_MILLISECONDS = 30000;
+  WRITER_MILLISECONDS = CHILD_MILLISECONDS + GATE_SLACK_MILLISECONDS;
   BUILD_MILLISECONDS = 600000;
   TERMINATION_GRACE_MILLISECONDS = 10000;
   POLL_MILLISECONDS = 1;
@@ -83,9 +97,18 @@ type
     FOutput: string;
     FExitCode: Integer;
     FFinished: Boolean;
+    FOwnGroup: Boolean;
+    {$IFDEF UNIX}
+    procedure ChildForked(ASender: TObject);
+    function GroupAlive: Boolean;
+    {$ENDIF}
+    procedure Kill;
   public
+    { AOwnGroup puts the child, and everything it starts, in a new Unix
+      process group that Kill signals as a whole. }
     constructor Create(const AExecutable, ADirectory: string;
-      const AArguments, AEnvironment: array of string);
+      const AArguments, AEnvironment: array of string;
+      const AOwnGroup: Boolean);
     destructor Destroy; override;
     procedure Drain;
     function Running: Boolean;
@@ -97,8 +120,11 @@ type
 
   TReadStats = record
     Observations: Integer;
-    { Reads that completed after the release while a writer still ran. }
-    Overlapping: Integer;
+    { The old text (AAllowed[0]) was read after the release. }
+    SawOld: Boolean;
+    { After that, the new text (AAllowed[1]) was read while a writer had
+      not yet exited: the reads straddled a publication. }
+    Straddled: Boolean;
     Torn: Integer;
     TornSample: string;
   end;
@@ -113,7 +139,7 @@ type
     function IncludePath: string;
     function ExpectedText(const AVersion: string): string;
     function Observe(const AAllowed: array of string;
-      var AStats: TReadStats): Boolean;
+      var AStats: TReadStats): Integer;
     function RunWriters(const AAllowed: array of string;
       out AStats: TReadStats): TChildren;
     procedure ExpectSucceeded(const AChildren: TChildren);
@@ -126,11 +152,22 @@ type
     procedure SetupTests; override;
     procedure TestConcurrentRunsPublishCompleteText;
     procedure TestCurrentTextIsLeftUntouched;
-    procedure TestConcurrentBuildsAreNotRejected;
-    procedure TestUnavailableTmpDirStagesBesideDestination;
+    procedure TestConcurrentBuildsSmoke;
+    procedure TestUnusableStagingDirectoryFailsCleanly;
     procedure TestMissingSourceDirectoryFailsCleanly;
     procedure TestFailedReplacementRemovesTemporaryFile;
   end;
+
+{$IFDEF UNIX}
+{ setpgid(2); FPC 3.2.2's BaseUnix does not bind it. }
+function CSetProcessGroup(const APID,
+  AProcessGroupID: LongInt): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'setpgid';
+  {$ELSE}
+  external name 'setpgid';
+  {$ENDIF}
+{$ENDIF}
 
 function VersionOverrideCleared: string;
 begin
@@ -139,19 +176,29 @@ begin
 end;
 
 constructor TChild.Create(const AExecutable, ADirectory: string;
-  const AArguments, AEnvironment: array of string);
+  const AArguments, AEnvironment: array of string;
+  const AOwnGroup: Boolean);
 var
   Argument: string;
 begin
   inherited Create;
   FExitCode := -1;
+  FOwnGroup := AOwnGroup;
   FProcess := TProcess.Create(nil);
   FProcess.Executable := AExecutable;
   FProcess.CurrentDirectory := ADirectory;
   FProcess.Options := [poUsePipes, poStderrToOutPut];
   for Argument in AArguments do FProcess.Parameters.Add(Argument);
   ConfigureProcessEnvironment(FProcess, AEnvironment);
+  {$IFDEF UNIX}
+  if FOwnGroup then FProcess.OnForkEvent := ChildForked;
+  {$ENDIF}
   FProcess.Execute;
+  {$IFDEF UNIX}
+  { Both sides set the group, so it exists whichever runs first; the
+    parent's call fails harmlessly once the child has exec'd. }
+  if FOwnGroup then CSetProcessGroup(FProcess.ProcessID, FProcess.ProcessID);
+  {$ENDIF}
 end;
 
 destructor TChild.Destroy;
@@ -166,6 +213,33 @@ begin
   inherited Destroy;
 end;
 
+{$IFDEF UNIX}
+procedure TChild.ChildForked(ASender: TObject);
+begin
+  { Runs in the forked child before exec. }
+  CSetProcessGroup(0, 0);
+end;
+
+function TChild.GroupAlive: Boolean;
+begin
+  Result := (FpKill(-FProcess.ProcessID, 0) = 0)
+    or (FpGetErrNo = ESysEPERM);
+end;
+{$ENDIF}
+
+{ Signals without waiting; the caller reaps within its own bound. }
+procedure TChild.Kill;
+begin
+  if FProcess.ProcessID <= 0 then Exit;
+  {$IFDEF UNIX}
+  if FOwnGroup and (FpKill(-FProcess.ProcessID, SIGKILL) = 0) then Exit;
+  FpKill(FProcess.ProcessID, SIGKILL);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows.TerminateProcess(FProcess.ProcessHandle, 1);
+  {$ENDIF}
+end;
+
 procedure TChild.Drain;
 begin
   if FProcess.Output.NumBytesAvailable > 0 then
@@ -175,14 +249,15 @@ end;
 function TChild.Running: Boolean;
 begin
   Drain;
+  { Nonblocking: waitpid(WNOHANG) on Unix, GetExitCodeProcess on Windows. }
   Result := FProcess.Running;
 end;
 
 { Waits until the child has exited and, on Windows, until its process
   handle is signalled: GetExitCodeProcess reports the exit before the kernel
   runs down the child's handles, including its working directory. Past
-  ADeadline the child is terminated, reaped within a grace period, and the
-  overrun raises. }
+  ADeadline the child (with its process group) is killed, reaped within a
+  grace period, and the overrun raises. }
 procedure TChild.Finish(const ADeadline: QWord);
 var
   TimedOut: Boolean;
@@ -195,7 +270,7 @@ begin
     if GetTickCount64 >= ADeadline then
     begin
       TimedOut := True;
-      FProcess.Terminate(1);
+      Kill;
       Break;
     end;
     Sleep(POLL_MILLISECONDS);
@@ -204,10 +279,22 @@ begin
   while Running do
   begin
     if GetTickCount64 >= GraceEnd then
-      raise Exception.CreateFmt('child %s did not exit after termination',
+      raise Exception.CreateFmt('child %s did not exit after it was killed',
         [FProcess.Executable]);
     Sleep(POLL_MILLISECONDS);
   end;
+  {$IFDEF UNIX}
+  { A killed group's other members are reaped by init; wait until they
+    are gone so none outlives the test's directories. }
+  if TimedOut and FOwnGroup then
+    while GroupAlive do
+    begin
+      if GetTickCount64 >= GraceEnd then
+        raise Exception.CreateFmt('process group of %s outlived its kill',
+          [FProcess.Executable]);
+      Sleep(POLL_MILLISECONDS);
+    end;
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   if not FProcess.WaitOnExit(TERMINATION_GRACE_MILLISECONDS) then
     raise Exception.CreateFmt('child %s exited but its handle never '
@@ -243,7 +330,8 @@ begin
       end;
       Sleep(POLL_MILLISECONDS);
     end;
-    Child := TChild.Create(ParamStr(4), GetCurrentDir, [], []);
+    { The script stays in the gate's process group. }
+    Child := TChild.Create(ParamStr(4), GetCurrentDir, [], [], False);
     try
       Child.Finish(GetTickCount64 + CHILD_MILLISECONDS);
       Write(Child.Output);
@@ -397,20 +485,20 @@ begin
     + '  PROGRAM_VERSION = ''' + AVersion + ''';' + LineEnding;
 end;
 
-{ Reads the include once. False when a Windows sharing violation kept the
-  read from happening; any other failure or unexpected content is torn. }
+{ Reads the include once and returns the index of the AAllowed text it
+  held; -1 when a Windows sharing violation kept the read from happening,
+  or when the read failed otherwise or held anything else (torn). }
 function TStampVersionTest.Observe(const AAllowed: array of string;
-  var AStats: TReadStats): Boolean;
+  var AStats: TReadStats): Integer;
 var
   Seen: string;
   Error, Allowed: Integer;
-  Matched: Boolean;
 begin
-  Result := True;
+  Result := -1;
   if not TryReadWhole(IncludePath, Seen, Error) then
   begin
     {$IFDEF MSWINDOWS}
-    if Error = READ_SHARING_VIOLATION then Exit(False);
+    if Error = READ_SHARING_VIOLATION then Exit;
     {$ENDIF}
     Inc(AStats.Torn);
     if AStats.TornSample = '' then
@@ -418,10 +506,8 @@ begin
     Exit;
   end;
   Inc(AStats.Observations);
-  Matched := False;
   for Allowed := 0 to High(AAllowed) do
-    if Seen = AAllowed[Allowed] then Matched := True;
-  if Matched then Exit;
+    if Seen = AAllowed[Allowed] then Exit(Allowed);
   Inc(AStats.Torn);
   if AStats.TornSample = '' then
     AStats.TornSample := Format('%d bytes: %s', [Length(Seen), Seen]);
@@ -435,11 +521,13 @@ var
   Index: Integer;
   Release, GatePrefix: string;
   Ready: array of string;
-  AllReady, AnyRunning, Observed: Boolean;
+  AllReady, AnyRunning: Boolean;
+  Seen: Integer;
   Deadline: QWord;
 begin
   AStats.Observations := 0;
-  AStats.Overlapping := 0;
+  AStats.SawOld := False;
+  AStats.Straddled := False;
   AStats.Torn := 0;
   AStats.TornSample := '';
   Inc(FBarrier);
@@ -455,7 +543,7 @@ begin
       Ready[Index] := GatePrefix + '-ready-' + IntToStr(Index);
       Result[Index] := TChild.Create(ExpandFileName(ParamStr(0)), FTarget,
         [GATE_ARGUMENT, Ready[Index], Release, FStampExe],
-        [VersionOverrideCleared]);
+        [VersionOverrideCleared], True);
     end;
 
     Deadline := GetTickCount64 + BARRIER_MILLISECONDS;
@@ -479,14 +567,15 @@ begin
     { The reader is running before any writer starts. }
     Observe(AAllowed, AStats);
     WriteTextFile(Release, '');
-    Deadline := GetTickCount64 + CHILD_MILLISECONDS;
+    Deadline := GetTickCount64 + WRITER_MILLISECONDS;
     repeat
-      Observed := Observe(AAllowed, AStats);
+      Seen := Observe(AAllowed, AStats);
       AnyRunning := False;
       for Index := 0 to High(Result) do
         if Result[Index].Running then AnyRunning := True;
-      { The read just taken completed while a writer still ran. }
-      if Observed and AnyRunning then Inc(AStats.Overlapping);
+      if Seen = 0 then AStats.SawOld := True
+      else if (Seen = 1) and AStats.SawOld and AnyRunning then
+        AStats.Straddled := True;
       {$IFDEF MSWINDOWS}
       { Let replacements land between reads. }
       Sleep(2);
@@ -525,7 +614,7 @@ end;
 function TStampVersionTest.RunStamp(const ADirectory: string): TChild;
 begin
   Result := TChild.Create(FStampExe, ADirectory, [],
-    [VersionOverrideCleared]);
+    [VersionOverrideCleared], True);
   try
     Result.Finish(GetTickCount64 + CHILD_MILLISECONDS);
   except
@@ -536,7 +625,7 @@ end;
 
 procedure TStampVersionTest.TestConcurrentRunsPublishCompleteText;
 var
-  Round, Overlapping, Torn: Integer;
+  Round, Straddled, Torn: Integer;
   Previous, Current, FirstTornSample: string;
   Stats: TReadStats;
   Writers: TChildren;
@@ -544,7 +633,7 @@ begin
   ResetTarget(True);
   Previous := ExpectedText('1.0.0');
   WriteTextFile(IncludePath, Previous);
-  Overlapping := 0;
+  Straddled := 0;
   Torn := 0;
   FirstTornSample := '';
   for Round := 1 to ROUND_COUNT do
@@ -557,7 +646,7 @@ begin
     finally
       FreeChildren(Writers);
     end;
-    Inc(Overlapping, Stats.Overlapping);
+    if Stats.Straddled then Inc(Straddled);
     Inc(Torn, Stats.Torn);
     if FirstTornSample = '' then FirstTornSample := Stats.TornSample;
     Expect<string>(ReadBinaryFile(IncludePath)).ToBe(Current);
@@ -568,7 +657,7 @@ begin
   if Torn <> 0 then
     WriteLn(ErrOutput, 'torn reads: ', Torn, '; first: ', FirstTornSample);
   Expect<Integer>(Torn).ToBe(0);
-  Expect<Boolean>(Overlapping > 0).ToBe(True);
+  Expect<Boolean>(Straddled > 0).ToBe(True);
 end;
 
 procedure TStampVersionTest.TestCurrentTextIsLeftUntouched;
@@ -596,13 +685,13 @@ begin
     FreeChildren(Writers);
   end;
   Expect<Integer>(Stats.Torn).ToBe(0);
-  Expect<Boolean>(Stats.Overlapping > 0).ToBe(True);
   Expect<LongInt>(FileAge(IncludePath)).ToBe(Past);
   Expect<string>(ReadBinaryFile(IncludePath)).ToBe(Current);
   Expect<string>(DirectoryEntries(FTarget + '/source')).ToBe(INCLUDE_NAME);
 end;
 
-procedure TStampVersionTest.TestConcurrentBuildsAreNotRejected;
+{ An end-to-end smoke, not a proof that the hooks overlapped. }
+procedure TStampVersionTest.TestConcurrentBuildsSmoke;
 var
   Round, Index: Integer;
   Version, StampCommand, WorkerState: string;
@@ -642,7 +731,7 @@ begin
           [VersionOverrideCleared,
            WORKER_STATE_DIR_ENV + '=' + WorkerState,
            WORKER_BUDGET_ENV + '=' + IntToStr(BUILD_COUNT),
-           WORKER_LEASE_TOKEN_ENV + '=']);
+           WORKER_LEASE_TOKEN_ENV + '='], True);
       Deadline := GetTickCount64 + BUILD_MILLISECONDS;
       for Index := 0 to High(Builds) do Builds[Index].Finish(Deadline);
       ExpectSucceeded(Builds);
@@ -658,7 +747,7 @@ begin
     Expect<Boolean>(Pos(TEMP_PREFIX,
       DirectoryEntries(FTarget + '/.lwpt/tmp')) = 0).ToBe(True);
     App := TChild.Create(ExpandFileName(ExpectedExe(FTarget + '/build/app')),
-      FTarget, [], []);
+      FTarget, [], [], True);
     try
       App.Finish(GetTickCount64 + CHILD_MILLISECONDS);
       Expect<Integer>(App.ExitCode).ToBe(0);
@@ -669,23 +758,31 @@ begin
   end;
 end;
 
-procedure TStampVersionTest.TestUnavailableTmpDirStagesBesideDestination;
+procedure TStampVersionTest.TestUnusableStagingDirectoryFailsCleanly;
 var
   Stamp: TChild;
+  Past: LongInt;
 begin
   ResetTarget(True);
-  { A tmp directory below a regular file can never be created. }
-  WriteTextFile(FTarget + '/blocker', 'not a directory');
-  WriteTargetManifest('5.0.0', #10'[lwpt]'#10'tmp-dir = "blocker/tmp"'#10);
+  WriteTargetManifest('5.0.0');
+  WriteTextFile(IncludePath, ExpectedText('4.9.9'));
+  Past := DateTimeToFileDate(Now - PAST_AGE_DAYS);
+  Expect<Integer>(FileSetDate(IncludePath, Past)).ToBe(0);
+  { A regular file named .lwpt keeps .lwpt/tmp from ever being created. }
+  WriteTextFile(FTarget + '/.lwpt', 'not a directory');
   Stamp := RunStamp(FTarget);
   try
-    Expect<Integer>(Stamp.ExitCode).ToBe(0);
+    Expect<Boolean>(Stamp.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('cannot create staging directory', Stamp.Output) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('tmp', Stamp.Output) > 0).ToBe(True);
   finally
     Stamp.Free;
   end;
-  Expect<string>(ReadBinaryFile(IncludePath)).ToBe(ExpectedText('5.0.0'));
+  Expect<string>(ReadBinaryFile(IncludePath)).ToBe(ExpectedText('4.9.9'));
+  Expect<LongInt>(FileAge(IncludePath)).ToBe(Past);
   Expect<string>(DirectoryEntries(FTarget + '/source')).ToBe(INCLUDE_NAME);
-  Expect<string>(DirectoryEntries(FTarget)).ToBe('blocker,lwpt.toml,source');
+  Expect<string>(DirectoryEntries(FTarget)).ToBe('.lwpt,lwpt.toml,source');
 end;
 
 procedure TStampVersionTest.TestMissingSourceDirectoryFailsCleanly;
@@ -700,7 +797,8 @@ begin
   finally
     Stamp.Free;
   end;
-  { The tmp directory may exist; nothing may be left in it. }
+  { The temporary file was written to .lwpt/tmp before the rename failed;
+    nothing may be left there. }
   Expect<string>(DirectoryEntries(FTarget + '/.lwpt/tmp')).ToBe('');
   Expect<Boolean>(DirectoryExists(FTarget + '/source')).ToBe(False);
 end;
@@ -732,11 +830,11 @@ begin
     + 'and leave no temporary file', TestConcurrentRunsPublishCompleteText);
   Test('concurrent runs whose text is already present leave the file '
     + 'untouched', TestCurrentTextIsLeftUntouched);
-  Test('concurrent lwpt builds running the hook are not rejected for '
-    + 'changed inputs', TestConcurrentBuildsAreNotRejected);
-  Test('an unavailable tmp directory stages beside the destination',
-    TestUnavailableTmpDirStagesBesideDestination);
-  Test('a target without source/ fails without leaving files behind',
+  Test('smoke: concurrent lwpt builds using the hook all succeed',
+    TestConcurrentBuildsSmoke);
+  Test('an unusable .lwpt/tmp fails cleanly and leaves the destination '
+    + 'unchanged', TestUnusableStagingDirectoryFailsCleanly);
+  Test('a target without source/ fails and removes its temporary file',
     TestMissingSourceDirectoryFailsCleanly);
   Test('a failed replacement removes its written temporary file',
     TestFailedReplacementRemovesTemporaryFile);
