@@ -333,14 +333,16 @@ var
 begin
   Result := '';
   Total := 0;
-  repeat
+  { The deadline holds on every iteration, including ones that read: a
+    surviving descendant that keeps writing cannot extend the barrier. }
+  while GetTickCount64 < ADeadline do
+  begin
     Available := 0;
     { Fails with a broken pipe once every writer has closed: EOF. }
     if not PeekWindowsPipe(AStream.Handle, nil, 0, nil, @Available, nil) then
       Break;
     if Available = 0 then
     begin
-      if GetTickCount64 >= ADeadline then Break;
       Sleep(10);
       Continue;
     end;
@@ -351,7 +353,7 @@ begin
     SetLength(Result, Total + N);
     Move(Buf[0], Result[Total + 1], N);
     Inc(Total, N);
-  until False;
+  end;
 end;
 {$ENDIF}
 
@@ -466,6 +468,14 @@ begin
   Result := not AProcess.Running;
 end;
 
+{ Signals only the direct child. That suffices for children that work
+  in-process (registry serve) and for Unix LWPT build and test children,
+  which forward SIGTERM to the process groups they own (ADR-0025). It does
+  not end descendants of a child that forwards nothing, nor, on Windows,
+  nested build and test children: TerminateProcess bypasses LWPT's
+  forwarding and its Job Objects are not kill-on-close. Process-tree
+  ownership for spawning callers is tracked in #365; this helper
+  deliberately creates no process group. }
 procedure SignalChild(AProcess: TProcess; const AForce: Boolean);
 begin
   {$IFDEF UNIX}
