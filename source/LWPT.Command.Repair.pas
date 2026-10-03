@@ -69,7 +69,7 @@ begin
     end;
     for i := 0 to Directories.Count - 1 do
     begin
-      if not DirectoryExists(Directories[i]) then Continue;
+      if not LongPathDirectoryExists(Directories[i]) then Continue;
       if not RetiredExecutableSweepAllowed(ACtx.ProjectRoot,
         Directories[i]) then
       begin

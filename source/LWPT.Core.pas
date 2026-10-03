@@ -115,6 +115,9 @@ function  LongPathCreateDir(const APath: string): Boolean;
 function  LongPathForceDirectories(const APath: string): Boolean;
 function  LongPathDeleteFile(const APath: string): Boolean;
 function  LongPathRemoveDir(const APath: string): Boolean;
+{ SysUtils.FileAge: the DOS timestamp of a file's last write, or -1 for a
+  missing path or a directory. }
+function  LongPathFileAge(const APath: string): LongInt;
 { SysUtils.RenameFile: never replaces an existing destination on Windows. }
 function  LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
 { The entries of ADirectory whose names match AMask, with the attributes
@@ -125,10 +128,15 @@ function  LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
 function  ListDirectoryEntries(const ADirectory, AMask: string;
   const AAttr: LongInt): TLWPTDirectoryEntries;
 {$IFDEF MSWINDOWS}
-{ The extended-length spelling of APath: absolute, backslash-separated,
-  without empty, '.' or '..' components, and without a trailing separator
-  except on a drive root. An already-extended or device-namespace path is
-  returned unchanged and '' stays ''. }
+{ The extended-length spelling of APath. The ordinary Win32 parse
+  (GetFullPathNameW) runs first, so the result names what the ordinary path
+  names: relative and root-relative paths resolve against the current
+  directory (drive or UNC), '.', '..', doubled separators and trailing dots
+  and spaces fold, and a trailing separator is kept. A fully qualified drive
+  or UNC result gains `\\?\` or `\\?\UNC\`; a reserved device name stays
+  in the device namespace (`\\.\NUL`); anything else is returned as parsed.
+  An already-extended or device-namespace input is returned unchanged and
+  '' stays ''. }
 function  WindowsExtendedPath(const APath: string): UnicodeString;
 {$ENDIF}
 
@@ -1044,47 +1052,67 @@ const
   EXTENDED_UNC_PREFIX = '\\?\UNC\';
   DEVICE_PATH_PREFIX = '\\.\';
 
+{ Win32's own parse of an ordinary path (GetFullPathNameW): relative and
+  root-relative paths resolve against the current directory, including a
+  UNC one; separators fold; '.' and '..' fold; trailing dots and spaces of a
+  component are dropped; reserved DOS device names become `\\.\<name>`; a
+  trailing separator is kept. The buffer is sized by the first call, so the
+  result is not limited to MAX_PATH. '' when Win32 rejects the path. }
+function WindowsFullPath(const APath: string): UnicodeString;
+var
+  Input: UnicodeString;
+  Needed, Written: DWORD;
+  FilePart: PWideChar;
+begin
+  Result := '';
+  Input := UnicodeString(StringReplace(APath, '/', '\', [rfReplaceAll]));
+  if Input = '' then Exit;
+  Needed := Windows.GetFullPathNameW(PWideChar(Input), 0, PWideChar(nil),
+    FilePart);
+  while Needed > 0 do
+  begin
+    SetLength(Result, Needed);
+    Written := Windows.GetFullPathNameW(PWideChar(Input), Needed,
+      PWideChar(Result), FilePart);
+    if Written = 0 then Break;
+    if Written < Needed then
+    begin
+      SetLength(Result, Written);
+      Exit;
+    end;
+    { The current directory changed between the two calls. }
+    Needed := Written;
+  end;
+  Result := '';
+end;
+
 function WindowsExtendedPath(const APath: string): UnicodeString;
 var
-  FullPath, Prefix, Body: UnicodeString;
-  i: Integer;
+  FullPath: UnicodeString;
 begin
   if APath = '' then Exit('');
-  { ExpandFileName does not understand the extended prefix; a caller that
-    already holds an extended path keeps it verbatim. }
-  if Copy(APath, 1, 4) = EXTENDED_PATH_PREFIX then
+  { A caller that already holds an extended or device-namespace path
+    (`\\.\pipe\...`) chose its spelling; it is not reparsed. }
+  if (Copy(APath, 1, 4) = EXTENDED_PATH_PREFIX)
+    or (Copy(APath, 1, 4) = DEVICE_PATH_PREFIX) then
     Exit(UnicodeString(APath));
-  { Device namespace paths (`\\.\pipe\...`) are not file system paths. }
-  if Copy(APath, 1, 4) = DEVICE_PATH_PREFIX then
-    Exit(UnicodeString(APath));
-  { ExpandFileName resolves relative paths against the current directory
-    and folds '.' and '..'; the extended spelling would otherwise pass them
-    to the file system as literal names. }
-  FullPath := UnicodeString(StringReplace(ExpandFileName(APath), '/', '\',
-    [rfReplaceAll]));
-  if Copy(FullPath, 1, 4) = EXTENDED_PATH_PREFIX then Exit(FullPath);
-  if Copy(FullPath, 1, 2) = '\\' then
-  begin
-    Prefix := EXTENDED_UNC_PREFIX;
-    Body := Copy(FullPath, 3, MaxInt);
-  end
-  else
-  begin
-    Prefix := EXTENDED_PATH_PREFIX;
-    Body := FullPath;
-  end;
-  { Win32 normalisation is bypassed for extended paths, so a doubled
-    separator would name an empty component. }
-  i := 2;
-  while i <= Length(Body) do
-    if (Body[i] = '\') and (Body[i - 1] = '\') then Delete(Body, i, 1)
-    else Inc(i);
-  { A drive root keeps its separator: `\\?\C:` names the volume device,
-    not its root directory. }
-  if (Length(Body) > 0) and (Body[Length(Body)] = '\')
-    and not ((Length(Body) = 3) and (Body[2] = ':')) then
-    SetLength(Body, Length(Body) - 1);
-  Result := Prefix + Body;
+  { The extended prefix switches Win32 normalisation off, so the ordinary
+    parse runs first and the prefix only spells its result. }
+  FullPath := WindowsFullPath(APath);
+  if FullPath = '' then Exit(UnicodeString(APath));
+  { A reserved device name parses into the device namespace; keep the
+    ordinary meaning instead of naming a file literally `NUL`. }
+  if (Copy(FullPath, 1, 4) = DEVICE_PATH_PREFIX)
+    or (Copy(FullPath, 1, 4) = EXTENDED_PATH_PREFIX) then
+    Exit(FullPath);
+  if (Length(FullPath) >= 3) and (FullPath[2] = ':')
+    and (FullPath[3] = '\') then
+    Exit(EXTENDED_PATH_PREFIX + FullPath);
+  if (Length(FullPath) > 2) and (FullPath[1] = '\') and (FullPath[2] = '\')
+    then
+    Exit(EXTENDED_UNC_PREFIX + Copy(FullPath, 3, MaxInt));
+  { Not fully qualified: leave it to ordinary Win32 semantics. }
+  Result := FullPath;
 end;
 
 { ADirectory's extended spelling joined with one more component. }
@@ -1118,15 +1146,35 @@ begin
 end;
 
 { SysUtils' FileOrDirExists with FollowLink: the entry's own directory bit
-  must match, and a reparse point must resolve to a target of that kind. }
+  must match, and a reparse point must resolve to a target of that kind.
+  As there, an attribute query that fails for a reason other than absence
+  (a file another process holds without sharing) falls back to the parent
+  directory's listing. }
 function WindowsObjectExists(const APath: string;
   const ADirectory: Boolean): Boolean;
-var ExtendedPath: UnicodeString; Attributes, TargetAttributes: Cardinal;
+var
+  ExtendedPath: UnicodeString;
+  Attributes, TargetAttributes, ErrorCode: Cardinal;
+  Find: THandle;
+  Data: TWin32FindDataW;
 begin
   ExtendedPath := WindowsExtendedPath(APath);
   if ExtendedPath = '' then Exit(False);
   Attributes := Windows.GetFileAttributesW(PWideChar(ExtendedPath));
-  if Attributes = $FFFFFFFF then Exit(False);
+  if Attributes = $FFFFFFFF then
+  begin
+    ErrorCode := Windows.GetLastError;
+    if ErrorCode in [Windows.ERROR_FILE_NOT_FOUND,
+      Windows.ERROR_PATH_NOT_FOUND, Windows.ERROR_INVALID_NAME,
+      Windows.ERROR_INVALID_DRIVE, Windows.ERROR_NOT_READY,
+      Windows.ERROR_INVALID_PARAMETER, Windows.ERROR_BAD_PATHNAME,
+      Windows.ERROR_BAD_NETPATH, Windows.ERROR_BAD_NET_NAME] then
+      Exit(False);
+    Find := Windows.FindFirstFileW(PWideChar(ExtendedPath), Data);
+    if Find = THandle(Windows.INVALID_HANDLE_VALUE) then Exit(False);
+    Windows.FindClose(Find);
+    Attributes := Data.dwFileAttributes;
+  end;
   if ((Attributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0) <> ADirectory then
     Exit(False);
   if (Attributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) = 0 then
@@ -1168,7 +1216,7 @@ end;
 
 function LongPathForceDirectories(const APath: string): Boolean;
 {$IFDEF MSWINDOWS}
-var E: EInOutError;
+var E: EInOutError; FullPath: string;
 
   function Force(const ADirectory: string): Boolean;
   var Parent: string;
@@ -1191,8 +1239,9 @@ begin
     E.ErrorCode := 3;
     raise E;
   end;
-  Result := Force(ExcludeTrailingPathDelimiter(
-    StringReplace(ExpandFileName(APath), '/', '\', [rfReplaceAll])));
+  FullPath := string(WindowsFullPath(APath));
+  if FullPath = '' then Exit(False);
+  Result := Force(ExcludeTrailingPathDelimiter(FullPath));
 end;
 {$ELSE}
 begin
@@ -1219,6 +1268,32 @@ begin
   Result := SysUtils.RemoveDir(APath);
   {$ENDIF}
 end;
+
+function LongPathFileAge(const APath: string): LongInt;
+{$IFDEF MSWINDOWS}
+var
+  Find: THandle;
+  Data: TWin32FindDataW;
+  LocalTime: TFileTime;
+  DosDate, DosTime: Word;
+begin
+  Result := -1;
+  if APath = '' then Exit;
+  Find := Windows.FindFirstFileW(PWideChar(WindowsExtendedPath(APath)), Data);
+  if Find = THandle(Windows.INVALID_HANDLE_VALUE) then Exit;
+  Windows.FindClose(Find);
+  if (Data.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+    Exit;
+  { The RTL's WinToDosTime: local time, DOS date in the high word. }
+  if Windows.FileTimeToLocalFileTime(Data.ftLastWriteTime, LocalTime)
+    and Windows.FileTimeToDosDateTime(LocalTime, DosDate, DosTime) then
+    Result := LongInt((LongWord(DosDate) shl 16) or LongWord(DosTime));
+end;
+{$ELSE}
+begin
+  Result := SysUtils.FileAge(APath);
+end;
+{$ENDIF}
 
 function LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
 begin

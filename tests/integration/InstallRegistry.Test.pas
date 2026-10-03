@@ -1746,10 +1746,11 @@ procedure TInstallRegistry.TestDeepProjectRetainsProofsPastMaxPath;
 const
   PROJECT_PATH_LENGTH = 130;
   HALT_EXIT_CODE = 89;
+  RUN_TIMEOUT_MILLISECONDS = 180000;
 var
   Registry: TSyntheticRegistry;
   Origin: TSyntheticContact;
-  CaseRoot, Project, Before, Longest, Proof: string;
+  CaseRoot, Project, Before, Longest, Proof, LiveProofs: string;
   Remaining: Integer;
   Run: TLwptResult;
 
@@ -1762,7 +1763,9 @@ var
     Environment[1] := PROJECT_NAME + '_CACHE_DIR=' + CaseRoot + '/cache';
     for Index := 0 to High(AEnvironment) do
       Environment[2 + Index] := AEnvironment[Index];
-    Result := RunLwptTesting(AArguments, Project, Environment);
+    Result := RunLwptTesting(AArguments, Project, Environment,
+      RUN_TIMEOUT_MILLISECONDS);
+    Expect<Boolean>(Result.TimedOut).ToBe(False);
   end;
 
   { Lock, cfg, modules and archives (with the committed proofs). }
@@ -1836,6 +1839,14 @@ begin
       { A proof document is named by its own hash. }
       Expect<string>(SHA256File(Longest))
         .ToBe(Copy(ExtractFileName(Longest), 1, 64));
+
+      { Damage the live proof set, so only a restore from the retained copy
+        past MAX_PATH can bring the baseline back. }
+      LiveProofs := Project + '/.' + PROGRAM_NAME
+        + '/archives/registry-proofs/sha256/';
+      WriteTextFile(LiveProofs + ExtractFileName(Longest), 'damaged'#10);
+      WriteTextFile(LiveProofs + StringOfChar('0', 64) + '.toml', 'extra'#10);
+      Expect<Boolean>(ProjectState <> Before).ToBe(True);
 
       ExpectSuccess('deep repair', RunDeep(['repair'], []));
       Expect<string>(ProjectState).ToBe(Before);

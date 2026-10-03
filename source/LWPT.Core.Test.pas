@@ -327,6 +327,8 @@ type
     procedure TestRetainAndRestoreThroughDeepRollbackRoot;
     {$IFDEF MSWINDOWS}
     procedure TestExtendedPathSpelling;
+    procedure TestExtendedPathKeepsWin32Meaning;
+    procedure TestRootRelativeUnderUncCurrentDirectory;
     {$ENDIF}
   end;
 
@@ -3516,6 +3518,9 @@ end;
 const
   { Win32 MAX_PATH, including the terminating NUL. }
   LEGACY_WINDOWS_MAX_PATH = 260;
+  {$IFDEF MSWINDOWS}
+  UNC_PROBE_DIRECTORY = '\\localhost\C$\Windows';
+  {$ENDIF}
 
 procedure TLongPathHelpers.BeforeAll;
 begin
@@ -3749,11 +3754,15 @@ procedure TLongPathHelpers.TestExtendedPathSpelling;
 var Current: string;
 begin
   Expect<string>(string(WindowsExtendedPath(''))).ToBe('');
+  { Win32 folds '.', '..' and doubled separators, and keeps a trailing
+    separator: a directory spelling never becomes a file operand. }
   Expect<string>(string(WindowsExtendedPath('C:\a\.\b\..\c//d\')))
+    .ToBe('\\?\C:\a\c\d\');
+  Expect<string>(string(WindowsExtendedPath('C:\a\.\b\..\c//d')))
     .ToBe('\\?\C:\a\c\d');
   Expect<string>(string(WindowsExtendedPath('C:/a/b'))).ToBe('\\?\C:\a\b');
   Expect<string>(string(WindowsExtendedPath('C:\'))).ToBe('\\?\C:\');
-  Expect<string>(string(WindowsExtendedPath('\\server\share\x\')))
+  Expect<string>(string(WindowsExtendedPath('\\server\share\x')))
     .ToBe('\\?\UNC\server\share\x');
   Expect<string>(string(WindowsExtendedPath('\\?\C:\already')))
     .ToBe('\\?\C:\already');
@@ -3762,6 +3771,58 @@ begin
   Current := ExcludeTrailingPathDelimiter(GetCurrentDir);
   Expect<string>(string(WindowsExtendedPath('rel\x')))
     .ToBe('\\?\' + Current + '\rel\x');
+end;
+
+{ CR-1: the extended spelling must name what the ordinary path named. }
+procedure TLongPathHelpers.TestExtendedPathKeepsWin32Meaning;
+var Dir, FilePath, Drive: string;
+begin
+  { Trailing dots and spaces are dropped by the Win32 parse. }
+  Expect<string>(string(WindowsExtendedPath('C:\a\file.txt.')))
+    .ToBe('\\?\C:\a\file.txt');
+  Expect<string>(string(WindowsExtendedPath('C:\a\file.txt  ')))
+    .ToBe('\\?\C:\a\file.txt');
+  { A bare reserved device name keeps its device meaning instead of
+    becoming a literal file named NUL in the current directory. }
+  Expect<string>(string(WindowsExtendedPath('NUL'))).ToBe('\\.\NUL');
+  Expect<string>(string(WindowsExtendedPath('CON'))).ToBe('\\.\CON');
+  { Root-relative resolves against the current drive. }
+  Drive := Copy(GetCurrentDir, 1, 2);
+  Expect<string>(string(WindowsExtendedPath('\foo\bar')))
+    .ToBe('\\?\' + Drive + '\foo\bar');
+
+  Dir := DeepPath('meaning');
+  LongPathForceDirectories(Dir);
+  FilePath := Dir + '\file.txt';
+  WriteLong(FilePath, 'x');
+  Expect<Boolean>(LongPathFileExists(FilePath + '.')).ToBe(True);
+  Expect<Boolean>(LongPathFileExists(FilePath + ' ')).ToBe(True);
+  { A trailing separator names a directory: a file never matches it. }
+  Expect<Boolean>(LongPathFileExists(FilePath + '\')).ToBe(False);
+  Expect<Boolean>(LongPathFileExists(FilePath + '/')).ToBe(False);
+  Expect<Boolean>(LongPathDirectoryExists(FilePath + '\')).ToBe(False);
+  Expect<Boolean>(LongPathDirectoryExists(Dir + '\')).ToBe(True);
+  Expect<Integer>(Length(ListDirectoryEntries(Dir + '\', '*', faAnyFile)))
+    .ToBe(1);
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'meaning');
+end;
+
+{ Root-relative paths under a UNC current directory resolve on its share,
+  not on a pseudo-drive built from the directory's first character. }
+procedure TLongPathHelpers.TestRootRelativeUnderUncCurrentDirectory;
+var Saved, Current, Share: string; Parts: TStringArray;
+begin
+  Saved := GetCurrentDir;
+  Expect<Boolean>(SetCurrentDir(UNC_PROBE_DIRECTORY)).ToBe(True);
+  try
+    Current := GetCurrentDir;
+    Parts := Copy(Current, 3, MaxInt).Split(['\']);
+    Share := '\\' + Parts[0] + '\' + Parts[1];
+    Expect<string>(string(WindowsExtendedPath('\foo')))
+      .ToBe('\\?\UNC\' + Copy(Share, 3, MaxInt) + '\foo');
+  finally
+    SetCurrentDir(Saved);
+  end;
 end;
 {$ENDIF}
 
@@ -3778,6 +3839,17 @@ begin
   {$IFDEF MSWINDOWS}
   Test('spells absolute, UNC and relative extended-length paths',
     TestExtendedPathSpelling);
+  Test('keeps the Win32 meaning of dots, devices and separators',
+    TestExtendedPathKeepsWin32Meaning);
+  { The administrative share is the only UNC directory a CI runner is
+    guaranteed to reach; Wine and locked-down hosts expose none. }
+  if DirectoryExists(UNC_PROBE_DIRECTORY) then
+    Test('resolves root-relative paths under a UNC current directory',
+      TestRootRelativeUnderUncCurrentDirectory)
+  else
+    Skip('resolves root-relative paths under a UNC current directory',
+      TestRootRelativeUnderUncCurrentDirectory,
+      UNC_PROBE_DIRECTORY + ' is not reachable on this host');
   {$ENDIF}
 end;
 

@@ -840,12 +840,12 @@ var
   Index: Integer;
 begin
   Result := nil;
-  if not FileExists(APath) then Exit;
+  if not LongPathFileExists(APath) then Exit;
   Lines := TStringList.Create;
   Parser := TTOMLParser.Create;
   Root := nil;
   try
-    Lines.LoadFromFile(APath);
+    LoadProtectedStrings(Lines, APath);
     try
       Root := Parser.ParseDocument(Lines.Text);
     except
