@@ -304,6 +304,32 @@ type
     RemoveDir fails. Links must also never be followed — a link to a
     directory outside the wiped tree must lose the link, not the
     target's contents. Unix-only fixtures (FpSymlink). }
+  { The Core filesystem helpers past the Win32 MAX_PATH ceiling (#347).
+    Every fixture path is asserted to exceed it, so a shallow scratch root
+    cannot make a case pass vacuously. On Windows the helpers must address
+    these paths by their extended-length spelling; Wine does not enforce
+    the ceiling, so native Windows CI is the proof there. On Unix the same
+    cases pin that the delegating helpers keep working at that depth. }
+  TLongPathHelpers = class(TTestSuite)
+  private
+    FScratch: string;
+    function DeepPath(const ALabel: string): string;
+    procedure WriteLong(const APath, AContent: string);
+    function ReadLong(const APath: string): string;
+  protected
+    procedure AfterAll; override;
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestCreateListRenameDelete;
+    procedure TestAtomicWritesAndMovesPastLimit;
+    procedure TestCopyHashAndWipeTree;
+    procedure TestRetainAndRestoreThroughDeepRollbackRoot;
+    {$IFDEF MSWINDOWS}
+    procedure TestExtendedPathSpelling;
+    {$ENDIF}
+  end;
+
   TWipeDirSymlinks = class(TTestSuite)
   private
     FScratch: string;
@@ -3485,6 +3511,274 @@ begin
     TestPathContainsBoundaries);
 end;
 
+{ ── TLongPathHelpers ─────────────────────────────────────────────── }
+
+const
+  { Win32 MAX_PATH, including the terminating NUL. }
+  LEGACY_WINDOWS_MAX_PATH = 260;
+
+procedure TLongPathHelpers.BeforeAll;
+begin
+  FScratch := ExpandFileName('build/tests/tmp/long-path-'
+    + IntToStr(GetProcessID));
+  if LongPathDirectoryExists(FScratch) then WipeDir(FScratch);
+  LongPathForceDirectories(FScratch);
+end;
+
+procedure TLongPathHelpers.AfterAll;
+begin
+  WipeDir(FScratch);
+end;
+
+{ An absolute directory path below the scratch root that is longer than
+  MAX_PATH by itself, built from components well inside NAME_MAX. }
+function TLongPathHelpers.DeepPath(const ALabel: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(FScratch) + ALabel;
+  while Length(Result) <= LEGACY_WINDOWS_MAX_PATH + 20 do
+    Result := Result + '/' + StringOfChar('d', 48);
+end;
+
+procedure TLongPathHelpers.WriteLong(const APath, AContent: string);
+var Stream: TLWPTProtectedFileStream;
+begin
+  Stream := OpenProtectedFileStream(APath, fmCreate);
+  try
+    if AContent <> '' then Stream.WriteBuffer(AContent[1], Length(AContent));
+  finally
+    Stream.Free;
+  end;
+end;
+
+function TLongPathHelpers.ReadLong(const APath: string): string;
+var Stream: TLWPTProtectedFileStream;
+begin
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
+  try
+    SetLength(Result, Stream.Size);
+    if Length(Result) > 0 then Stream.ReadBuffer(Result[1], Length(Result));
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure TLongPathHelpers.TestCreateListRenameDelete;
+var
+  Dir, FilePath, Renamed: string;
+  Entries: TLWPTDirectoryEntries;
+begin
+  Dir := DeepPath('crud');
+  Expect<Boolean>(Length(Dir) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(Dir)).ToBe(False);
+  Expect<Boolean>(LongPathForceDirectories(Dir)).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(Dir)).ToBe(True);
+  Expect<Boolean>(LongPathFileExists(Dir)).ToBe(False);
+  { Forcing an existing directory is a no-op success. }
+  Expect<Boolean>(LongPathForceDirectories(Dir + '/')).ToBe(True);
+
+  FilePath := Dir + '/file.txt';
+  WriteLong(FilePath, 'abc');
+  Expect<Boolean>(LongPathFileExists(FilePath)).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(FilePath)).ToBe(False);
+  Expect<string>(SHA256File(FilePath)).ToBe(SHA256Hex(BytesOf('abc')));
+
+  Expect<Boolean>(LongPathCreateDir(Dir + '/sub')).ToBe(True);
+  Expect<Boolean>(LongPathCreateDir(Dir + '/sub')).ToBe(False);
+  Entries := ListDirectoryEntries(Dir, '*', faAnyFile);
+  Expect<Integer>(Length(Entries)).ToBe(2);
+  Entries := ListDirectoryEntries(Dir, '*.txt', faAnyFile);
+  Expect<Integer>(Length(Entries)).ToBe(1);
+  Expect<string>(Entries[0].Name).ToBe('file.txt');
+  Expect<Int64>(Entries[0].Size).ToBe(3);
+  Expect<Integer>(Length(ListDirectoryEntries(Dir, '*.none', faAnyFile)))
+    .ToBe(0);
+  Expect<Integer>(Length(ListDirectoryEntries(Dir + '/missing', '*',
+    faAnyFile))).ToBe(0);
+
+  Renamed := Dir + '/sub/renamed.txt';
+  Expect<Boolean>(LongPathRenameFile(FilePath, Renamed)).ToBe(True);
+  Expect<Boolean>(LongPathFileExists(FilePath)).ToBe(False);
+  Expect<string>(ReadLong(Renamed)).ToBe('abc');
+  {$IFDEF MSWINDOWS}
+  { MoveFileW never replaces an existing destination (POSIX rename does). }
+  WriteLong(FilePath, 'other');
+  Expect<Boolean>(LongPathRenameFile(FilePath, Renamed)).ToBe(False);
+  Expect<string>(ReadLong(Renamed)).ToBe('abc');
+  {$ENDIF}
+
+  Expect<Boolean>(LongPathRemoveDir(Dir + '/sub')).ToBe(False);
+  Expect<Boolean>(LongPathDeleteFile(Renamed)).ToBe(True);
+  Expect<Boolean>(LongPathFileExists(Renamed)).ToBe(False);
+  Expect<Boolean>(LongPathRemoveDir(Dir + '/sub')).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(Dir + '/sub')).ToBe(False);
+
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'crud');
+  Expect<Boolean>(LongPathDirectoryExists(Dir)).ToBe(False);
+  Expect<Boolean>(LongPathDirectoryExists(
+    IncludeTrailingPathDelimiter(FScratch) + 'crud')).ToBe(False);
+end;
+
+procedure TLongPathHelpers.TestAtomicWritesAndMovesPastLimit;
+var
+  Dir, TmpRoot, Target, Staged, MovedDir: string;
+  Lines: TStringList;
+begin
+  Dir := DeepPath('atomic');
+  TmpRoot := Dir + '/tmp';
+  Target := Dir + '/state/value.txt';
+  Expect<Boolean>(Length(Target) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+  Lines := TStringList.Create;
+  try
+    Lines.Add('one');
+    { The write stages below a deep tmp root and creates the target's
+      missing parent. }
+    AtomicWriteText(Target, TmpRoot, Lines);
+    LoadProtectedStrings(Lines, Target);
+    Expect<string>(Lines[0]).ToBe('one');
+  finally
+    Lines.Free;
+  end;
+  AtomicWriteBytes(Target, TmpRoot, BytesOf('two'));
+  Expect<string>(ReadLong(Target)).ToBe('two');
+  Expect<Integer>(Length(ListDirectoryEntries(TmpRoot, '*', faAnyFile)))
+    .ToBe(0);
+
+  Staged := Dir + '/incoming.tmp';
+  WriteLong(Staged, 'three');
+  Expect<Boolean>(AtomicReplaceFile(Staged, Target)).ToBe(True);
+  Expect<string>(ReadLong(Target)).ToBe('three');
+  Expect<Boolean>(LongPathFileExists(Staged)).ToBe(False);
+
+  Expect<Boolean>(AtomicMoveFile(Target, Dir + '/moved/value.txt'))
+    .ToBe(True);
+  Expect<Boolean>(LongPathFileExists(Target)).ToBe(False);
+  Expect<string>(ReadLong(Dir + '/moved/value.txt')).ToBe('three');
+
+  { AtomicMoveDir over an existing destination renames the old tree aside
+    and removes it after the move. }
+  MovedDir := Dir + '/published';
+  LongPathForceDirectories(MovedDir);
+  WriteLong(MovedDir + '/old.txt', 'old');
+  Expect<Boolean>(AtomicMoveDir(Dir + '/moved', MovedDir)).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(Dir + '/moved')).ToBe(False);
+  Expect<Boolean>(LongPathFileExists(MovedDir + '/old.txt')).ToBe(False);
+  Expect<string>(ReadLong(MovedDir + '/value.txt')).ToBe('three');
+  Expect<Boolean>(AtomicRemovePath(MovedDir)).ToBe(True);
+  Expect<Boolean>(LongPathDirectoryExists(MovedDir)).ToBe(False);
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'atomic');
+end;
+
+procedure TLongPathHelpers.TestCopyHashAndWipeTree;
+var
+  Source, Copied, CopyRoot: string;
+  Globs, NoGlobs: TStringArray;
+begin
+  Source := IncludeTrailingPathDelimiter(FScratch) + 'tree-source';
+  LongPathForceDirectories(Source + '/nested/inner');
+  WriteLong(Source + '/top.txt', 'top'#13#10);
+  WriteLong(Source + '/nested/a.pas', 'unit a;');
+  WriteLong(Source + '/nested/inner/b.bin', 'b'#0'c');
+  Copied := DeepPath('tree-copy');
+  Expect<Boolean>(Length(Copied + '/nested/inner/b.bin')
+    > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+
+  CopyDirTree(Source, Copied);
+  Expect<string>(ReadLong(Copied + '/nested/inner/b.bin')).ToBe('b'#0'c');
+  Expect<string>(HashTree(Copied)).ToBe(HashTree(Source));
+  Expect<string>(LegacyHashTree(Copied)).ToBe(LegacyHashTree(Source));
+  Expect<string>(FindTreeLink(Copied)).ToBe('');
+
+  SetLength(Globs, 1);
+  Globs[0] := 'top.txt';
+  NoGlobs := nil;
+  ApplyIncludeExclude(Copied, NoGlobs, Globs);
+  Expect<Boolean>(LongPathFileExists(Copied + '/top.txt')).ToBe(False);
+  Expect<Boolean>(LongPathFileExists(Copied + '/nested/a.pas')).ToBe(True);
+
+  CopyRoot := IncludeTrailingPathDelimiter(FScratch) + 'tree-copy';
+  WipeDir(CopyRoot);
+  Expect<Boolean>(LongPathDirectoryExists(CopyRoot)).ToBe(False);
+  WipeDir(Source);
+end;
+
+procedure TLongPathHelpers.TestRetainAndRestoreThroughDeepRollbackRoot;
+var
+  Live, RollbackRoot, Backup, FileBackup, Original: string;
+begin
+  Live := IncludeTrailingPathDelimiter(FScratch) + 'live';
+  LongPathForceDirectories(Live + '/sha256');
+  WriteLong(Live + '/sha256/' + StringOfChar('a', 64) + '.toml', 'proof');
+  WriteLong(Live + '/top.txt', 'top');
+  Original := HashTree(Live);
+  RollbackRoot := DeepPath('rollback');
+
+  { The registry-proof shape of #347: the live tree is shallow, but its
+    retained copy nests a 64-hex name below a deep rollback root. }
+  Expect<Boolean>(AtomicRetainPath(Live, RollbackRoot, 'p', Backup))
+    .ToBe(True);
+  Expect<Boolean>(Length(Backup + '/sha256/' + StringOfChar('a', 64)
+    + '.toml') > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+  Expect<string>(ReadLong(Backup + '/sha256/' + StringOfChar('a', 64)
+    + '.toml')).ToBe('proof');
+  Expect<string>(AtomicRetainedDestination(Backup)).ToBe(Live);
+
+  WriteLong(Live + '/sha256/' + StringOfChar('b', 64) + '.toml', 'new');
+  WriteLong(Live + '/top.txt', 'changed');
+  Expect<Boolean>(HashTree(Live) <> Original).ToBe(True);
+
+  Expect<Boolean>(AtomicRestorePath(Backup, Live)).ToBe(True);
+  Expect<string>(HashTree(Live)).ToBe(Original);
+  Expect<Boolean>(LongPathDirectoryExists(Backup)).ToBe(False);
+  Expect<Boolean>(LongPathFileExists(Backup + '.rollback')).ToBe(False);
+
+  { A retained file below the same root, discarded after commit. }
+  Expect<Boolean>(AtomicRetainPath(Live + '/top.txt', RollbackRoot,
+    'lockfile', FileBackup)).ToBe(True);
+  Expect<Boolean>(Length(FileBackup) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+  Expect<string>(ReadLong(FileBackup)).ToBe('top');
+  AtomicDiscardRetainedPath(FileBackup);
+  Expect<Boolean>(LongPathFileExists(FileBackup)).ToBe(False);
+  Expect<Boolean>(LongPathFileExists(FileBackup + '.rollback')).ToBe(False);
+
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'rollback');
+  WipeDir(Live);
+end;
+
+{$IFDEF MSWINDOWS}
+procedure TLongPathHelpers.TestExtendedPathSpelling;
+var Current: string;
+begin
+  Expect<string>(string(WindowsExtendedPath(''))).ToBe('');
+  Expect<string>(string(WindowsExtendedPath('C:\a\.\b\..\c//d\')))
+    .ToBe('\\?\C:\a\c\d');
+  Expect<string>(string(WindowsExtendedPath('C:/a/b'))).ToBe('\\?\C:\a\b');
+  Expect<string>(string(WindowsExtendedPath('C:\'))).ToBe('\\?\C:\');
+  Expect<string>(string(WindowsExtendedPath('\\server\share\x\')))
+    .ToBe('\\?\UNC\server\share\x');
+  Expect<string>(string(WindowsExtendedPath('\\?\C:\already')))
+    .ToBe('\\?\C:\already');
+  Current := ExcludeTrailingPathDelimiter(GetCurrentDir);
+  Expect<string>(string(WindowsExtendedPath('rel\x')))
+    .ToBe('\\?\' + Current + '\rel\x');
+end;
+{$ENDIF}
+
+procedure TLongPathHelpers.SetupTests;
+begin
+  Test('creates, lists, renames and deletes past MAX_PATH',
+    TestCreateListRenameDelete);
+  Test('atomic writes, replacement and moves past MAX_PATH',
+    TestAtomicWritesAndMovesPastLimit);
+  Test('copies, hashes, filters and wipes a tree past MAX_PATH',
+    TestCopyHashAndWipeTree);
+  Test('retains and restores through a rollback root past MAX_PATH',
+    TestRetainAndRestoreThroughDeepRollbackRoot);
+  {$IFDEF MSWINDOWS}
+  Test('spells absolute, UNC and relative extended-length paths',
+    TestExtendedPathSpelling);
+  {$ENDIF}
+end;
+
 { ── TWipeDirSymlinks ───────────────────────────────────────────── }
 
 procedure TWipeDirSymlinks.ResetScratch;
@@ -5038,6 +5332,8 @@ begin
     PROJECT_NAME + '.Core: ApplyIncludeExclude'));
   TestRunnerProgram.AddSuite(TCopyDirTreeGuards.Create(
     PROJECT_NAME + '.Core: CopyDirTree recursion guards'));
+  TestRunnerProgram.AddSuite(TLongPathHelpers.Create(
+    PROJECT_NAME + '.Core: long-path helpers past MAX_PATH'));
   TestRunnerProgram.AddSuite(TWipeDirSymlinks.Create(
     PROJECT_NAME + '.Core: WipeDir symlink handling'));
   TestRunnerProgram.AddSuite(TPruneOrphans.Create(

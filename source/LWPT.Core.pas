@@ -85,6 +85,53 @@ function  CanonicalPathGlob(const AGlob: string): string;
 procedure CanonicalizePathGlobs(var AGlobs: TStringArray);
 procedure ApplyIncludeExclude(const ARoot: string; const AIncludes, AExcludes: TStringArray);
 
+{ Long-path-safe filesystem primitives (#347). Toolkit state nests 64-hex
+  names (registry proofs, rollback copies of modules and proofs), so a deep
+  checkout passes the Win32 MAX_PATH ceiling of 260 characters that the
+  plain-path Win32 APIs, and every FPC RTL file routine built on them,
+  enforce. On Windows each primitive addresses its path by the
+  extended-length spelling from WindowsExtendedPath (`\\?\C:\...`, or
+  `\\?\UNC\server\share\...`), which the W APIs accept up to 32,767
+  characters; relative paths are first made absolute against the current
+  directory, exactly as Win32 would resolve them. On Unix each delegates to
+  the SysUtils routine of the same name, unchanged. The atomic helpers below
+  and the install transaction use only these for project-owned state. }
+type
+  TLWPTDirectoryEntry = record
+    Name: string;
+    { SysUtils fa* bits and size, exactly as SysUtils.FindFirst reports
+      them. }
+    Attr: LongInt;
+    Size: Int64;
+  end;
+  TLWPTDirectoryEntries = array of TLWPTDirectoryEntry;
+
+{ SysUtils.FileExists / DirectoryExists: links are followed, so a dangling
+  link is neither. }
+function  LongPathFileExists(const APath: string): Boolean;
+function  LongPathDirectoryExists(const APath: string): Boolean;
+function  LongPathCreateDir(const APath: string): Boolean;
+{ SysUtils.ForceDirectories, including its EInOutError for an empty path. }
+function  LongPathForceDirectories(const APath: string): Boolean;
+function  LongPathDeleteFile(const APath: string): Boolean;
+function  LongPathRemoveDir(const APath: string): Boolean;
+{ SysUtils.RenameFile: never replaces an existing destination on Windows. }
+function  LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
+{ The entries of ADirectory whose names match AMask, with the attributes
+  SysUtils.FindFirst(<dir>/<mask>, AAttr) reports, minus '.' and '..'.
+  An empty ADirectory means the current directory. Empty when the directory
+  is missing or cannot be enumerated. The snapshot is taken before the
+  caller acts, so deleting while iterating is safe. }
+function  ListDirectoryEntries(const ADirectory, AMask: string;
+  const AAttr: LongInt): TLWPTDirectoryEntries;
+{$IFDEF MSWINDOWS}
+{ The extended-length spelling of APath: absolute, backslash-separated,
+  without empty, '.' or '..' components, and without a trailing separator
+  except on a drive root. An already-extended path is returned unchanged and
+  '' stays ''. }
+function  WindowsExtendedPath(const APath: string): UnicodeString;
+{$ENDIF}
+
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
 function  PathContains(const AParent, AChild: string): Boolean;
 function  IsDirSymlinkOrJunction(const APath: string): Boolean;
@@ -586,7 +633,7 @@ begin
   Lines := TStringList.Create;
   Parser := TTOMLParser.Create;
   try
-    Lines.LoadFromFile(APath);
+    LoadProtectedStrings(Lines, APath);
     try
       Result := Parser.ParseDocument(Lines.Text);
     except
@@ -605,7 +652,7 @@ end;
 procedure RequireCurrentLockfileSchema(const APath: string);
 var Root: TTOMLNode;
 begin
-  if not FileExists(APath) then Exit;
+  if not LongPathFileExists(APath) then Exit;
   Root := ParseLockfileDocument(APath);
   try
     CheckLockfileSchema(Root, APath, False);
@@ -617,7 +664,7 @@ end;
 function ReadLockfileSchemaVersion(const APath: string): Integer;
 var Root, VersionNode: TTOMLNode;
 begin
-  if not FileExists(APath) then Exit(0);
+  if not LongPathFileExists(APath) then Exit(0);
   try
     Root := ParseLockfileDocument(APath);
   except
@@ -767,32 +814,28 @@ procedure ApplyIncludeExclude(const ARoot: string;
   end;
 
   function WalkAndPrune(const ADir, ARelDir: string): Integer;
-  var SR: TSearchRec; Base, RelPath, Full: string;
+  var Entries: TLWPTDirectoryEntries; i: Integer; Base, RelPath, Full: string;
   begin
     Result := 0;
     Base := IncludeTrailingPathDelimiter(ADir);
-    if SysUtils.FindFirst(Base + '*', faAnyFile, SR) = 0 then
-      try
-        repeat
-          if (SR.Name = '.') or (SR.Name = '..') then Continue;
-          if ARelDir = '' then RelPath := SR.Name
-          else RelPath := ARelDir + '/' + SR.Name;
-          Full := Base + SR.Name;
-          if (SR.Attr and faDirectory) <> 0 then
-          begin
-            if WalkAndPrune(Full, RelPath) = 0 then
-              SysUtils.RemoveDir(Full)
-            else
-              Inc(Result);
-          end
-          else if ShouldKeep(RelPath) then
-            Inc(Result)
-          else
-            SysUtils.DeleteFile(Full);
-        until SysUtils.FindNext(SR) <> 0;
-      finally
-        SysUtils.FindClose(SR);
-      end;
+    Entries := ListDirectoryEntries(ADir, '*', faAnyFile);
+    for i := 0 to High(Entries) do
+    begin
+      if ARelDir = '' then RelPath := Entries[i].Name
+      else RelPath := ARelDir + '/' + Entries[i].Name;
+      Full := Base + Entries[i].Name;
+      if (Entries[i].Attr and faDirectory) <> 0 then
+      begin
+        if WalkAndPrune(Full, RelPath) = 0 then
+          LongPathRemoveDir(Full)
+        else
+          Inc(Result);
+      end
+      else if ShouldKeep(RelPath) then
+        Inc(Result)
+      else
+        LongPathDeleteFile(Full);
+    end;
   end;
 
 begin
@@ -804,7 +847,7 @@ function CopyFileContent(const ASrc, ADst: string): Boolean;
 var SrcS, DstS: TLWPTProtectedFileStream;
 begin
   Result := False;
-  if not FileExists(ASrc) then Exit;
+  if not LongPathFileExists(ASrc) then Exit;
   try
     SrcS := OpenProtectedFileStream(ASrc, fmOpenRead or fmShareDenyNone);
     try
@@ -864,7 +907,7 @@ function IsSameDirectory(const A, B: string): Boolean;
     { zero access: metadata only. FILE_FLAG_BACKUP_SEMANTICS is
       required to open a directory handle; reparse points are
       followed so the identity is the final target's. }
-    Result := Windows.CreateFileW(PWideChar(UnicodeString(APath)), 0,
+    Result := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)), 0,
       FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, 0);
   end;
@@ -922,32 +965,29 @@ end;
 procedure CopyDirTree(const ASrc, ADst: string);
 
   procedure CopyRec(const ASrcDir, ADstDir: string);
-  var SR: TSearchRec; S, D: string;
+  var Entries: TLWPTDirectoryEntries; i: Integer; S, D, Name: string;
   begin
     S := IncludeTrailingPathDelimiter(ASrcDir);
     D := IncludeTrailingPathDelimiter(ADstDir);
-    ForceDirectories(ADstDir);
-    if SysUtils.FindFirst(S + '*', faAnyFile or faSymLink, SR) = 0 then
-      try
-        repeat
-          if (SR.Name = '.') or (SR.Name = '..') then Continue;
-          if (SR.Attr and faSymLink) <> 0 then
-          begin
-            if ((SR.Attr and faDirectory) = 0)
-               and FileExists(S + SR.Name)
-               and not CopyFileContent(S + SR.Name, D + SR.Name) then
-              raise EExtractError.CreateFmt(
-                'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
-          end
-          else if (SR.Attr and faDirectory) <> 0 then
-            CopyRec(S + SR.Name, D + SR.Name)
-          else if not CopyFileContent(S + SR.Name, D + SR.Name) then
-            raise EExtractError.CreateFmt(
-              'failed to copy "%s" to "%s"', [S + SR.Name, D + SR.Name]);
-        until SysUtils.FindNext(SR) <> 0;
-      finally
-        SysUtils.FindClose(SR);
-      end;
+    LongPathForceDirectories(ADstDir);
+    Entries := ListDirectoryEntries(ASrcDir, '*', faAnyFile or faSymLink);
+    for i := 0 to High(Entries) do
+    begin
+      Name := Entries[i].Name;
+      if (Entries[i].Attr and faSymLink) <> 0 then
+      begin
+        if ((Entries[i].Attr and faDirectory) = 0)
+           and LongPathFileExists(S + Name)
+           and not CopyFileContent(S + Name, D + Name) then
+          raise EExtractError.CreateFmt(
+            'failed to copy "%s" to "%s"', [S + Name, D + Name]);
+      end
+      else if (Entries[i].Attr and faDirectory) <> 0 then
+        CopyRec(S + Name, D + Name)
+      else if not CopyFileContent(S + Name, D + Name) then
+        raise EExtractError.CreateFmt(
+          'failed to copy "%s" to "%s"', [S + Name, D + Name]);
+    end;
   end;
 
 var
@@ -999,19 +1039,236 @@ begin
 end;
 
 {$IFDEF MSWINDOWS}
+const
+  EXTENDED_PATH_PREFIX = '\\?\';
+  EXTENDED_UNC_PREFIX = '\\?\UNC\';
+
 function WindowsExtendedPath(const APath: string): UnicodeString;
 var
-  FullPath: UnicodeString;
+  FullPath, Prefix, Body: UnicodeString;
+  i: Integer;
 begin
+  if APath = '' then Exit('');
+  { ExpandFileName does not understand the extended prefix; a caller that
+    already holds an extended path keeps it verbatim. }
+  if Copy(APath, 1, 4) = EXTENDED_PATH_PREFIX then
+    Exit(UnicodeString(APath));
+  { ExpandFileName resolves relative paths against the current directory
+    and folds '.' and '..'; the extended spelling would otherwise pass them
+    to the file system as literal names. }
   FullPath := UnicodeString(StringReplace(ExpandFileName(APath), '/', '\',
     [rfReplaceAll]));
-  if Copy(FullPath, 1, 4) = '\\?\' then Exit(FullPath);
+  if Copy(FullPath, 1, 4) = EXTENDED_PATH_PREFIX then Exit(FullPath);
   if Copy(FullPath, 1, 2) = '\\' then
-    Result := '\\?\UNC\' + Copy(FullPath, 3, MaxInt)
+  begin
+    Prefix := EXTENDED_UNC_PREFIX;
+    Body := Copy(FullPath, 3, MaxInt);
+  end
   else
-    Result := '\\?\' + FullPath;
+  begin
+    Prefix := EXTENDED_PATH_PREFIX;
+    Body := FullPath;
+  end;
+  { Win32 normalisation is bypassed for extended paths, so a doubled
+    separator would name an empty component. }
+  i := 2;
+  while i <= Length(Body) do
+    if (Body[i] = '\') and (Body[i - 1] = '\') then Delete(Body, i, 1)
+    else Inc(i);
+  { A drive root keeps its separator: `\\?\C:` names the volume device,
+    not its root directory. }
+  if (Length(Body) > 0) and (Body[Length(Body)] = '\')
+    and not ((Length(Body) = 3) and (Body[2] = ':')) then
+    SetLength(Body, Length(Body) - 1);
+  Result := Prefix + Body;
 end;
 
+{ ADirectory's extended spelling joined with one more component. }
+function WindowsExtendedChild(const ADirectory: UnicodeString;
+  const AName: UnicodeString): UnicodeString;
+begin
+  if (ADirectory <> '') and (ADirectory[Length(ADirectory)] = '\') then
+    Result := ADirectory + AName
+  else
+    Result := ADirectory + '\' + AName;
+end;
+
+{ The attributes of the object a link resolves to; False when it dangles.
+  Backup semantics opens directory targets as well as file targets. }
+function WindowsTargetAttributes(const AExtendedPath: UnicodeString;
+  out AAttributes: Cardinal): Boolean;
+var Handle: THandle; Info: TByHandleFileInformation;
+begin
+  AAttributes := 0;
+  Handle := Windows.CreateFileW(PWideChar(AExtendedPath), 0,
+    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+      or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
+    FILE_FLAG_BACKUP_SEMANTICS_LWPT, 0);
+  if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then Exit(False);
+  try
+    Result := Windows.GetFileInformationByHandle(Handle, Info);
+    if Result then AAttributes := Info.dwFileAttributes;
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+end;
+
+{ SysUtils' FileOrDirExists with FollowLink: the entry's own directory bit
+  must match, and a reparse point must resolve to a target of that kind. }
+function WindowsObjectExists(const APath: string;
+  const ADirectory: Boolean): Boolean;
+var ExtendedPath: UnicodeString; Attributes, TargetAttributes: Cardinal;
+begin
+  ExtendedPath := WindowsExtendedPath(APath);
+  if ExtendedPath = '' then Exit(False);
+  Attributes := Windows.GetFileAttributesW(PWideChar(ExtendedPath));
+  if Attributes = $FFFFFFFF then Exit(False);
+  if ((Attributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0) <> ADirectory then
+    Exit(False);
+  if (Attributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) = 0 then
+    Exit(True);
+  Result := WindowsTargetAttributes(ExtendedPath, TargetAttributes)
+    and (((TargetAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0)
+      = ADirectory);
+end;
+{$ENDIF}
+
+function LongPathFileExists(const APath: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WindowsObjectExists(APath, False);
+  {$ELSE}
+  Result := SysUtils.FileExists(APath);
+  {$ENDIF}
+end;
+
+function LongPathDirectoryExists(const APath: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WindowsObjectExists(APath, True);
+  {$ELSE}
+  Result := SysUtils.DirectoryExists(APath);
+  {$ENDIF}
+end;
+
+function LongPathCreateDir(const APath: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  if APath = '' then Exit(False);
+  Result := Windows.CreateDirectoryW(PWideChar(WindowsExtendedPath(APath)),
+    nil);
+  {$ELSE}
+  Result := SysUtils.CreateDir(APath);
+  {$ENDIF}
+end;
+
+function LongPathForceDirectories(const APath: string): Boolean;
+{$IFDEF MSWINDOWS}
+var E: EInOutError;
+
+  function Force(const ADirectory: string): Boolean;
+  var Parent: string;
+  begin
+    if LongPathDirectoryExists(ADirectory) then Exit(True);
+    Parent := ExtractFileDir(ADirectory);
+    { A root that does not exist (a missing drive or share) ends the walk. }
+    if (Parent = '') or (Parent = ADirectory) then Exit(False);
+    if not Force(Parent) then Exit(False);
+    { A concurrent creator winning the race still satisfies the
+      postcondition. }
+    Result := LongPathCreateDir(ADirectory)
+      or LongPathDirectoryExists(ADirectory);
+  end;
+
+begin
+  if APath = '' then
+  begin
+    E := EInOutError.Create('Cannot create empty directory');
+    E.ErrorCode := 3;
+    raise E;
+  end;
+  Result := Force(ExcludeTrailingPathDelimiter(
+    StringReplace(ExpandFileName(APath), '/', '\', [rfReplaceAll])));
+end;
+{$ELSE}
+begin
+  Result := SysUtils.ForceDirectories(APath);
+end;
+{$ENDIF}
+
+function LongPathDeleteFile(const APath: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  if APath = '' then Exit(False);
+  Result := Windows.DeleteFileW(PWideChar(WindowsExtendedPath(APath)));
+  {$ELSE}
+  Result := SysUtils.DeleteFile(APath);
+  {$ENDIF}
+end;
+
+function LongPathRemoveDir(const APath: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  if APath = '' then Exit(False);
+  Result := Windows.RemoveDirectoryW(PWideChar(WindowsExtendedPath(APath)));
+  {$ELSE}
+  Result := SysUtils.RemoveDir(APath);
+  {$ENDIF}
+end;
+
+function LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  if (AOldPath = '') or (ANewPath = '') then Exit(False);
+  Result := Windows.MoveFileW(PWideChar(WindowsExtendedPath(AOldPath)),
+    PWideChar(WindowsExtendedPath(ANewPath)));
+  {$ELSE}
+  Result := SysUtils.RenameFile(AOldPath, ANewPath);
+  {$ENDIF}
+end;
+
+function ListDirectoryEntries(const ADirectory, AMask: string;
+  const AAttr: LongInt): TLWPTDirectoryEntries;
+var
+  Count: Integer;
+  {$IFDEF MSWINDOWS}
+  Search: TUnicodeSearchRec;
+  Directory: UnicodeString;
+  {$ELSE}
+  Search: TSearchRec;
+  {$ENDIF}
+  Name, Root: string;
+begin
+  Result := nil;
+  Count := 0;
+  Root := ADirectory;
+  if Root = '' then Root := '.';
+  {$IFDEF MSWINDOWS}
+  Directory := WindowsExtendedPath(Root);
+  if SysUtils.FindFirst(WindowsExtendedChild(Directory, UnicodeString(AMask)),
+       AAttr, Search) <> 0 then Exit;
+  {$ELSE}
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(Root) + AMask,
+       AAttr, Search) <> 0 then Exit;
+  {$ENDIF}
+  try
+    repeat
+      Name := string(Search.Name);
+      if (Name = '.') or (Name = '..') then Continue;
+      if Count = Length(Result) then
+        SetLength(Result, Count * 2 + 16);
+      Result[Count].Name := Name;
+      Result[Count].Attr := Search.Attr;
+      Result[Count].Size := Search.Size;
+      Inc(Count);
+    until SysUtils.FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+  SetLength(Result, Count);
+end;
+
+{$IFDEF MSWINDOWS}
 function WindowsPathExists(const APath: string): Boolean;
 var
   ExtendedPath: UnicodeString;
@@ -1129,14 +1386,15 @@ begin
     end
     else
       Component := Component + Dir[i];
-  Result := DirectoryExists(Dir) and not IsDirSymlinkOrJunction(Dir);
+  Result := LongPathDirectoryExists(Dir) and not IsDirSymlinkOrJunction(Dir);
 end;
 
 function RemoveRetiredExecutables(const AOwnerRoot, ADirectory: string;
   out ARetained: Integer): Integer;
 var
   Dir, Full: string;
-  Search: TSearchRec;
+  Entries: TLWPTDirectoryEntries;
+  i: Integer;
 begin
   Result := 0;
   ARetained := 0;
@@ -1145,29 +1403,21 @@ begin
   if not RetiredExecutableSweepAllowed(AOwnerRoot, Dir) then Exit;
   { faSymLink makes Unix FindFirst lstat entries, so a link reports itself
     instead of its target and is skipped below. }
-  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(Dir)
-    + RetiredExecutablePrefix + '*' + TmpPathExtension,
-    faAnyFile or faSymLink, Search) <> 0 then Exit;
-  try
-    repeat
-      if not IsRetiredExecutableName(Search.Name) then Continue;
-      if (Search.Attr and (faDirectory or faSymLink)) <> 0 then Continue;
-      Full := IncludeTrailingPathDelimiter(Dir) + Search.Name;
-      if IsDirSymlinkOrJunction(Full) then Continue;
-      { Revalidate the directory before each deletion so a link swapped in
-        during the scan stops the sweep. }
-      if not RetiredExecutableSweepAllowed(AOwnerRoot, Dir) then Break;
-      {$IFDEF MSWINDOWS}
-      if Windows.DeleteFileW(PWideChar(WindowsExtendedPath(Full))) then
-      {$ELSE}
-      if SysUtils.DeleteFile(Full) then
-      {$ENDIF}
-        Inc(Result)
-      else
-        Inc(ARetained);
-    until SysUtils.FindNext(Search) <> 0;
-  finally
-    SysUtils.FindClose(Search);
+  Entries := ListDirectoryEntries(Dir,
+    RetiredExecutablePrefix + '*' + TmpPathExtension, faAnyFile or faSymLink);
+  for i := 0 to High(Entries) do
+  begin
+    if not IsRetiredExecutableName(Entries[i].Name) then Continue;
+    if (Entries[i].Attr and (faDirectory or faSymLink)) <> 0 then Continue;
+    Full := IncludeTrailingPathDelimiter(Dir) + Entries[i].Name;
+    if IsDirSymlinkOrJunction(Full) then Continue;
+    { Revalidate the directory before each deletion so a link swapped in
+      during the scan stops the sweep. }
+    if not RetiredExecutableSweepAllowed(AOwnerRoot, Dir) then Break;
+    if LongPathDeleteFile(Full) then
+      Inc(Result)
+    else
+      Inc(ARetained);
   end;
 end;
 
@@ -1181,7 +1431,8 @@ begin
             + APrefix + TmpPathDelimiter + ProcessIdStr + TmpPathDelimiter
             + EncodeBase36(TmpPathStartedAt) + TmpPathDelimiter
             + IntToStr(Int64(Sequence)) + TmpPathExtension;
-  until (not FileExists(Result)) and (not DirectoryExists(Result));
+  until (not LongPathFileExists(Result))
+    and (not LongPathDirectoryExists(Result));
 end;
 
 function MakeSiblingTmpPath(const APath, ATag: string): string;
@@ -1210,9 +1461,9 @@ begin
     the postcondition and retry briefly while that competing creation lands. }
   for Attempt := 1 to DirectoryCreateAttempts do
   begin
-    if DirectoryExists(ATmpRoot) then Break;
-    ForceDirectories(ATmpRoot);
-    if DirectoryExists(ATmpRoot) then Break;
+    if LongPathDirectoryExists(ATmpRoot) then Break;
+    LongPathForceDirectories(ATmpRoot);
+    if LongPathDirectoryExists(ATmpRoot) then Break;
     Sleep(1);
   end;
   Result := MakeUniqueTmpPath(ATmpRoot, AHint);
@@ -1229,7 +1480,7 @@ end;
 {$IFDEF MSWINDOWS}
 var Attrs: Cardinal;
 begin
-  Attrs := Windows.GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  Attrs := Windows.GetFileAttributesW(PWideChar(WindowsExtendedPath(APath)));
   if Attrs = $FFFFFFFF then Exit(False);
   Result := (Attrs and $400) <> 0;  { FILE_ATTRIBUTE_REPARSE_POINT }
 end;
@@ -1244,12 +1495,12 @@ end;
 {$IFDEF MSWINDOWS}
 var Attrs: Cardinal;
 begin
-  Attrs := Windows.GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  Attrs := Windows.GetFileAttributesW(PWideChar(WindowsExtendedPath(APath)));
   if Attrs = $FFFFFFFF then Exit(False);
   if (Attrs and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
-    Result := Windows.RemoveDirectoryW(PWideChar(UnicodeString(APath)))
+    Result := Windows.RemoveDirectoryW(PWideChar(WindowsExtendedPath(APath)))
   else
-    Result := Windows.DeleteFileW(PWideChar(UnicodeString(APath)));
+    Result := Windows.DeleteFileW(PWideChar(WindowsExtendedPath(APath)));
 end;
 {$ENDIF}
 
@@ -1276,14 +1527,14 @@ var
 begin
   AData := nil;
   AIsDirectory := False;
-  Attrs := Windows.GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  Attrs := Windows.GetFileAttributesW(PWideChar(WindowsExtendedPath(APath)));
   if (Attrs = $FFFFFFFF)
      or ((Attrs and Windows.FILE_ATTRIBUTE_REPARSE_POINT) = 0) then
     Exit(False);
   AIsDirectory := (Attrs and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0;
   Flags := FILE_FLAG_OPEN_REPARSE_POINT_LWPT;
   if AIsDirectory then Flags := Flags or FILE_FLAG_BACKUP_SEMANTICS_LWPT;
-  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)), 0,
+  Handle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)), 0,
     Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
       or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING, Flags, 0);
   if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then Exit(False);
@@ -1319,12 +1570,13 @@ begin
   if Length(AData) = 0 then Exit;
   if AIsDirectory then
   begin
-    if not Windows.CreateDirectoryW(PWideChar(UnicodeString(APath)), nil) then
+    if not Windows.CreateDirectoryW(PWideChar(WindowsExtendedPath(APath)),
+      nil) then
       Exit;
   end
   else
   begin
-    Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+    Handle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
       Windows.GENERIC_WRITE, 0, nil, Windows.CREATE_NEW,
       Windows.FILE_ATTRIBUTE_NORMAL, 0);
     if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then Exit;
@@ -1332,7 +1584,7 @@ begin
   end;
   Flags := FILE_FLAG_OPEN_REPARSE_POINT_LWPT;
   if AIsDirectory then Flags := Flags or FILE_FLAG_BACKUP_SEMANTICS_LWPT;
-  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+  Handle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
     Windows.GENERIC_WRITE, 0, nil, Windows.OPEN_EXISTING, Flags, 0);
   if Handle <> THandle(Windows.INVALID_HANDLE_VALUE) then
     try
@@ -1344,9 +1596,9 @@ begin
     end;
   if not Result then
     if AIsDirectory then
-      Windows.RemoveDirectoryW(PWideChar(UnicodeString(APath)))
+      Windows.RemoveDirectoryW(PWideChar(WindowsExtendedPath(APath)))
     else
-      Windows.DeleteFileW(PWideChar(UnicodeString(APath)));
+      Windows.DeleteFileW(PWideChar(WindowsExtendedPath(APath)));
 end;
 {$ENDIF}
 
@@ -1359,7 +1611,7 @@ end;
 
 function PathExists(const APath: string): Boolean; inline;
 begin
-  Result := FileExists(APath) or DirectoryExists(APath)
+  Result := LongPathFileExists(APath) or LongPathDirectoryExists(APath)
         or IsDirSymlinkOrJunction(APath);
 end;
 
@@ -1371,9 +1623,9 @@ begin
       raise EExtractError.CreateFmt('failed to remove link "%s"', [APath]);
     Exit;
   end;
-  if DirectoryExists(APath) then
+  if LongPathDirectoryExists(APath) then
     WipeDir(APath)
-  else if FileExists(APath) and not SysUtils.DeleteFile(APath) then
+  else if LongPathFileExists(APath) and not LongPathDeleteFile(APath) then
     raise EExtractError.CreateFmt('failed to delete "%s"', [APath]);
 end;
 
@@ -1385,7 +1637,7 @@ end;
   dir. Links are unlinked, never followed — wiping through one would
   destroy content outside APath. }
 procedure WipeDir(const APath: string);
-var SR: TSearchRec; Base, Full: string;
+var Entries: TLWPTDirectoryEntries; i: Integer; Base, Full: string;
 begin
   if IsDirSymlinkOrJunction(APath) then
   begin
@@ -1393,33 +1645,29 @@ begin
       raise EExtractError.CreateFmt('failed to remove link "%s"', [APath]);
     Exit;
   end;
-  if not DirectoryExists(APath) then Exit;
+  if not LongPathDirectoryExists(APath) then Exit;
   Base := IncludeTrailingPathDelimiter(APath);
-  if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        Full := Base + SR.Name;
-        if (SR.Attr and faSymLink) <> 0 then
-        begin
-          if (SR.Attr and faDirectory) <> 0 then
-          begin
-            if not RemoveDirLink(Full) then
-              raise EExtractError.CreateFmt(
-                'failed to remove link "%s"', [Full]);
-          end
-          else if not SysUtils.DeleteFile(Full) then
-            raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
-        end
-        else if (SR.Attr and faDirectory) <> 0 then
-          WipeDir(Full)
-        else if not SysUtils.DeleteFile(Full) then
-          raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
-      until SysUtils.FindNext(SR) <> 0;
-    finally
-      SysUtils.FindClose(SR);
-    end;
-  if not SysUtils.RemoveDir(APath) then
+  Entries := ListDirectoryEntries(APath, '*', faAnyFile or faSymLink);
+  for i := 0 to High(Entries) do
+  begin
+    Full := Base + Entries[i].Name;
+    if (Entries[i].Attr and faSymLink) <> 0 then
+    begin
+      if (Entries[i].Attr and faDirectory) <> 0 then
+      begin
+        if not RemoveDirLink(Full) then
+          raise EExtractError.CreateFmt(
+            'failed to remove link "%s"', [Full]);
+      end
+      else if not LongPathDeleteFile(Full) then
+        raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
+    end
+    else if (Entries[i].Attr and faDirectory) <> 0 then
+      WipeDir(Full)
+    else if not LongPathDeleteFile(Full) then
+      raise EExtractError.CreateFmt('failed to delete "%s"', [Full]);
+  end;
+  if not LongPathRemoveDir(APath) then
     raise EExtractError.CreateFmt('failed to remove directory "%s"', [APath]);
 end;
 
@@ -1427,9 +1675,9 @@ function AtomicMoveFile(const ASrc, ADst: string): Boolean;
 var
   DstDir, StagedCopy: string;
 begin
-  if not FileExists(ASrc) then Exit(False);
+  if not LongPathFileExists(ASrc) then Exit(False);
   DstDir := ExtractFileDir(ADst);
-  if DstDir <> '' then ForceDirectories(DstDir);
+  if DstDir <> '' then LongPathForceDirectories(DstDir);
   { One same-filesystem replacement is the common path. Unlike renaming the
     old destination aside first, this never creates a reader-visible gap. }
   if AtomicReplaceFile(ASrc, ADst) then Exit(True);
@@ -1445,10 +1693,10 @@ begin
     if not AtomicReplaceFile(StagedCopy, ADst) then Exit;
     { Publication is already complete. A failed source cleanup is recoverable
       residue, not a failed move that should trigger rollback of the new path. }
-    SysUtils.DeleteFile(ASrc);
+    LongPathDeleteFile(ASrc);
     Result := True;
   finally
-    if FileExists(StagedCopy) then SysUtils.DeleteFile(StagedCopy);
+    if LongPathFileExists(StagedCopy) then LongPathDeleteFile(StagedCopy);
   end;
 end;
 
@@ -1461,33 +1709,34 @@ var
   begin
     if Backup = '' then Exit;
     if PathExists(ADst) then RemovePath(ADst);
-    if PathExists(Backup) then SysUtils.RenameFile(Backup, ADst);
+    if PathExists(Backup) then LongPathRenameFile(Backup, ADst);
   end;
 
 begin
   SourceIsLink := IsDirSymlinkOrJunction(ASrc);
-  if (not DirectoryExists(ASrc)) and (not SourceIsLink) then Exit(False);
+  if (not LongPathDirectoryExists(ASrc)) and (not SourceIsLink) then
+    Exit(False);
   DstDir := ExtractFileDir(ExcludeTrailingPathDelimiter(ADst));
-  if DstDir <> '' then ForceDirectories(DstDir);
+  if DstDir <> '' then LongPathForceDirectories(DstDir);
   Backup := '';
   Result := False;
 
   if PathExists(ADst) then
   begin
     Backup := MakeSiblingTmpPath(ExcludeTrailingPathDelimiter(ADst), 'old');
-    if not SysUtils.RenameFile(ADst, Backup) then Exit(False);
+    if not LongPathRenameFile(ADst, Backup) then Exit(False);
   end;
 
   try
-    Result := SysUtils.RenameFile(ASrc, ADst);
+    Result := LongPathRenameFile(ASrc, ADst);
     if (not Result) and (not SourceIsLink) then
     begin
       { EXDEV path: recursive copy + wipe-source. The old destination
         remains recoverable until the copy finishes. }
-      ForceDirectories(ADst);
+      LongPathForceDirectories(ADst);
       CopyDirTree(ASrc, ADst);
       WipeDir(ASrc);
-      Result := DirectoryExists(ADst);
+      Result := LongPathDirectoryExists(ADst);
     end;
 
     if Result then
@@ -1517,9 +1766,9 @@ begin
     if LinkIsDirectory then Result := 'link-dir:' + SHA256Hex(LinkData)
     else Result := 'link-file:' + SHA256Hex(LinkData);
   end
-  else if DirectoryExists(APath) then
+  else if LongPathDirectoryExists(APath) then
     Result := 'tree:' + HashTree(APath)
-  else if FileExists(APath) then
+  else if LongPathFileExists(APath) then
     Result := 'file:' + SHA256File(APath)
   else
     Result := 'absent';
@@ -1534,7 +1783,8 @@ function SnapshotMatches(const APath, AExpected: string): Boolean;
 const LEGACY_TREE_SNAPSHOT = 'tree:' + LEGACY_TREE_DIGEST_PREFIX;
 begin
   if Copy(AExpected, 1, Length(LEGACY_TREE_SNAPSHOT)) = LEGACY_TREE_SNAPSHOT then
-    Result := (not IsDirSymlinkOrJunction(APath)) and DirectoryExists(APath)
+    Result := (not IsDirSymlinkOrJunction(APath))
+      and LongPathDirectoryExists(APath)
       and ('tree:' + LegacyHashTree(APath) = AExpected)
   else
     Result := SnapshotPathHash(APath) = AExpected;
@@ -1559,14 +1809,14 @@ begin
       if not CopyLinkObject(APath, ABackupPath) then Exit;
       Actual := SnapshotPathHash(ABackupPath);
     end
-    else if FileExists(APath) and not IsDirSymlinkOrJunction(APath) then
+    else if LongPathFileExists(APath) and not IsDirSymlinkOrJunction(APath) then
     begin
       if not CopyFileContent(APath, ABackupPath) then Exit;
       Actual := SnapshotPathHash(ABackupPath);
     end
     else
     begin
-      ForceDirectories(ABackupPath);
+      LongPathForceDirectories(ABackupPath);
       CopyDirTree(APath, ABackupPath);
       Actual := SnapshotPathHash(ABackupPath);
     end;
@@ -1611,10 +1861,10 @@ begin
       'injected restore exception for "%s"', [ADestination]);
   {$ENDIF}
   Result := False;
-  if not FileExists(ABackupPath + '.rollback') then Exit;
+  if not LongPathFileExists(ABackupPath + '.rollback') then Exit;
   Meta := TStringList.Create;
   try
-    Meta.LoadFromFile(ABackupPath + '.rollback');
+    LoadProtectedStrings(Meta, ABackupPath + '.rollback');
     if Meta.Count < 2 then Exit;
     if Meta[0] <> ADestination then Exit;
     Expected := Meta[1];
@@ -1632,7 +1882,8 @@ begin
     readable tree while rollback is already degraded. }
   if not SnapshotMatches(ABackupPath, Expected) then Exit;
   if not AtomicRemovePath(ADestination) then Exit(False);
-  if FileExists(ABackupPath) and not IsDirSymlinkOrJunction(ABackupPath) then
+  if LongPathFileExists(ABackupPath)
+    and not IsDirSymlinkOrJunction(ABackupPath) then
     Result := AtomicMoveFile(ABackupPath, ADestination)
   else
     Result := AtomicMoveDir(ABackupPath, ADestination);
@@ -1644,10 +1895,10 @@ var Meta: TStringList;
 begin
   Result := '';
   if ABackupPath = '' then Exit;
-  if not FileExists(ABackupPath + '.rollback') then Exit;
+  if not LongPathFileExists(ABackupPath + '.rollback') then Exit;
   Meta := TStringList.Create;
   try
-    Meta.LoadFromFile(ABackupPath + '.rollback');
+    LoadProtectedStrings(Meta, ABackupPath + '.rollback');
     if Meta.Count > 0 then Result := Meta[0];
   finally
     Meta.Free;
@@ -1711,7 +1962,7 @@ begin
   if not WindowsFileExists(ASrc) then Exit(False);
   {$ENDIF}
   DstDir := ExtractFileDir(ADst);
-  if DstDir <> '' then ForceDirectories(DstDir);
+  if DstDir <> '' then LongPathForceDirectories(DstDir);
   {$IFDEF UNIX}
   Result := FpRename(PChar(ASrc), PChar(ADst)) = 0;
   {$ENDIF}
@@ -1793,7 +2044,7 @@ procedure EnsureDstDir(const ADst: string);
 var D: string;
 begin
   D := ExtractFileDir(ADst);
-  if D <> '' then ForceDirectories(D);
+  if D <> '' then LongPathForceDirectories(D);
 end;
 
 const
@@ -1998,10 +2249,11 @@ begin
   end;
   Handle := THandle(Descriptor);
   {$ELSE}
-  { Windows file handles are created non-inheritable. }
+  { Windows file handles are created non-inheritable. The extended-length
+    spelling keeps deep toolkit state reachable past MAX_PATH. }
   if (AMode and fmCreate) = fmCreate then
   begin
-    Handle := FileCreate(APath, AMode and not fmCreate,
+    Handle := FileCreate(WindowsExtendedPath(APath), AMode and not fmCreate,
       PROTECTED_CREATE_PERMISSIONS);
     if Handle = THandle(-1) then
       raise EFCreateError.CreateFmt('Unable to create file "%s": %s',
@@ -2009,7 +2261,7 @@ begin
   end
   else
   begin
-    Handle := FileOpen(APath, AMode);
+    Handle := FileOpen(WindowsExtendedPath(APath), AMode);
     if Handle = THandle(-1) then
       raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
         [APath, SysErrorMessage(GetLastOSError)]);
@@ -2084,7 +2336,7 @@ begin
   if AtomicReplaceFile(Tmp, ADst) then Exit;
   if not AtomicMoveFile(Tmp, ADst) then
   begin
-    SysUtils.DeleteFile(Tmp);
+    LongPathDeleteFile(Tmp);
     raise EExtractError.CreateFmt(
       'atomic write of "%s" failed (could not commit tmp file)', [ADst]);
   end;
@@ -2104,7 +2356,7 @@ begin
   if AtomicReplaceFile(Tmp, ADst) then Exit;
   if not AtomicMoveFile(Tmp, ADst) then
   begin
-    SysUtils.DeleteFile(Tmp);
+    LongPathDeleteFile(Tmp);
     raise EExtractError.CreateFmt(
       'atomic write of "%s" failed (could not commit tmp file)', [ADst]);
   end;
@@ -2306,7 +2558,7 @@ function SHA256File(const APath: string): string;
 var
   Stream: TLWPTProtectedFileStream;
 begin
-  if not FileExists(APath) then Exit('');
+  if not LongPathFileExists(APath) then Exit('');
   Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     Result := SHA256Stream(Stream);
@@ -2393,28 +2645,24 @@ end;
 
 { The v3 inventory, unchanged: native-name relative paths. }
 procedure CollectFiles(const ARoot, ARel: string; AList: TStringList);
-var SR: TSearchRec; Path, RelPath: string;
+var Entries: TLWPTDirectoryEntries; i: Integer; Path, RelPath: string;
 begin
   Path := IncludeTrailingPathDelimiter(ARoot + ARel);
-  if SysUtils.FindFirst(Path + '*', faAnyFile or faSymLink, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        RelPath := ARel + SR.Name;
-        if (SR.Attr and faSymLink) <> 0 then
-        begin
-          if ((SR.Attr and faDirectory) = 0)
-             and FileExists(Path + SR.Name) then
-            AList.Add(CanonicalTreeHashPath(RelPath, PathDelim));
-        end
-        else if (SR.Attr and faDirectory) <> 0 then
-          CollectFiles(ARoot, RelPath + PathDelim, AList)
-        else
-          AList.Add(CanonicalTreeHashPath(RelPath, PathDelim));
-      until SysUtils.FindNext(SR) <> 0;
-    finally
-      SysUtils.FindClose(SR);
-    end;
+  Entries := ListDirectoryEntries(Path, '*', faAnyFile or faSymLink);
+  for i := 0 to High(Entries) do
+  begin
+    RelPath := ARel + Entries[i].Name;
+    if (Entries[i].Attr and faSymLink) <> 0 then
+    begin
+      if ((Entries[i].Attr and faDirectory) = 0)
+         and LongPathFileExists(Path + Entries[i].Name) then
+        AList.Add(CanonicalTreeHashPath(RelPath, PathDelim));
+    end
+    else if (Entries[i].Attr and faDirectory) <> 0 then
+      CollectFiles(ARoot, RelPath + PathDelim, AList)
+    else
+      AList.Add(CanonicalTreeHashPath(RelPath, PathDelim));
+  end;
 end;
 
 { Fold-order comparator for both tree digests: ASCII case-insensitive,
@@ -2470,7 +2718,7 @@ var
   FullPath : string;
 begin
   { directory: hash the sorted file tree }
-  if DirectoryExists(APathOrArchive) then
+  if LongPathDirectoryExists(APathOrArchive) then
   begin
     Files := TStringList.Create;
     try
@@ -2505,7 +2753,7 @@ begin
     end;
   end
   { file (e.g. the archive itself): hash its bytes }
-  else if FileExists(APathOrArchive) then
+  else if LongPathFileExists(APathOrArchive) then
     Result := LEGACY_TREE_DIGEST_PREFIX + SHA256File(APathOrArchive)
   else
     Result := LEGACY_TREE_DIGEST_PREFIX + SHA256Hex(BytesOf(APathOrArchive));
@@ -2793,7 +3041,8 @@ var
   NameUTF8, RelPath: string;
   Kind: TTreeEntryKind;
 begin
-  Find := FindFirstFileW(PWideChar(AWideDir + '\*'), Data);
+  Find := FindFirstFileW(PWideChar(WindowsExtendedChild(AWideDir, '*')),
+    Data);
   if Find = INVALID_HANDLE_VALUE then Exit;
   try
     repeat
@@ -2807,14 +3056,14 @@ begin
       begin
         if (Data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
           Kind := tekDirectoryLink
-        else if WideTargetIsFile(AWideDir + '\' + Name) then
+        else if WideTargetIsFile(WindowsExtendedChild(AWideDir, Name)) then
           Kind := tekFileLink
         else
           Kind := tekDanglingLink;
         AEntries.AddObject(RelPath, TObject(PtrInt(Ord(Kind))));
       end
       else if (Data.dwFileAttributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
-        CollectTreeEntriesRec(ARootLabel, AWideDir + '\' + Name,
+        CollectTreeEntriesRec(ARootLabel, WindowsExtendedChild(AWideDir, Name),
           RelPath + TREE_HASH_PATH_SEPARATOR, AEntries)
       else
         AEntries.AddObject(RelPath, TObject(PtrInt(Ord(tekFile))));
@@ -2827,8 +3076,8 @@ end;
 function OpenTreeFile(const ADirectory, ARelPath: string): TStream;
 var Handle: THandle; WidePath: UnicodeString;
 begin
-  WidePath := UnicodeString(ExcludeTrailingPathDelimiter(ADirectory)) + '\'
-    + TreePathToWide(ARelPath);
+  WidePath := WindowsExtendedChild(WindowsExtendedPath(ADirectory),
+    TreePathToWide(ARelPath));
   { Non-inheritable (no security attributes), as every toolkit handle. }
   Handle := CreateFileW(PWideChar(WidePath), GENERIC_READ,
     FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
@@ -2885,12 +3134,12 @@ end;
 
 procedure CollectTreeEntries(const ADirectory: string; AEntries: TStringList);
 begin
-  if not DirectoryExists(ADirectory) then
+  if not LongPathDirectoryExists(ADirectory) then
     raise EVerifyError.CreateFmt(
       'cannot hash the tree at %s: it is not a directory', [ADirectory]);
   {$IFDEF MSWINDOWS}
-  CollectTreeEntriesRec(ADirectory,
-    UnicodeString(ExcludeTrailingPathDelimiter(ADirectory)), '', AEntries);
+  CollectTreeEntriesRec(ADirectory, WindowsExtendedPath(ADirectory), '',
+    AEntries);
   {$ELSE}
   CollectTreeEntriesRec(ADirectory, IncludeTrailingPathDelimiter(ADirectory),
     '', AEntries);

@@ -1672,7 +1672,7 @@ begin
     { Ledger publication stages through the project temporary root while
       holding this same lock. Serialize repair's residue sweep with that
       writer so a live atomic ledger update cannot lose its staged file. }
-    if (ATemporaryRoot <> '') and DirectoryExists(ATemporaryRoot) then
+    if (ATemporaryRoot <> '') and LongPathDirectoryExists(ATemporaryRoot) then
     begin
       WipeDir(ATemporaryRoot);
       ATemporaryRootCleaned := True;
