@@ -49,6 +49,7 @@ uses
   LWPT.Registry.Verification,
   Tests.LwptSubprocess,
   Tests.RegistryProcess,
+  Tests.Scratch,
   TOML;
 
 function RegistryArtifactHash(const AArchive: TBytes): string;
@@ -81,28 +82,17 @@ var
   Parser: TTOMLParser;
   Root: TTOMLNode;
   StateText: string;
-  Stream: TFileStream;
 begin
   Result := '';
   if not FileExists(ADataDirectory + '/state/current.toml') then Exit;
-  Stream := TFileStream.Create(ADataDirectory + '/state/current.toml', fmOpenRead);
-  try
-    SetLength(StateText, Stream.Size);
-    if Length(StateText) > 0 then Stream.ReadBuffer(StateText[1], Length(StateText));
-  finally
-    Stream.Free;
-  end;
+  { Shared reads: the listener may be replacing state as this runs. }
+  StateText := ReadBinaryFile(ADataDirectory + '/state/current.toml');
   Parser := TTOMLParser.Create;
   try
     Root := Parser.ParseDocument(StateText);
     try
-      Stream := TFileStream.Create(ADataDirectory + '/' + TomlStr(Root, 'checkpoint', ''), fmOpenRead);
-      try
-        SetLength(Result, Stream.Size);
-        if Length(Result) > 0 then Stream.ReadBuffer(Result[1], Length(Result));
-      finally
-        Stream.Free;
-      end;
+      Result := ReadBinaryFile(ADataDirectory + '/'
+        + TomlStr(Root, 'checkpoint', ''));
     finally
       Root.Free;
     end;
