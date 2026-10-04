@@ -3087,7 +3087,7 @@ end;
 { Every regular file below ARoot as "file:<relative path>", and every link
   as "link:<relative path>". Directories are walked, not listed: a Git
   checkout keeps no empty directory. }
-procedure CollectRegistryTreeEntries(const ARoot, ARel: string;
+procedure CollectModuleTreeEntries(const ARoot, ARel: string;
   AList: TStringList);
 var Entries: TLWPTDirectoryEntries; i: Integer; Rel: string;
 begin
@@ -3099,7 +3099,7 @@ begin
     if (Entries[i].Attr and faSymLink) <> 0 then
       AList.Add('link:' + Rel)
     else if (Entries[i].Attr and faDirectory) <> 0 then
-      CollectRegistryTreeEntries(ARoot, Rel + '/', AList)
+      CollectModuleTreeEntries(ARoot, Rel + '/', AList)
     else
       AList.Add('file:' + Rel);
   end;
@@ -3124,7 +3124,7 @@ end;
   the first difference. Under schema v4 equal tree digests already prove an
   equal layout (ADR-0052); this comparison only names the first differing
   path after a digest mismatch. }
-function RegistryTreeDifference(const AExpected, AActual: string): string;
+function ModuleTreeDifference(const AExpected, AActual: string): string;
 var Expected, Actual: TStringList; k: Integer;
 
   function Named(const AEntry: string): string;
@@ -3141,8 +3141,8 @@ begin
     Actual.CaseSensitive := True;
     Expected.Sorted := True;
     Actual.Sorted := True;
-    CollectRegistryTreeEntries(AExpected, '', Expected);
-    CollectRegistryTreeEntries(AActual, '', Actual);
+    CollectModuleTreeEntries(AExpected, '', Expected);
+    CollectModuleTreeEntries(AActual, '', Actual);
     for k := 0 to Actual.Count - 1 do
       if Copy(Actual[k], 1, 5) = 'link:' then
         Exit('link ' + Named(Actual[k]));
@@ -3224,7 +3224,7 @@ begin
     Difference := '';
     if (Rederived <> ALockHash) or (Installed <> Rederived) then
     begin
-      Difference := RegistryTreeDifference(Tree, AInstalled);
+      Difference := ModuleTreeDifference(Tree, AInstalled);
       if Difference = '' then
         Difference := 'tree hash ' + Rederived + ', installed ' + Installed
           + ', lockfile ' + ALockHash
@@ -3238,6 +3238,76 @@ begin
         + 'its proof-authenticated archive (%s). Restore %s from version '
         + 'control, or run `%s install --offline` to restore it from the '
         + 'archive.', [APackage.Name, Difference, AInstalled, PROGRAM_NAME]);
+  finally
+    if LongPathDirectoryExists(Scratch) then WipeDir(Scratch);
+  end;
+end;
+
+{ Stages into ATarget the tree a local or workspace source materializes to:
+  install's own copy (file links read through, directory links dropped)
+  under the dependency's include/exclude policy. Its HashTree is the
+  computedHash an install of the source at this moment records. }
+procedure StageLocalSourceTree(const ASource, ATarget: string;
+  const ADep: TDependency);
+begin
+  LongPathForceDirectories(ATarget);
+  CopyDirTree(ASource, ATarget);
+  ApplyIncludeExclude(ATarget, ADep.IncludeGlobs, ADep.ExcludeGlobs);
+end;
+
+{ --frozen: a local or workspace module is a snapshot of a live source, so
+  the committed tree and its lock entry can agree with each other while both
+  are stale. Re-derive the snapshot from ASource in a private scratch
+  directory below ATmpRoot, removed on every path, and require its tree
+  digest to equal computedHash. Nothing committed is written. The caller has
+  already proven the installed tree equals computedHash. }
+procedure VerifyLocalSourceTree(const ASource, ATmpRoot, AInstalled,
+  ALockHash, AProjectRoot: string; const ADep: TDependency;
+  const AIsWorkspace: Boolean);
+var
+  Scratch, Tree, Derived, Difference, Subject, Source, Module: string;
+
+  function Reworded(var AText: string; const AFrom, ATo: string): Boolean;
+  begin
+    Result := Copy(AText, 1, Length(AFrom)) = AFrom;
+    if Result then
+      AText := ATo + Copy(AText, Length(AFrom) + 1, MaxInt);
+  end;
+
+begin
+  Source := ProjectDisplayPath(AProjectRoot,
+    ExcludeTrailingPathDelimiter(ASource));
+  if AIsWorkspace then
+    Subject := 'workspace package "' + ADep.Name + '"'
+  else
+    Subject := 'local dependency "' + ADep.Name + '"';
+  if not LongPathDirectoryExists(ASource) then
+    raise EVerifyError.CreateFmt(
+      '[frozen] source of %s is missing at %s, so its committed module '
+      + 'cannot be proven current. Restore the source, or remove the '
+      + 'dependency from %s and run `%s install`.',
+      [Subject, Source, MANIFEST_FILE, PROGRAM_NAME]);
+  { Short names keep the scratch tree inside the legacy Windows path limit
+    in deep projects. }
+  Scratch := MakeTmpPath(ATmpRoot, 'fl');
+  try
+    Tree := Scratch + '/t';
+    StageLocalSourceTree(ASource, Tree, ADep);
+    Derived := HashTree(Tree);
+    if Derived = ALockHash then Exit;
+    { Named from the source's side: a file only the source has was added. }
+    Difference := ModuleTreeDifference(Tree, AInstalled);
+    if not Reworded(Difference, 'missing ', 'added ')
+       and not Reworded(Difference, 'unexpected ', 'removed ')
+       and (Difference = '') then
+      Difference := 'tree layout changed';
+    Module := ProjectDisplayPath(AProjectRoot, AInstalled);
+    raise EVerifyError.CreateFmt(
+      '[frozen] %s at %s changed after it was installed (%s; source tree '
+      + 'hash %s, lockfile %s). %s and %s still hold the previous snapshot. '
+      + 'Run `%s install` and commit the updated %s and %s.',
+      [Subject, Source, Difference, Derived, ALockHash, Module,
+       LWPT.Core.LOCKFILE, PROGRAM_NAME, LWPT.Core.LOCKFILE, Module]);
   finally
     if LongPathDirectoryExists(Scratch) then WipeDir(Scratch);
   end;
@@ -4559,10 +4629,7 @@ var
         end;
         RecheckPath := MakeTmpPath(PlanScratch,
           'preflight-' + R.Nodes[k].Name);
-        LongPathForceDirectories(RecheckPath);
-        CopyDirTree(LivePath, RecheckPath);
-        ApplyIncludeExclude(RecheckPath,
-          R.Nodes[k].Dep.IncludeGlobs, R.Nodes[k].Dep.ExcludeGlobs);
+        StageLocalSourceTree(LivePath, RecheckPath, R.Nodes[k].Dep);
         try
           {$IFDEF INSTALL_TESTING}
           if SameText(TestSeamValue('STALE_LOCAL_SNAPSHOT'),
@@ -5198,7 +5265,17 @@ begin
         + '`lwpt install` online to resolve the changed graph.',
         [AResolved[i].Name]);
     { The v3-to-v4 upgrade never consults a v3 computedHash: it is the
-      value the #352 flaw lets a forged tree match (ADR-0052). }
+      value the #352 flaw lets a forged tree match (ADR-0052). A local or
+      workspace source is copied again, so its mismatch means the source
+      changed after the lock was written. }
+    if ACheckTreeHash and (AResolved[i].Hash <> Lock.Hash)
+       and (AResolved[i].SrcKind = skLocal) then
+      raise EVerifyError.CreateFmt(
+        '[offline] tree hash mismatch for "%s": staged=%s lockfile=%s. '
+        + 'Its local or workspace source changed after it was installed. '
+        + 'Run `%s install` and commit the updated %s and module.',
+        [AResolved[i].Name, AResolved[i].Hash, Lock.Hash, PROGRAM_NAME,
+         LWPT.Core.LOCKFILE]);
     if ACheckTreeHash and (AResolved[i].Hash <> Lock.Hash) then
       raise EVerifyError.CreateFmt(
         '[offline] tree hash mismatch for "%s": staged=%s lockfile=%s. '
@@ -6522,6 +6599,8 @@ var
   LockChanged: Boolean;
   Locked: TLockedRegistry;
   RegistryPackage: TLWPTRegistryPackage;
+  LocalSourcePath: string;
+  LocalMember: TWorkspace;
   {$IFDEF INSTALL_TESTING}
   TestCorruption: TStringList;
   {$ENDIF}
@@ -6777,6 +6856,20 @@ begin
           FillFrozenArchiveHash(Resolved[i], LockEntries, ArchivesRoot);
       end;
       VerifyAgainstLockfile(Resolved, LockEntries);
+      { A local or workspace node's installed tree and computedHash are both
+        a snapshot of a live source; agreeing with each other proves
+        nothing when both are stale. Re-derive each from its source. }
+      for i := 0 to High(Resolved) do
+      begin
+        if R.Nodes[i].Dep.SrcKind <> skLocal then Continue;
+        LocalSourcePath := ResolveProjectPath(AContext.ProjectRoot,
+          R.Nodes[i].Dep.SrcLocator);
+        VerifyLocalSourceTree(LocalSourcePath, TmpRoot, R.Nodes[i].UnitDir,
+          Resolved[i].Hash, AContext.ProjectRoot, R.Nodes[i].Dep,
+          FindWorkspace(Man.Workspaces, R.Nodes[i].Name, LocalMember)
+          and SameFileName(ExcludeTrailingPathDelimiter(LocalSourcePath),
+            ExcludeTrailingPathDelimiter(ExpandFileName(LocalMember.Path))));
+      end;
       { A registry node's installed tree is authenticated, not only its
         archive: the tree re-derived from the proof-authenticated archive
         under the declared extraction policy must equal both the installed
