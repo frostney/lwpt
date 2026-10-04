@@ -1437,11 +1437,13 @@ procedure ReadManifestSnapshot(const APath: string; out AContent,
 var
   Bytes: TBytes;
   ContentSize: SizeInt;
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
 begin
-  if not FileExists(APath) then
+  { Dependency manifests are read from resolver staging below .lwpt/tmp,
+    which can pass the Windows MAX_PATH (#347). }
+  if not LongPathFileExists(APath) then
     raise EManifestError.CreateFmt('no manifest at %s', [APath]);
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     ContentSize := Stream.Size;
     SetLength(Bytes, ContentSize);

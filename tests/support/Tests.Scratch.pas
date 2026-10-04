@@ -27,6 +27,10 @@
   make the wipe escape the tree, delete live package sources, or
   recurse forever.
 
+  On Windows the wipe addresses every entry by its extended-length
+  (`\\?\`) spelling, so it removes trees that toolkit code legitimately
+  nests past MAX_PATH (#347); the root is located the same way.
+
   A wipe that cannot complete raises, naming the path: a test that
   silently proceeds on a half-wiped scratch dir turns into stale-state
   flakiness that is far harder to diagnose than a loud setup error. }
@@ -40,11 +44,34 @@ interface
 function CreateScratchRoot(const ASuite: string): string;
 procedure WriteTextFile(const APath, AContent: string);
 procedure RecursiveDelete(const APath: string);
+{ Reads a whole file as raw bytes. It shares read, write, and delete
+  access, the way LWPT's own registry readers do, so a file the toolkit
+  publishes with an atomic rename can be read while that rename still
+  holds its handle. On Windows a sharing violation from a briefly held
+  handle (the rename's own write-through, a scanner) is retried for up to
+  READ_SHARING_RETRY_MILLISECONDS before the open fails. }
 function ReadBinaryFile(const APath: string): string;
 function TestCompilerExecutable: string;
 { Creates APath with length ASize without writing its bytes. On Windows the
   file is marked sparse first, so a large reservation costs no disk. }
 procedure CreateSparseFile(const APath: string; const ASize: Int64);
+
+const
+  READ_SHARING_RETRY_MILLISECONDS = 2000;
+
+type
+  TScratchReadSharingRetryHook = procedure(const APath: string);
+
+var
+  { Test-only observation: incremented, atomically, each time
+    ReadBinaryFile retries an open that failed with a sharing violation,
+    so a test can prove a retry happened without timing it. }
+  ScratchReadSharingRetries: LongInt = 0;
+  { Test-only: when set, ReadBinaryFile calls it on the reading thread
+    after each open that failed with a sharing violation and before it
+    sleeps, so a test can release the conflicting handle at exactly that
+    point. Production use leaves it nil. }
+  ScratchReadSharingRetryHook: TScratchReadSharingRetryHook = nil;
 
 implementation
 
@@ -367,10 +394,66 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+const
+  ERROR_SHARING_VIOLATION_LWPT = 32;
+
+function ScratchExtendedPath(const APath: string): UnicodeString; forward;
+
+{ Opens APath for reading with full sharing, retrying only a sharing
+  violation within READ_SHARING_RETRY_MILLISECONDS. The caller closes the
+  returned handle. }
+function OpenSharedReadHandle(const APath: string): THandle;
+var
+  ErrorCode: DWORD;
+  StartedAt: QWord;
+  WidePath: UnicodeString;
+begin
+  { The extended-length spelling reaches files past MAX_PATH. }
+  WidePath := ScratchExtendedPath(APath);
+  StartedAt := GetTickCount64;
+  repeat
+    Result := Windows.CreateFileW(PWideChar(WidePath), Windows.GENERIC_READ,
+      Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+        or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
+      Windows.FILE_ATTRIBUTE_NORMAL, 0);
+    if Result <> Windows.INVALID_HANDLE_VALUE then Exit;
+    ErrorCode := Windows.GetLastError;
+    if (ErrorCode <> ERROR_SHARING_VIOLATION_LWPT)
+      or (GetTickCount64 - StartedAt >= READ_SHARING_RETRY_MILLISECONDS) then
+      raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+        [APath, SysErrorMessage(ErrorCode)]);
+    InterLockedIncrement(ScratchReadSharingRetries);
+    if Assigned(ScratchReadSharingRetryHook) then
+      ScratchReadSharingRetryHook(APath);
+    SysUtils.Sleep(10);
+  until False;
+end;
+{$ENDIF}
+
 function ReadBinaryFile(const APath: string): string;
 var
+  {$IFDEF MSWINDOWS}
+  Handle: THandle;
+  Stream: THandleStream;
+  {$ELSE}
   Stream: TFileStream;
+  {$ENDIF}
 begin
+  {$IFDEF MSWINDOWS}
+  Handle := OpenSharedReadHandle(APath);
+  try
+    Stream := THandleStream.Create(Handle);
+    try
+      SetLength(Result, Stream.Size);
+      if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+    finally
+      Stream.Free;
+    end;
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+  {$ELSE}
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
     SetLength(Result, Stream.Size);
@@ -378,6 +461,7 @@ begin
   finally
     Stream.Free;
   end;
+  {$ENDIF}
 end;
 
 procedure CreateSparseFile(const APath: string; const ASize: Int64);
@@ -416,6 +500,145 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF MSWINDOWS}
+{ The extended-length (`\\?\`) spelling of an absolute scratch path, from
+  Win32's own parse, so cleanup reaches trees that toolkit code legitimately
+  nests past MAX_PATH (#347). This unit stays free of LWPT units because
+  root E2E programs share it; LWPT.Core's helpers are not available here. }
+function ScratchExtendedPath(const APath: string): UnicodeString;
+var
+  Input, Full: UnicodeString;
+  Needed, Written: DWORD;
+  FilePart: PWideChar;
+begin
+  Input := UnicodeString(StringReplace(APath, '/', '\', [rfReplaceAll]));
+  if Copy(Input, 1, 4) = '\\?\' then Exit(Input);
+  Full := '';
+  Needed := Windows.GetFullPathNameW(PWideChar(Input), 0, PWideChar(nil),
+    FilePart);
+  while Needed > 0 do
+  begin
+    SetLength(Full, Needed);
+    Written := Windows.GetFullPathNameW(PWideChar(Input), Needed,
+      PWideChar(Full), FilePart);
+    if (Written = 0) or (Written < Needed) then
+    begin
+      SetLength(Full, Written);
+      Break;
+    end;
+    Needed := Written;
+  end;
+  if Full = '' then Exit(Input);
+  while (Length(Full) > 3) and (Full[Length(Full)] = '\') do
+    SetLength(Full, Length(Full) - 1);
+  if (Length(Full) >= 3) and (Full[2] = ':') and (Full[3] = '\') then
+    Result := '\\?\' + Full
+  else if (Copy(Full, 1, 2) = '\\') and (Copy(Full, 1, 4) <> '\\.\') then
+    Result := '\\?\UNC\' + Copy(Full, 3, MaxInt)
+  else
+    Result := Full;
+end;
+
+procedure RaiseScratchError(const AFormat, APath: string);
+begin
+  raise Exception.CreateFmt(AFormat,
+    [APath, SysErrorMessage(Windows.GetLastError)]);
+end;
+
+{ Removes the directory AExtended (an extended spelling) and its contents.
+  Links are removed as nodes and never followed: RemoveDirectoryW detaches
+  a directory link or junction, DeleteFileW removes a file link. ADisplay
+  names the same path for diagnostics. }
+procedure RecursiveDeleteExtended(const AExtended: UnicodeString;
+  const ADisplay: string);
+var
+  Find: THandle;
+  Data: TWin32FindDataW;
+  Names: array of UnicodeString;
+  Attributes: array of DWORD;
+  Count, Index: Integer;
+  Name, Child: UnicodeString;
+  ChildDisplay: string;
+begin
+  Count := 0;
+  Names := nil;
+  Attributes := nil;
+  { Snapshot the listing first; the deletions below never race the
+    enumeration handle. }
+  Find := Windows.FindFirstFileW(PWideChar(AExtended + '\*'), Data);
+  if Find <> THandle(Windows.INVALID_HANDLE_VALUE) then
+    try
+      repeat
+        Name := PWideChar(@Data.cFileName[0]);
+        if (Name = '.') or (Name = '..') then Continue;
+        if Count = Length(Names) then
+        begin
+          SetLength(Names, Count * 2 + 16);
+          SetLength(Attributes, Count * 2 + 16);
+        end;
+        Names[Count] := Name;
+        Attributes[Count] := Data.dwFileAttributes;
+        Inc(Count);
+      until not Windows.FindNextFileW(Find, Data);
+    finally
+      Windows.FindClose(Find);
+    end;
+  for Index := 0 to Count - 1 do
+  begin
+    Child := AExtended + '\' + Names[Index];
+    ChildDisplay := IncludeTrailingPathDelimiter(ADisplay)
+      + string(Names[Index]);
+    if (Attributes[Index] and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+    begin
+      if (Attributes[Index] and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+      begin
+        if not Windows.RemoveDirectoryW(PWideChar(Child)) then
+          RaiseScratchError(
+            'RecursiveDelete: failed to remove dir link "%s": %s',
+            ChildDisplay);
+      end
+      else if not Windows.DeleteFileW(PWideChar(Child)) then
+        RaiseScratchError('RecursiveDelete: failed to unlink "%s": %s',
+          ChildDisplay);
+    end
+    else if (Attributes[Index] and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+      RecursiveDeleteExtended(Child, ChildDisplay)
+    else if not Windows.DeleteFileW(PWideChar(Child)) then
+      RaiseScratchError('RecursiveDelete: failed to delete "%s": %s',
+        ChildDisplay);
+  end;
+  if not Windows.RemoveDirectoryW(PWideChar(AExtended)) then
+    RaiseScratchError('RecursiveDelete: failed to remove directory "%s": %s',
+      ADisplay);
+end;
+
+procedure RecursiveDelete(const APath: string);
+var
+  Extended: UnicodeString;
+  Attributes: DWORD;
+begin
+  if APath = '' then Exit;
+  Extended := ScratchExtendedPath(ExcludeTrailingPathDelimiter(APath));
+  Attributes := Windows.GetFileAttributesW(PWideChar(Extended));
+  if Attributes = $FFFFFFFF then Exit;
+  { A root link is removed as a node through the same extended spelling as
+    a child link; its target is never touched. }
+  if (Attributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
+  begin
+    if (Attributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+    begin
+      if not Windows.RemoveDirectoryW(PWideChar(Extended)) then
+        RaiseScratchError(
+          'RecursiveDelete: failed to remove dir link "%s": %s', APath);
+    end
+    else if not Windows.DeleteFileW(PWideChar(Extended)) then
+      RaiseScratchError('RecursiveDelete: failed to unlink "%s": %s', APath);
+    Exit;
+  end;
+  if (Attributes and Windows.FILE_ATTRIBUTE_DIRECTORY) = 0 then Exit;
+  RecursiveDeleteExtended(Extended, ExcludeTrailingPathDelimiter(APath));
+end;
+{$ELSE}
 procedure RecursiveDelete(const APath: string);
 var
   SR, RootSearch: TSearchRec;
@@ -435,15 +658,10 @@ begin
     SysUtils.FindClose(RootSearch);
   end;
   Base := IncludeTrailingPathDelimiter(APath);
-  { faSymLink in the mask makes FindFirst report links as links (the
-    same $400 bit is FILE_ATTRIBUTE_REPARSE_POINT on Windows, so
-    junctions carry it too); a link is removed as a node instead of
-    recursed into. The node-removal call is platform-split: a Unix
-    symlink (even one whose Attr also carries faDirectory from the
-    target) unlinks via DeleteFile — RemoveDir on a symlink is
-    ENOTDIR — while a Windows junction / directory reparse point is
-    the opposite: DeleteFile cannot remove it, RemoveDir detaches it
-    without touching the target. }
+  { faSymLink in the mask makes FindFirst report links as links; a link is
+    removed as a node instead of recursed into. A Unix symlink (even one
+    whose Attr also carries faDirectory from the target) unlinks via
+    DeleteFile; RemoveDir on a symlink is ENOTDIR. }
   if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
     try
       repeat
@@ -465,5 +683,6 @@ begin
       'RecursiveDelete: failed to remove directory "%s": %s',
       [APath, SysErrorMessage(GetLastOSError)]);
 end;
+{$ENDIF}
 
 end.

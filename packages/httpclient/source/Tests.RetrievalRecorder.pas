@@ -2,12 +2,24 @@
   URL fetches.
 
   The client-options tests use a fixture leaf whose AIA issuer, OCSP, and
-  CRL URLs all point at http://127.0.0.1:47931/. The recorder binds exactly
+  CRL URLs all point at http://127.0.0.1:6741/. The recorder binds exactly
   that port, answers every request with an uncacheable 404, and counts the
   connections it accepted, so a test can prove that a chain evaluation made
   no retrieval (zero requests) and that the same endpoint is observable when
-  retrieval is allowed (at least one request). The port is fixed because it
-  is baked into the certificate; Create raises when it is taken.
+  retrieval is allowed (at least one request).
+
+  The port is fixed because it is baked into the certificate, so it sits
+  below every supported platform's default ephemeral range: Linux
+  32768-60999, Windows and macOS 49152-65535, and FreeBSD 10000-65535.
+  Inside such a range, any outbound loopback connection a concurrent test
+  program opens can be auto-bound to the port and refuse the listener with
+  EADDRINUSE, and SO_REUSEADDR cannot override a socket that lacks it. 6741
+  is also unassigned by IANA and clear of common unregistered services. A
+  host can still make it unavailable: an existing listener, an explicit
+  Windows port exclusion or persistent reservation, or an ephemeral range
+  reconfigured below it (Windows, Linux, and macOS all allow that). Create
+  retries a bind refused with EADDRINUSE for a bounded time, then raises
+  with the operating-system error.
 
   BSD sockets on Unix and WinSock2 on Windows. }
 
@@ -24,7 +36,9 @@ uses
   {$IFDEF MSWINDOWS}, WinSock2 {$ENDIF};
 
 const
-  RETRIEVAL_RECORDER_PORT = 47931;
+  RETRIEVAL_RECORDER_PORT = 6741;
+  { How long Create retries a bind refused because the port is in use. }
+  RETRIEVAL_RECORDER_BIND_MILLISECONDS = 5000;
 
 type
   ERetrievalRecorderError = class(Exception);
@@ -112,16 +126,90 @@ begin
   {$ENDIF}
 end;
 
-constructor TRetrievalRecorder.Create;
-{$IFDEF MSWINDOWS}
+function LastRecorderSocketError: Integer;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := WinSock2.WSAGetLastError;
+  {$ELSE}
+  Result := SocketError;
+  {$ENDIF}
+end;
+
+function RecorderAddressInUse(const AError: Integer): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := AError = WSAEADDRINUSE;
+  {$ELSE}
+  Result := AError = ESysEADDRINUSE;
+  {$ENDIF}
+end;
+
+{ Opens a listener on 127.0.0.1:RETRIEVAL_RECORDER_PORT. On failure it
+  returns False with the socket closed, the failing call in AStage and its
+  operating-system error in AError. }
+function OpenRecorderListener(out ASocket: TSocket; out AStage: string;
+  out AError: Integer): Boolean;
 var
+  {$IFDEF MSWINDOWS}
   Address: TSockAddrIn;
-  WSAData: TWSAData;
-{$ELSE}
-var
+  {$ELSE}
   Address: TInetSockAddr;
   ReuseAddress: LongInt;
-{$ENDIF}
+  {$ENDIF}
+begin
+  Result := False;
+  AError := 0;
+  AStage := 'socket()';
+  {$IFDEF MSWINDOWS}
+  ASocket := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
+  {$ELSE}
+  ASocket := FpSocket(AF_INET, SOCK_STREAM, 0);
+  {$ENDIF}
+  if not RecorderSocketValid(ASocket) then
+  begin
+    AError := LastRecorderSocketError;
+    ASocket := INVALID_RECORDER_SOCKET;
+    Exit;
+  end;
+  FillChar(Address, SizeOf(Address), 0);
+  Address.sin_family := AF_INET;
+  AStage := 'bind()';
+  {$IFDEF MSWINDOWS}
+  Address.sin_port := WinSock2.htons(RETRIEVAL_RECORDER_PORT);
+  Address.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+  if WinSock2.bind(ASocket, PSockAddr(@Address), SizeOf(Address)) = 0 then
+  begin
+    AStage := 'listen()';
+    Result := WinSock2.listen(ASocket, 16) = 0;
+  end;
+  {$ELSE}
+  { Reruns must not trip over the previous run's TIME_WAIT connections. }
+  ReuseAddress := 1;
+  FpSetSockOpt(ASocket, SOL_SOCKET, SO_REUSEADDR, @ReuseAddress,
+    SizeOf(ReuseAddress));
+  Address.sin_port := HToNs(RETRIEVAL_RECORDER_PORT);
+  Address.sin_addr := StrToNetAddr('127.0.0.1');
+  if FpBind(ASocket, @Address, SizeOf(Address)) = 0 then
+  begin
+    AStage := 'listen()';
+    Result := FpListen(ASocket, 16) = 0;
+  end;
+  {$ENDIF}
+  if not Result then
+  begin
+    AError := LastRecorderSocketError;
+    CloseRecorderSocket(ASocket);
+  end;
+end;
+
+constructor TRetrievalRecorder.Create;
+var
+  Attempts, ErrorCode: Integer;
+  Stage: string;
+  StartedAt: QWord;
+  {$IFDEF MSWINDOWS}
+  WSAData: TWSAData;
+  {$ENDIF}
 begin
   inherited Create(True);
   FreeOnTerminate := False;
@@ -132,32 +220,26 @@ begin
   if WinSock2.WSAStartup($0202, WSAData) <> 0 then
     raise ERetrievalRecorderError.Create('WSAStartup failed');
   FWinSockStarted := True;
-  FListenSocket := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
-  {$ELSE}
-  FListenSocket := FpSocket(AF_INET, SOCK_STREAM, 0);
   {$ENDIF}
-  if not RecorderSocketValid(FListenSocket) then
-    raise ERetrievalRecorderError.Create('retrieval recorder socket() failed');
-  FillChar(Address, SizeOf(Address), 0);
-  Address.sin_family := AF_INET;
-  {$IFDEF MSWINDOWS}
-  Address.sin_port := WinSock2.htons(RETRIEVAL_RECORDER_PORT);
-  Address.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
-  if (WinSock2.bind(FListenSocket, PSockAddr(@Address), SizeOf(Address)) <> 0)
-     or (WinSock2.listen(FListenSocket, 16) <> 0) then
-  {$ELSE}
-  { Reruns must not trip over the previous run's TIME_WAIT connections. }
-  ReuseAddress := 1;
-  FpSetSockOpt(FListenSocket, SOL_SOCKET, SO_REUSEADDR, @ReuseAddress,
-    SizeOf(ReuseAddress));
-  Address.sin_port := HToNs(RETRIEVAL_RECORDER_PORT);
-  Address.sin_addr := StrToNetAddr('127.0.0.1');
-  if (FpBind(FListenSocket, @Address, SizeOf(Address)) <> 0) or
-     (FpListen(FListenSocket, 16) <> 0) then
-  {$ENDIF}
-    raise ERetrievalRecorderError.CreateFmt(
-      'retrieval recorder could not listen on 127.0.0.1:%d; the port is ' +
-      'baked into the fixture certificate', [RETRIEVAL_RECORDER_PORT]);
+  { Another process can hold the port briefly, for example a loopback
+    connection that is closing; only that error is worth waiting out. }
+  Attempts := 0;
+  StartedAt := GetTickCount64;
+  repeat
+    Inc(Attempts);
+    if OpenRecorderListener(FListenSocket, Stage, ErrorCode) then
+      Break;
+    if (Stage <> 'bind()') or not RecorderAddressInUse(ErrorCode) or
+       (GetTickCount64 - StartedAt >= RETRIEVAL_RECORDER_BIND_MILLISECONDS) then
+      raise ERetrievalRecorderError.CreateFmt(
+        'retrieval recorder could not listen on 127.0.0.1:%d (the port is ' +
+        'baked into the fixture certificate): %s failed with error %d (%s) ' +
+        'after %d attempt(s) in %d ms',
+        [RETRIEVAL_RECORDER_PORT, Stage, ErrorCode,
+         SysErrorMessage(ErrorCode), Attempts,
+         GetTickCount64 - StartedAt]);
+    Sleep(100);
+  until False;
   Start;
 end;
 

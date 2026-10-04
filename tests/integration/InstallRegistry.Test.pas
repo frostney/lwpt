@@ -19,8 +19,10 @@ uses
   LWPT.Core,
   LWPT.ProducerLease,
   LWPT.Registry.Consumer,
+  LWPT.Registry.ConsumerStore,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.PayloadHandoff,
   Tests.RegistryConsumer,
   Tests.Scratch,
   Tests.TarSynth;
@@ -127,10 +129,29 @@ type
     procedure TestDecision8RejectsForgedSignature;
     procedure TestFirstInstallRollsBackAfterLockWrite;
     procedure TestProofReplacementAndPruningRollBack;
+    procedure TestDeepProjectRetainsProofsPastMaxPath;
     procedure TestLockFloorNeverReachesPerUserState;
     procedure TestLaggingMirrorLackingHistoryIsStale;
     procedure TestEarlierOriginAdvanceSurvivesLaterFailure;
+    procedure TestConcurrentProcessesMergeSharedState;
+    procedure TestOfflineRestoreSurvivesEvictionPressure;
+    procedure TestInvalidStateBudgetFailsBeforeRequests;
+    procedure TestRepairReportsDocumentStore;
   end;
+
+  { One install process run from a test thread, so two can overlap. }
+  TInstallProcess = class(TThread)
+  protected
+    procedure Execute; override;
+  public
+    Project, Error: string;
+    Environment: array of string;
+    Run: TLwptResult;
+  end;
+
+const
+  { Win32 MAX_PATH, including the terminating NUL. }
+  LEGACY_WINDOWS_MAX_PATH = 260;
 
 function ReadText(const APath: string): string;
 begin
@@ -1728,6 +1749,146 @@ begin
   end;
 end;
 
+{ Issue #347: replacing committed registry proofs copies them below the
+  journaled rollback root as .lwpt/tmp/install-transaction.<..>/
+  rollback-p.<..>/sha256/<64 hex>.toml, about 160 characters below the
+  project root. The project root here is padded so that copy passes the
+  Win32 MAX_PATH ceiling while extraction, which keeps that ceiling by
+  design, still fits. A halt after retention leaves the copy on disk, so
+  its length is measured rather than assumed; repair then restores from it
+  and a clean install replaces the proofs through it. Per-user state and
+  the cache stay shallow: only project-owned state is deep. }
+procedure TInstallRegistry.TestDeepProjectRetainsProofsPastMaxPath;
+const
+  PROJECT_PATH_LENGTH = 130;
+  HALT_EXIT_CODE = 89;
+  RUN_TIMEOUT_MILLISECONDS = 180000;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Project, Before, Longest, Proof, LiveProofs: string;
+  Remaining: Integer;
+  Run: TLwptResult;
+
+  function RunDeep(const AArguments, AEnvironment: array of string): TLwptResult;
+  var Environment: array of string; Index: Integer;
+  begin
+    SetLength(Environment, 2 + Length(AEnvironment));
+    Environment[0] := PROJECT_NAME + '_REGISTRY_STATE_DIR=' + CaseRoot
+      + '/state';
+    Environment[1] := PROJECT_NAME + '_CACHE_DIR=' + CaseRoot + '/cache';
+    for Index := 0 to High(AEnvironment) do
+      Environment[2 + Index] := AEnvironment[Index];
+    Result := RunLwptTesting(AArguments, Project, Environment,
+      RUN_TIMEOUT_MILLISECONDS);
+    Expect<Boolean>(Result.TimedOut).ToBe(False);
+  end;
+
+  { Lock, cfg, modules and archives (with the committed proofs). }
+  function ProjectState: string;
+  begin
+    Result := SHA256File(Project + '/lwpt.lock')
+      + '|' + SHA256File(Project + '/lwpt.cfg')
+      + '|' + HashTree(Project + '/.lwpt/modules')
+      + '|' + HashTree(Project + '/.lwpt/archives');
+  end;
+
+  { The longest file path below ADirectory, walked with the Core helpers:
+    the RTL enumeration cannot reach past MAX_PATH on Windows. }
+  function LongestFile(const ADirectory: string): string;
+  var Entries: TLWPTDirectoryEntries; i: Integer; Candidate: string;
+  begin
+    Result := '';
+    Entries := ListDirectoryEntries(ADirectory, '*', faAnyFile);
+    for i := 0 to High(Entries) do
+    begin
+      if (Entries[i].Attr and faDirectory) <> 0 then
+        Candidate := LongestFile(ADirectory + '/' + Entries[i].Name)
+      else
+        Candidate := ADirectory + '/' + Entries[i].Name;
+      if Length(Candidate) > Length(Result) then Result := Candidate;
+    end;
+  end;
+
+begin
+  CaseRoot := NewCase('deep-proofs');
+  Project := ExpandFileName(CaseRoot + '/project');
+  Expect<Boolean>(Length(Project) + 2 < PROJECT_PATH_LENGTH).ToBe(True);
+  repeat
+    Remaining := PROJECT_PATH_LENGTH - Length(Project) - 1;
+    if Remaining < 1 then Break;
+    if Remaining > 48 then Remaining := 48;
+    Project := Project + '/' + StringOfChar('p', Remaining);
+  until False;
+  Expect<Boolean>(Length(Project) >= PROJECT_PATH_LENGTH - 1).ToBe(True);
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    try
+      LongPathForceDirectories(Project + '/source');
+      WriteTextFile(Project + '/source/main.pas',
+        'program main;'#10 + '{$mode delphi}{$H+}'#10 + 'begin end.'#10);
+      Registry.AddPackage('json', '1.0.0',
+        RegistryPackageArchive('json', '1.0.0'), []);
+      Window(Registry);
+      WriteTextFile(Project + '/lwpt.toml', '[package]'#10
+        + 'name = "consumer"'#10 + 'version = "1.0.0"'#10
+        + 'units = ["source"]'#10
+        + Declaration('corp', Registry, Origin.BaseURL, [])
+        + '[dependencies]'#10 + 'json = "registry:json@^1.0.0"'#10);
+      ExpectSuccess('deep baseline', RunDeep(['install'], []));
+      Before := ProjectState;
+
+      { A new selection replaces the committed proof set. }
+      Registry.AddPackage('json', '1.1.0',
+        RegistryPackageArchive('json', '1.1.0'), []);
+      Window(Registry);
+      Run := RunDeep(['install'],
+        [PROJECT_NAME + '_TEST_HALT_AFTER_PROOF_RETAIN=1']);
+      if Run.ExitCode <> HALT_EXIT_CODE then
+        WriteLn('--- deep halt ---'#10, Output(Run), '---');
+      Expect<Integer>(Run.ExitCode).ToBe(HALT_EXIT_CODE);
+      Longest := LongestFile(Project + '/.' + PROGRAM_NAME + '/tmp');
+      WriteLn('  deepest retained path: ', Length(Longest), ' characters');
+      Expect<Boolean>(Length(Longest) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+      Expect<Boolean>(Pos('rollback-p', Longest) > 0).ToBe(True);
+      Expect<string>(ExtractFileExt(Longest)).ToBe('.toml');
+      { A proof document is named by its own hash. }
+      Expect<string>(SHA256File(Longest))
+        .ToBe(Copy(ExtractFileName(Longest), 1, 64));
+
+      { Damage the live proof set, so only a restore from the retained copy
+        past MAX_PATH can bring the baseline back. }
+      LiveProofs := Project + '/.' + PROGRAM_NAME
+        + '/archives/registry-proofs/sha256/';
+      WriteTextFile(LiveProofs + ExtractFileName(Longest), 'damaged'#10);
+      WriteTextFile(LiveProofs + StringOfChar('0', 64) + '.toml', 'extra'#10);
+      Expect<Boolean>(ProjectState <> Before).ToBe(True);
+
+      ExpectSuccess('deep repair', RunDeep(['repair'], []));
+      Expect<string>(ProjectState).ToBe(Before);
+      Expect<string>(LongestFile(Project + '/.' + PROGRAM_NAME + '/tmp'))
+        .ToBe('');
+
+      ExpectSuccess('deep replacement', RunDeep(['install'], []));
+      Expect<string>(EntryField(ReadText(Project + '/lwpt.lock'), 'json',
+        'resolvedRef')).ToBe('1.1.0');
+      Proof := Project + '/.' + PROGRAM_NAME
+        + '/archives/registry-proofs/sha256/'
+        + Copy(Registry.RecordHash('json', '1.1.0'), 8, 64) + '.toml';
+      Expect<Boolean>(LongPathFileExists(Proof)).ToBe(True);
+      Expect<string>(LongestFile(Project + '/.' + PROGRAM_NAME + '/tmp'))
+        .ToBe('');
+    finally
+      { The RTL scratch cleanup cannot remove a tree past MAX_PATH. }
+      if LongPathDirectoryExists(CaseRoot + '/project') then
+        WipeDir(CaseRoot + '/project');
+    end;
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
 procedure TInstallRegistry.TestProofReplacementAndPruningRollBack;
 var
   Registry: TSyntheticRegistry;
@@ -1905,6 +2066,352 @@ begin
   end;
 end;
 
+{ ---------------------------------------------------------------------------
+  Per-user document store: shared merges and eviction (#345)
+  --------------------------------------------------------------------------- }
+
+const
+  { The subprocess watchdog: RunLwptTesting terminates a child that runs
+    longer, so every wait below is bounded. }
+  CONCURRENT_INSTALL_MILLISECONDS = 3 * 60 * 1000;
+  CONCURRENT_WAIT_MILLISECONDS = CONCURRENT_INSTALL_MILLISECONDS + 30 * 1000;
+
+procedure TInstallProcess.Execute;
+begin
+  try
+    Run := RunLwptTesting(['install'], Project, Environment,
+      CONCURRENT_INSTALL_MILLISECONDS);
+  except
+    on E: Exception do Error := E.Message;
+  end;
+end;
+
+function StartInstall(const AProject: string;
+  const AEnvironment: array of string): TInstallProcess;
+var Index: Integer;
+begin
+  Result := TInstallProcess.Create(True);
+  Result.Project := AProject;
+  SetLength(Result.Environment, Length(AEnvironment));
+  for Index := 0 to High(AEnvironment) do
+    Result.Environment[Index] := AEnvironment[Index];
+  Result.Start;
+end;
+
+{ True when AProcess ended within the bounded wait. A process that did not
+  is left running rather than freed. }
+function AwaitFinished(AProcess: TInstallProcess): Boolean;
+var StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while not AProcess.Finished
+     and (GetTickCount64 - StartedAt < CONCURRENT_WAIT_MILLISECONDS) do
+    Sleep(20);
+  Result := AProcess.Finished;
+end;
+
+{ Waits for APath's completion marker, or for AProcess to end first. }
+function AwaitPayload(const APath: string; AProcess: TInstallProcess): Boolean;
+var StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while not PayloadIsReadable(APath) and not AProcess.Finished
+     and (GetTickCount64 - StartedAt < 120 * 1000) do
+    Sleep(20);
+  Result := PayloadIsReadable(APath);
+end;
+
+{ The value of AKey in a lock's single [registry."<identity>"] table. }
+function LockTableValue(const ALock, AKey: string): string;
+var Rest: string; Start: Integer;
+begin
+  Rest := StringReplace(ALock, #13#10, #10, [rfReplaceAll]);
+  Start := Pos(#10 + AKey + ' = "', Rest);
+  if Start = 0 then Exit('');
+  Rest := Copy(Rest, Start + Length(AKey) + 5, MaxInt);
+  Result := Copy(Rest, 1, Pos('"', Rest) - 1);
+end;
+
+function PlantOrphan(const AStateRoot, ALabel: string; const ASize: Integer): string;
+var Bytes: TBytes;
+begin
+  Bytes := BytesOf(ALabel + StringOfChar('.', ASize - Length(ALabel)));
+  Result := SHA256BytesPrefixed(Bytes);
+  ForceDirectories(RegistryStateDocumentsDirectory(AStateRoot));
+  WriteBytesToFile(RegistryStateDocumentPath(AStateRoot, Result), Bytes);
+end;
+
+function StoreHolds(const AStateRoot, AHash: string): Boolean;
+begin
+  Result := LoadRegistryStateDocument(AStateRoot, AHash) <> nil;
+end;
+
+function DirectoryIsEmpty(const APath: string): Boolean;
+var Entry: TSearchRec;
+begin
+  Result := True;
+  if FindFirst(APath + '/*', faAnyFile, Entry) <> 0 then Exit;
+  try
+    repeat
+      if (Entry.Name <> '.') and (Entry.Name <> '..') then Exit(False);
+    until FindNext(Entry) <> 0;
+  finally
+    FindClose(Entry);
+  end;
+end;
+
+procedure TInstallRegistry.TestConcurrentProcessesMergeSharedState;
+var
+  First, Second: TSyntheticRegistry;
+  FirstOrigin, SecondOrigin: TSyntheticContact;
+  FirstCase, SecondCase, State, Signals, Orphan, Lock, HeldBy, WaitingBy: string;
+  Holder, Waiter: TInstallProcess;
+  Loaded: TLWPTRegistryConsumerState;
+  Released: Boolean;
+
+  procedure ExpectLockedDocumentsStored(const ACase, AName: string);
+  begin
+    Lock := LockText(ACase);
+    Expect<Boolean>(StoreHolds(State, LockTableValue(Lock, 'checkpoint'))).ToBe(True);
+    Expect<Boolean>(StoreHolds(State, LockTableValue(Lock, 'signature'))).ToBe(True);
+    Expect<Boolean>(StoreHolds(State, LockTableValue(Lock, 'snapshot'))).ToBe(True);
+    Expect<Boolean>(StoreHolds(State, EntryField(Lock, AName, 'registryRecord')))
+      .ToBe(True);
+  end;
+
+begin
+  FirstCase := NewCase('concurrent-first');
+  SecondCase := NewCase('concurrent-second');
+  State := FirstCase + '/state';
+  Signals := FirstCase + '/signals';
+  First := NewRegistry(IDENTITY, FirstOrigin);
+  Second := NewRegistry(OTHER_IDENTITY, SecondOrigin, 9);
+  Holder := nil;
+  Waiter := nil;
+  Released := False;
+  try
+    First.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(First);
+    Second.AddPackage('http', '1.0.0', RegistryPackageArchive('http', '1.0.0'), []);
+    Window(Second);
+    WriteProject(FirstCase, Declaration('corp', First, FirstOrigin.BaseURL, []),
+      'json = "registry:json"'#10);
+    WriteProject(SecondCase, Declaration('corp', Second, SecondOrigin.BaseURL, []),
+      'http = "registry:http"'#10);
+    { Evictable, and evicted by whichever process passes first. }
+    Orphan := PlantOrphan(State, 'orphan', 4096);
+    try
+      { Two independent processes share one per-user state directory, each
+        merging a different origin under a zero budget. The first holds the
+        store lease inside its merge until the second is seen waiting. }
+      Holder := StartInstall(FirstCase + '/project',
+        [PROJECT_NAME + '_REGISTRY_STATE_DIR=' + State,
+         PROJECT_NAME + '_CACHE_DIR=' + FirstCase + '/cache',
+         REGISTRY_STATE_MAX_BYTES_ENV + '=0',
+         PROJECT_NAME + '_TEST_REGISTRY_STATE_HOLD=' + Signals + '/first']);
+      Expect<Boolean>(AwaitPayload(Signals + '/first/held', Holder)).ToBe(True);
+      HeldBy := ReadPayloadText(Signals + '/first/held');
+      Waiter := StartInstall(SecondCase + '/project',
+        [PROJECT_NAME + '_REGISTRY_STATE_DIR=' + State,
+         PROJECT_NAME + '_CACHE_DIR=' + SecondCase + '/cache',
+         REGISTRY_STATE_MAX_BYTES_ENV + '=0',
+         PROJECT_NAME + '_TEST_REGISTRY_STATE_CONTENDED=' + Signals + '/second']);
+      Expect<Boolean>(AwaitPayload(Signals + '/second/waiting', Waiter)).ToBe(True);
+      WaitingBy := ReadPayloadText(Signals + '/second/waiting');
+      Expect<Boolean>(StrToIntDef(HeldBy, 0) > 0).ToBe(True);
+      Expect<Boolean>(StrToIntDef(WaitingBy, 0) > 0).ToBe(True);
+      Expect<Boolean>(HeldBy <> WaitingBy).ToBe(True);
+      { The second origin's state is written only under the store lease. }
+      Expect<Boolean>(FileExists(RegistryStatePathAt(State, OTHER_IDENTITY,
+        Second.KeyID))).ToBe(False);
+      Expect<Boolean>(Holder.Finished).ToBe(False);
+      PublishPayloadCompletion(Signals + '/first/release');
+      Released := True;
+      Expect<Boolean>(AwaitFinished(Holder)).ToBe(True);
+      Expect<Boolean>(AwaitFinished(Waiter)).ToBe(True);
+      Expect<string>(Holder.Error).ToBe('');
+      Expect<string>(Waiter.Error).ToBe('');
+      Expect<Boolean>(Holder.Run.TimedOut).ToBe(False);
+      Expect<Boolean>(Waiter.Run.TimedOut).ToBe(False);
+      ExpectSuccess('holding install', Holder.Run);
+      ExpectSuccess('waiting install', Waiter.Run);
+    finally
+      if not Released then PublishPayloadCompletion(Signals + '/first/release');
+      if (Holder <> nil) and AwaitFinished(Holder) then Holder.Free;
+      if (Waiter <> nil) and AwaitFinished(Waiter) then Waiter.Free;
+    end;
+    Expect<Boolean>(LoadRegistryConsumerStateAt(State, IDENTITY, First.KeyID,
+      Loaded)).ToBe(True);
+    Expect<Int64>(Loaded.State.Sequence).ToBe(1);
+    Expect<Boolean>(LoadRegistryConsumerStateAt(State, OTHER_IDENTITY,
+      Second.KeyID, Loaded)).ToBe(True);
+    Expect<Int64>(Loaded.State.Sequence).ToBe(1);
+    { Each origin's accepted documents survived the other's eviction. }
+    ExpectLockedDocumentsStored(FirstCase, 'json');
+    ExpectLockedDocumentsStored(SecondCase, 'http');
+    Expect<Boolean>(FileExists(RegistryStateDocumentPath(State, Orphan))).ToBe(False);
+    { Every write landed atomically: no staging file remains. }
+    Expect<Boolean>(DirectoryIsEmpty(State + '/tmp')).ToBe(True);
+  finally
+    SecondOrigin.Free;
+    Second.Free;
+    FirstOrigin.Free;
+    First.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestOfflineRestoreSurvivesEvictionPressure;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, State, Lock, Orphan, Checkpoint, Signature, Snapshot, RecordHash: string;
+  CheckpointBytes, SnapshotBytes, RecordBytes: string;
+
+  function Committed(const AHash: string): string;
+  begin
+    Result := RegistryProofPath(CaseRoot + '/project/.lwpt/archives', AHash);
+  end;
+
+begin
+  CaseRoot := NewCase('offline-eviction');
+  State := CaseRoot + '/state';
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Registry.Publish(RegistryStamp(-7200), RegistryStamp(6 * DAY));
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json@^1"'#10);
+    { First seen by the seed install, so it is the least recently used. }
+    Orphan := PlantOrphan(State, 'stale', 64 * 1024);
+    ExpectSuccess('eviction seed', Install(CaseRoot, ['install']));
+    Lock := LockText(CaseRoot);
+    Checkpoint := LockTableValue(Lock, 'checkpoint');
+    Signature := LockTableValue(Lock, 'signature');
+    Snapshot := LockTableValue(Lock, 'snapshot');
+    RecordHash := EntryField(Lock, 'json', 'registryRecord');
+    CheckpointBytes := ReadText(Committed(Checkpoint));
+    SnapshotBytes := ReadText(Committed(Snapshot));
+    RecordBytes := ReadText(Committed(RecordHash));
+    { The origin advances without changing the selection: the lock keeps its
+      older proof, whose checkpoint the per-user head now supersedes. }
+    Registry.AddPackage('other', '1.0.0', RegistryPackageArchive('other', '1.0.0'), []);
+    Window(Registry);
+    ExpectSuccess('advance under pressure', InstallWith(CaseRoot, ['install'],
+      [REGISTRY_STATE_MAX_BYTES_ENV + '=4096']));
+    Expect<Integer>(StateSequence(CaseRoot)).ToBe(2);
+    Expect<string>(LockText(CaseRoot)).ToBe(Lock);
+    { The oldest evictable document left; the lock's superseded checkpoint
+      was used by this install and fits the budget. }
+    Expect<Boolean>(FileExists(RegistryStateDocumentPath(State, Orphan))).ToBe(False);
+    Expect<Boolean>(StoreHolds(State, Checkpoint)).ToBe(True);
+    Expect<Boolean>(StoreHolds(State, Signature)).ToBe(True);
+    Expect<Boolean>(DeleteFile(Committed(Checkpoint))).ToBe(True);
+    Expect<Boolean>(DeleteFile(Committed(Snapshot))).ToBe(True);
+    Expect<Boolean>(DeleteFile(Committed(RecordHash))).ToBe(True);
+    Origin.Mode := scmFail;
+    ExpectSuccess('offline restore', Install(CaseRoot, ['install', '--offline']));
+    Expect<string>(ReadText(Committed(Checkpoint))).ToBe(CheckpointBytes);
+    Expect<string>(ReadText(Committed(Snapshot))).ToBe(SnapshotBytes);
+    Expect<string>(ReadText(Committed(RecordHash))).ToBe(RecordBytes);
+    Expect<string>(LockText(CaseRoot)).ToBe(Lock);
+    { A zero budget evicts the superseded checkpoint, never the history the
+      lock's snapshot and record lie on. }
+    Origin.Mode := scmServe;
+    ExpectSuccess('zero budget', InstallWith(CaseRoot, ['install'],
+      [REGISTRY_STATE_MAX_BYTES_ENV + '=0']));
+    Expect<Boolean>(StoreHolds(State, Checkpoint)).ToBe(False);
+    Expect<Boolean>(StoreHolds(State, Signature)).ToBe(False);
+    Expect<Boolean>(StoreHolds(State, Snapshot)).ToBe(True);
+    Expect<Boolean>(StoreHolds(State, RecordHash)).ToBe(True);
+    Expect<Boolean>(DeleteFile(Committed(Snapshot))).ToBe(True);
+    Expect<Boolean>(DeleteFile(Committed(RecordHash))).ToBe(True);
+    Origin.Mode := scmFail;
+    ExpectSuccess('offline restore after a zero budget', Install(CaseRoot,
+      ['install', '--offline']));
+    Expect<string>(ReadText(Committed(Snapshot))).ToBe(SnapshotBytes);
+    Expect<string>(ReadText(Committed(RecordHash))).ToBe(RecordBytes);
+    Expect<string>(LockText(CaseRoot)).ToBe(Lock);
+    ExpectSuccess('frozen after restore', Install(CaseRoot, ['install', '--frozen']));
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestInvalidStateBudgetFailsBeforeRequests;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Before: string;
+begin
+  CaseRoot := NewCase('invalid-budget');
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    Before := Fingerprint(CaseRoot);
+    ExpectFailure(InstallWith(CaseRoot, ['install'],
+      [REGISTRY_STATE_MAX_BYTES_ENV + '=64MiB']), REGISTRY_STATE_MAX_BYTES_ENV
+      + ' must be an integer from 0 through');
+    Expect<Integer>(Origin.Requests).ToBe(0);
+    ExpectUnchanged(CaseRoot, Before);
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
+procedure TInstallRegistry.TestRepairReportsDocumentStore;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, State, Orphan, Before, Text: string;
+  Run: TLwptResult;
+begin
+  CaseRoot := NewCase('repair-store');
+  State := CaseRoot + '/state';
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    Registry.AddPackage('json', '1.0.0', RegistryPackageArchive('json', '1.0.0'), []);
+    Window(Registry);
+    WriteProject(CaseRoot, Declaration('corp', Registry, Origin.BaseURL, []),
+      'json = "registry:json"'#10);
+    ExpectSuccess('repair seed', Install(CaseRoot, ['install']));
+    Orphan := PlantOrphan(State, 'orphan', 1000);
+    WriteTextFile(RegistryStateDocumentsDirectory(State) + '/README', 'foreign');
+    Before := TreeFingerprint(State);
+    Run := InstallWith(CaseRoot, ['repair'],
+      [PROJECT_NAME + '_WORKER_STATE_DIR=' + CaseRoot + '/workers']);
+    ExpectSuccess('repair report', Run);
+    Text := Output(Run);
+    { The seed stored a checkpoint, its signature, a snapshot, and a record. }
+    Expect<Boolean>(Pos('per-user registry document store ' + ExpandFileName(State)
+      + ' holds 5 document(s), ', Text) > 0).ToBe(True);
+    Expect<Boolean>(Pos('for 1 origin state file(s)', Text) > 0).ToBe(True);
+    Expect<Boolean>(Pos('repair: 4 live document(s) (', Text) > 0).ToBe(True);
+    Expect<Boolean>(Pos('; 1 evictable (1000 byte(s)) under a budget of 67108864 '
+      + 'byte(s) (' + REGISTRY_STATE_MAX_BYTES_ENV + ')', Text) > 0).ToBe(True);
+    Expect<Boolean>(Pos('ignored 1 foreign entry(ies)', Text) > 0).ToBe(True);
+    Expect<Boolean>(Pos('removed nothing from per-user registry state', Text) > 0)
+      .ToBe(True);
+    { Repair is read-only here, even beyond the budget. }
+    Run := InstallWith(CaseRoot, ['repair'],
+      [PROJECT_NAME + '_WORKER_STATE_DIR=' + CaseRoot + '/workers',
+       REGISTRY_STATE_MAX_BYTES_ENV + '=0']);
+    ExpectSuccess('repair under a zero budget', Run);
+    Expect<string>(TreeFingerprint(State)).ToBe(Before);
+    Expect<Boolean>(FileExists(RegistryStateDocumentPath(State, Orphan))).ToBe(True);
+    ExpectFailure(InstallWith(CaseRoot, ['repair'],
+      [PROJECT_NAME + '_WORKER_STATE_DIR=' + CaseRoot + '/workers',
+       REGISTRY_STATE_MAX_BYTES_ENV + '=-1']), 'registry_state_budget_invalid');
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
 procedure TInstallRegistry.SetupTests;
 begin
   Test('#62: a dependency selects a protocol-v1 origin explicitly',
@@ -1998,6 +2505,8 @@ begin
     TestFirstInstallRollsBackAfterLockWrite);
   Test('rollback: proof replacement and pruning are restored on failure',
     TestProofReplacementAndPruningRollBack);
+  Test('a deep project retains, restores and replaces proofs past MAX_PATH',
+    TestDeepProjectRetainsProofsPastMaxPath);
   Test('an unsigned lock floor never reaches per-user state',
     TestLockFloorNeverReachesPerUserState);
   Test('#55: a lagging contact lacking newer history is stale, with a healthy '
@@ -2005,6 +2514,15 @@ begin
   Test('per-user state failure contract: an earlier origin''s authenticated '
     + 'advance survives a later origin''s failure',
     TestEarlierOriginAdvanceSurvivesLaterFailure);
+  Test('#345: two install processes merge one per-user state directory under '
+    + 'the store lease, and neither evicts the other''s accepted documents',
+    TestConcurrentProcessesMergeSharedState);
+  Test('#345: --offline restores locked proof documents from the store after '
+    + 'eviction pressure', TestOfflineRestoreSurvivesEvictionPressure);
+  Test('#345: an invalid document budget fails before any request',
+    TestInvalidStateBudgetFailsBeforeRequests);
+  Test('#345: repair reports the document store and removes nothing',
+    TestRepairReportsDocumentStore);
 end;
 
 begin

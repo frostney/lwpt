@@ -51,17 +51,10 @@ type
     procedure MirrorStartProvesListenerOwnership;
   end;
 
+{ Shares the file with a live origin's atomic renames; see ReadBinaryFile. }
 function ReadBytes(const APath: string): TBytes;
-var
-  Stream: TFileStream;
 begin
-  Stream := TFileStream.Create(APath, fmOpenRead);
-  try
-    SetLength(Result, Stream.Size);
-    if Length(Result) > 0 then Stream.ReadBuffer(Result[0], Length(Result));
-  finally
-    Stream.Free;
-  end;
+  Result := BytesOf(ReadBinaryFile(APath));
 end;
 
 function Text(const ABytes: TBytes): string;
