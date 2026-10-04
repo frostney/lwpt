@@ -35,7 +35,8 @@ uses
   LWPT.Core,
   LWPT.ProcessRunner,
   LWPT.ProcessTree,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  Tests.ProcessSupport;
 
 const
   ReportGroupSwitch = '--process-tree-report-group';
@@ -139,8 +140,7 @@ begin
     AResult.Stdout := AResult.Stdout + DrainPipe(P.Output);
     if GetTickCount64 - StartedAt >= ShutdownChildTimeoutMilliseconds then
     begin
-      P.Terminate(255);
-      P.WaitOnExit;
+      TerminateChildProcess(P, AResult.Stdout, AResult.Stderr);
       AResult.ErrorMessage := Format(
         'shutdown child did not exit within %d ms; output: %s',
         [ShutdownChildTimeoutMilliseconds, AResult.Stdout]);
@@ -309,11 +309,7 @@ begin
       except
         on E: Exception do CancelFailure := E.Message;
       end;
-      if P.Running then
-      begin
-        P.Terminate(255);
-        P.WaitOnExit;
-      end;
+      if P.Running then TerminateChildProcess(P);
       Expect<string>(CancelFailure).ToBe('');
       Expect<Integer>(NormalisedExitCode(P)).ToBe(WindowsControlExitCode);
     finally

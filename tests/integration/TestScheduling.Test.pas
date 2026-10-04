@@ -48,6 +48,12 @@ const
   MarkerWaitCeilingSeconds = 5;
   ProcessExitCeilingSeconds = 8;
   ProcessStartupCeilingSeconds = 10;
+  { Bound on a direct child that a test or fixture reaps while the test
+    drives its termination; it outlasts every termination wait below. }
+  ProcessReapCeilingSeconds = 60;
+  { Bound on the nested build a cancellation fixture waits for; the bail
+    under test ends that fixture long before. }
+  NestedFixtureWaitMilliseconds = 120000;
   WindowsControllerCompletionCeilingSeconds =
     ProcessStartupCeilingSeconds + ProcessExitCeilingSeconds + 2;
   ProcessCaptureOverflowBytes = 16 * 1024 * 1024 + 64 * 1024;
@@ -240,7 +246,23 @@ end;
 
 procedure TProcessWaitThread.Execute;
 begin
-  FProcess.WaitOnExit;
+  { Running reaps the child, polled against a deadline. }
+  WaitForChildExit(FProcess, QWord(ProcessReapCeilingSeconds) * 1000);
+end;
+
+{ Cleanup for a child that runs under a process tree: the tree's bounded
+  termination ends its descendants, then the direct child is ended and
+  reaped, bounded, in case the tree could not. }
+procedure EndChildProcessTree(const ATree: TLWPTProcessTree;
+  const AChild: TProcess);
+begin
+  if Assigned(ATree) and (AChild.ProcessID > 0) then
+    try
+      ATree.Terminate;
+    except
+      { The direct child's termination below is the fallback. }
+    end;
+  TerminateChildProcess(AChild);
 end;
 
 constructor TBlockingProcess.Create;
@@ -1263,7 +1285,7 @@ begin
     + '{$mode delphi}{$H+}'#10
     + 'uses Process, SysUtils;'#10
     + 'var Child: TProcess; Entry: string; Index: Integer;'#10
-    + '  MarkerFile: Text;'#10
+    + '  MarkerFile: Text; StartedAt: QWord;'#10
     + 'begin'#10
     + '  if FileExists('
     + PascalString(FScratch + '/control/' + FixtureSetupModeName) + ') then'#10
@@ -1318,7 +1340,10 @@ begin
     + PascalString(ProcessTreeProxyPIDFileEnvironment + '=' + PIDFile)
     + ');'#10
     + '    Child.Execute;'#10
-    + '    Child.WaitOnExit;'#10
+    + '    StartedAt := GetTickCount64;'#10
+    + '    while Child.Running and (GetTickCount64 - StartedAt < '
+    + IntToStr(NestedFixtureWaitMilliseconds) + ') do'#10
+    + '      Sleep(10);'#10
     + '  finally'#10
     + '    Child.Free;'#10
     + '  end;'#10
@@ -1557,7 +1582,7 @@ begin
     begin
       if WaitThreadStarted and not ChildReaped then
         JoinWaitThreadAfterBoundedExit
-      else if Child.Running then Child.Terminate(1);
+      else if not WaitThreadStarted then EndChildProcessTree(ChildTree, Child);
       WaitThread.Free;
       ChildTree.Free;
       Child.Free;
@@ -1672,7 +1697,7 @@ begin
     begin
       WaitThread.Free;
       WaitThread := nil;
-      if Child.Running then Child.Terminate(1);
+      EndChildProcessTree(ChildTree, Child);
     end;
     ChildTree.Free;
     Child.Free;
@@ -1730,14 +1755,15 @@ begin
     Expect<string>(BlockerThread.ErrorMessage).ToBe('');
     Expect<string>(ManagedThread.ErrorMessage).ToBe('');
     Expect<Boolean>(ManagedProcess.Entered).ToBe(True);
-    ManagedProcess.WaitOnExit;
+    Expect<Boolean>(WaitForChildExit(ManagedProcess,
+      QWord(ProcessExitCeilingSeconds) * 1000)).ToBe(True);
     Expect<Boolean>(PayloadIsReadable(Marker)).ToBe(True);
   finally
     Blocker.Release;
     if BlockerThreadStarted then BlockerThread.WaitFor;
     if ManagedThreadStarted then ManagedThread.WaitFor;
-    if ManagedThreadStarted and ManagedProcess.Running then
-      ManagedProcess.Terminate(1);
+    if ManagedThreadStarted then
+      EndChildProcessTree(ManagedTree, ManagedProcess);
     BlockerThread.Free;
     ManagedThread.Free;
     ManagedTree.Free;
@@ -1753,7 +1779,6 @@ var
   ChildTree: TLWPTProcessTree;
   Environment: array of string;
   Marker: string;
-  Started: TDateTime;
 begin
   Marker := FScratch + '/control/clean-acknowledgement-exit';
   SetLength(Environment, 2);
@@ -1766,12 +1791,9 @@ begin
     Child.Executable := ExpandFileName(ParamStr(0));
     ConfigureProcessEnvironment(Child, Environment);
     ChildTree.Execute;
-    Started := Now;
-    while Child.Running and ((Now - Started) * SecondsPerDay
-      < ProcessExitCeilingSeconds) do Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(Child.Running).ToBe(False);
-    Child.WaitOnExit;
-    Expect<Integer>(Child.ExitStatus).ToBe(0);
+    Expect<Boolean>(WaitForChildExit(Child,
+      QWord(ProcessExitCeilingSeconds) * 1000)).ToBe(True);
+    Expect<Integer>(ChildProcessExitCode(Child)).ToBe(0);
     Expect<Boolean>(PayloadIsReadable(Marker)).ToBe(True);
 
     TLWPTProcessTree.NewTerminationDeadlines(DescendantDeadline,
@@ -1780,7 +1802,7 @@ begin
       AcknowledgementDeadline);
     ChildTree.CompleteTermination;
   finally
-    if Child.Running then Child.Terminate(1);
+    EndChildProcessTree(ChildTree, Child);
     ChildTree.Free;
     Child.Free;
   end;
@@ -2073,13 +2095,9 @@ begin
     Expect<Boolean>(PayloadIsReadable(PIDFile)).ToBe(True);
     CompilerPID := StrToInt(Trim(ReadPayloadText(PIDFile)));
     Expect<Integer>(FpKill(Process.ProcessID, ASignal)).ToBe(0);
-    Started := Now;
-    while Process.Running
-      and ((Now - Started) * SecondsPerDay
-        < ProcessExitCeilingSeconds) do
-      Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(Process.Running).ToBe(False);
-    Process.WaitOnExit;
+    Expect<Boolean>(WaitForChildExit(Process,
+      QWord(ProcessExitCeilingSeconds) * 1000)).ToBe(True);
+    { The raw wait status: LWPT re-raises the forwarded signal. }
     Expect<Integer>(Process.ExitStatus).ToBe(ASignal);
     Expect<Boolean>(ProcessIsRunning(CompilerPID)).ToBe(False);
   finally
@@ -2135,8 +2153,7 @@ begin
     Expect<Boolean>(PayloadIsReadable(Marker)).ToBe(True);
     Expect<Int64>(ChannelFile.Size).ToBe(0);
   finally
-    if Child.Running then Child.Terminate(1);
-    Child.WaitOnExit;
+    TerminateChildProcess(Child);
     Child.Free;
     ChannelFile.Free;
   end;
@@ -2191,8 +2208,7 @@ begin
     BytesRead := FpRead(StatusPipe[0], Buffer, SizeOf(Buffer));
     Expect<Boolean>(BytesRead <= 0).ToBe(True);
   finally
-    if Child.Running then Child.Terminate(1);
-    Child.WaitOnExit;
+    TerminateChildProcess(Child);
     Child.Free;
     if StatusPipe[0] >= 0 then FpClose(StatusPipe[0]);
     if StatusPipe[1] >= 0 then FpClose(StatusPipe[1]);
@@ -2353,7 +2369,6 @@ var
   Controller: TProcess;
   ControllerTree: TLWPTProcessTree;
   ControllerState, ControllerStateFile, PIDFile, ProjectRoot: string;
-  Started: TDateTime;
 begin
   CompilerPID := -1;
   ProjectRoot := FScratch + '/' + AProjectName;
@@ -2373,13 +2388,8 @@ begin
     Controller.Parameters.Add(FScratch + '/' + AProjectName + '-worker-state');
     Controller.Options := [poNewConsole];
     ControllerTree.Execute;
-    Started := Now;
-    while Controller.Running
-      and ((Now - Started) * SecondsPerDay
-        < WindowsControllerCompletionCeilingSeconds) do
-      Sleep(ProcessPollMilliseconds);
-    Expect<Boolean>(Controller.Running).ToBe(False);
-    Controller.WaitOnExit;
+    Expect<Boolean>(WaitForChildExit(Controller,
+      QWord(WindowsControllerCompletionCeilingSeconds) * 1000)).ToBe(True);
     if Controller.ExitStatus <> 0 then
     begin
       ControllerState := 'not recorded';
@@ -2520,12 +2530,8 @@ begin
       ControlProcessGroupID) then Exit(7);
     RecordWindowsControllerState(StatePath, 'control sent '
       + UIntToStr(QWord(ControlType)) + ', ' + ProcessContext);
-    Started := Now;
-    while LwptProcess.Running
-      and ((Now - Started) * SecondsPerDay < ProcessExitCeilingSeconds) do
-      Sleep(ProcessPollMilliseconds);
-    if LwptProcess.Running then Exit(8);
-    LwptProcess.WaitOnExit;
+    if not WaitForChildExit(LwptProcess,
+      QWord(ProcessExitCeilingSeconds) * 1000) then Exit(8);
     RecordWindowsControllerState(StatePath, 'LWPT exited '
       + IntToStr(LwptProcess.ExitStatus) + ', ' + ProcessContext);
     if DWORD(LwptProcess.ExitStatus) <> WindowsControlExitCode then Exit(9);
@@ -2535,7 +2541,7 @@ begin
     Result := 0;
     RecordWindowsControllerState(StatePath, 'complete, ' + ProcessContext);
   finally
-    if LwptProcess.Running then LwptProcess.Terminate(1);
+    TerminateChildProcess(LwptProcess);
     TerminateWindowsProcess(CompilerPID);
     if WrongReadHandle <> 0 then Windows.CloseHandle(WrongReadHandle);
     if WrongWriteHandle <> 0 then Windows.CloseHandle(WrongWriteHandle);
@@ -2667,20 +2673,16 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not PayloadIsReadable(APIDFile + '-descendant') then Exit(2);
     PublishReadablePayload(APIDFile + '-owner', IntToStr(GetProcessID));
-    while Child.Running do Sleep(ProcessPollMilliseconds);
-    Child.WaitOnExit;
+    if not WaitForChildExit(Child, QWord(ProcessReapCeilingSeconds) * 1000)
+    then
+      Exit(3);
     { The forwarding thread owns the cancellation decision, while this main
       thread reaps the fixture child so Unix process-group membership can
       become empty before the inherited absolute deadline. }
     Sleep(LongRunningFixtureMilliseconds);
     Result := 0;
   finally
-    if Child.Running then
-      try
-        ChildTree.Terminate;
-      except
-        Child.Terminate(1);
-      end;
+    if Child.Running then EndChildProcessTree(ChildTree, Child);
     ChildTree.Free;
     Child.Free;
   end;

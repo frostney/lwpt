@@ -31,6 +31,7 @@ uses
   LWPT.Manifest,
   LWPT.Registry.Consumer,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   TOML;
 
 type
@@ -4749,9 +4750,11 @@ begin
     Command.Parameters.Add('/C');
     Command.Parameters.Add('mklink /J "' + ExpandFileName(ALink) + '" "'
       + ExpandFileName(ATarget) + '"');
-    Command.Options := [poWaitOnExit, poNoConsole];
+    Command.Options := [poNoConsole];
     try
       Command.Execute;
+      { A cmd.exe past the deadline is ended and raises. }
+      FinishChild(Command, CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'mklink');
     except
       Exit(False);
     end;

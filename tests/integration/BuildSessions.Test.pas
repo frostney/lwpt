@@ -19,6 +19,7 @@ uses
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -59,6 +60,9 @@ const
     wait loop as soon as the barrier is seen, so a large ceiling costs
     nothing when the machine is idle. }
   ConcurrencyBarrierCeilingSeconds = 180;
+  { Bound on a released build or compiler child's exit. It matches the
+    RunLwpt default and comfortably exceeds the barrier ceiling. }
+  BuildExitCeilingMilliseconds = CHILD_COMPLETION_TIMEOUT_MILLISECONDS;
 
 type
   TBuildSessions = class(TTestSuite)
@@ -171,9 +175,9 @@ begin
   Process := TProcess.Create(nil);
   try
     Process.Executable := APath;
-    Process.Options := [poWaitOnExit];
     Process.Execute;
-    Result := Process.ExitStatus;
+    Result := FinishChild(Process, BuildExitCeilingMilliseconds,
+      'built program');
   finally
     Process.Free;
   end;
@@ -187,9 +191,8 @@ function RunSelfWithEnv(const AArgs, AEnv: array of string;
   out AOutput: string): Integer;
 var
   P: TProcess;
-  Buffer: array[0..4095] of Byte;
-  Count, i: Integer;
-  Chunk: string;
+  i: Integer;
+  MergedIntoOutput: string;
 begin
   AOutput := '';
   P := TProcess.Create(nil);
@@ -199,17 +202,9 @@ begin
     for i := 0 to High(AEnv) do P.Environment.Add(AEnv[i]);
     P.Options := [poUsePipes, poStderrToOutPut];
     P.Execute;
-    repeat
-      Count := P.Output.Read(Buffer[0], SizeOf(Buffer));
-      if Count > 0 then
-      begin
-        SetString(Chunk, PAnsiChar(@Buffer[0]), Count);
-        AOutput := AOutput + Chunk;
-      end;
-    until Count <= 0;
-    P.WaitOnExit;
-    Result := P.ExitCode;
-    if (Result = 0) and (P.ExitStatus <> 0) then Result := P.ExitStatus;
+    MergedIntoOutput := '';
+    Result := FinishChild(P, AOutput, MergedIntoOutput,
+      BuildExitCeilingMilliseconds, 'guard probe');
   finally
     P.Free;
   end;
@@ -520,7 +515,8 @@ begin
     + FScratch + '/shared-cache');
   for i := 0 to High(AExtraEnv) do
     SetProcessEnv(Result.Environment, AExtraEnv[i]);
-  Result.Execute;
+  { Owned with its compiler proxies: a Windows termination ends them too. }
+  ExecuteOwnedChild(Result);
 end;
 
 function TBuildSessions.RunLwptWithWorkerEnv(
@@ -617,15 +613,15 @@ begin
       Sleep(10);
     end;
     { Diagnostics before the release/wait: a child that hung before
-      signalling ready would never see the release and WaitOnExit would
-      block with the evidence still unflushed. }
+      signalling ready would never see the release, and the exit wait would
+      spend its whole deadline before the evidence was written. }
     if not (SawTwoSessions and SawTwoJobRoots) then
       DumpBarrierDiagnostics('concurrent-sessions', ReadyDir);
     WriteTextFile(ReleasePath, 'release');
-    First.WaitOnExit;
-    Second.WaitOnExit;
-    FirstStatus := First.ExitStatus;
-    SecondStatus := Second.ExitStatus;
+    FirstStatus := FinishChild(First, BuildExitCeilingMilliseconds,
+      'first build');
+    SecondStatus := FinishChild(Second, BuildExitCeilingMilliseconds,
+      'second build');
 
     Expect<Boolean>(SawTwoSessions).ToBe(True);
     Expect<Boolean>(SawTwoJobRoots).ToBe(True);
@@ -639,6 +635,8 @@ begin
     Expect<Integer>(RepairResult.ExitCode).ToBe(0);
     Expect<Integer>(CountSessionDirs).ToBe(0);
   finally
+    ReapChild(First, BuildExitCeilingMilliseconds);
+    ReapChild(Second, BuildExitCeilingMilliseconds);
     First.Free;
     Second.Free;
   end;
@@ -708,10 +706,10 @@ begin
       Sleep(10);
     end;
     WriteTextFile(ReleasePath, 'release');
-    First.WaitOnExit;
-    Second.WaitOnExit;
-    FirstStatus := First.ExitStatus;
-    SecondStatus := Second.ExitStatus;
+    FirstStatus := FinishChild(First, BuildExitCeilingMilliseconds,
+      'first build');
+    SecondStatus := FinishChild(Second, BuildExitCeilingMilliseconds,
+      'second build');
 
     Expect<Boolean>(ProducerReady).ToBe(True);
     Expect<Boolean>(TwoSessions).ToBe(True);
@@ -722,8 +720,8 @@ begin
       .ToBe(True);
   finally
     WriteTextFile(ReleasePath, 'release');
-    if Assigned(Second) and Second.Running then Second.WaitOnExit;
-    if First.Running then First.WaitOnExit;
+    ReapChild(Second, BuildExitCeilingMilliseconds);
+    ReapChild(First, BuildExitCeilingMilliseconds);
     Second.Free;
     First.Free;
   end;
@@ -775,10 +773,10 @@ begin
     if not Ready then
       DumpBarrierDiagnostics('relocated-publication', ReadyDir);
     WriteTextFile(ReleasePath, 'release');
-    First.WaitOnExit;
-    Second.WaitOnExit;
-    FirstStatus := First.ExitStatus;
-    SecondStatus := Second.ExitStatus;
+    FirstStatus := FinishChild(First, BuildExitCeilingMilliseconds,
+      'first build');
+    SecondStatus := FinishChild(Second, BuildExitCeilingMilliseconds,
+      'second build');
 
     Expect<Boolean>(Ready).ToBe(True);
     Expect<Boolean>(((FirstStatus = 0) and (SecondStatus = 1))
@@ -787,8 +785,8 @@ begin
       .ToBe(True);
   finally
     WriteTextFile(ReleasePath, 'release');
-    if First.Running then First.WaitOnExit;
-    if Second.Running then Second.WaitOnExit;
+    ReapChild(First, BuildExitCeilingMilliseconds);
+    ReapChild(Second, BuildExitCeilingMilliseconds);
     First.Free;
     Second.Free;
   end;
@@ -847,14 +845,14 @@ begin
       Sleep(10);
     end;
     { Diagnostics before the release/wait — see the concurrent-sessions
-      note: a hung child would block WaitOnExit with evidence unflushed. }
+      note: a hung child would hold the exit wait to its deadline first. }
     if not Ready then
       DumpBarrierDiagnostics('distinct-outputs', ReadyDir);
     WriteTextFile(ReleasePath, 'release');
-    First.WaitOnExit;
-    Second.WaitOnExit;
-    FirstStatus := First.ExitStatus;
-    SecondStatus := Second.ExitStatus;
+    FirstStatus := FinishChild(First, BuildExitCeilingMilliseconds,
+      'first build');
+    SecondStatus := FinishChild(Second, BuildExitCeilingMilliseconds,
+      'second build');
 
     Expect<Boolean>(Ready).ToBe(True);
     Expect<Integer>(FirstStatus).ToBe(0);
@@ -865,8 +863,8 @@ begin
       .ToBe(True);
   finally
     WriteTextFile(ReleasePath, 'release');
-    if First.Running then First.WaitOnExit;
-    if Second.Running then Second.WaitOnExit;
+    ReapChild(First, BuildExitCeilingMilliseconds);
+    ReapChild(Second, BuildExitCeilingMilliseconds);
     First.Free;
     Second.Free;
     RecursiveDelete(Project);
@@ -894,6 +892,7 @@ procedure TBuildSessions.TestInFlightWorkspaceChangeRefusesPublication;
 var
   Project, ReadyDir, ReleasePath, RealFPC: string;
   Build: TProcess;
+  BuildStatus: Integer;
   Ready: Boolean;
   Started: TDateTime;
   Env: array of string;
@@ -969,17 +968,17 @@ begin
         + 'begin Result := 2; end;'#10
         + 'end.'#10);
     WriteTextFile(ReleasePath, 'release');
-    Build.WaitOnExit;
+    BuildStatus := FinishChild(Build, BuildExitCeilingMilliseconds, 'build');
 
     Expect<Boolean>(Ready).ToBe(True);
-    Expect<Integer>(Build.ExitStatus).ToBe(1);
+    Expect<Integer>(BuildStatus).ToBe(1);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/app')))
       .ToBe(False);
     RepairResult := RunLwptWithWorkerEnv(['repair'], Project, []);
     Expect<Integer>(RepairResult.ExitCode).ToBe(0);
   finally
     WriteTextFile(ReleasePath, 'release');
-    if Build.Running then Build.WaitOnExit;
+    ReapChild(Build, BuildExitCeilingMilliseconds);
     Build.Free;
     RecursiveDelete(Project);
   end;
@@ -988,6 +987,7 @@ end;
 procedure TBuildSessions.TestInFlightSourceChangeRefusesPublication;
 var
   Build: TProcess;
+  BuildStatus: Integer;
   Started: TDateTime;
   Ready: Boolean;
   ReadyDir, ReleasePath, RealFPC: string;
@@ -1023,10 +1023,10 @@ begin
     end;
     if Ready then WriteAppSource(True);
     WriteTextFile(ReleasePath, 'release');
-    Build.WaitOnExit;
+    BuildStatus := FinishChild(Build, BuildExitCeilingMilliseconds, 'build');
 
     Expect<Boolean>(Ready).ToBe(True);
-    Expect<Integer>(Build.ExitStatus).ToBe(1);
+    Expect<Integer>(BuildStatus).ToBe(1);
     Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app')))
       .ToBe(False);
     Expect<Integer>(CountSessionDirs).ToBe(1);
@@ -1035,7 +1035,7 @@ begin
     Expect<Integer>(CountSessionDirs).ToBe(0);
   finally
     WriteTextFile(ReleasePath, 'release');
-    if Build.Running then Build.WaitOnExit;
+    ReapChild(Build, BuildExitCeilingMilliseconds);
     Build.Free;
     WriteAppSource(False);
   end;
@@ -1099,15 +1099,15 @@ begin
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/beta')))
       .ToBe(True);
     WriteTextFile(ReleaseDir + '/app', 'release');
-    Build.WaitOnExit;
-    Expect<Integer>(Build.ExitCode).ToBe(0);
+    Expect<Integer>(FinishChild(Build, BuildExitCeilingMilliseconds,
+      'build')).ToBe(0);
     Expect<Boolean>(FileExists(ExpectedExe(Project + '/build/app')))
       .ToBe(True);
   finally
     WriteTextFile(ReleaseDir + '/alpha', 'release');
     WriteTextFile(ReleaseDir + '/beta', 'release');
     WriteTextFile(ReleaseDir + '/app', 'release');
-    if Build.Running then Build.WaitOnExit;
+    ReapChild(Build, BuildExitCeilingMilliseconds);
     Build.Free;
     RecursiveDelete(Project);
   end;
@@ -1168,13 +1168,13 @@ begin
       DumpBarrierDiagnostics('app ready after releases', ReadyDir);
     Expect<Boolean>(EntryReady(ReadyDir, 'app')).ToBe(True);
     WriteTextFile(ReleaseDir + '/app', 'release');
-    Build.WaitOnExit;
-    Expect<Integer>(Build.ExitCode).ToBe(0);
+    Expect<Integer>(FinishChild(Build, BuildExitCeilingMilliseconds,
+      'build')).ToBe(0);
   finally
     WriteTextFile(ReleaseDir + '/alpha', 'release');
     WriteTextFile(ReleaseDir + '/beta', 'release');
     WriteTextFile(ReleaseDir + '/app', 'release');
-    if Build.Running then Build.WaitOnExit;
+    ReapChild(Build, BuildExitCeilingMilliseconds);
     Build.Free;
     RecursiveDelete(Project);
   end;
@@ -1427,8 +1427,7 @@ begin
     Expect<Boolean>(Pos('HEARTBEAT build elapsed ', RunResult.Stdout) = 0)
       .ToBe(True);
   finally
-    if Holder.Running then Holder.Terminate(1);
-    Holder.WaitOnExit;
+    TerminateChildProcess(Holder);
     Holder.Free;
     RecursiveDelete(Project);
   end;
@@ -1653,9 +1652,9 @@ begin
   try
     Process.Executable := Compiler;
     for i := 1 to ParamCount do Process.Parameters.Add(ParamStr(i));
-    Process.Options := [poWaitOnExit];
     Process.Execute;
-    Result := Process.ExitStatus;
+    Result := FinishChild(Process, BuildExitCeilingMilliseconds,
+      'real compiler');
   finally
     Process.Free;
   end;

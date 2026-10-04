@@ -19,6 +19,7 @@ uses
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch,
   Tests.SpawnGuardProbe;
 
@@ -66,6 +67,11 @@ const
   CAPTURE_STDERR_PREFIX = 'stderr-begin:';
   CAPTURE_STDERR_SUFFIX = ':stderr-end';
   WAIT_TIMEOUT_MILLISECONDS = 10000;
+  { Bound on a nested child that a child mode starts and waits for. Each
+    nested child waits at most a few WAIT_TIMEOUT_MILLISECONDS periods; the
+    test process's own waits on child modes use the longer
+    CHILD_COMPLETION_TIMEOUT_MILLISECONDS. }
+  NESTED_CHILD_TIMEOUT_MILLISECONDS = 6 * WAIT_TIMEOUT_MILLISECONDS;
   SCRATCH_DELETE_TIMEOUT_MILLISECONDS = 2000;
   SCRATCH_DELETE_RETRY_MILLISECONDS = 25;
   MARKER_COMPLETE_SUFFIX = '.complete';
@@ -635,7 +641,7 @@ var
     ChildRelease, ChildConsume, ChildAcquired, CancellationError : string;
   Snapshot : TLWPTWorkerBudgetSnapshot;
   Lines, RequestLines, FirstEnvironment, SecondEnvironment : TStringList;
-  Reclaimed : Integer;
+  Reclaimed, ChildExit, FirstExit, SecondExit : Integer;
   Child, FirstChild, SecondChild : TProcess;
   FirstThread, SecondThread : TLeaseThread;
   {$IFDEF UNIX}
@@ -860,9 +866,9 @@ begin
       Lines.Add('parent-root=' + WorkerStateRoot);
       Lines.Add('child-environment-root=' + EnvValue(
         Child.Environment, WORKER_STATE_DIR_ENV));
-      Child.Options := [poWaitOnExit];
       Child.Execute;
-      Lines.Add('child-exit=' + IntToStr(Child.ExitStatus));
+      Lines.Add('child-exit=' + IntToStr(FinishChild(Child,
+        NESTED_CHILD_TIMEOUT_MILLISECONDS, 'nested child')));
       Lines.Add('child-output=' + ChildOutput);
       Lines.SaveToFile(ParamStr(2));
     finally
@@ -1011,8 +1017,9 @@ begin
       AddWorkerEnvironment(FirstChild, WorkerStateRoot);
       FirstChild.Environment.Add(
         WORKER_LEASE_TOKEN_ENV + '=' + DelegationToken);
-      FirstChild.Options := [poWaitOnExit];
       FirstChild.Execute;
+      FirstExit := FinishChild(FirstChild, NESTED_CHILD_TIMEOUT_MILLISECONDS,
+        'first fan-out child');
 
       SecondChild := TProcess.Create(nil);
       SecondChild.Executable := ExpandFileName(ParamStr(0));
@@ -1021,11 +1028,12 @@ begin
       AddWorkerEnvironment(SecondChild, WorkerStateRoot);
       SecondChild.Environment.Add(
         WORKER_LEASE_TOKEN_ENV + '=' + DelegationToken);
-      SecondChild.Options := [poWaitOnExit];
       SecondChild.Execute;
+      SecondExit := FinishChild(SecondChild,
+        NESTED_CHILD_TIMEOUT_MILLISECONDS, 'second fan-out child');
 
-      Lines.Add('first-exit=' + IntToStr(FirstChild.ExitStatus));
-      Lines.Add('second-exit=' + IntToStr(SecondChild.ExitStatus));
+      Lines.Add('first-exit=' + IntToStr(FirstExit));
+      Lines.Add('second-exit=' + IntToStr(SecondExit));
       Lines.SaveToFile(ParamStr(2));
     finally
       SecondChild.Free;
@@ -1127,8 +1135,9 @@ begin
       Lease := nil;
       if ParamStr(1) = DELEGATION_CRASH_SWITCH then
       begin
-        Child.Terminate(9);
-        Child.WaitOnExit;
+        KillChildProcess(Child);
+        if not WaitForChildExit(Child, NESTED_CHILD_TIMEOUT_MILLISECONDS) then
+          raise Exception.Create('killed delegated child did not exit');
         Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
         Snapshot := GetWorkerBudgetSnapshot;
         Lines.Add('reacquired=' + BoolToStr(Lease <> nil, True));
@@ -1163,8 +1172,8 @@ begin
         Lines.Add('child-owner-after-snapshot='
           + BoolToStr(FileExists(OwnerPath), True));
         WriteMarker(ChildRelease, 'release');
-        Child.WaitOnExit;
-        Lines.Add('child-exit-status=' + IntToStr(Child.ExitStatus));
+        Lines.Add('child-exit-status=' + IntToStr(FinishChild(Child,
+          NESTED_CHILD_TIMEOUT_MILLISECONDS, 'delegated child')));
         Snapshot := GetWorkerBudgetSnapshot;
         Lines.Add('active-after-child='
           + IntToStr(Snapshot.ActiveWorkers));
@@ -1176,10 +1185,9 @@ begin
         Child.Parameters.Add(UNCONSUMED_CHILD_SWITCH);
         AddWorkerEnvironment(Child, WorkerStateRoot);
         AppendWorkerLeaseEnvironment(Child.Environment, Lease);
-        Child.Options := [poWaitOnExit];
         Child.Execute;
-        Lines.Add('unconsumed-child-exit='
-          + IntToStr(Child.ExitStatus));
+        Lines.Add('unconsumed-child-exit=' + IntToStr(FinishChild(Child,
+          NESTED_CHILD_TIMEOUT_MILLISECONDS, 'unconsumed child')));
         Lease.CancelPendingDelegation;
         Lease.Release;
         FreeAndNil(Lease);
@@ -1224,7 +1232,7 @@ begin
       begin
         WriteMarker(ChildConsume, 'consume');
         WriteMarker(ChildRelease, 'release');
-        Child.WaitOnExit;
+        ReapChild(Child, NESTED_CHILD_TIMEOUT_MILLISECONDS);
       end;
       Child.Free;
       Lease.Free;
@@ -1381,14 +1389,15 @@ begin
         Child.Environment, WORKER_LEASE_TOKEN_ENV);
       RequestLines.LoadFromFile(
         WorkerStateRoot + '/nested-parent.request');
-      Child.Options := [poWaitOnExit];
       Child.Execute;
+      ChildExit := FinishChild(Child, NESTED_CHILD_TIMEOUT_MILLISECONDS,
+        'nested child');
       Lease.Release;
       Lease.Free;
       Lease := nil;
       Lease := Session.Acquire(WAIT_TIMEOUT_MILLISECONDS);
       Snapshot := GetWorkerBudgetSnapshot;
-      Lines.Add('child-exit=' + IntToStr(Child.ExitStatus));
+      Lines.Add('child-exit=' + IntToStr(ChildExit));
       Lines.Add('active=' + IntToStr(Snapshot.ActiveWorkers));
       Lines.Add('entries=' + IntToStr(Length(Snapshot.Entries)));
       Lines.Add('raw-token-persisted=' + BoolToStr(
@@ -1576,6 +1585,7 @@ procedure TWorkerBudgetProcesses.RunUtilityWithBudget(const ASwitch,
   AOutputPath, ABudget: string);
 var
   Utility : TProcess;
+  UtilityExit : Integer;
 begin
   Utility := TProcess.Create(nil);
   try
@@ -1583,39 +1593,14 @@ begin
     Utility.Parameters.Add(ASwitch);
     Utility.Parameters.Add(AOutputPath);
     AddWorkerEnvironment(Utility, FScratch + '/state', ABudget);
-    Utility.Options := [poWaitOnExit];
     Utility.Execute;
-    if Utility.ExitStatus <> 0 then
+    UtilityExit := FinishChild(Utility, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+      'worker-budget utility ' + ASwitch);
+    if UtilityExit <> 0 then
       raise Exception.CreateFmt(
-        'worker-budget utility %s exited %d',
-        [ASwitch, Utility.ExitStatus]);
+        'worker-budget utility %s exited %d', [ASwitch, UtilityExit]);
   finally
     Utility.Free;
-  end;
-end;
-
-function ReadProcessStream(AStream: TStream;
-  AAvailableBytes: Integer): string;
-const
-  CHUNK_SIZE = 4096;
-var
-  Buffer : array[0..CHUNK_SIZE - 1] of Byte;
-  Count, Requested, Total : Integer;
-begin
-  Result := '';
-  Total := 0;
-  while Total < AAvailableBytes do
-  begin
-    Requested := AAvailableBytes - Total;
-    if Requested > SizeOf(Buffer) then Requested := SizeOf(Buffer);
-    Count := AStream.Read(Buffer, Requested);
-    if Count > 0 then
-    begin
-      SetLength(Result, Total + Count);
-      Move(Buffer, Result[Total + 1], Count);
-      Inc(Total, Count);
-    end;
-    if Count <= 0 then Break;
   end;
 end;
 
@@ -1624,7 +1609,6 @@ function RunStateRootUtility(const ASwitch, AOutputPath, AWorktree,
   const AExtraArgument: string = ''): TStateRootUtilityResult;
 var
   Utility : TProcess;
-  AvailableBytes : Integer;
 begin
   Result.ExitCode := -1;
   Result.Stdout := '';
@@ -1646,29 +1630,10 @@ begin
       WORKER_LEASE_TOKEN_ENV + '=']);
     Utility.Options := [poUsePipes];
     Utility.Execute;
-    while Utility.Running do
-    begin
-      AvailableBytes := Utility.Output.NumBytesAvailable;
-      if AvailableBytes > 0 then
-        Result.Stdout := Result.Stdout
-          + ReadProcessStream(Utility.Output, AvailableBytes);
-      AvailableBytes := Utility.Stderr.NumBytesAvailable;
-      if AvailableBytes > 0 then
-        Result.Stderr := Result.Stderr
-          + ReadProcessStream(Utility.Stderr, AvailableBytes);
-      Sleep(10);
-    end;
-    AvailableBytes := Utility.Output.NumBytesAvailable;
-    if AvailableBytes > 0 then
-      Result.Stdout := Result.Stdout
-        + ReadProcessStream(Utility.Output, AvailableBytes);
-    AvailableBytes := Utility.Stderr.NumBytesAvailable;
-    if AvailableBytes > 0 then
-      Result.Stderr := Result.Stderr
-        + ReadProcessStream(Utility.Stderr, AvailableBytes);
-    Result.ExitCode := Utility.ExitCode;
-    if (Result.ExitCode = 0) and (Utility.ExitStatus <> 0) then
-      Result.ExitCode := Utility.ExitStatus;
+    { Both pipes are drained while the utility runs, so a large write never
+      blocks it. }
+    Result.ExitCode := FinishChild(Utility, Result.Stdout, Result.Stderr,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'state-root utility ' + ASwitch);
   finally
     Utility.Free;
   end;
@@ -1772,12 +1737,12 @@ procedure TWorkerBudgetProcesses.StopChild(AProcess: TProcess);
 begin
   if AProcess = nil then Exit;
   try
-    if AProcess.Running then
-      AProcess.Terminate(1);
     { Always reap the child. On Windows a process that has begun exiting can
       retain its current-directory handle after Running changes state; the
-      next test must not wipe that worktree until the handle is closed. }
-    AProcess.WaitOnExit;
+      next test must not wipe that worktree until the handle is closed,
+      which the bounded termination waits for. }
+    if not TerminateChildProcess(AProcess) then
+      raise Exception.Create('worker-budget child did not stop');
   finally
     AProcess.Free;
   end;
@@ -1938,8 +1903,9 @@ begin
       FirstAcquired, FirstRelease);
     Expect<Boolean>(WaitForFile(FirstAcquired,
       WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
-    FirstProcess.Terminate(9);
-    FirstProcess.WaitOnExit;
+    KillChildProcess(FirstProcess);
+    Expect<Boolean>(WaitForChildExit(FirstProcess,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS)).ToBe(True);
 
     RunUtility(REPAIR_SWITCH, RepairPath);
     Values := ReadUtilityValues(RepairPath);
@@ -2063,8 +2029,8 @@ begin
       Expect<Boolean>(FileExists(ContenderAcquired)).ToBe(False);
 
       WriteMarker(ReleasePath, 'release');
-      Process.WaitOnExit;
-      Expect<Integer>(Process.ExitStatus).ToBe(0);
+      Expect<Integer>(FinishChild(Process,
+        CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'owner')).ToBe(0);
       Expect<Boolean>(WaitForFile(ContenderAcquired,
         WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
       WriteMarker(ContenderRelease, 'release');
@@ -2116,8 +2082,8 @@ begin
       end;
     end;
     WriteMarker(ReleasePrefix + '-4', 'release');
-    Reacquirer.WaitOnExit;
-    Expect<Integer>(Reacquirer.ExitStatus).ToBe(0);
+    Expect<Integer>(FinishChild(Reacquirer,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'reacquirer')).ToBe(0);
   finally
     StopChild(Waiter);
     StopChild(Reacquirer);
@@ -2220,8 +2186,10 @@ begin
     Expect<Boolean>(WaitForFile(ChildOutput,
       WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
 
-    Parent.Terminate(9);
-    Parent.WaitOnExit;
+    { Only the parent dies: its delegated child must survive it. }
+    KillChildProcess(Parent);
+    Expect<Boolean>(WaitForChildExit(Parent,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS)).ToBe(True);
     RunUtility(SNAPSHOT_SWITCH, SnapshotPath);
     Values := ReadUtilityValues(SnapshotPath);
     Expect<Integer>(StrToIntDef(Values.Values['active'], 0)).ToBe(1);
@@ -2371,10 +2339,10 @@ begin
     Expect<Boolean>(WaitForFile(SecondReady,
       WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
     WriteMarker(ReleasePath, 'probe');
-    FirstProcess.WaitOnExit;
-    SecondProcess.WaitOnExit;
-    Expect<Integer>(FirstProcess.ExitStatus).ToBe(0);
-    Expect<Integer>(SecondProcess.ExitStatus).ToBe(0);
+    Expect<Integer>(FinishChild(FirstProcess,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'first probe')).ToBe(0);
+    Expect<Integer>(FinishChild(SecondProcess,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'second probe')).ToBe(0);
     FirstValues := ReadUtilityValues(FirstOutput);
     SecondValues := ReadUtilityValues(SecondOutput);
     Expect<string>(FirstValues.Values['root']).ToBe(
@@ -2415,8 +2383,8 @@ begin
       WAIT_TIMEOUT_MILLISECONDS)).ToBe(True);
     Expect<Boolean>(DirectoryExists(StateRoot)).ToBe(False);
     WriteMarker(RootCreateRelease, 'retry');
-    Probe.WaitOnExit;
-    Expect<Integer>(Probe.ExitStatus).ToBe(0);
+    Expect<Integer>(FinishChild(Probe, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+      'retry probe')).ToBe(0);
     Values := ReadUtilityValues(OutputPath);
     Expect<string>(Values.Values['root']).ToBe(StateRoot);
     Expect<string>(Values.Values['acquired']).ToBe('True');

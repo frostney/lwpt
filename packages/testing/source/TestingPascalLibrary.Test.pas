@@ -29,6 +29,9 @@ program TestingPascalLibrary.Test;
 {$mode delphi}{$H+}
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -38,6 +41,8 @@ uses
 
 const
   ACTIVE_CASE_CHILD_ARGUMENT = '--active-case-marker-canary-child';
+  { The marker child runs one small suite and exits. }
+  CHILD_TIMEOUT_MILLISECONDS = 60000;
 
 type
   TCanarySuite = class(TTestSuite)
@@ -172,9 +177,49 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+{ Declared here rather than through the Windows unit, which would shadow
+  SysUtils routines. }
+function TerminateChildHandle(AProcess: THandle;
+  AExitCode: LongWord): LongBool; stdcall;
+  external 'kernel32.dll' name 'TerminateProcess';
+{$ENDIF}
+
+{ A bounded replacement for poWaitOnExit, which waits forever for a child
+  that never exits. Running is a nonblocking status query that also reaps
+  the child on Unix, so ExitCode then decodes its status. A child past the
+  deadline is killed and reported as an error. }
+function FinishChildWithin(AProcess: TProcess;
+  const ATimeoutMilliseconds: QWord): Integer;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while AProcess.Running
+    and (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
+    Sleep(10);
+  if AProcess.Running then
+  begin
+    {$IFDEF UNIX}
+    FpKill(AProcess.ProcessID, SIGKILL);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    TerminateChildHandle(AProcess.ProcessHandle, 1);
+    {$ENDIF}
+    StartedAt := GetTickCount64;
+    while AProcess.Running and (GetTickCount64 - StartedAt < 2000) do
+      Sleep(10);
+    raise Exception.CreateFmt('child %s did not exit within %d ms',
+      [AProcess.Executable, ATimeoutMilliseconds]);
+  end;
+  Result := AProcess.ExitCode;
+  if (Result = 0) and (AProcess.ExitStatus <> 0) then
+    Result := AProcess.ExitStatus;
+end;
+
 procedure TestActiveCaseMarkerProtocol;
 var
-  EnvironmentIndex: Integer;
+  EnvironmentIndex, MarkerExitCode: Integer;
   MarkerProcess: TProcess;
 begin
   ActiveCaseMarkerPath := GetTempFileName('', 'tpl-active-case-');
@@ -187,9 +232,10 @@ begin
       MarkerProcess.Environment.Add(GetEnvironmentString(EnvironmentIndex));
     MarkerProcess.Environment.Values[TEST_ACTIVE_CASE_FILE_ENVIRONMENT] :=
       ActiveCaseMarkerPath;
-    MarkerProcess.Options := [poWaitOnExit];
     MarkerProcess.Execute;
-    if MarkerProcess.ExitStatus <> 0 then Halt(MarkerProcess.ExitStatus);
+    MarkerExitCode := FinishChildWithin(MarkerProcess,
+      CHILD_TIMEOUT_MILLISECONDS);
+    if MarkerExitCode <> 0 then Halt(MarkerExitCode);
     if ReadMarker <> 'active case canary > second marker case' then Halt(21);
   finally
     MarkerProcess.Free;

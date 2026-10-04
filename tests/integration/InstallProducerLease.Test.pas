@@ -16,6 +16,7 @@ uses
   TestingPascalLibrary,
   Tests.HTTPMockServer,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch,
   Tests.TarSynth;
 
@@ -37,7 +38,6 @@ type
       const ACrashProducer: Boolean): TProcess;
     function FinishInstall(const AProcess: TProcess;
       out AOutput: string): Integer;
-    function WaitForExit(const AProcess: TProcess): Boolean;
     procedure AssertMaterialized(const ARoot, AArchiveHash: string);
   protected
     procedure BeforeAll; override;
@@ -151,40 +151,20 @@ begin
   Result.CurrentDirectory := ARoot;
   Result.Options := [poUsePipes];
   ConfigureProcessEnvironment(Result, Environment);
-  Result.Execute;
-end;
-
-function TInstallProducerLease.WaitForExit(const AProcess: TProcess): Boolean;
-var
-  StartedAt: QWord;
-begin
-  StartedAt := GetTickCount64;
-  while AProcess.Running do
-  begin
-    if GetTickCount64 - StartedAt >= PROCESS_TIMEOUT_MILLISECONDS then
-      Exit(False);
-    Sleep(10);
-  end;
-  Result := True;
+  ExecuteOwnedChild(Result);
 end;
 
 function TInstallProducerLease.FinishInstall(const AProcess: TProcess;
   out AOutput: string): Integer;
 begin
-  if not WaitForExit(AProcess) then
+  if not WaitForChildExit(AProcess, PROCESS_TIMEOUT_MILLISECONDS) then
   begin
-    AProcess.Terminate(1);
-    AProcess.WaitOnExit;
+    TerminateChildProcess(AProcess);
     AOutput := 'install process timed out';
     Exit(-1);
   end;
-  AProcess.WaitOnExit;
   AOutput := ReadStream(AProcess.Output) + ReadStream(AProcess.Stderr);
-  Result := AProcess.ExitStatus;
-  {$IFDEF UNIX}
-  { TProcess can expose waitpid's raw status after a Running poll. }
-  if (Result > 255) and (Result mod 256 = 0) then Result := Result div 256;
-  {$ENDIF}
+  Result := ChildProcessExitCode(AProcess);
 end;
 
 procedure TInstallProducerLease.AssertMaterialized(const ARoot,

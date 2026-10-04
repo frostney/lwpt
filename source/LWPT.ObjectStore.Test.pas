@@ -23,6 +23,7 @@ uses
   LWPT.ObjectStore,
   LWPT.ProcessTree,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -363,15 +364,18 @@ begin
     while AProcess.Running
       and (GetTickCount64 - StartedAt < ADMIT_CHILD_TIMEOUT_MS) do
       Sleep(10);
+    TerminationSent := False;
+    TerminationError := 0;
     if AProcess.Running then
     begin
       Result.TimedOut := True;
       TerminationSent := ForceTerminateAdmitter(AProcess, TerminationError);
-      if not AProcess.WaitOnExit(ADMIT_CHILD_TERMINATION_TIMEOUT_MS) then
-        AbortForUnreapedAdmitter(AProcess, APhasePrefix, TerminationSent,
-          TerminationError);
     end;
-    if AProcess.Running then AProcess.WaitOnExit;
+    { Bounded, and on Windows it also covers the exited child's handle
+      rundown. }
+    if not WaitForChildExit(AProcess, ADMIT_CHILD_TERMINATION_TIMEOUT_MS) then
+      AbortForUnreapedAdmitter(AProcess, APhasePrefix, TerminationSent,
+        TerminationError);
     StdoutReader.WaitFor;
     StderrReader.WaitFor;
     if StdoutReader.ErrorMessage <> '' then
@@ -572,9 +576,9 @@ begin
     end;
     if Assigned(ProtectedStageChild) then
     begin
-      if ProtectedStageChild.Running then
-        ProtectedStageChild.Terminate(0);
-      ProtectedStageChild.WaitOnExit(2000);
+      { The spawn under test is unmanaged, so only the direct shell is
+        ended; its sleep exits on its own within five seconds. }
+      TerminateChildProcess(ProtectedStageChild);
       ProtectedStageChild.Free;
       ProtectedStageChild := nil;
     end;

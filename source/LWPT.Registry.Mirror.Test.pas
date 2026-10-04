@@ -26,6 +26,7 @@ uses
   LWPT.Registry.Store,
   LWPT.Registry.Verification,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.RegistryProcess,
   Tests.RegistryServer,
   Tests.Scratch;
