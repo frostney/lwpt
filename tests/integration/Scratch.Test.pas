@@ -229,33 +229,15 @@ end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
-type
-  { Reads one file on its own thread, so the test can hold the file while
-    the read retries and release it only after observing a retry. }
-  TFileReader = class(TThread)
-  private
-    FPath: string;
-  protected
-    procedure Execute; override;
-  public
-    Content, Failure: string;
-    constructor Create(const APath: string);
-  end;
+var
+  { The exclusive handle the retry hook releases at the first retry. }
+  HeldExclusiveHandle: THandle = 0;
 
-constructor TFileReader.Create(const APath: string);
+procedure ReleaseHeldHandleOnRetry(const APath: string);
 begin
-  FPath := APath;
-  FreeOnTerminate := False;
-  inherited Create(False);
-end;
-
-procedure TFileReader.Execute;
-begin
-  try
-    Content := ReadBinaryFile(FPath);
-  except
-    on E: Exception do Failure := E.Message;
-  end;
+  if HeldExclusiveHandle = 0 then Exit;
+  Windows.CloseHandle(HeldExclusiveHandle);
+  HeldExclusiveHandle := 0;
 end;
 
 function OpenTestHandle(const APath: string; const AAccess,
@@ -300,19 +282,16 @@ begin
 end;
 
 { A handle that shares nothing makes every open fail with a sharing
-  violation. A read retries that, and only that, until the handle closes;
-  the test releases the handle only after observing a retried open, so no
-  timing window decides the outcome. Held past the retry bound, the read
-  fails. }
+  violation. A read retries that, and only that: the retry hook releases
+  the handle at the first failed open, on the reading thread, so the read
+  must then succeed with no timing involved. Held past the retry bound,
+  with no hook, the read fails. }
 procedure TScratch.TestReadsRetryABrieflyExclusiveHandle;
 {$IFDEF MSWINDOWS}
 var
-  Root, Path, Failure: string;
+  Root, Path, Content, Failure: string;
   Handle: THandle;
-  Reader: TFileReader;
   Baseline: LongInt;
-  StartedAt: QWord;
-  Retried: Boolean;
 {$ENDIF}
 begin
   {$IFDEF MSWINDOWS}
@@ -320,30 +299,23 @@ begin
   try
     Path := Root + '\held.toml';
     WriteTextFile(Path, 'held = true' + #10);
-    Handle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
+    HeldExclusiveHandle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
     Baseline := InterLockedExchangeAdd(ScratchReadSharingRetries, 0);
-    Reader := TFileReader.Create(Path);
+    ScratchReadSharingRetryHook := ReleaseHeldHandleOnRetry;
     try
-      { Bounded only as a hang guard; a retry normally shows at once. }
-      StartedAt := GetTickCount64;
-      repeat
-        Retried := InterLockedExchangeAdd(ScratchReadSharingRetries, 0)
-          > Baseline;
-        if Retried or Reader.Finished then Break;
-        SysUtils.Sleep(1);
-      until GetTickCount64 - StartedAt >= READ_SHARING_RETRY_MILLISECONDS;
-      Windows.CloseHandle(Handle);
-      Handle := Windows.INVALID_HANDLE_VALUE;
-      Reader.WaitFor;
-      Expect<Boolean>(Retried).ToBe(True);
-      Expect<string>(Reader.Failure).ToBe('');
-      { WriteTextFile uses the platform line ending. }
-      Expect<string>(Trim(Reader.Content)).ToBe('held = true');
+      Content := ReadBinaryFile(Path);
     finally
-      if Handle <> Windows.INVALID_HANDLE_VALUE then
-        Windows.CloseHandle(Handle);
-      Reader.Free;
+      ScratchReadSharingRetryHook := nil;
+      if HeldExclusiveHandle <> 0 then
+      begin
+        Windows.CloseHandle(HeldExclusiveHandle);
+        HeldExclusiveHandle := 0;
+      end;
     end;
+    Expect<Boolean>(InterLockedExchangeAdd(ScratchReadSharingRetries, 0)
+      > Baseline).ToBe(True);
+    { WriteTextFile uses the platform line ending. }
+    Expect<string>(Trim(Content)).ToBe('held = true');
     Handle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
     try
       Baseline := InterLockedExchangeAdd(ScratchReadSharingRetries, 0);

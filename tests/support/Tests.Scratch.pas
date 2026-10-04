@@ -59,11 +59,19 @@ procedure CreateSparseFile(const APath: string; const ASize: Int64);
 const
   READ_SHARING_RETRY_MILLISECONDS = 2000;
 
+type
+  TScratchReadSharingRetryHook = procedure(const APath: string);
+
 var
   { Test-only observation: incremented, atomically, each time
     ReadBinaryFile retries an open that failed with a sharing violation,
     so a test can prove a retry happened without timing it. }
   ScratchReadSharingRetries: LongInt = 0;
+  { Test-only: when set, ReadBinaryFile calls it on the reading thread
+    after each open that failed with a sharing violation and before it
+    sleeps, so a test can release the conflicting handle at exactly that
+    point. Production use leaves it nil. }
+  ScratchReadSharingRetryHook: TScratchReadSharingRetryHook = nil;
 
 implementation
 
@@ -416,6 +424,8 @@ begin
       raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
         [APath, SysErrorMessage(ErrorCode)]);
     InterLockedIncrement(ScratchReadSharingRetries);
+    if Assigned(ScratchReadSharingRetryHook) then
+      ScratchReadSharingRetryHook(APath);
     SysUtils.Sleep(10);
   until False;
 end;
