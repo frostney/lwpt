@@ -110,6 +110,10 @@ const
   POLL_MILLISECONDS = 1;
   { A past modification time that no run can reproduce by rewriting. }
   PAST_AGE_DAYS = 2;
+  { How far an input's modification time is set past its hook output's.
+    Hook staleness compares FileAge stamps strictly: whole seconds on Unix,
+    2-second DOS time on Windows. Four seconds clears either bucket. }
+  NEWER_INPUT_SECONDS = 4;
   {$IFDEF MSWINDOWS}
   { The one open failure a Windows reader may meet while a replacement
     holds the path: ERROR_SHARING_VIOLATION. }
@@ -770,6 +774,18 @@ begin
       ''#10 +
       '[build]'#10 +
       'app = { source = "source/app.pas", output = "build/app" }'#10);
+    { The staleness gate cannot see an edit made in the same FileAge tick
+      as the previous round's output, so date the manifest past it
+      explicitly instead of relying on elapsed time. The first round has
+      no output yet, so its hook runs regardless. }
+    if Round > 1 then
+    begin
+      Expect<Integer>(FileSetDate(FTarget + '/lwpt.toml',
+        DateTimeToFileDate(FileDateToDateTime(FileAge(IncludePath))
+          + NEWER_INPUT_SECONDS / SecsPerDay))).ToBe(0);
+      Expect<Boolean>(FileAge(FTarget + '/lwpt.toml') > FileAge(IncludePath))
+        .ToBe(True);
+    end;
     SetLength(Builds, BUILD_COUNT);
     for Index := 0 to High(Builds) do Builds[Index] := nil;
     try
