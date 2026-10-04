@@ -44,6 +44,12 @@ interface
 function CreateScratchRoot(const ASuite: string): string;
 procedure WriteTextFile(const APath, AContent: string);
 procedure RecursiveDelete(const APath: string);
+{ Reads a whole file as raw bytes. It shares read, write, and delete
+  access, the way LWPT's own registry readers do, so a file the toolkit
+  publishes with an atomic rename can be read while that rename still
+  holds its handle. On Windows a sharing violation from a briefly held
+  handle (the rename's own write-through, a scanner) is retried for up to
+  READ_SHARING_RETRY_MILLISECONDS before the open fails. }
 function ReadBinaryFile(const APath: string): string;
 function TestCompilerExecutable: string;
 { Creates APath with length ASize without writing its bytes. On Windows the
@@ -87,6 +93,23 @@ type
   coarse-timestamp counterpart, or to skip a date the filesystem cannot
   store. }
 function ProbeTimestampSupport: TTimestampSupport;
+
+const
+  READ_SHARING_RETRY_MILLISECONDS = 2000;
+
+type
+  TScratchReadSharingRetryHook = procedure(const APath: string);
+
+var
+  { Test-only observation: incremented, atomically, each time
+    ReadBinaryFile retries an open that failed with a sharing violation,
+    so a test can prove a retry happened without timing it. }
+  ScratchReadSharingRetries: LongInt = 0;
+  { Test-only: when set, ReadBinaryFile calls it on the reading thread
+    after each open that failed with a sharing violation and before it
+    sleeps, so a test can release the conflicting handle at exactly that
+    point. Production use leaves it nil. }
+  ScratchReadSharingRetryHook: TScratchReadSharingRetryHook = nil;
 
 implementation
 
@@ -410,10 +433,66 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+const
+  ERROR_SHARING_VIOLATION_LWPT = 32;
+
+function ScratchExtendedPath(const APath: string): UnicodeString; forward;
+
+{ Opens APath for reading with full sharing, retrying only a sharing
+  violation within READ_SHARING_RETRY_MILLISECONDS. The caller closes the
+  returned handle. }
+function OpenSharedReadHandle(const APath: string): THandle;
+var
+  ErrorCode: DWORD;
+  StartedAt: QWord;
+  WidePath: UnicodeString;
+begin
+  { The extended-length spelling reaches files past MAX_PATH. }
+  WidePath := ScratchExtendedPath(APath);
+  StartedAt := GetTickCount64;
+  repeat
+    Result := Windows.CreateFileW(PWideChar(WidePath), Windows.GENERIC_READ,
+      Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+        or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
+      Windows.FILE_ATTRIBUTE_NORMAL, 0);
+    if Result <> Windows.INVALID_HANDLE_VALUE then Exit;
+    ErrorCode := Windows.GetLastError;
+    if (ErrorCode <> ERROR_SHARING_VIOLATION_LWPT)
+      or (GetTickCount64 - StartedAt >= READ_SHARING_RETRY_MILLISECONDS) then
+      raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+        [APath, SysErrorMessage(ErrorCode)]);
+    InterLockedIncrement(ScratchReadSharingRetries);
+    if Assigned(ScratchReadSharingRetryHook) then
+      ScratchReadSharingRetryHook(APath);
+    SysUtils.Sleep(10);
+  until False;
+end;
+{$ENDIF}
+
 function ReadBinaryFile(const APath: string): string;
 var
+  {$IFDEF MSWINDOWS}
+  Handle: THandle;
+  Stream: THandleStream;
+  {$ELSE}
   Stream: TFileStream;
+  {$ENDIF}
 begin
+  {$IFDEF MSWINDOWS}
+  Handle := OpenSharedReadHandle(APath);
+  try
+    Stream := THandleStream.Create(Handle);
+    try
+      SetLength(Result, Stream.Size);
+      if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+    finally
+      Stream.Free;
+    end;
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+  {$ELSE}
   Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
   try
     SetLength(Result, Stream.Size);
@@ -421,6 +500,7 @@ begin
   finally
     Stream.Free;
   end;
+  {$ENDIF}
 end;
 
 procedure CreateSparseFile(const APath: string; const ASize: Int64);

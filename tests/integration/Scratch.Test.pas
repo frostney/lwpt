@@ -29,6 +29,9 @@ type
     procedure TestRootsAreUniqueAcrossCalls;
     procedure TestReapingDeletesDeadAndLeavesLiveOwner;
     procedure TestRecursiveDeleteRemovesTreesPastMaxPath;
+    procedure TestReadsShareAHandleHoldingDeleteAccess;
+    procedure TestReadsRetryABrieflyExclusiveHandle;
+    procedure TestReadsReachFilesPastMaxPath;
     {$IFDEF MSWINDOWS}
     procedure TestRecursiveDeleteRemovesRootLinkPastMaxPath;
     {$ENDIF}
@@ -225,6 +228,142 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF MSWINDOWS}
+var
+  { The exclusive handle the retry hook releases at the first retry. }
+  HeldExclusiveHandle: THandle = 0;
+
+procedure ReleaseHeldHandleOnRetry(const APath: string);
+begin
+  if HeldExclusiveHandle = 0 then Exit;
+  Windows.CloseHandle(HeldExclusiveHandle);
+  HeldExclusiveHandle := 0;
+end;
+
+function OpenTestHandle(const APath: string; const AAccess,
+  AShare: DWORD): THandle;
+begin
+  Result := Windows.CreateFileW(PWideChar(UnicodeString(APath)), AAccess,
+    AShare, nil, Windows.OPEN_EXISTING, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if Result = Windows.INVALID_HANDLE_VALUE then RaiseLastOSError;
+end;
+{$ENDIF}
+
+{ A write-through rename keeps its handle, with delete access, open while
+  the renamed file is already visible; a reader that does not share delete
+  access fails against it with a sharing violation. }
+procedure TScratch.TestReadsShareAHandleHoldingDeleteAccess;
+{$IFDEF MSWINDOWS}
+const
+  DELETE_ACCESS = $00010000;
+var
+  Root, Path: string;
+  Handle: THandle;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Root := CreateScratchRoot('scratch-shared-read');
+  try
+    Path := Root + '\published.toml';
+    WriteTextFile(Path, 'complete = true' + #10);
+    Handle := OpenTestHandle(Path, DELETE_ACCESS or Windows.GENERIC_READ,
+      Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+        or Windows.FILE_SHARE_DELETE);
+    try
+      { WriteTextFile uses the platform line ending. }
+      Expect<string>(Trim(ReadBinaryFile(Path))).ToBe('complete = true');
+    finally
+      Windows.CloseHandle(Handle);
+    end;
+  finally
+    RecursiveDelete(Root);
+  end;
+  {$ENDIF}
+end;
+
+{ A handle that shares nothing makes every open fail with a sharing
+  violation. A read retries that, and only that: the retry hook releases
+  the handle at the first failed open, on the reading thread, so the read
+  must then succeed with no timing involved. Held past the retry bound,
+  with no hook, the read fails. }
+procedure TScratch.TestReadsRetryABrieflyExclusiveHandle;
+{$IFDEF MSWINDOWS}
+var
+  Root, Path, Content, Failure: string;
+  Handle: THandle;
+  Baseline: LongInt;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Root := CreateScratchRoot('scratch-shared-read');
+  try
+    Path := Root + '\held.toml';
+    WriteTextFile(Path, 'held = true' + #10);
+    HeldExclusiveHandle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
+    Baseline := InterLockedExchangeAdd(ScratchReadSharingRetries, 0);
+    ScratchReadSharingRetryHook := ReleaseHeldHandleOnRetry;
+    try
+      Content := ReadBinaryFile(Path);
+    finally
+      ScratchReadSharingRetryHook := nil;
+      if HeldExclusiveHandle <> 0 then
+      begin
+        Windows.CloseHandle(HeldExclusiveHandle);
+        HeldExclusiveHandle := 0;
+      end;
+    end;
+    Expect<Boolean>(InterLockedExchangeAdd(ScratchReadSharingRetries, 0)
+      > Baseline).ToBe(True);
+    { WriteTextFile uses the platform line ending. }
+    Expect<string>(Trim(Content)).ToBe('held = true');
+    Handle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
+    try
+      Baseline := InterLockedExchangeAdd(ScratchReadSharingRetries, 0);
+      Failure := '';
+      try
+        ReadBinaryFile(Path);
+      except
+        on E: EFOpenError do Failure := E.Message;
+      end;
+      Expect<Boolean>(Failure <> '').ToBe(True);
+      Expect<Boolean>(InterLockedExchangeAdd(ScratchReadSharingRetries, 0)
+        > Baseline).ToBe(True);
+    finally
+      Windows.CloseHandle(Handle);
+    end;
+  finally
+    RecursiveDelete(Root);
+  end;
+  {$ENDIF}
+end;
+
+{ A file nested past the 260-character Win32 MAX_PATH reads through its
+  extended-length spelling. }
+procedure TScratch.TestReadsReachFilesPastMaxPath;
+var
+  Root, FilePath: string;
+  Stream: TLWPTProtectedFileStream;
+  Content: string;
+begin
+  Root := CreateScratchRoot('scratch-deep-read');
+  try
+    FilePath := DeepBelow(Root) + '/' + StringOfChar('r', 40) + '.toml';
+    Expect<Boolean>(Length(FilePath) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+    Expect<Boolean>(LongPathForceDirectories(ExtractFileDir(FilePath)))
+      .ToBe(True);
+    Content := 'deep = true' + #10;
+    Stream := OpenProtectedFileStream(FilePath, fmCreate);
+    try
+      Stream.WriteBuffer(Content[1], Length(Content));
+    finally
+      Stream.Free;
+    end;
+    Expect<string>(ReadBinaryFile(FilePath)).ToBe(Content);
+  finally
+    RecursiveDelete(Root);
+  end;
+end;
+
 procedure TScratch.SetupTests;
 {$IFDEF MSWINDOWS}
 var SkipReason: string;
@@ -233,6 +372,18 @@ begin
   Test('roots are unique across calls', TestRootsAreUniqueAcrossCalls);
   Test('recursive delete removes a tree past MAX_PATH',
     TestRecursiveDeleteRemovesTreesPastMaxPath);
+  Test('a read reaches a file past MAX_PATH', TestReadsReachFilesPastMaxPath);
+  {$IFDEF MSWINDOWS}
+  Test('a read shares the file with a handle holding delete access',
+    TestReadsShareAHandleHoldingDeleteAccess);
+  Test('a read retries a briefly exclusive handle within its bound',
+    TestReadsRetryABrieflyExclusiveHandle);
+  {$ELSE}
+  Skip('a read shares the file with a handle holding delete access',
+    TestReadsShareAHandleHoldingDeleteAccess, 'Windows share modes');
+  Skip('a read retries a briefly exclusive handle within its bound',
+    TestReadsRetryABrieflyExclusiveHandle, 'Windows share modes');
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   SkipReason := LongJunctionSkipReason;
   if SkipReason = '' then
