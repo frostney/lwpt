@@ -103,11 +103,11 @@ end;
   authored style from the raw bytes and pin it for the write-back. }
 procedure LoadManifestLines(const APath: string; ALines: TStringList);
 var
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
   Raw: AnsiString;
 begin
-  ALines.LoadFromFile(APath);
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyWrite);
+  LoadProtectedStrings(ALines, APath);
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyWrite);
   try
     SetLength(Raw, Stream.Size);
     if Length(Raw) > 0 then

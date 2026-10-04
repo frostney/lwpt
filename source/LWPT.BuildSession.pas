@@ -381,7 +381,7 @@ var
   Info: TByHandleFileInformation;
 begin
   Result := '';
-  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)), 0,
+  Handle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)), 0,
     Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
       or Windows.FILE_SHARE_DELETE,
     nil, Windows.OPEN_EXISTING, Windows.FILE_FLAG_BACKUP_SEMANTICS, 0);
@@ -718,7 +718,7 @@ var
   Lines: TStringList;
 begin
   Result := -1;
-  if not FileExists(APath) then Exit;
+  if not LongPathFileExists(APath) then Exit;
   Lines := TStringList.Create;
   try
     LoadProtectedStrings(Lines, APath);
@@ -733,7 +733,7 @@ function IncompleteStateIsAbandoned(const APath: string): Boolean;
 var
   Age: LongInt;
 begin
-  Age := FileAge(APath);
+  Age := LongPathFileAge(APath);
   if Age < 0 then Exit(False);
   Result := MilliSecondsBetween(Now, FileDateToDateTime(Age))
     >= SESSION_PARTIAL_GRACE_MILLISECONDS;
@@ -745,10 +745,11 @@ var
 begin
   for Attempt := 1 to 100 do
   begin
-    if DirectoryExists(APath) or ForceDirectories(APath) then Exit(True);
+    if LongPathDirectoryExists(APath) or LongPathForceDirectories(APath) then
+      Exit(True);
     Sleep(10);
   end;
-  Result := DirectoryExists(APath);
+  Result := LongPathDirectoryExists(APath);
 end;
 
 function ReadSessionState(const APath: string): string;
@@ -756,7 +757,7 @@ var
   Lines: TStringList;
 begin
   Result := '';
-  if not FileExists(APath) then Exit;
+  if not LongPathFileExists(APath) then Exit;
   Lines := TStringList.Create;
   try
     LoadProtectedStrings(Lines, APath);
@@ -809,7 +810,7 @@ begin
   FLocked := True;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
-  FHandle := Windows.CreateFileW(PWideChar(UnicodeString(FPath)),
+  FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(FPath)),
     Windows.GENERIC_READ or Windows.GENERIC_WRITE,
     Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
       or Windows.FILE_SHARE_DELETE,
@@ -910,7 +911,7 @@ var
   Overlapped: TOverlapped;
   ErrorCode: DWORD;
 begin
-  Handle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+  Handle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
     Windows.GENERIC_READ or Windows.GENERIC_WRITE,
     Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
       or Windows.FILE_SHARE_DELETE,
@@ -969,7 +970,7 @@ begin
     PublicationCriticalSections[FCriticalSectionIndex]);
   FCriticalSectionEntered := True;
   try
-    ForceDirectories(ExtractFileDir(FPath));
+    LongPathForceDirectories(ExtractFileDir(FPath));
     Started := Now;
     Acquired := False;
     {$IFDEF UNIX}
@@ -997,7 +998,7 @@ begin
       FpWrite(FDescriptor, PIDLine[1], Length(PIDLine));
     {$ENDIF}
     {$IFDEF MSWINDOWS}
-    FHandle := Windows.CreateFileW(PWideChar(UnicodeString(FPath)),
+    FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(FPath)),
       Windows.GENERIC_READ or Windows.GENERIC_WRITE,
       Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE, nil,
       Windows.OPEN_ALWAYS, Windows.FILE_ATTRIBUTE_NORMAL, 0);
@@ -1144,7 +1145,7 @@ begin
   if RootIdentity = '' then Exit;
   IdentityPath := IncludeTrailingPathDelimiter(ARoot)
     + SESSION_ROOT_IDENTITY_FILE;
-  if not FileExists(IdentityPath) then Exit;
+  if not LongPathFileExists(IdentityPath) then Exit;
   if IsDirSymlinkOrJunction(IdentityPath) then Exit;
   Lines := TStringList.Create;
   try
@@ -1183,7 +1184,7 @@ begin
   if RootIdentity = '' then
     raise ELWPTError.CreateFmt(
       'could not identify build sessions directory %s', [ARoot]);
-  if not FileExists(IdentityPath) then
+  if not LongPathFileExists(IdentityPath) then
   begin
     Lines := TStringList.Create;
     try
@@ -1210,7 +1211,7 @@ var
 begin
   ARoots.Clear;
   LedgerPath := BuildSessionLedgerPath(AProjectRoot);
-  if not FileExists(LedgerPath) then Exit;
+  if not LongPathFileExists(LedgerPath) then Exit;
   Lines := TStringList.Create;
   try
     LoadProtectedStrings(Lines, LedgerPath);
@@ -1356,8 +1357,8 @@ begin
     PendingRoot := IncludeTrailingPathDelimiter(BaseRoot) + '.creating-'
       + FSessionID;
     Inc(CollisionCounter);
-  until (not DirectoryExists(FSessionRoot))
-    and (not DirectoryExists(PendingRoot));
+  until (not LongPathDirectoryExists(FSessionRoot))
+    and (not LongPathDirectoryExists(PendingRoot));
   if not EnsureDirectory(PendingRoot) then
     raise ELWPTError.CreateFmt(
       'could not create build session directory %s', [PendingRoot]);
@@ -1368,17 +1369,18 @@ begin
     FSessionOwnerGuard := TLWPTSessionOwnerGuard.Create(
       FSessionOwnerGuardPath);
     WriteState('active');
-    if not SysUtils.RenameFile(PendingRoot,
+    if not LongPathRenameFile(PendingRoot,
       IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
       raise ELWPTError.CreateFmt(
         'could not publish build session directory %s', [FSessionID]);
     FSessionRoot := IncludeTrailingPathDelimiter(BaseRoot) + FSessionID;
   except
     FreeAndNil(FSessionOwnerGuard);
-    if FileExists(FSessionOwnerGuardPath) then
-      SysUtils.DeleteFile(FSessionOwnerGuardPath);
-    if DirectoryExists(PendingRoot) then WipeDir(PendingRoot);
-    if DirectoryExists(IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
+    if LongPathFileExists(FSessionOwnerGuardPath) then
+      LongPathDeleteFile(FSessionOwnerGuardPath);
+    if LongPathDirectoryExists(PendingRoot) then WipeDir(PendingRoot);
+    if LongPathDirectoryExists(IncludeTrailingPathDelimiter(BaseRoot)
+      + FSessionID) then
       WipeDir(IncludeTrailingPathDelimiter(BaseRoot) + FSessionID);
     raise;
   end;
@@ -1415,7 +1417,7 @@ end;
 function TLWPTBuildSession.JobRoot(const AName: string): string;
 begin
   Result := FSessionRoot + '/jobs/' + BuildSessionPathKey(AName);
-  ForceDirectories(Result);
+  LongPathForceDirectories(Result);
 end;
 
 function TLWPTBuildSession.JobLogPath(const AName: string): string;
@@ -1433,7 +1435,7 @@ end;
 function TLWPTBuildSession.HookRoot: string;
 begin
   Result := FSessionRoot + '/hooks';
-  ForceDirectories(Result);
+  LongPathForceDirectories(Result);
 end;
 
 function TLWPTBuildSession.SessionReference: string;
@@ -1450,7 +1452,7 @@ var
   Bytes: TBytes;
 begin
   LogPath := JobLogPath(AName);
-  if not ForceDirectories(ExtractFileDir(LogPath)) then
+  if not LongPathForceDirectories(ExtractFileDir(LogPath)) then
     raise ELWPTError.CreateFmt('could not create session log directory %s',
       [ExtractFileDir(LogPath)]);
   { Committed-path write goes through the atomic helper (staged under the
@@ -1474,21 +1476,22 @@ begin
     { The guard lives beside session directories, so it remains observable
       while private compiler and hook staging is removed on every platform.
       Stable job logs remain until lwpt repair reclaims the completed session. }
-    HasLogs := DirectoryExists(FSessionRoot + ObservabilityLogsDirectory);
+    HasLogs := LongPathDirectoryExists(FSessionRoot
+      + ObservabilityLogsDirectory);
     WriteState('completing');
     if HasLogs then
     begin
-      if DirectoryExists(FSessionRoot + '/jobs') then
+      if LongPathDirectoryExists(FSessionRoot + '/jobs') then
         WipeDir(FSessionRoot + '/jobs');
-      if DirectoryExists(FSessionRoot + '/hooks') then
+      if LongPathDirectoryExists(FSessionRoot + '/hooks') then
         WipeDir(FSessionRoot + '/hooks');
       WriteState('completed');
     end
     else
       WipeDir(FSessionRoot);
     FreeAndNil(FSessionOwnerGuard);
-    if FileExists(FSessionOwnerGuardPath)
-      and (not SysUtils.DeleteFile(FSessionOwnerGuardPath)) then
+    if LongPathFileExists(FSessionOwnerGuardPath)
+      and (not LongPathDeleteFile(FSessionOwnerGuardPath)) then
       raise ELWPTError.CreateFmt(
         'could not remove build session owner guard %s',
         [FSessionOwnerGuardPath]);
@@ -1590,7 +1593,6 @@ procedure RepairBuildSessions(const AProjectRoot, ATemporaryRoot: string;
   out ATemporaryRootCleaned: Boolean);
 var
   Root, SessionPath, SessionID, StatePath, AgePath, OwnerPath: string;
-  Search: TSearchRec;
   PID: LongInt;
   State: string;
   OwnerHeld: Boolean;
@@ -1601,44 +1603,42 @@ var
   i: Integer;
 
   procedure ReclaimSessionPattern(const APattern: string);
+  var
+    Entries: TLWPTDirectoryEntries;
+    EntryIndex: Integer;
   begin
     if RootRequiresIdentity
       and not SessionRootIdentityMatches(Root, ProjectIdentity) then Exit;
-    if SysUtils.FindFirst(Root + '/' + APattern, faAnyFile, Search) <> 0 then
-      Exit;
-    try
-      repeat
-        if (Search.Name = '.') or (Search.Name = '..') then Continue;
-        if (Search.Attr and faDirectory) = 0 then Continue;
-        SessionPath := Root + '/' + Search.Name;
-        SessionID := Search.Name;
-        if Copy(SessionID, 1, Length('.creating-')) = '.creating-' then
-          Delete(SessionID, 1, Length('.creating-'));
-        OwnerPath := SessionOwnerGuardPath(Root, SessionID);
-        StatePath := SessionPath + '/session.state';
-        PID := ReadPID(StatePath);
-        State := ReadSessionState(StatePath);
-        OwnerHeld := SessionOwnerGuardHeld(OwnerPath);
-        if FileExists(StatePath) then AgePath := StatePath
-        else AgePath := SessionPath;
-        if OwnerHeld then
-          Inc(ARetained)
-        else if (State <> 'failed')
-          and (not IncompleteStateIsAbandoned(AgePath))
-          and ((State = '') or ProcessIsAlive(PID)) then
-          Inc(ARetained)
-        else
-        begin
-          if RootRequiresIdentity
-            and not SessionRootIdentityMatches(Root, ProjectIdentity) then
-            Exit;
-          WipeDir(SessionPath);
-          if FileExists(OwnerPath) then SysUtils.DeleteFile(OwnerPath);
-          Inc(ARemoved);
-        end;
-      until SysUtils.FindNext(Search) <> 0;
-    finally
-      SysUtils.FindClose(Search);
+    Entries := ListDirectoryEntries(Root, APattern, faAnyFile);
+    for EntryIndex := 0 to High(Entries) do
+    begin
+      if (Entries[EntryIndex].Attr and faDirectory) = 0 then Continue;
+      SessionPath := Root + '/' + Entries[EntryIndex].Name;
+      SessionID := Entries[EntryIndex].Name;
+      if Copy(SessionID, 1, Length('.creating-')) = '.creating-' then
+        Delete(SessionID, 1, Length('.creating-'));
+      OwnerPath := SessionOwnerGuardPath(Root, SessionID);
+      StatePath := SessionPath + '/session.state';
+      PID := ReadPID(StatePath);
+      State := ReadSessionState(StatePath);
+      OwnerHeld := SessionOwnerGuardHeld(OwnerPath);
+      if LongPathFileExists(StatePath) then AgePath := StatePath
+      else AgePath := SessionPath;
+      if OwnerHeld then
+        Inc(ARetained)
+      else if (State <> 'failed')
+        and (not IncompleteStateIsAbandoned(AgePath))
+        and ((State = '') or ProcessIsAlive(PID)) then
+        Inc(ARetained)
+      else
+      begin
+        if RootRequiresIdentity
+          and not SessionRootIdentityMatches(Root, ProjectIdentity) then
+          Exit;
+        WipeDir(SessionPath);
+        if LongPathFileExists(OwnerPath) then LongPathDeleteFile(OwnerPath);
+        Inc(ARemoved);
+      end;
     end;
   end;
 
@@ -1647,7 +1647,7 @@ var
   begin
     Root := ARoot;
     RootRequiresIdentity := ARequireIdentity;
-    if not DirectoryExists(Root) then Exit;
+    if not LongPathDirectoryExists(Root) then Exit;
     if RootRequiresIdentity
       and not SessionRootIdentityMatches(Root, ProjectIdentity) then Exit;
     ReclaimSessionPattern('s-*');
@@ -1672,7 +1672,7 @@ begin
     { Ledger publication stages through the project temporary root while
       holding this same lock. Serialize repair's residue sweep with that
       writer so a live atomic ledger update cannot lose its staged file. }
-    if (ATemporaryRoot <> '') and DirectoryExists(ATemporaryRoot) then
+    if (ATemporaryRoot <> '') and LongPathDirectoryExists(ATemporaryRoot) then
     begin
       WipeDir(ATemporaryRoot);
       ATemporaryRootCleaned := True;
