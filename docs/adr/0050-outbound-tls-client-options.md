@@ -310,8 +310,13 @@ The decision:
 
 The policy is pinned by observation, not by timing. A fixture leaf, served
 or evaluated without its intermediate, points its AIA, OCSP, and CRL URLs
-at `http://127.0.0.1:47931/`, where the tests run a recorder that counts
-every request (`Tests.RetrievalRecorder`). An anchors-only evaluation must
+at `http://127.0.0.1:6741/`, where the tests run a recorder that counts
+every request (`Tests.RetrievalRecorder`). The port sits below every
+supported platform's default ephemeral range, so a concurrent test's
+outbound loopback connection cannot take it on a default-configured host;
+an existing listener, an explicit port reservation, or a lowered ephemeral
+range can still refuse it, and the recorder then fails naming the
+operating-system error. An anchors-only evaluation must
 fail with zero requests. The positive control is system plus anchors,
 whose fallback evaluation is allowed to fetch: on Windows and macOS the
 recorder must then see at least one request, which shows that the
