@@ -134,12 +134,13 @@ function DescendantGone(const APID: Integer): Boolean;
 var
   StartedAt: QWord;
 begin
-  { An ended descendant can linger as a zombie until its adopter reaps it. }
+  { An ended descendant can linger as a zombie until its adopter reaps it,
+    which ProcessIsLive counts as gone. }
   StartedAt := GetTickCount64;
-  while ProcessIsRunning(APID)
+  while ProcessIsLive(APID)
     and (GetTickCount64 - StartedAt < DescendantGoneMilliseconds) do
     Sleep(ProcessPollMilliseconds);
-  Result := not ProcessIsRunning(APID);
+  Result := not ProcessIsLive(APID);
 end;
 
 procedure TProcessSupportTests.BeforeAll;
@@ -282,11 +283,12 @@ begin
     { The holder forwards nothing, so Unix needs its own process group. }
     ExecuteOwnedChild(Child, True);
     DescendantPID := WaitForDescendantPID(PIDPath);
-    Expect<Boolean>(ProcessIsRunning(DescendantPID)).ToBe(True);
+    Expect<Boolean>(ProcessIsLive(DescendantPID)).ToBe(True);
     Expect<Boolean>(TerminateChildProcess(Child)).ToBe(True);
     Expect<Boolean>(DescendantGone(DescendantPID)).ToBe(True);
   finally
-    ReapChild(Child, CHILD_KILL_MILLISECONDS);
+    { The whole owned tree, whatever an assertion above left running. }
+    TerminateChildProcess(Child);
     Child.Free;
   end;
 end;
@@ -314,7 +316,9 @@ begin
     Expect<Boolean>(TerminateChildProcess(Child)).ToBe(True);
     Expect<Boolean>(DescendantGone(DescendantPID)).ToBe(True);
   finally
-    ReapChild(Child, CHILD_KILL_MILLISECONDS);
+    { The whole owned tree, unconditionally: a failed assertion above must
+      not leave the surviving sleeper running in its own group. }
+    TerminateChildProcess(Child);
     Child.Free;
   end;
 end;

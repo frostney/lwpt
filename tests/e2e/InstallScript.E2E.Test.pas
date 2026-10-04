@@ -183,13 +183,6 @@ const
 
 function prctl(AOption: LongInt; AArgument: PtrUInt): LongInt; cdecl;
   external 'c' name 'prctl';
-
-{ An exited process waits in state Z (or X while being removed) for its
-  parent to reap it; it no longer runs. }
-function ProcessStateIsLive(const AState: Char): Boolean;
-begin
-  Result := (AState <> 'Z') and (AState <> 'X');
-end;
 {$ENDIF}
 {$ENDIF}
 
@@ -733,27 +726,6 @@ begin
   Expect<Boolean>(RunMode('missing-entry', InstallStderr) <> 0).ToBe(True);
   Expect<Boolean>(Pos('checksums file has no entry',
     InstallStderr) > 0).ToBe(True);
-end;
-
-{ Linux reports an exited but unreaped process as state Z; it no longer
-  runs. Elsewhere kill(pid, 0) is the probe. }
-function ProcessIsLive(const APid: LongInt): Boolean;
-{$IFDEF LINUX}
-var
-  State: Char;
-  Parent, Group: LongInt;
-{$ENDIF}
-begin
-  {$IFDEF LINUX}
-  Result := ReadProcessStat(APid, State, Parent, Group)
-    and ProcessStateIsLive(State);
-  {$ELSE}
-  {$IFDEF UNIX}
-  Result := FpKill(APid, 0) = 0;
-  {$ELSE}
-  Result := False;
-  {$ENDIF}
-  {$ENDIF}
 end;
 
 { install.sh prints "Downloading" and then waits on curl, which forwards

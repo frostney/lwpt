@@ -560,6 +560,9 @@ begin
 end;
 
 {$IFDEF MSWINDOWS}
+const
+  JUNCTION_COMMAND_TIMEOUT_MILLISECONDS = 60000;
+
 function TryCreateWindowsJunction(const ALinkDirectory,
   ALinkTarget: string): Boolean;
 var
@@ -577,10 +580,18 @@ begin
     ProcessInstance.Parameters.Add('mklink /J "' +
       StringReplace(ALinkDirectory, '/', '\', [rfReplaceAll]) + '" "' +
       StringReplace(ALinkTarget, '/', '\', [rfReplaceAll]) + '"');
-    ProcessInstance.Options := [poWaitOnExit];
     try
       ProcessInstance.Execute;
-      Result := ProcessInstance.ExitStatus = 0;
+      { Bounded, unlike poWaitOnExit: a cmd.exe that never exits is ended and
+        the junction reported as not created. }
+      if ProcessInstance.WaitOnExit(JUNCTION_COMMAND_TIMEOUT_MILLISECONDS) then
+        Result := ProcessInstance.ExitStatus = 0
+      else
+      begin
+        Windows.TerminateProcess(ProcessInstance.ProcessHandle, 1);
+        ProcessInstance.WaitOnExit(JUNCTION_COMMAND_TIMEOUT_MILLISECONDS);
+        Result := False;
+      end;
     except
       Result := False;
     end;

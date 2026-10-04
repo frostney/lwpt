@@ -65,6 +65,11 @@ type
   EChildProcessSurvivors = class(Exception);
 
 function ProcessIsRunning(const APID: Integer): Boolean;
+{ ProcessIsRunning that treats an exited process as gone even before its
+  parent reaps it: on Linux a process in state Z or X (procfs) no longer
+  runs, although kill(pid, 0) still succeeds for it, which a subreaper that
+  defers reaping makes last. Elsewhere it is ProcessIsRunning. }
+function ProcessIsLive(const APID: Integer): Boolean;
 
 { Drains only the bytes reported available at entry. A child can stay live
   after one progress line, and descendants can inherit its pipe writer, so
@@ -139,8 +144,10 @@ function CapturedOutputTail(const AText: string): string;
 
 { Cleanup: gives a started child ATimeoutMilliseconds to exit, then ends it
   through TerminateChildProcess, draining and discarding a poUsePipes
-  child's output throughout. Never raises for a child that will not stop;
-  True when it is gone. A nil or never-started AProcess is gone. }
+  child's output throughout. An owned child whose tree still has running
+  members after it exited has them ended too. Never raises for a child that
+  will not stop; True when it and its owned tree are gone. A nil or
+  never-started AProcess is gone. }
 
 { Runs AExecutable with AArguments in ADirectory (the current directory when
   empty) and returns its exit code, its standard output and error merged
@@ -774,9 +781,9 @@ var
 begin
   if (AProcess = nil) or (AProcess.ProcessID <= 0) then Exit(True);
   Discarded := '';
-  Result := WaitForChildExit(AProcess, Discarded, Discarded,
-    ATimeoutMilliseconds) or TerminateChildProcess(AProcess, Discarded,
-    Discarded);
+  Result := (WaitForChildExit(AProcess, Discarded, Discarded,
+    ATimeoutMilliseconds) and (OwnedChildSurvivors(AProcess) = ''))
+    or TerminateChildProcess(AProcess, Discarded, Discarded);
 end;
 
 function RunChildCommand(const ADirectory, AExecutable: string;
@@ -866,6 +873,21 @@ begin
   Result := '';
 end;
 {$ENDIF}
+{$ENDIF}
+
+function ProcessIsLive(const APID: Integer): Boolean;
+{$IFDEF LINUX}
+var
+  State: Char;
+  Parent, Group: LongInt;
+begin
+  Result := (APID > 0) and ReadProcessStat(APID, State, Parent, Group)
+    and (State <> 'Z') and (State <> 'X');
+end;
+{$ELSE}
+begin
+  Result := ProcessIsRunning(APID);
+end;
 {$ENDIF}
 
 end.
