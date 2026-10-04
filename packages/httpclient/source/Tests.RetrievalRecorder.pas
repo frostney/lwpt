@@ -9,16 +9,17 @@
   retrieval is allowed (at least one request).
 
   The port is fixed because it is baked into the certificate, so it sits
-  below every supported platform's ephemeral range: Linux 32768-60999,
-  Windows and macOS 49152-65535, and FreeBSD 10000-65535. Inside such a
-  range, any outbound loopback connection a concurrent test program opens
-  can be auto-bound to the port and refuse the listener with EADDRINUSE,
-  and SO_REUSEADDR cannot override a socket that lacks it. 6741 is also
-  unassigned by IANA and clear of common unregistered services. Windows
-  takes its Hyper-V and WinNAT port exclusions from the dynamic range, so
-  only a host whose dynamic range was moved below 6741 can still reserve
-  it. Create retries a bind refused with EADDRINUSE for a bounded time,
-  then raises with the operating-system error.
+  below every supported platform's default ephemeral range: Linux
+  32768-60999, Windows and macOS 49152-65535, and FreeBSD 10000-65535.
+  Inside such a range, any outbound loopback connection a concurrent test
+  program opens can be auto-bound to the port and refuse the listener with
+  EADDRINUSE, and SO_REUSEADDR cannot override a socket that lacks it. 6741
+  is also unassigned by IANA and clear of common unregistered services. A
+  host can still make it unavailable: an existing listener, an explicit
+  Windows port exclusion or persistent reservation, or an ephemeral range
+  reconfigured below it (Windows, Linux, and macOS all allow that). Create
+  retries a bind refused with EADDRINUSE for a bounded time, then raises
+  with the operating-system error.
 
   BSD sockets on Unix and WinSock2 on Windows. }
 

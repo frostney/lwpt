@@ -96,7 +96,7 @@ openssl pkcs12 -export -inkey localhost-test-leaf-key.pem \
 shape. Its leaf, `localhost-loopback-aia-leaf-cert.pem` (serial `0x7103`,
 `loopback-aia-leaf.cnf`), points the AIA, OCSP, and CRL URLs at
 `http://127.0.0.1:6741/`, the fixed port of the tests' retrieval recorder,
-so any fetch is counted. The port sits below every supported platform's
+so any fetch is counted. The port sits below every supported platform's default
 ephemeral range, where an outbound loopback connection from a concurrent
 test could otherwise take it (see `Tests.RetrievalRecorder.pas`); changing
 it means changing `RETRIEVAL_RECORDER_PORT` and regenerating this leaf.
