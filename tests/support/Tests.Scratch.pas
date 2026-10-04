@@ -541,10 +541,18 @@ begin
   Extended := ScratchExtendedPath(ExcludeTrailingPathDelimiter(APath));
   Attributes := Windows.GetFileAttributesW(PWideChar(Extended));
   if Attributes = $FFFFFFFF then Exit;
+  { A root link is removed as a node through the same extended spelling as
+    a child link; its target is never touched. }
   if (Attributes and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0 then
   begin
-    RemoveLink(APath, faSymLink or LongInt(Attributes
-      and Windows.FILE_ATTRIBUTE_DIRECTORY));
+    if (Attributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+    begin
+      if not Windows.RemoveDirectoryW(PWideChar(Extended)) then
+        RaiseScratchError(
+          'RecursiveDelete: failed to remove dir link "%s": %s', APath);
+    end
+    else if not Windows.DeleteFileW(PWideChar(Extended)) then
+      RaiseScratchError('RecursiveDelete: failed to unlink "%s": %s', APath);
     Exit;
   end;
   if (Attributes and Windows.FILE_ATTRIBUTE_DIRECTORY) = 0 then Exit;
