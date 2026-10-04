@@ -9,7 +9,15 @@ uses
   SysUtils;
 
 const
-  { Bound for each readiness phase of a started registry child. }
+  { Bound for a started child's bind announcement. Before announcing, the
+    child loads its store and, for TLS, imports its identity (macOS: into
+    a temporary keychain); Network.framework on macOS 26 and newer then
+    allows its listener 10 s to become ready. A collision ends the child
+    at once, so this generous bound is spent only by a child that never
+    announces. }
+  RegistryAnnounceMilliseconds = 30000;
+  { Bound for each readiness phase after the announcement, such as
+    discovery naming this registry. }
   RegistryReadyMilliseconds = 5000;
 
 type
@@ -29,6 +37,14 @@ procedure BindRegistryChildToParent(AProcess: TProcess);
   wait timed out. }
 function WaitForRegistryHandleRelease(AProcess: TProcess;
   const ATimeoutMilliseconds: Cardinal): Boolean;
+{ Polls, bounded, until AProcess reports an exit; Running is a nonblocking
+  status query. Use it instead of the parameterless WaitOnExit, which never
+  returns for a hung child. True does not mean the child's handles are
+  released: follow it with WaitForRegistryHandleRelease or
+  StopRegistryProcess before reading the exit status or removing the
+  child's working directory. }
+function WaitForRegistryExit(AProcess: TProcess;
+  const ATimeoutMilliseconds: QWord): Boolean;
 
 function StopRegistryProcess(var AProcess: TProcess;
   const AGraceMilliseconds: QWord = 12000;
@@ -54,6 +70,15 @@ function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
 function LaunchRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
   const AEnvironment: array of string; const AWorkingDirectory: string = '';
   const AAllowRelocation: Boolean = True;
+  const AExecutable: string = ''): TProcess;
+{ LaunchRegistryCLI for a registry whose base URL names a relay or proxy
+  port and whose listener binds AListenPort. A listen port taken between
+  selection and bind moves only the listener: AListenPort is updated, and
+  the base URL and identity stay as initialized, so the caller must point
+  its relay at the new AListenPort. }
+function LaunchRegistryCLIBehindRelay(const ADataDirectory, ABaseURL: string;
+  var AListenPort: Word; const AEnvironment: array of string;
+  const AWorkingDirectory: string = '';
   const AExecutable: string = ''): TProcess;
 procedure StopRegistryCLI(var AProcess: TProcess);
 
@@ -191,11 +216,32 @@ end;
 const
   RegistryStartAttempts = 5;
 
-function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
-  const APort: Word): string;
+{ Rewrites an initialized data directory's listen port to APort and, when
+  ABaseURL is nonempty, its base URL; identity and role are untouched. }
+procedure RewriteRegistryTransport(const ADataDirectory, ABaseURL: string;
+  const APort: Word);
 var
   Lines: TStringList;
   Index: Integer;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LineBreak := #10;
+    Lines.LoadFromFile(ADataDirectory + '/registry.toml');
+    for Index := 0 to Lines.Count - 1 do
+      if (ABaseURL <> '') and (Pos('base_url = ', Lines[Index]) = 1) then
+        Lines[Index] := 'base_url = "' + ABaseURL + '"'
+      else if Pos('port = ', Lines[Index]) = 1 then
+        Lines[Index] := 'port = ' + IntToStr(APort);
+    Lines.SaveToFile(ADataDirectory + '/registry.toml');
+  finally
+    Lines.Free;
+  end;
+end;
+
+function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
+  const APort: Word): string;
+var
   Authority, Host, Path: string;
 begin
   Authority := Copy(ABaseURL, Pos('://', ABaseURL) + 3, MaxInt);
@@ -210,31 +256,49 @@ begin
   if Pos(':', Host) > 0 then Host := Copy(Host, 1, Pos(':', Host) - 1);
   Result := Copy(ABaseURL, 1, Pos('://', ABaseURL) + 2) + Host + ':'
     + IntToStr(APort) + Path;
-  Lines := TStringList.Create;
-  try
-    Lines.LineBreak := #10;
-    Lines.LoadFromFile(ADataDirectory + '/registry.toml');
-    for Index := 0 to Lines.Count - 1 do
-      if Pos('base_url = ', Lines[Index]) = 1 then
-        Lines[Index] := 'base_url = "' + Result + '"'
-      else if Pos('port = ', Lines[Index]) = 1 then
-        Lines[Index] := 'port = ' + IntToStr(APort);
-    Lines.SaveToFile(ADataDirectory + '/registry.toml');
-  finally
-    Lines.Free;
-  end;
+  RewriteRegistryTransport(ADataDirectory, Result, APort);
 end;
 
-{ Moves an initialized data directory to a newly selected port. }
-function RelocateRegistryPort(const ADataDirectory, ABaseURL: string): string;
-begin
-  Result := RelocateRegistryPortTo(ADataDirectory, ABaseURL,
-    FindAvailableRegistryTestPort);
-end;
+type
+  TRegistryRelocation = (rrNone, rrBaseURL, rrListener);
+
+function LaunchRegistryChild(const ADataDirectory: string;
+  var ABaseURL: string; var AListenPort: Word;
+  const AEnvironment: array of string; const AWorkingDirectory: string;
+  const ARelocation: TRegistryRelocation;
+  const AExecutable: string): TProcess; forward;
 
 function LaunchRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
   const AEnvironment: array of string; const AWorkingDirectory: string;
   const AAllowRelocation: Boolean; const AExecutable: string): TProcess;
+var
+  UnusedListenPort: Word;
+begin
+  UnusedListenPort := 0;
+  if AAllowRelocation then
+    Result := LaunchRegistryChild(ADataDirectory, ABaseURL, UnusedListenPort,
+      AEnvironment, AWorkingDirectory, rrBaseURL, AExecutable)
+  else
+    Result := LaunchRegistryChild(ADataDirectory, ABaseURL, UnusedListenPort,
+      AEnvironment, AWorkingDirectory, rrNone, AExecutable);
+end;
+
+function LaunchRegistryCLIBehindRelay(const ADataDirectory, ABaseURL: string;
+  var AListenPort: Word; const AEnvironment: array of string;
+  const AWorkingDirectory: string; const AExecutable: string): TProcess;
+var
+  BaseURL: string;
+begin
+  BaseURL := ABaseURL;
+  Result := LaunchRegistryChild(ADataDirectory, BaseURL, AListenPort,
+    AEnvironment, AWorkingDirectory, rrListener, AExecutable);
+end;
+
+function LaunchRegistryChild(const ADataDirectory: string;
+  var ABaseURL: string; var AListenPort: Word;
+  const AEnvironment: array of string; const AWorkingDirectory: string;
+  const ARelocation: TRegistryRelocation;
+  const AExecutable: string): TProcess;
 var
   Started: QWord;
   Attempt: Integer;
@@ -268,7 +332,7 @@ begin
         if Pos(' listening at ' + ABaseURL, Output) > 0 then Exit;
         if not Result.Running then Break;
         Sleep(10);
-      until GetTickCount64 - Started >= RegistryReadyMilliseconds;
+      until GetTickCount64 - Started >= RegistryAnnounceMilliseconds;
       ExitState := 'running';
       if not Result.Running then ExitState := IntToStr(Result.ExitCode)
         + ' (status=' + IntToStr(Result.ExitStatus) + ')';
@@ -276,7 +340,7 @@ begin
       Collided := (not Result.Running) and (Pos('listen_failed:', Diagnostics) > 0);
       { A caller that asserts readiness is refused must not be rescued by
         relocating to a free port. }
-      if not Collided or not AAllowRelocation
+      if not Collided or (ARelocation = rrNone)
          or (Attempt = RegistryStartAttempts) then
         raise Exception.Create('registry CLI listener did not become ready after '
           + IntToStr(Attempt) + ' start attempt(s); exit=' + ExitState
@@ -288,7 +352,13 @@ begin
     end;
     { Another process took the port after it was selected. }
     StopRegistryCLI(Result);
-    ABaseURL := RelocateRegistryPort(ADataDirectory, ABaseURL);
+    if ARelocation = rrListener then
+    begin
+      AListenPort := FindAvailableRegistryTestPort;
+      RewriteRegistryTransport(ADataDirectory, '', AListenPort);
+    end
+    else ABaseURL := RelocateRegistryPortTo(ADataDirectory, ABaseURL,
+      FindAvailableRegistryTestPort);
   end;
 end;
 

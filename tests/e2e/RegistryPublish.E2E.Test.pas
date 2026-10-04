@@ -57,6 +57,7 @@ type
     procedure TestLocalRefusalsMakeNoConnectionAndReadNoToken;
     procedure TestPublishesOverHTTPSWithTheTestRoot;
     procedure TestPublishesAcrossKeyRotations;
+    procedure TestRelayedOriginMovesOnlyItsListener;
   end;
 
 procedure TRegistryPublishE2E.BeforeEach;
@@ -203,6 +204,50 @@ begin
   ExpectProjectUntouched;
   FOrigin.Stop;
   ExpectSecretAbsent(Token);
+end;
+
+{ Another process holds a relayed origin's listen port before it starts.
+  Only the listener may move: the advertised relay URL and the identity
+  that publication reports stay as initialized, and publication through
+  the relay reaches the moved listener. }
+procedure TRegistryPublishE2E.TestRelayedOriginMovesOnlyItsListener;
+var
+  Relay: TTCPRelay;
+  Occupier: TRegistryTestServer;
+  Token, Base, Path: string;
+  Bytes: TBytes;
+  Run: TLwptResult;
+begin
+  Relay := TTCPRelay.Create(0);
+  { The occupier binds a kernel-chosen port first and the origin listens
+    there, so the collision is certain rather than raced. }
+  Occupier := TRegistryTestServer.Create(nil, True);
+  try
+    Occupier.Start;
+    FOrigin := TPublishOrigin.Create(FScratch, 'relayed', Relay.Port,
+      Occupier.Port);
+    Base := FOrigin.Base;
+    Token := FOrigin.IssueToken(['--packages', 'relayed-*']);
+    FOrigin.Start;
+    Expect<Boolean>(FOrigin.ListenPort <> Occupier.Port).ToBe(True);
+    Expect<string>(FOrigin.Base).ToBe(Base);
+    Expect<string>(FOrigin.Identity).ToBe(Base);
+    Relay.Backend := FOrigin.ListenPort;
+    Bytes := PublishTarGz('relayed-lib', '1.0.0', 'through the relay');
+    Path := Archive('relayed-lib.tar.gz', Bytes);
+    Run := Publish(Path, Token, []);
+    if Run.ExitCode <> 0 then WriteLn(StdErr, Run.Stderr);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('published relayed-lib@1.0.0 to ' + Base
+      + ' at sequence 2 ', PublishLine(Run)) = 1).ToBe(True);
+    Expect<Boolean>(Relay.Accepted > 0).ToBe(True);
+    Expect<Integer>(Occupier.RequestCount).ToBe(0);
+    Expect<Integer>(FOrigin.LatestSequence).ToBe(2);
+  finally
+    FreeAndNil(FOrigin);
+    Occupier.Free;
+    Relay.Free;
+  end;
 end;
 
 procedure TRegistryPublishE2E.TestSilentIssueTokenPrintsOnlyTheToken;
@@ -472,6 +517,8 @@ begin
     FOrigin := TPublishOrigin.Create(FScratch, 'tls-origin', Relay.Port, Backend, True);
     Token := FOrigin.IssueToken(['--packages', 'tls-*']);
     FOrigin.Start;
+    { A start that lost the backend port moved only the listener. }
+    Relay.Backend := FOrigin.ListenPort;
     Seam := UpperCase(RegistryProgramName) + '_TEST_REGISTRY_TRUST_ANCHORS='
       + TestRootCertificatePath;
     Bytes := PublishTarGz('tls-lib', '1.0.0', 'over tls');
@@ -573,6 +620,8 @@ begin
     TestLocalRefusalsMakeNoConnectionAndReadNoToken);
   Test('HTTPS publication trusts the test root only in the test build; a refused certificate is not retried',
     TestPublishesOverHTTPSWithTheTestRoot);
+  Test('a relayed origin whose listen port is held moves only its listener',
+    TestRelayedOriginMovesOnlyItsListener);
   Test('a root-pinned publish walks the rotation chain before and after its commit',
     TestPublishesAcrossKeyRotations);
 end;
