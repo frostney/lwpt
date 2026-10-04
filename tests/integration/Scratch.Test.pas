@@ -29,6 +29,8 @@ type
     procedure TestRootsAreUniqueAcrossCalls;
     procedure TestReapingDeletesDeadAndLeavesLiveOwner;
     procedure TestRecursiveDeleteRemovesTreesPastMaxPath;
+    procedure TestReadsShareAHandleHoldingDeleteAccess;
+    procedure TestReadsRetryABrieflyExclusiveHandle;
     {$IFDEF MSWINDOWS}
     procedure TestRecursiveDeleteRemovesRootLinkPastMaxPath;
     {$ENDIF}
@@ -225,6 +227,127 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF MSWINDOWS}
+type
+  { Closes a handle after a delay, standing in for a writer, a rename, or a
+    scanner that holds a file briefly. }
+  THandleCloser = class(TThread)
+  private
+    FHandle: THandle;
+    FDelayMilliseconds: Cardinal;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AHandle: THandle;
+      const ADelayMilliseconds: Cardinal);
+  end;
+
+constructor THandleCloser.Create(const AHandle: THandle;
+  const ADelayMilliseconds: Cardinal);
+begin
+  FHandle := AHandle;
+  FDelayMilliseconds := ADelayMilliseconds;
+  FreeOnTerminate := False;
+  inherited Create(False);
+end;
+
+procedure THandleCloser.Execute;
+begin
+  SysUtils.Sleep(FDelayMilliseconds);
+  Windows.CloseHandle(FHandle);
+end;
+
+function OpenTestHandle(const APath: string; const AAccess,
+  AShare: DWORD): THandle;
+begin
+  Result := Windows.CreateFileW(PWideChar(UnicodeString(APath)), AAccess,
+    AShare, nil, Windows.OPEN_EXISTING, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if Result = Windows.INVALID_HANDLE_VALUE then RaiseLastOSError;
+end;
+{$ENDIF}
+
+{ A write-through rename keeps its handle, with delete access, open while
+  the renamed file is already visible; a reader that does not share delete
+  access fails against it with a sharing violation. }
+procedure TScratch.TestReadsShareAHandleHoldingDeleteAccess;
+{$IFDEF MSWINDOWS}
+const
+  DELETE_ACCESS = $00010000;
+var
+  Root, Path: string;
+  Handle: THandle;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Root := CreateScratchRoot('scratch-shared-read');
+  try
+    Path := Root + '\published.toml';
+    WriteTextFile(Path, 'complete = true' + #10);
+    Handle := OpenTestHandle(Path, DELETE_ACCESS or Windows.GENERIC_READ,
+      Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+        or Windows.FILE_SHARE_DELETE);
+    try
+      Expect<string>(ReadBinaryFile(Path)).ToBe('complete = true' + #10);
+    finally
+      Windows.CloseHandle(Handle);
+    end;
+  finally
+    RecursiveDelete(Root);
+  end;
+  {$ENDIF}
+end;
+
+{ A handle that shares nothing makes every open fail with a sharing
+  violation. A read retries that, and only that, until the handle closes,
+  within READ_SHARING_RETRY_MILLISECONDS; past the bound it fails. }
+procedure TScratch.TestReadsRetryABrieflyExclusiveHandle;
+{$IFDEF MSWINDOWS}
+var
+  Root, Path, Failure: string;
+  Handle: THandle;
+  Closer: THandleCloser;
+  StartedAt, Elapsed: QWord;
+{$ENDIF}
+begin
+  {$IFDEF MSWINDOWS}
+  Root := CreateScratchRoot('scratch-shared-read');
+  try
+    Path := Root + '\held.toml';
+    WriteTextFile(Path, 'held = true' + #10);
+    Handle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
+    Closer := THandleCloser.Create(Handle, 300);
+    try
+      StartedAt := GetTickCount64;
+      Expect<string>(ReadBinaryFile(Path)).ToBe('held = true' + #10);
+      Elapsed := GetTickCount64 - StartedAt;
+      Expect<Boolean>(Elapsed >= 200).ToBe(True);
+    finally
+      Closer.WaitFor;
+      Closer.Free;
+    end;
+    Handle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
+    try
+      Failure := '';
+      StartedAt := GetTickCount64;
+      try
+        ReadBinaryFile(Path);
+      except
+        on E: EFOpenError do Failure := E.Message;
+      end;
+      Elapsed := GetTickCount64 - StartedAt;
+      Expect<Boolean>(Failure <> '').ToBe(True);
+      Expect<Boolean>(Elapsed >= READ_SHARING_RETRY_MILLISECONDS).ToBe(True);
+      Expect<Boolean>(Elapsed < READ_SHARING_RETRY_MILLISECONDS + 3000)
+        .ToBe(True);
+    finally
+      Windows.CloseHandle(Handle);
+    end;
+  finally
+    RecursiveDelete(Root);
+  end;
+  {$ENDIF}
+end;
+
 procedure TScratch.SetupTests;
 {$IFDEF MSWINDOWS}
 var SkipReason: string;
@@ -233,6 +356,17 @@ begin
   Test('roots are unique across calls', TestRootsAreUniqueAcrossCalls);
   Test('recursive delete removes a tree past MAX_PATH',
     TestRecursiveDeleteRemovesTreesPastMaxPath);
+  {$IFDEF MSWINDOWS}
+  Test('a read shares the file with a handle holding delete access',
+    TestReadsShareAHandleHoldingDeleteAccess);
+  Test('a read retries a briefly exclusive handle within its bound',
+    TestReadsRetryABrieflyExclusiveHandle);
+  {$ELSE}
+  Skip('a read shares the file with a handle holding delete access',
+    TestReadsShareAHandleHoldingDeleteAccess, 'Windows share modes');
+  Skip('a read retries a briefly exclusive handle within its bound',
+    TestReadsRetryABrieflyExclusiveHandle, 'Windows share modes');
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   SkipReason := LongJunctionSkipReason;
   if SkipReason = '' then

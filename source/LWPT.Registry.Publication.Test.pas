@@ -16,6 +16,7 @@ uses
 
   LWPT.Core,
   LWPT.ProducerLease,
+  LWPT.Registry.Audit,
   LWPT.Registry.Incoming,
   LWPT.Registry.Mirror,
   LWPT.Registry.Publication,
@@ -56,6 +57,18 @@ type
     Response: TRawHTTPResponse;
     constructor Create(const APort: Word; const AMethod, ATarget,
       AToken: string; const ABody: TBytes);
+  end;
+
+  { Writes ACount audit records through the server's own writer. }
+  TAuditWriter = class(TThread)
+  private
+    FRoot: string;
+    FCount: Integer;
+  protected
+    procedure Execute; override;
+  public
+    Failure: string;
+    constructor Create(const ARoot: string; const ACount: Integer);
   end;
 
   { Takes a guard as soon as it is free and holds it for a while. }
@@ -152,6 +165,7 @@ type
     procedure TestMalformedMutationsAreAudited;
     procedure TestSlowBodiesHitTheDeadline;
     procedure TestIncompleteMutatingHeadsAreAudited;
+    procedure TestAuditRecordsReadWhileWrittenNeverFail;
     procedure TestLongAdmissionStillAnswersRetryably;
     procedure TestStartRelocatesFromAHeldPort;
   private
@@ -192,6 +206,39 @@ begin
   RTLEventSetEvent(Acquired);
   Sleep(FHoldMilliseconds);
   Guard.Free;
+end;
+
+constructor TAuditWriter.Create(const ARoot: string; const ACount: Integer);
+begin
+  FRoot := ARoot;
+  FCount := ACount;
+  FreeOnTerminate := False;
+  inherited Create(False);
+end;
+
+function AuditRaceRecord(const AIndex: Integer): TLWPTRegistryAuditRecord;
+begin
+  Result := Default(TLWPTRegistryAuditRecord);
+  Result.RequestID := 'race' + Format('%.28d', [AIndex]);
+  Result.ReceivedAt := '2026-10-04T12:00:00Z';
+  Result.CompletedAt := Result.ReceivedAt;
+  Result.Peer := '127.0.0.1';
+  Result.Method := 'PUT';
+  Result.Route := REGISTRY_AUDIT_INVALID_ROUTE;
+  Result.Status := 400;
+  Result.Code := 'invalid_request';
+end;
+
+procedure TAuditWriter.Execute;
+var
+  Index: Integer;
+begin
+  try
+    for Index := 0 to FCount - 1 do
+      WriteRegistryAuditRecord(FRoot, AuditRaceRecord(Index));
+  except
+    on E: Exception do Failure := E.ClassName + ': ' + E.Message;
+  end;
 end;
 
 constructor TServeThread.Create(AServer: TLWPTRegistryServer);
@@ -1734,6 +1781,72 @@ begin
   end;
 end;
 
+{ An operator or test reading audit records while the origin writes them
+  must never fail: each record appears through an atomic rename, and the
+  reader shares the file with the rename's own handle. On Windows that
+  handle is still open, with delete access, as the record becomes visible
+  (a write-through move flushes before closing it), which is what failed
+  a reader that did not share delete access. }
+procedure TRegistryPublicationContract.TestAuditRecordsReadWhileWrittenNeverFail;
+const
+  RECORD_COUNT = 300;
+var
+  Root, Path, Text: string;
+  Writer: TAuditWriter;
+  Seen, Files: TStringList;
+  Failures: Integer;
+  FirstFailure: string;
+  Started: QWord;
+  WriterDone: Boolean;
+begin
+  Root := FScratch + '/audit-race';
+  ForceDirectories(Root + '/audit');
+  Failures := 0;
+  FirstFailure := '';
+  Seen := TStringList.Create;
+  Files := TStringList.Create;
+  Writer := TAuditWriter.Create(Root, RECORD_COUNT);
+  try
+    Seen.Sorted := True;
+    Started := GetTickCount64;
+    repeat
+      WriterDone := Writer.Finished;
+      Files.Clear;
+      CollectFiles(Root + '/audit', Files);
+      for Path in Files do
+      begin
+        if (Pos('.staging', Path) > 0) or (Seen.IndexOf(Path) >= 0) then
+          Continue;
+        try
+          Text := ReadBinaryFile(Path);
+          { A visible record is complete: it was renamed into place. }
+          if Pos('auth_failure = ""' + #10, Text) = 0 then
+            raise Exception.Create('incomplete record ' + Path);
+          Seen.Add(Path);
+        except
+          on E: Exception do
+          begin
+            Inc(Failures);
+            if FirstFailure = '' then FirstFailure := E.Message;
+            Seen.Add(Path);
+          end;
+        end;
+      end;
+    until (WriterDone and (Seen.Count >= RECORD_COUNT))
+      or (GetTickCount64 - Started > 30000);
+    Writer.WaitFor;
+    if FirstFailure <> '' then WriteLn(StdErr, 'first audit read failure: ',
+      FirstFailure);
+    Expect<string>(Writer.Failure).ToBe('');
+    Expect<Integer>(Failures).ToBe(0);
+    Expect<Integer>(Seen.Count).ToBe(RECORD_COUNT);
+  finally
+    Writer.Free;
+    Files.Free;
+    Seen.Free;
+  end;
+end;
+
 procedure TRegistryPublicationContract.SlowAdmissionHook(const APoint: string);
 begin
   { Slow progress while admission owns the publication lease, then another
@@ -1880,6 +1993,8 @@ begin
   Test('a slow body is cut off at its deadline', TestSlowBodiesHitTheDeadline);
   Test('incomplete mutating heads are audited once on EOF and deadline',
     TestIncompleteMutatingHeadsAreAudited);
+  Test('audit records read while they are written never fail',
+    TestAuditRecordsReadWhileWrittenNeverFail);
   Test('an admission that waits past the header deadline still answers 503',
     TestLongAdmissionStillAnswersRetryably);  Test('a start whose port another listener holds relocates to its own',
     TestStartRelocatesFromAHeldPort);
