@@ -8,8 +8,10 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
+  Classes,
   SysUtils,
 
+  LWPT.Core,
   TestingPascalLibrary,
   Tests.Scratch;
 
@@ -23,6 +25,7 @@ type
     procedure SetupTests; override;
     procedure TestRootsAreUniqueAcrossCalls;
     procedure TestReapingDeletesDeadAndLeavesLiveOwner;
+    procedure TestRecursiveDeleteRemovesTreesPastMaxPath;
   end;
 
 procedure TScratch.TestRootsAreUniqueAcrossCalls;
@@ -74,9 +77,39 @@ begin
   end;
 end;
 
+{ #347: toolkit code legitimately nests state past the Windows MAX_PATH, so
+  scratch cleanup must remove such trees. The fixture is written with the
+  Core long-path helpers; the wipe uses only Tests.Scratch. }
+procedure TScratch.TestRecursiveDeleteRemovesTreesPastMaxPath;
+const
+  { Win32 MAX_PATH, including the terminating NUL. }
+  LEGACY_WINDOWS_MAX_PATH = 260;
+var
+  Root, Deep, FilePath: string;
+  Stream: TLWPTProtectedFileStream;
+begin
+  Root := CreateScratchRoot('scratch-deep');
+  Deep := Root;
+  while Length(Deep) <= LEGACY_WINDOWS_MAX_PATH + 20 do
+    Deep := Deep + '/' + StringOfChar('d', 48);
+  FilePath := Deep + '/' + StringOfChar('f', 40) + '.txt';
+  Expect<Boolean>(Length(FilePath) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+  Expect<Boolean>(LongPathForceDirectories(Deep + '/empty')).ToBe(True);
+  Stream := OpenProtectedFileStream(FilePath, fmCreate);
+  Stream.Free;
+  Expect<Boolean>(LongPathFileExists(FilePath)).ToBe(True);
+
+  RecursiveDelete(Root);
+
+  Expect<Boolean>(LongPathFileExists(FilePath)).ToBe(False);
+  Expect<Boolean>(LongPathDirectoryExists(Root)).ToBe(False);
+end;
+
 procedure TScratch.SetupTests;
 begin
   Test('roots are unique across calls', TestRootsAreUniqueAcrossCalls);
+  Test('recursive delete removes a tree past MAX_PATH',
+    TestRecursiveDeleteRemovesTreesPastMaxPath);
   Test('reaping deletes dead owner and leaves live owner',
     TestReapingDeletesDeadAndLeavesLiveOwner);
 end;
