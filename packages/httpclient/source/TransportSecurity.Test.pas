@@ -53,9 +53,7 @@ uses
   {$ENDIF}
   base64,
   TestingPascalLibrary,
-  {$IFDEF MSWINDOWS}
   Tests.RetrievalRecorder,
-  {$ENDIF}
   TransportSecurity;
 
 const
@@ -119,6 +117,7 @@ type
     procedure TestMalformedAnchorsRejected;
     procedure TestInconsistentOptionsRejected;
     procedure TestNativeMaterialRejectedBeforeConnecting;
+    procedure TestLoopbackAIAFixtureNamesRecorderPort;
     procedure TestSChannelAnchorVerificationStaysOffline;
     procedure TestSChannelAnchorPassMakesNoRetrieval;
     procedure TestSChannelChainExecutionFailureIsNotARefusal;
@@ -5424,6 +5423,10 @@ const
     'packages/httpclient/source/fixtures/test-root-cert.pem';
   TEST_INTERMEDIATE_CERTIFICATE_PATH =
     'packages/httpclient/source/fixtures/localhost-test-intermediate-cert.pem';
+  LOOPBACK_AIA_LEAF_PATH =
+    'packages/httpclient/source/fixtures/localhost-loopback-aia-leaf-cert.pem';
+  { FreeBSD's first ephemeral port; Linux, macOS, and Windows start higher. }
+  EPHEMERAL_RANGE_FLOOR = 10000;
 
 function TextBytes(const AText: AnsiString): TBytes;
 begin
@@ -5666,6 +5669,37 @@ begin
   {$ENDIF}
 end;
 
+{ The recorder's port is baked into the loopback-AIA leaf, so the two must
+  agree: a mismatch would leave the zero-request assertions vacuous wherever
+  no positive control runs. The port must also stay below every platform's
+  ephemeral range, where a concurrent test's outbound loopback connection
+  can take it (Tests.RetrievalRecorder). The URLs are IA5Strings, so they
+  appear verbatim in the DER. }
+procedure TTransportSecurityClientOptionTests.TestLoopbackAIAFixtureNamesRecorderPort;
+var
+  Leaf: TBytes;
+  Remaining: AnsiString;
+  LoopbackURLs, RecorderURLs: Integer;
+begin
+  Expect<Boolean>(RETRIEVAL_RECORDER_PORT < EPHEMERAL_RANGE_FLOOR).ToBe(True);
+  Leaf := PEMCertificateDER(LOOPBACK_AIA_LEAF_PATH);
+  SetString(Remaining, PAnsiChar(@Leaf[0]), Length(Leaf));
+  LoopbackURLs := 0;
+  RecorderURLs := 0;
+  while Pos(AnsiString('http://127.0.0.1:'), Remaining) > 0 do
+  begin
+    Delete(Remaining, 1, Pos(AnsiString('http://127.0.0.1:'), Remaining) - 1);
+    Inc(LoopbackURLs);
+    if Pos(AnsiString('http://127.0.0.1:' + IntToStr(RETRIEVAL_RECORDER_PORT)
+       + '/'), Remaining) = 1 then
+      Inc(RecorderURLs);
+    Delete(Remaining, 1, 1);
+  end;
+  { The AIA issuer, OCSP, and CRL distribution-point URLs. }
+  Expect<Integer>(LoopbackURLs).ToBe(3);
+  Expect<Integer>(RecorderURLs).ToBe(3);
+end;
+
 { Observable retrieval: the leaf's AIA, OCSP, and CRL URLs point at a local
   recorder, and its intermediate is withheld. The offline anchor pass must
   reject it with zero requests. The positive control is system plus
@@ -5675,9 +5709,6 @@ end;
   would fetch too and fail the zero-request assertion. }
 procedure TTransportSecurityClientOptionTests.TestSChannelAnchorPassMakesNoRetrieval;
 {$IFDEF MSWINDOWS}
-const
-  LOOPBACK_AIA_LEAF_PATH =
-    'packages/httpclient/source/fixtures/localhost-loopback-aia-leaf-cert.pem';
 var
   ErrorMessage: string;
   Leaf: TBytes;
@@ -5767,6 +5798,8 @@ begin
     TestInconsistentOptionsRejected);
   Test('natively malformed anchors and identities are rejected before connecting',
     TestNativeMaterialRejectedBeforeConnecting);
+  Test('the loopback-AIA fixture names the recorder port below ephemeral ranges',
+    TestLoopbackAIAFixtureNamesRecorderPort);
   {$IFDEF MSWINDOWS}
   Test('SChannel anchor verification never fetches certificate URLs',
     TestSChannelAnchorVerificationStaysOffline);

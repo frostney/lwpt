@@ -95,9 +95,13 @@ openssl pkcs12 -export -inkey localhost-test-leaf-key.pem \
 `localhost-loopback-aia-identity.p12` (passphrase `test-only`) has the same
 shape. Its leaf, `localhost-loopback-aia-leaf-cert.pem` (serial `0x7103`,
 `loopback-aia-leaf.cnf`), points the AIA, OCSP, and CRL URLs at
-`http://127.0.0.1:47931/`, the fixed port of the tests' retrieval recorder,
-so any fetch is counted. Regenerate it like the unreachable-AIA leaf with
-that configuration and serial.
+`http://127.0.0.1:6741/`, the fixed port of the tests' retrieval recorder,
+so any fetch is counted. The port sits below every supported platform's
+ephemeral range, where an outbound loopback connection from a concurrent
+test could otherwise take it (see `Tests.RetrievalRecorder.pas`); changing
+it means changing `RETRIEVAL_RECORDER_PORT` and regenerating this leaf.
+Regenerate it like the unreachable-AIA leaf with that configuration and
+serial.
 
 `localhost-multi-identity.p12` (passphrase `test-only`) carries two
 certificate-and-key identities, the test leaf and the test root, to pin the
