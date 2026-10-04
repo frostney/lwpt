@@ -440,12 +440,13 @@ end;
   nil when absent, not a regular file (never opened), unreadable, or
   larger. }
 function ReadSmallFile(const APath: string; const AMaximum: Int64): TBytes;
-var Stream: TFileStream;
+var Stream: TLWPTProtectedFileStream;
 begin
   Result := nil;
   if not RegistryStoreFileIsRegular(APath) then Exit;
   try
-    Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+    { A shared read: a concurrent atomic replacement never conflicts. }
+    Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   except
     on E: EFOpenError do Exit;
   end;

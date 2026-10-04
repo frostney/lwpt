@@ -376,7 +376,8 @@ begin
   Result := nil;
   { Never open a link, FIFO, or device planted under a document name. }
   if not RegistryStoreFileIsRegular(APath) then Exit;
-  { An evictable document may be removed between the check and the open. }
+  { An evictable document may be removed between the check and the open.
+    The shared read never conflicts with another install publishing it. }
   try
     Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   except
@@ -667,7 +668,7 @@ function LoadRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string
   out AState: TLWPTRegistryConsumerState): Boolean;
 var
   Path, Text: string;
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
   Parser: TTOMLParser;
   Root: TTOMLNode;
   Sequence: Int64;
@@ -675,7 +676,10 @@ begin
   AState := Default(TLWPTRegistryConsumerState);
   Path := RegistryStatePathAt(ARoot, AIdentity, ATrustKeyId);
   if not FileExists(Path) then Exit(False);
-  Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+  { Read without the producer lease while another project's install may
+    atomically replace this file: a shared read (see
+    OpenProtectedFileStream) never conflicts with that replacement. }
+  Stream := OpenProtectedFileStream(Path, fmOpenRead or fmShareDenyNone);
   try
     if Stream.Size > RegistryStateDocumentBytes then
       RaiseCorruptState(Path, 'oversized');
@@ -921,10 +925,10 @@ end;
   --------------------------------------------------------------------------- }
 
 function ReadStateFileBytes(const APath: string): TBytes;
-var Stream: TFileStream;
+var Stream: TLWPTProtectedFileStream;
 begin
   Result := nil;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     if Stream.Size > RegistryStateDocumentBytes then
       raise ELWPTRegistryError.CreateStable('registry_state_corrupt', 'oversized');

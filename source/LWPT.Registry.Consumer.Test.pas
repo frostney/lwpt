@@ -6,12 +6,16 @@ uses
   {$IFDEF UNIX}
   cthreads,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
   SysUtils,
 
   LWPT.Core,
   LWPT.Manifest,
   LWPT.Registry.Consumer,
+  LWPT.Registry.ConsumerStore,
   LWPT.Registry.Verification,
   TestingPascalLibrary,
   Tests.RegistryConsumer,
@@ -61,6 +65,10 @@ type
     procedure TestConcurrentStateMergesAreMonotonic;
     procedure TestRotationChainLoadingIsBounded;
     procedure TestLockedSelectionLoadingIsBounded;
+    procedure TestStateReadsDuringConcurrentPublication;
+    {$IFDEF MSWINDOWS}
+    procedure TestStateReadsShareAPublisherDeleteHandle;
+    {$ENDIF}
   end;
 
   TMergeThread = class(TThread)
@@ -69,6 +77,21 @@ type
   public
     Root, Identity, KeyId, PublicKey, Error: string;
     Sequence: Integer;
+  end;
+
+  { Reads per-user state, and the document being published, without the
+    producer lease until the publisher sets Done. }
+  TStateReadThread = class(TThread)
+  protected
+    procedure Execute; override;
+  public
+    Root, Identity, KeyId: string;
+    Sequence: Int64;
+    Documents: TStringArray;
+    Completed, Done: LongInt;
+    Reads, SharingFailures, OpenFailures, MissedDocuments,
+      WrongStates: Integer;
+    Error: string;
   end;
 
 procedure TRegistryConsumerTests.BeforeAll;
@@ -793,6 +816,206 @@ begin
   end;
 end;
 
+const
+  RACE_IDENTITY = 'https://packages.example.com';
+
+{ Accepted state at ASequence, its timestamps rising with it. }
+function SequencedState(const AKeyId, APublicKey: string;
+  const ASequence: Integer): TLWPTRegistryConsumerState;
+begin
+  Result := Default(TLWPTRegistryConsumerState);
+  Result.State.KeyId := AKeyId;
+  Result.State.PublicKey := APublicKey;
+  Result.State.Sequence := ASequence;
+  Result.State.Snapshot := 'sha256:' + StringOfChar('a', 56)
+    + LowerCase(IntToHex(ASequence, 8));
+  Result.State.CheckpointHash := 'sha256:' + StringOfChar('b', 56)
+    + LowerCase(IntToHex(ASequence, 8));
+  Result.State.PublishedAt := Format('2026-10-01T%.2d:%.2d:00Z',
+    [ASequence div 60, ASequence mod 60]);
+  Result.State.ExpiresAt := '2026-10-02T00:00:00Z';
+  Result.State.ClockFloor := Result.State.PublishedAt;
+end;
+
+function RaceDocument(const AIndex: Integer): TLWPTRegistryDocumentArray;
+begin
+  SetLength(Result, 1);
+  Result[0].Bytes := BytesOf('race document ' + IntToStr(AIndex) + #10);
+end;
+
+function IsSharingViolation(const AMessage: string): Boolean;
+begin
+  {$IFDEF MSWINDOWS}
+  Result := Pos(SysErrorMessage(Windows.ERROR_SHARING_VIOLATION),
+    AMessage) > 0;
+  {$ELSE}
+  Result := False;
+  {$ENDIF}
+end;
+
+procedure TStateReadThread.Execute;
+var
+  State: TLWPTRegistryConsumerState;
+  Next: LongInt;
+  Present: Boolean;
+begin
+  try
+    repeat
+      try
+        if LoadRegistryConsumerStateAt(Root, Identity, KeyId, State) then
+        begin
+          Inc(Reads);
+          if State.State.Sequence <> Sequence then Inc(WrongStates);
+        end;
+      except
+        on E: EFOpenError do
+          if IsSharingViolation(E.Message) then Inc(SharingFailures)
+          else Inc(OpenFailures);
+      end;
+      { The document the publisher is renaming into place now. Documents
+        are written once and never removed here, so one that exists must
+        read whole. }
+      Next := InterLockedExchangeAdd(Completed, 0);
+      if Next <= High(Documents) then
+      begin
+        Present := RegistryStoreFileIsRegular(RegistryStateDocumentPath(Root,
+          Documents[Next]));
+        if Present and (LoadRegistryStateDocument(Root, Documents[Next])
+          = nil) then Inc(MissedDocuments);
+      end;
+    until InterLockedExchangeAdd(Done, 0) <> 0;
+  except
+    on E: Exception do Error := E.ClassName + ': ' + E.Message;
+  end;
+end;
+
+{ Another project's install publishes per-user state and documents while
+  this install reads them without the producer lease (#372). The publisher
+  side runs the primitive a merge uses: each round first-publishes a new
+  document and replaces the state file with AtomicWriteBytes. Neither side
+  may fail for the other: no read meets a sharing violation, no existing
+  document is unreadable, no state read is torn, and every publication
+  commits. On Windows FPC's fmShareDenyNone, which does not share delete
+  access, failed both sides. ReplaceFileW moves the old file aside before
+  moving the new one in, so a Windows reader can still find the state
+  briefly absent; that is the publisher's property, not a sharing
+  conflict, and is only counted. }
+procedure TRegistryConsumerTests.TestStateReadsDuringConcurrentPublication;
+const
+  PUBLICATIONS = 400;
+  STATE_SEQUENCE = 9;
+var
+  Root, StatePath, Failure: string;
+  StateBytes, DocumentBytes: TBytes;
+  Reader: TStateReadThread;
+  Loaded: TLWPTRegistryConsumerState;
+  Index, Failures: Integer;
+begin
+  Root := FScratch + '/state-read-race';
+  MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    SequencedState(FKeyID, FPublicKey, STATE_SEQUENCE), nil, nil);
+  StatePath := RegistryStatePathAt(Root, RACE_IDENTITY, FKeyID);
+  StateBytes := BytesOf(ReadBinaryFile(StatePath));
+  Reader := TStateReadThread.Create(True);
+  try
+    Reader.Root := Root;
+    Reader.Identity := RACE_IDENTITY;
+    Reader.KeyId := FKeyID;
+    Reader.Sequence := STATE_SEQUENCE;
+    SetLength(Reader.Documents, PUBLICATIONS);
+    for Index := 0 to PUBLICATIONS - 1 do
+      Reader.Documents[Index] :=
+        SHA256BytesPrefixed(RaceDocument(Index)[0].Bytes);
+    Reader.Start;
+    Failures := 0;
+    Failure := '';
+    for Index := 0 to PUBLICATIONS - 1 do
+    begin
+      try
+        DocumentBytes := RaceDocument(Index)[0].Bytes;
+        AtomicWriteBytes(RegistryStateDocumentPath(Root,
+          Reader.Documents[Index]), Root + '/tmp', DocumentBytes);
+        AtomicWriteBytes(StatePath, Root + '/tmp', StateBytes);
+      except
+        on E: Exception do
+        begin
+          Inc(Failures);
+          Failure := E.Message;
+        end;
+      end;
+      InterLockedIncrement(Reader.Completed);
+    end;
+    InterLockedExchange(Reader.Done, 1);
+    Reader.WaitFor;
+    Expect<string>(Failure).ToBe('');
+    Expect<Integer>(Failures).ToBe(0);
+    Expect<string>(Reader.Error).ToBe('');
+    Expect<Integer>(Reader.SharingFailures).ToBe(0);
+    Expect<Integer>(Reader.MissedDocuments).ToBe(0);
+    Expect<Integer>(Reader.WrongStates).ToBe(0);
+    Expect<Boolean>(Reader.Reads > 0).ToBe(True);
+    {$IFNDEF MSWINDOWS}
+    { rename(2) replaces the path in one step. }
+    Expect<Integer>(Reader.OpenFailures).ToBe(0);
+    {$ENDIF}
+  finally
+    Reader.Free;
+  end;
+  Expect<Boolean>(LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    Loaded)).ToBe(True);
+  Expect<Int64>(Loaded.State.Sequence).ToBe(STATE_SEQUENCE);
+end;
+
+{$IFDEF MSWINDOWS}
+const
+  DELETE_ACCESS_TEST = $00010000;
+
+{ The handle a write-through rename keeps, with delete access, while the
+  file it renamed is already visible. }
+function HoldPublisherHandle(const APath: string): THandle;
+begin
+  Result := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
+    DELETE_ACCESS_TEST or Windows.GENERIC_READ, Windows.FILE_SHARE_READ
+      or Windows.FILE_SHARE_WRITE or Windows.FILE_SHARE_DELETE, nil,
+    Windows.OPEN_EXISTING, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if Result = Windows.INVALID_HANDLE_VALUE then RaiseLastOSError;
+end;
+
+{ The deterministic half of the race above: with the publisher's handle
+  held, the state file and a document both read. }
+procedure TRegistryConsumerTests.TestStateReadsShareAPublisherDeleteHandle;
+var
+  Root, Hash: string;
+  History: TLWPTRegistryDocumentArray;
+  Loaded: TLWPTRegistryConsumerState;
+  StateHandle, DocumentHandle: THandle;
+  Bytes: TBytes;
+begin
+  Root := FScratch + '/state-read-delete-handle';
+  History := RaceDocument(1);
+  Hash := SHA256BytesPrefixed(History[0].Bytes);
+  MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    SequencedState(FKeyID, FPublicKey, 7), nil, History);
+  StateHandle := HoldPublisherHandle(RegistryStatePathAt(Root, RACE_IDENTITY,
+    FKeyID));
+  try
+    DocumentHandle := HoldPublisherHandle(RegistryStateDocumentPath(Root,
+      Hash));
+    try
+      Expect<Boolean>(LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+        Loaded)).ToBe(True);
+      Expect<Int64>(Loaded.State.Sequence).ToBe(7);
+      Bytes := LoadRegistryStateDocument(Root, Hash);
+      Expect<Integer>(Length(Bytes)).ToBe(Length(History[0].Bytes));
+    finally
+      Windows.CloseHandle(DocumentHandle);
+    end;
+  finally
+    Windows.CloseHandle(StateHandle);
+  end;
+end;
+{$ENDIF}
+
 procedure TRegistryConsumerTests.SetupTests;
 begin
   Test('registry sources parse in bare and inline-table forms',
@@ -840,6 +1063,12 @@ begin
     TestLockedSelectionLoadingIsBounded);
   Test('rotation chains load within count and byte limits and refuse repeats',
     TestRotationChainLoadingIsBounded);
+  Test('per-user state and documents read while another install publishes '
+    + 'them', TestStateReadsDuringConcurrentPublication);
+  {$IFDEF MSWINDOWS}
+  Test('per-user state and documents read beside a publisher holding '
+    + 'delete access', TestStateReadsShareAPublisherDeleteHandle);
+  {$ENDIF}
 end;
 
 begin

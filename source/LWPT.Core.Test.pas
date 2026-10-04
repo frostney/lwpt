@@ -345,6 +345,27 @@ type
     procedure TestLinkTargetOutsideTreeSurvives;
   end;
 
+  { Shared reads of toolkit state (#372): OpenProtectedFileStream with
+    fmOpenRead or fmShareDenyNone never conflicts with an atomic
+    replacement of the file, on Windows as on Unix. }
+  TProtectedSharedReads = class(TTestSuite)
+  private
+    FScratch: string;
+    function Fixture(const AName, AContent: string): string;
+  protected
+    procedure AfterAll; override;
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestReplacementKeepsASharedReaderOpen;
+    procedure TestMissingFileIsNotRetried;
+    {$IFDEF MSWINDOWS}
+    procedure TestSharedReadSharesADeleteHandle;
+    procedure TestSharedReadRetriesASharingViolation;
+    procedure TestSharedReadFailsPastItsRetryBound;
+    {$ENDIF}
+  end;
+
   { MatchPathGlob: path-vs-glob matching for [dependencies]
     include / exclude. Covers single-segment wildcards (`*`, `?`),
     recursive wildcard (`**`), and the edge cases that trip naive
@@ -3879,6 +3900,208 @@ begin
   {$ENDIF}
 end;
 
+{ ── TProtectedSharedReads ──────────────────────────────────────── }
+
+procedure TProtectedSharedReads.BeforeAll;
+begin
+  FScratch := ExpandFileName('build/tests/tmp/shared-read-'
+    + IntToStr(GetProcessID));
+  if LongPathDirectoryExists(FScratch) then WipeDir(FScratch);
+  LongPathForceDirectories(FScratch + '/tmp');
+end;
+
+procedure TProtectedSharedReads.AfterAll;
+begin
+  WipeDir(FScratch);
+end;
+
+function TProtectedSharedReads.Fixture(const AName, AContent: string): string;
+begin
+  Result := FScratch + '/' + AName;
+  AtomicWriteBytes(Result, FScratch + '/tmp', BytesOf(AContent));
+end;
+
+function ReadStreamText(const AStream: TStream): string;
+begin
+  AStream.Position := 0;
+  SetLength(Result, AStream.Size);
+  if Length(Result) > 0 then AStream.ReadBuffer(Result[1], Length(Result));
+end;
+
+function ReadSharedText(const APath: string): string;
+var Stream: TLWPTProtectedFileStream;
+begin
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
+  try
+    Result := ReadStreamText(Stream);
+  finally
+    Stream.Free;
+  end;
+end;
+
+{ The publisher side: an atomic replacement succeeds while a shared reader
+  holds the destination open, the reader keeps the bytes it opened, and
+  once it closes nothing but the destination remains. On Windows this is
+  ReplaceFileW's contract with a reader that shares delete access. }
+procedure TProtectedSharedReads.TestReplacementKeepsASharedReaderOpen;
+var
+  Path: string;
+  Reader: TLWPTProtectedFileStream;
+  Entries: TLWPTDirectoryEntries;
+begin
+  LongPathForceDirectories(FScratch + '/replace');
+  Path := Fixture('replace/state.toml', 'one');
+  Reader := OpenProtectedFileStream(Path, fmOpenRead or fmShareDenyNone);
+  try
+    AtomicWriteBytes(Path, FScratch + '/tmp', BytesOf('two'));
+    Expect<string>(ReadStreamText(Reader)).ToBe('one');
+    Expect<string>(ReadSharedText(Path)).ToBe('two');
+  finally
+    Reader.Free;
+  end;
+  Entries := ListDirectoryEntries(FScratch + '/replace', '*', faAnyFile);
+  Expect<Integer>(Length(Entries)).ToBe(1);
+  Expect<string>(Entries[0].Name).ToBe('state.toml');
+end;
+
+{ Only a sharing violation is retried: a missing file fails at once. }
+procedure TProtectedSharedReads.TestMissingFileIsNotRetried;
+var Baseline: LongInt; Failed: Boolean;
+begin
+  Baseline := InterLockedExchangeAdd(ProtectedReadSharingRetries, 0);
+  Failed := False;
+  try
+    ReadSharedText(FScratch + '/missing.toml');
+  except
+    on E: EFOpenError do Failed := True;
+  end;
+  Expect<Boolean>(Failed).ToBe(True);
+  Expect<LongInt>(InterLockedExchangeAdd(ProtectedReadSharingRetries, 0))
+    .ToBe(Baseline);
+end;
+
+{$IFDEF MSWINDOWS}
+const
+  DELETE_ACCESS_TEST = $00010000;
+
+var
+  { The exclusive handle the retry hook releases at the first retry. }
+  HeldExclusiveHandle: THandle = 0;
+
+procedure ReleaseHeldHandleOnRetry(const APath: string);
+begin
+  if HeldExclusiveHandle = 0 then Exit;
+  Windows.CloseHandle(HeldExclusiveHandle);
+  HeldExclusiveHandle := 0;
+end;
+
+function HoldTestHandle(const APath: string; const AAccess,
+  AShare: DWORD): THandle;
+begin
+  Result := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
+    AAccess, AShare, nil, Windows.OPEN_EXISTING,
+    Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if Result = Windows.INVALID_HANDLE_VALUE then RaiseLastOSError;
+end;
+
+{ A write-through rename keeps its handle, with delete access, open while
+  the renamed file is already visible. A shared read opens beside it; a
+  read that denies writing, which keeps FPC's meaning and so does not
+  share delete access, fails against the same handle. }
+procedure TProtectedSharedReads.TestSharedReadSharesADeleteHandle;
+var
+  Path: string;
+  Handle: THandle;
+  Denied: Boolean;
+begin
+  Path := Fixture('published.toml', 'complete = true');
+  Handle := HoldTestHandle(Path, DELETE_ACCESS_TEST or Windows.GENERIC_READ,
+    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+      or Windows.FILE_SHARE_DELETE);
+  try
+    Expect<string>(ReadSharedText(Path)).ToBe('complete = true');
+    Denied := False;
+    try
+      OpenProtectedFileStream(Path, fmOpenRead or fmShareDenyWrite).Free;
+    except
+      on E: EFOpenError do Denied := True;
+    end;
+    Expect<Boolean>(Denied).ToBe(True);
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+end;
+
+{ A handle that shares nothing makes every open fail with a sharing
+  violation. The retry hook releases it at the first retry, on the reading
+  thread, so the read must then succeed with no timing involved. }
+procedure TProtectedSharedReads.TestSharedReadRetriesASharingViolation;
+var
+  Path, Content: string;
+  Baseline: LongInt;
+begin
+  Path := Fixture('held.toml', 'held = true');
+  HeldExclusiveHandle := HoldTestHandle(Path, Windows.GENERIC_READ, 0);
+  Baseline := InterLockedExchangeAdd(ProtectedReadSharingRetries, 0);
+  ProtectedReadSharingRetryTestHook := ReleaseHeldHandleOnRetry;
+  try
+    Content := ReadSharedText(Path);
+  finally
+    ProtectedReadSharingRetryTestHook := nil;
+    if HeldExclusiveHandle <> 0 then
+    begin
+      Windows.CloseHandle(HeldExclusiveHandle);
+      HeldExclusiveHandle := 0;
+    end;
+  end;
+  Expect<Boolean>(InterLockedExchangeAdd(ProtectedReadSharingRetries, 0)
+    > Baseline).ToBe(True);
+  Expect<string>(Content).ToBe('held = true');
+end;
+
+{ Held past PROTECTED_READ_SHARING_RETRY_MILLISECONDS, with no hook to
+  release it, the sharing violation fails the read after retrying it. }
+procedure TProtectedSharedReads.TestSharedReadFailsPastItsRetryBound;
+var
+  Path, Failure: string;
+  Handle: THandle;
+  Baseline: LongInt;
+begin
+  Path := Fixture('exclusive.toml', 'exclusive = true');
+  Handle := HoldTestHandle(Path, Windows.GENERIC_READ, 0);
+  try
+    Baseline := InterLockedExchangeAdd(ProtectedReadSharingRetries, 0);
+    Failure := '';
+    try
+      ReadSharedText(Path);
+    except
+      on E: EFOpenError do Failure := E.Message;
+    end;
+    Expect<Boolean>(Failure <> '').ToBe(True);
+    Expect<Boolean>(InterLockedExchangeAdd(ProtectedReadSharingRetries, 0)
+      > Baseline).ToBe(True);
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+end;
+{$ENDIF}
+
+procedure TProtectedSharedReads.SetupTests;
+begin
+  Test('an atomic replacement keeps a shared reader open on its old bytes',
+    TestReplacementKeepsASharedReaderOpen);
+  Test('a shared read of a missing file fails without retrying',
+    TestMissingFileIsNotRetried);
+  {$IFDEF MSWINDOWS}
+  Test('a shared read opens beside a handle holding delete access',
+    TestSharedReadSharesADeleteHandle);
+  Test('a shared read retries a sharing violation until it clears',
+    TestSharedReadRetriesASharingViolation);
+  Test('a shared read fails once a sharing violation outlasts its bound',
+    TestSharedReadFailsPastItsRetryBound);
+  {$ENDIF}
+end;
+
 { ── TWipeDirSymlinks ───────────────────────────────────────────── }
 
 procedure TWipeDirSymlinks.ResetScratch;
@@ -5434,6 +5657,8 @@ begin
     PROJECT_NAME + '.Core: CopyDirTree recursion guards'));
   TestRunnerProgram.AddSuite(TLongPathHelpers.Create(
     PROJECT_NAME + '.Core: long-path helpers past MAX_PATH'));
+  TestRunnerProgram.AddSuite(TProtectedSharedReads.Create(
+    PROJECT_NAME + '.Core: shared reads beside atomic replacement'));
   TestRunnerProgram.AddSuite(TWipeDirSymlinks.Create(
     PROJECT_NAME + '.Core: WipeDir symlink handling'));
   TestRunnerProgram.AddSuite(TPruneOrphans.Create(
