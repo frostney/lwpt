@@ -1788,7 +1788,9 @@ begin
   DstDir := ExtractFileDir(ADst);
   if DstDir <> '' then LongPathForceDirectories(DstDir);
   { One same-filesystem replacement is the common path. Unlike renaming the
-    old destination aside first, this never creates a reader-visible gap. }
+    old destination aside first, it creates no reader-visible gap on Unix; on
+    Windows ReplaceFileW can leave the path briefly absent (see
+    ReplaceFileInOneOperation). }
   if AtomicReplaceFile(ASrc, ADst) then Exit(True);
 
   { EXDEV (or its Windows equivalent): copy to a unique sibling on the
@@ -2050,10 +2052,15 @@ end;
 {$ENDIF}
 
 { Replace a file in one filesystem operation. Unlike AtomicMoveFile this
-  helper never renames the old destination aside, because doing so creates
-  an observable missing-path window. It is intentionally strict: callers
-  must stage the source on the same filesystem as the destination.
-  ARetireInUseBackup is set only by AtomicReplaceExecutable. }
+  helper never renames the old destination aside itself. On Unix rename(2)
+  leaves no missing-path window. On Windows ReplaceFileW moves the replaced
+  file to its backup name before moving the replacement in (its
+  ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 contract; Wine does both renames on
+  every call), so a reader can briefly find the path absent. Readers that
+  must not mistake that for a missing file coordinate with the writer; see
+  docs/tooling.md. It is intentionally strict: callers must stage the
+  source on the same filesystem as the destination. ARetireInUseBackup is
+  set only by AtomicReplaceExecutable. }
 function ReplaceFileInOneOperation(const ASrc, ADst: string;
   ARetireInUseBackup: Boolean): Boolean;
 var
