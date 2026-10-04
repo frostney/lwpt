@@ -58,6 +58,7 @@ type
     procedure TestZeroAllowanceDoesNotBlock;
     procedure TestOwnedTreeIsTerminatedWithItsDescendants;
     procedure TestFinishChildReportsASurvivingDescendant;
+    procedure TestReapChildEndsAnOwnedTreesSurvivor;
     procedure TestRunLwptReportsASurvivingDescendant;
   end;
 
@@ -323,6 +324,31 @@ begin
   end;
 end;
 
+procedure TProcessSupportTests.TestReapChildEndsAnOwnedTreesSurvivor;
+var
+  Child: TProcess;
+  DescendantPID: Integer;
+  PIDPath: string;
+begin
+  { Cleanup must not rely on listing survivors, which Darwin cannot: the
+    parent has exited, its descendant still runs in the owned tree, and
+    ReapChild has to end it on every platform. }
+  PIDPath := FScratch + '/reap-survivor-pid';
+  Child := SelfChild([SurvivorSwitch, PIDPath], []);
+  try
+    ExecuteOwnedChild(Child, True);
+    DescendantPID := WaitForDescendantPID(PIDPath);
+    Expect<Boolean>(WaitForChildExit(Child, CaseTimeoutMilliseconds))
+      .ToBe(True);
+    Expect<Boolean>(ProcessIsLive(DescendantPID)).ToBe(True);
+    Expect<Boolean>(ReapChild(Child, CaseTimeoutMilliseconds)).ToBe(True);
+    Expect<Boolean>(DescendantGone(DescendantPID)).ToBe(True);
+  finally
+    TerminateChildProcess(Child);
+    Child.Free;
+  end;
+end;
+
 procedure TProcessSupportTests.TestRunLwptReportsASurvivingDescendant;
 var
   DescendantPID: Integer;
@@ -369,6 +395,8 @@ begin
     TestFinishChildReportsASurvivingDescendant,
     'survivors are listed from a Job Object or Linux procfs');
   {$ENDIF}
+  Test('ReapChild ends the surviving descendant of an exited owned child',
+    TestReapChildEndsAnOwnedTreesSurvivor);
   {$IFDEF MSWINDOWS}
   Test('RunLwpt reports a descendant that outlives its child',
     TestRunLwptReportsASurvivingDescendant);

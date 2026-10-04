@@ -144,10 +144,12 @@ function CapturedOutputTail(const AText: string): string;
 
 { Cleanup: gives a started child ATimeoutMilliseconds to exit, then ends it
   through TerminateChildProcess, draining and discarding a poUsePipes
-  child's output throughout. An owned child whose tree still has running
-  members after it exited has them ended too. Never raises for a child that
-  will not stop; True when it and its owned tree are gone. A nil or
-  never-started AProcess is gone. }
+  child's output throughout. A child started with ExecuteOwnedChild always
+  goes through that termination once the wait ends, which ends any member
+  of its process group or Job Object that outlived it and does nothing for
+  an empty one, so no platform depends on OwnedChildSurvivors listing them.
+  Never raises for a child that will not stop; True when it and its owned
+  tree are gone. A nil or never-started AProcess is gone. }
 
 { Runs AExecutable with AArguments in ADirectory (the current directory when
   empty) and returns its exit code, its standard output and error merged
@@ -781,9 +783,12 @@ var
 begin
   if (AProcess = nil) or (AProcess.ProcessID <= 0) then Exit(True);
   Discarded := '';
-  Result := (WaitForChildExit(AProcess, Discarded, Discarded,
-    ATimeoutMilliseconds) and (OwnedChildSurvivors(AProcess) = ''))
-    or TerminateChildProcess(AProcess, Discarded, Discarded);
+  Result := WaitForChildExit(AProcess, Discarded, Discarded,
+    ATimeoutMilliseconds);
+  { Termination first checks whether the child and its owned tree are
+    already gone, so an empty tree is left alone. }
+  if not Result or (ChildTreeOf(AProcess) <> nil) then
+    Result := TerminateChildProcess(AProcess, Discarded, Discarded);
 end;
 
 function RunChildCommand(const ADirectory, AExecutable: string;
