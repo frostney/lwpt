@@ -14,6 +14,7 @@ uses
 
   LWPT.Core,
   LWPT.Manifest,
+  LWPT.ProducerLease,
   LWPT.Registry.Consumer,
   LWPT.Registry.ConsumerStore,
   LWPT.Registry.Verification,
@@ -66,6 +67,7 @@ type
     procedure TestRotationChainLoadingIsBounded;
     procedure TestLockedSelectionLoadingIsBounded;
     procedure TestStateReadsDuringConcurrentPublication;
+    procedure TestAbsentStateIsReadUnderThePublisherLease;
     {$IFDEF MSWINDOWS}
     procedure TestStateReadsShareAPublisherDeleteHandle;
     {$ENDIF}
@@ -89,9 +91,8 @@ type
     Sequence: Int64;
     Documents: TStringArray;
     Completed, Done: LongInt;
-    Reads, SharingFailures, OpenFailures, MissedDocuments,
-      WrongStates: Integer;
-    Error: string;
+    Reads, Absences, Failures, MissedDocuments, WrongStates: Integer;
+    Failure: string;
   end;
 
 procedure TRegistryConsumerTests.BeforeAll;
@@ -843,35 +844,20 @@ begin
   Result[0].Bytes := BytesOf('race document ' + IntToStr(AIndex) + #10);
 end;
 
-function IsSharingViolation(const AMessage: string): Boolean;
-begin
-  {$IFDEF MSWINDOWS}
-  Result := Pos(SysErrorMessage(Windows.ERROR_SHARING_VIOLATION),
-    AMessage) > 0;
-  {$ELSE}
-  Result := False;
-  {$ENDIF}
-end;
-
 procedure TStateReadThread.Execute;
 var
   State: TLWPTRegistryConsumerState;
   Next: LongInt;
   Present: Boolean;
 begin
-  try
-    repeat
-      try
-        if LoadRegistryConsumerStateAt(Root, Identity, KeyId, State) then
-        begin
-          Inc(Reads);
-          if State.State.Sequence <> Sequence then Inc(WrongStates);
-        end;
-      except
-        on E: EFOpenError do
-          if IsSharingViolation(E.Message) then Inc(SharingFailures)
-          else Inc(OpenFailures);
-      end;
+  repeat
+    try
+      if LoadRegistryConsumerStateAt(Root, Identity, KeyId, State) then
+      begin
+        Inc(Reads);
+        if State.State.Sequence <> Sequence then Inc(WrongStates);
+      end
+      else Inc(Absences);
       { The document the publisher is renaming into place now. Documents
         are written once and never removed here, so one that exists must
         read whole. }
@@ -883,87 +869,204 @@ begin
         if Present and (LoadRegistryStateDocument(Root, Documents[Next])
           = nil) then Inc(MissedDocuments);
       end;
-    until InterLockedExchangeAdd(Done, 0) <> 0;
-  except
-    on E: Exception do Error := E.ClassName + ': ' + E.Message;
-  end;
+    except
+      on E: Exception do
+      begin
+        Inc(Failures);
+        if Failure = '' then Failure := E.ClassName + ': ' + E.Message;
+      end;
+    end;
+  until InterLockedExchangeAdd(Done, 0) <> 0;
+end;
+
+var
+  { Set by the reader thread whenever it waits for the publisher's lease. }
+  RaceReaderWaiting: LongInt = 0;
+
+procedure NoteRaceReaderWaiting(const AKey: string);
+begin
+  InterLockedExchange(RaceReaderWaiting, 1);
+end;
+
+function AwaitStateLease(ACoordinator: TLWPTProducerLeaseCoordinator;
+  const AKey: string): TLWPTProducerLease;
+begin
+  repeat
+    Result := ACoordinator.TryAcquire(AKey, 'test state publisher');
+    if Result = nil then Sleep(1);
+  until Result <> nil;
 end;
 
 { Another project's install publishes per-user state and documents while
   this install reads them without the producer lease (#372). The publisher
-  side runs the primitive a merge uses: each round first-publishes a new
-  document and replaces the state file with AtomicWriteBytes. Neither side
-  may fail for the other: no read meets a sharing violation, no existing
-  document is unreadable, no state read is torn, and every publication
-  commits. On Windows FPC's fmShareDenyNone, which does not share delete
-  access, failed both sides. ReplaceFileW moves the old file aside before
-  moving the new one in, so a Windows reader can still find the state
-  briefly absent; that is the publisher's property, not a sharing
-  conflict, and is only counted. }
+  runs the primitive a merge uses, under the per-origin lease a merge
+  holds: each round first-publishes a new document and replaces the state
+  file with AtomicWriteBytes. Neither side may fail for the other. Every
+  state read returns the published state: never absent, never torn, never
+  an open error (on Windows a sharing violation, or the moment ReplaceFileW
+  has moved the old file aside, which the reader waits out under the
+  lease). No existing document is unreadable, and every publication
+  commits. FPC's fmShareDenyNone, which does not share delete access,
+  failed both sides on Windows. }
 procedure TRegistryConsumerTests.TestStateReadsDuringConcurrentPublication;
 const
-  PUBLICATIONS = 400;
+  BATCHES = 40;
+  ROUNDS = 10;
   STATE_SEQUENCE = 9;
 var
   Root, StatePath, Failure: string;
   StateBytes, DocumentBytes: TBytes;
   Reader: TStateReadThread;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
   Loaded: TLWPTRegistryConsumerState;
-  Index, Failures: Integer;
+  Batch, Round, Index, Failures: Integer;
 begin
   Root := FScratch + '/state-read-race';
   MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
     SequencedState(FKeyID, FPublicKey, STATE_SEQUENCE), nil, nil);
   StatePath := RegistryStatePathAt(Root, RACE_IDENTITY, FKeyID);
   StateBytes := BytesOf(ReadBinaryFile(StatePath));
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
   Reader := TStateReadThread.Create(True);
   try
     Reader.Root := Root;
     Reader.Identity := RACE_IDENTITY;
     Reader.KeyId := FKeyID;
     Reader.Sequence := STATE_SEQUENCE;
-    SetLength(Reader.Documents, PUBLICATIONS);
-    for Index := 0 to PUBLICATIONS - 1 do
+    SetLength(Reader.Documents, BATCHES * ROUNDS);
+    for Index := 0 to High(Reader.Documents) do
       Reader.Documents[Index] :=
         SHA256BytesPrefixed(RaceDocument(Index)[0].Bytes);
+    RaceReaderWaiting := 0;
+    RegistryStateLeaseContendedTestHook := NoteRaceReaderWaiting;
     Reader.Start;
     Failures := 0;
     Failure := '';
-    for Index := 0 to PUBLICATIONS - 1 do
+    Index := 0;
+    for Batch := 1 to BATCHES do
     begin
+      Lease := AwaitStateLease(Coordinator, RegistryStateLeaseKey(StatePath));
       try
-        DocumentBytes := RaceDocument(Index)[0].Bytes;
-        AtomicWriteBytes(RegistryStateDocumentPath(Root,
-          Reader.Documents[Index]), Root + '/tmp', DocumentBytes);
-        AtomicWriteBytes(StatePath, Root + '/tmp', StateBytes);
-      except
-        on E: Exception do
+        for Round := 1 to ROUNDS do
         begin
-          Inc(Failures);
-          Failure := E.Message;
+          try
+            DocumentBytes := RaceDocument(Index)[0].Bytes;
+            AtomicWriteBytes(RegistryStateDocumentPath(Root,
+              Reader.Documents[Index]), Root + '/tmp', DocumentBytes);
+            AtomicWriteBytes(StatePath, Root + '/tmp', StateBytes);
+          except
+            on E: Exception do
+            begin
+              Inc(Failures);
+              Failure := E.Message;
+            end;
+          end;
+          InterLockedIncrement(Reader.Completed);
+          Inc(Index);
         end;
+      finally
+        Lease.Free;
       end;
-      InterLockedIncrement(Reader.Completed);
+      { A reader waiting for the lease polls every
+        PRODUCER_LEASE_POLL_MILLISECONDS; let it in before the next batch so
+        it keeps reading during publication instead of only after it. }
+      if InterLockedExchange(RaceReaderWaiting, 0) <> 0 then
+        Sleep(3 * PRODUCER_LEASE_POLL_MILLISECONDS);
     end;
     InterLockedExchange(Reader.Done, 1);
     Reader.WaitFor;
+    RegistryStateLeaseContendedTestHook := nil;
     Expect<string>(Failure).ToBe('');
     Expect<Integer>(Failures).ToBe(0);
-    Expect<string>(Reader.Error).ToBe('');
-    Expect<Integer>(Reader.SharingFailures).ToBe(0);
-    Expect<Integer>(Reader.MissedDocuments).ToBe(0);
+    Expect<string>(Reader.Failure).ToBe('');
+    Expect<Integer>(Reader.Failures).ToBe(0);
+    Expect<Integer>(Reader.Absences).ToBe(0);
     Expect<Integer>(Reader.WrongStates).ToBe(0);
+    Expect<Integer>(Reader.MissedDocuments).ToBe(0);
     Expect<Boolean>(Reader.Reads > 0).ToBe(True);
-    {$IFNDEF MSWINDOWS}
-    { rename(2) replaces the path in one step. }
-    Expect<Integer>(Reader.OpenFailures).ToBe(0);
-    {$ENDIF}
   finally
+    RegistryStateLeaseContendedTestHook := nil;
+    { Stops a reader an exception left running; Free waits for it. }
+    InterLockedExchange(Reader.Done, 1);
     Reader.Free;
+    Coordinator.Free;
   end;
   Expect<Boolean>(LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
     Loaded)).ToBe(True);
   Expect<Int64>(Loaded.State.Sequence).ToBe(STATE_SEQUENCE);
+end;
+
+var
+  { The publisher the contention hook completes: its lease, and the state
+    file it has moved aside mid-replacement. }
+  AbsencePublisherLease: TLWPTProducerLease = nil;
+  AbsenceStatePath: string = '';
+  AbsenceContentions: Integer = 0;
+
+procedure CompleteReplacementOnContention(const AKey: string);
+begin
+  Inc(AbsenceContentions);
+  if AbsencePublisherLease = nil then Exit;
+  if not RenameFile(AbsenceStatePath + '.aside', AbsenceStatePath) then
+    raise Exception.Create('fixture: could not restore the state file');
+  FreeAndNil(AbsencePublisherLease);
+end;
+
+{ CR-1 of #372, deterministic: a publisher holds the per-origin lease and has
+  moved the old state file aside, as ReplaceFileW does mid-replacement. A
+  lease-free read must not take that moment for a fresh state directory,
+  which would drop the per-user sequence prior and let an older, still
+  valid checkpoint in. The read meets the publisher's lease, the contention
+  hook completes the replacement on the reading thread, and the read then
+  returns the stored sequence 9, which keeps a sequence 8 checkpoint stale
+  against a lock that records only 3. A state that is really absent, with
+  no publisher, reads as absent without waiting. }
+procedure TRegistryConsumerTests.TestAbsentStateIsReadUnderThePublisherLease;
+var
+  Root: string;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Loaded, Locked, Prior: TLWPTRegistryConsumerState;
+  Found: Boolean;
+begin
+  Root := FScratch + '/state-absence';
+  MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    SequencedState(FKeyID, FPublicKey, 9), nil, nil);
+  AbsenceStatePath := RegistryStatePathAt(Root, RACE_IDENTITY, FKeyID);
+  AbsenceContentions := 0;
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
+  try
+    AbsencePublisherLease := Coordinator.TryAcquire(
+      RegistryStateLeaseKey(AbsenceStatePath), 'test publisher');
+    Expect<Boolean>(AbsencePublisherLease <> nil).ToBe(True);
+    Expect<Boolean>(RenameFile(AbsenceStatePath,
+      AbsenceStatePath + '.aside')).ToBe(True);
+    RegistryStateLeaseContendedTestHook := CompleteReplacementOnContention;
+    try
+      Found := LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+        Loaded);
+    finally
+      RegistryStateLeaseContendedTestHook := nil;
+      if AbsencePublisherLease <> nil then
+      begin
+        RenameFile(AbsenceStatePath + '.aside', AbsenceStatePath);
+        FreeAndNil(AbsencePublisherLease);
+      end;
+    end;
+    Expect<Boolean>(Found).ToBe(True);
+    Expect<Int64>(Loaded.State.Sequence).ToBe(9);
+    Expect<Boolean>(AbsenceContentions > 0).ToBe(True);
+    Locked := SequencedState(FKeyID, FPublicKey, 3);
+    Prior := MergeRegistryAcceptedStates(Loaded, Locked);
+    Expect<Int64>(Prior.State.Sequence).ToBe(9);
+    { Another origin's state was never written: absent at once. }
+    AbsenceContentions := 0;
+    Expect<Boolean>(LoadRegistryConsumerStateAt(Root,
+      'https://other.example.com', FKeyID, Loaded)).ToBe(False);
+    Expect<Integer>(AbsenceContentions).ToBe(0);
+  finally
+    Coordinator.Free;
+  end;
 end;
 
 {$IFDEF MSWINDOWS}
@@ -1065,6 +1168,8 @@ begin
     TestRotationChainLoadingIsBounded);
   Test('per-user state and documents read while another install publishes '
     + 'them', TestStateReadsDuringConcurrentPublication);
+  Test('a state file a publisher has moved aside is read under its lease, '
+    + 'never as fresh state', TestAbsentStateIsReadUnderThePublisherLease);
   {$IFDEF MSWINDOWS}
   Test('per-user state and documents read beside a publisher holding '
     + 'delete access', TestStateReadsShareAPublisherDeleteHandle);

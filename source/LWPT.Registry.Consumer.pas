@@ -186,15 +186,36 @@ type
     DocumentPath: string;
   end;
 
+{$IFDEF INSTALL_TESTING}
+type
+  TLWPTRegistryStateLeaseTestHook = procedure(const AKey: string);
+
+var
+  { Test-only: called on the waiting thread each time a per-user state
+    lease it needs is held by another producer, before it polls again, so
+    a test can complete that producer's work at exactly that point.
+    Production code must leave it nil. }
+  RegistryStateLeaseContendedTestHook: TLWPTRegistryStateLeaseTestHook = nil;
+{$ENDIF}
+
 function RegistryStateRoot: string;
 function RegistryStatePath(const AIdentity, ATrustKeyId: string): string;
 function RegistryStatePathAt(const ARoot, AIdentity, ATrustKeyId: string): string;
 { False when no state exists. Corrupt state raises, naming the file; it is
-  never reset, because a reset would lower the clock floor. }
+  never reset, because a reader that sees no state loses the clock floor
+  and the sequence prior. These take no lease. A merge replaces the file
+  under its per-origin producer lease, and on Windows ReplaceFileW moves the
+  old file aside before it moves the new one in, so the path can be briefly
+  absent mid-replacement. An absent file, or one that cannot be opened, is
+  therefore read again under that lease before it counts: the read waits
+  for a merge in progress and then sees its result. }
 function LoadRegistryConsumerState(const AIdentity, ATrustKeyId: string;
   out AState: TLWPTRegistryConsumerState): Boolean;
 function LoadRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
   out AState: TLWPTRegistryConsumerState): Boolean;
+{ The per-origin producer lease key of the state file at AStatePath, held by
+  every replacement of that file. }
+function RegistryStateLeaseKey(const AStatePath: string): string;
 { Merges AState into the per-user file under a producer lease. The sequence
   and floor never go down. The exact bytes of ARotations, the chain that
   reaches the accepted key, join the per-user document store so a later
@@ -664,8 +685,11 @@ begin
     ATrustKeyId, AState);
 end;
 
-function LoadRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
-  out AState: TLWPTRegistryConsumerState): Boolean;
+{ The state file at APath as it is now: False when it does not exist,
+  EFOpenError when it exists but cannot be opened. Callers that do not hold
+  the per-origin lease use LoadRegistryConsumerStateAt instead. }
+function ReadRegistryConsumerStateFile(const APath, AIdentity,
+  ATrustKeyId: string; out AState: TLWPTRegistryConsumerState): Boolean;
 var
   Path, Text: string;
   Stream: TLWPTProtectedFileStream;
@@ -674,11 +698,11 @@ var
   Sequence: Int64;
 begin
   AState := Default(TLWPTRegistryConsumerState);
-  Path := RegistryStatePathAt(ARoot, AIdentity, ATrustKeyId);
+  Path := APath;
   if not FileExists(Path) then Exit(False);
-  { Read without the producer lease while another project's install may
-    atomically replace this file: a shared read (see
-    OpenProtectedFileStream) never conflicts with that replacement. }
+  { Another project's install may replace this file atomically while it is
+    read: a shared read (see OpenProtectedFileStream) never conflicts with
+    that replacement. }
   Stream := OpenProtectedFileStream(Path, fmOpenRead or fmShareDenyNone);
   try
     if Stream.Size > RegistryStateDocumentBytes then
@@ -837,12 +861,54 @@ begin
     if Assigned(Result) then Exit;
     {$IFDEF INSTALL_TESTING}
     PublishStateContention;
+    if Assigned(RegistryStateLeaseContendedTestHook) then
+      RegistryStateLeaseContendedTestHook(AKey);
     {$ENDIF}
     if GetTickCount64 - StartedAt > StateLeaseWaitMilliseconds then
       raise ELWPTRegistryError.CreateStable('registry_state_locked',
         'another process holds the per-user registry state for ' + AWhat);
     Sleep(PRODUCER_LEASE_POLL_MILLISECONDS);
   until False;
+end;
+
+function RegistryStateLeaseKey(const AStatePath: string): string;
+begin
+  Result := 'registry-state:' + ExtractFileName(AStatePath);
+end;
+
+function LoadRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
+  out AState: TLWPTRegistryConsumerState): Boolean;
+var
+  Root, Path: string;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+begin
+  Root := ExcludeTrailingPathDelimiter(ARoot);
+  Path := RegistryStatePathAt(Root, AIdentity, ATrustKeyId);
+  try
+    if ReadRegistryConsumerStateFile(Path, AIdentity, ATrustKeyId, AState) then
+      Exit(True);
+  except
+    { Possibly the moment a replacement has moved the old file aside. }
+    on E: EFOpenError do;
+  end;
+  { A merge creates the lease directory before it ever writes the state
+    file, so without one no replacement can be in progress. }
+  if not DirectoryExists(Root + '/locks') then
+    Exit(ReadRegistryConsumerStateFile(Path, AIdentity, ATrustKeyId, AState));
+  { Believe absence, or an open failure, only under the lease every
+    replacement holds: a merge in progress finishes first. }
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
+  Lease := nil;
+  try
+    Lease := AcquireStateLease(Coordinator, RegistryStateLeaseKey(Path),
+      'registry consumer state read for ' + AIdentity, AIdentity);
+    Result := ReadRegistryConsumerStateFile(Path, AIdentity, ATrustKeyId,
+      AState);
+  finally
+    Lease.Free;
+    Coordinator.Free;
+  end;
 end;
 
 procedure MergeRegistryConsumerStateAt(const ARoot, AIdentity, ATrustKeyId: string;
@@ -877,9 +943,8 @@ begin
   try
     { The per-origin lease first, then the store lease; eviction takes only
       the store lease, so the order cannot deadlock. }
-    Lease := AcquireStateLease(Coordinator, 'registry-state:'
-      + ExtractFileName(Path), 'registry consumer state for ' + AIdentity,
-      AIdentity);
+    Lease := AcquireStateLease(Coordinator, RegistryStateLeaseKey(Path),
+      'registry consumer state for ' + AIdentity, AIdentity);
     StoreLease := AcquireStateLease(Coordinator, REGISTRY_STORE_LEASE_KEY,
       'registry document store merge for ' + AIdentity, AIdentity);
     {$IFDEF INSTALL_TESTING}
@@ -903,7 +968,9 @@ begin
     Merged := AState;
     Merged.State.Origin := AIdentity;
     Current := Default(TLWPTRegistryConsumerState);
-    if LoadRegistryConsumerStateAt(Root, AIdentity, ATrustKeyId, Current) then
+    { This merge holds the per-origin lease, so no replacement is in
+      progress and the file reads as it is. }
+    if ReadRegistryConsumerStateFile(Path, AIdentity, ATrustKeyId, Current) then
       Merged := MergeRegistryAcceptedStates(Current, AState)
     else
       Merged.State.ClockFloor := RegistryLaterTimestamp(
@@ -1013,7 +1080,13 @@ begin
       Exit(Fail(Entries[Index].Name,
         'its origin and pinned key do not name this file'));
     try
-      if not LoadRegistryConsumerStateAt(ARoot, Identity, TrustKeyId, State) then
+      { Never the per-origin lease here: an eviction pass already holds the
+        store lease, which a merge takes after the per-origin lease, and
+        every merge holds the store lease while it replaces a state file.
+        A reading pass takes no lease, and a file that vanishes mid-pass
+        only makes it incomplete. }
+      if not ReadRegistryConsumerStateFile(Path, Identity, TrustKeyId,
+           State) then
         Exit(Fail(Entries[Index].Name, 'it disappeared while being read'));
     except
       on E: Exception do Exit(Fail(Entries[Index].Name, E.Message));

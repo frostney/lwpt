@@ -60,8 +60,8 @@ program	*	source/LWPT.ManifestEdit.Test.pas	5	31
 program	*	source/LWPT.Observability.Test.pas	1	6
 program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
-program	*	source/LWPT.Registry.Consumer.Test.pas	1	25
-program	windows/*	source/LWPT.Registry.Consumer.Test.pas	1	26
+program	*	source/LWPT.Registry.Consumer.Test.pas	1	26
+program	windows/*	source/LWPT.Registry.Consumer.Test.pas	1	27
 program	*	source/LWPT.Registry.ConsumerStore.Test.pas	1	17
 program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
 program	*	source/LWPT.Registry.Incoming.Test.pas	1	11
