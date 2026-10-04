@@ -105,6 +105,14 @@ type
     Size: Int64;
   end;
   TLWPTDirectoryEntries = array of TLWPTDirectoryEntry;
+  { A file's last-write time as whole seconds since the Unix epoch (negative
+    before 1970) plus the nanoseconds within that second (always 0 to
+    999,999,999). The two parts are compared separately, never folded into
+    one count, so every time a filesystem can record stays in range. }
+  TLWPTModificationStamp = record
+    Seconds: Int64;
+    Nanoseconds: Int64;
+  end;
 
 { SysUtils.FileExists / DirectoryExists: links are followed, so a dangling
   link is neither. }
@@ -118,18 +126,20 @@ function  LongPathRemoveDir(const APath: string): Boolean;
 { SysUtils.FileAge: the DOS timestamp of a file's last write, or -1 for a
   missing path or a directory. }
 function  LongPathFileAge(const APath: string): LongInt;
-{ The last-write time of the file APath at the filesystem's own resolution,
-  as an ordered stamp for comparing two files on this host. Unix: stat's
-  st_mtime and its nanosecond field (links followed, as SysUtils.FileAge
-  does), as nanoseconds since the Unix epoch. Windows: the raw UTC
-  ftLastWriteTime of the entry itself (as SysUtils.FileAge reads it), in
-  100-nanosecond ticks since 1601, without FileAge's local-time and
-  2-second DOS conversion. False, with AStamp 0, for a missing path or a
-  directory. FileAge's whole-second (Unix) and 2-second (Windows) ticks
-  make two writes in one tick indistinguishable; this keeps their order
-  wherever the filesystem records it. }
+{ The last-write time of the file APath at the filesystem's own resolution.
+  Unix: stat's st_mtime and its nanosecond field (links followed, as
+  SysUtils.FileAge does). Windows: the raw UTC ftLastWriteTime of the entry
+  itself (as SysUtils.FileAge reads it), 100-nanosecond ticks since 1601,
+  without FileAge's local-time and 2-second DOS conversion. False, with a
+  zero AStamp, for a missing path or a directory. FileAge's whole-second
+  (Unix) and 2-second (Windows) ticks make two writes in one tick
+  indistinguishable; this keeps their order wherever the filesystem
+  records it. }
 function  LongPathModificationStamp(const APath: string;
-  out AStamp: Int64): Boolean;
+  out AStamp: TLWPTModificationStamp): Boolean;
+{ Negative when A is earlier than B, zero when equal, positive when later. }
+function  CompareModificationStamps(const A,
+  B: TLWPTModificationStamp): Integer;
 { SysUtils.RenameFile: never replaces an existing destination on Windows. }
 function  LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
 { The entries of ADirectory whose names match AMask, with the attributes
@@ -1317,37 +1327,56 @@ end;
 {$ENDIF}
 
 function LongPathModificationStamp(const APath: string;
-  out AStamp: Int64): Boolean;
+  out AStamp: TLWPTModificationStamp): Boolean;
 {$IFDEF MSWINDOWS}
+const
+  FILETIME_TICKS_PER_SECOND = 10000000;
+  NANOSECONDS_PER_FILETIME_TICK = 100;
+  { Seconds from the FILETIME origin (1601-01-01) to the Unix epoch. }
+  UNIX_EPOCH_FILETIME_SECONDS = 11644473600;
 var
   Data: TWin32FileAttributeData;
+  Ticks: QWord;
 begin
-  AStamp := 0;
+  AStamp := Default(TLWPTModificationStamp);
   if APath = '' then Exit(False);
   if not Windows.GetFileAttributesExW(PWideChar(WindowsExtendedPath(APath)),
     GetFileExInfoStandard, @Data) then Exit(False);
   if (Data.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
     Exit(False);
-  AStamp := Int64((QWord(Data.ftLastWriteTime.dwHighDateTime) shl 32)
-    or QWord(Data.ftLastWriteTime.dwLowDateTime));
+  Ticks := (QWord(Data.ftLastWriteTime.dwHighDateTime) shl 32)
+    or QWord(Data.ftLastWriteTime.dwLowDateTime);
+  AStamp.Seconds := Int64(Ticks div FILETIME_TICKS_PER_SECOND)
+    - UNIX_EPOCH_FILETIME_SECONDS;
+  AStamp.Nanoseconds := Int64(Ticks mod FILETIME_TICKS_PER_SECOND)
+    * NANOSECONDS_PER_FILETIME_TICK;
   Result := True;
 end;
 {$ELSE}
-const
-  NANOSECONDS_PER_SECOND = 1000000000;
 var
   Info: BaseUnix.Stat;
 begin
-  AStamp := 0;
+  AStamp := Default(TLWPTModificationStamp);
   if APath = '' then Exit(False);
   if (FpStat(APath, Info) <> 0) or fpS_ISDIR(Info.st_mode) then Exit(False);
+  AStamp.Seconds := Int64(Info.st_mtime);
   { FPC 3.2.2 spells the field st_mtime_nsec on Linux and st_mtimensec on
     the BSDs, Darwin included. }
-  AStamp := Int64(Info.st_mtime) * NANOSECONDS_PER_SECOND
-    + Int64(Info.{$IFDEF LINUX}st_mtime_nsec{$ELSE}st_mtimensec{$ENDIF});
+  AStamp.Nanoseconds :=
+    Int64(Info.{$IFDEF LINUX}st_mtime_nsec{$ELSE}st_mtimensec{$ENDIF});
   Result := True;
 end;
 {$ENDIF}
+
+function CompareModificationStamps(const A,
+  B: TLWPTModificationStamp): Integer;
+begin
+  if A.Seconds < B.Seconds then Exit(-1);
+  if A.Seconds > B.Seconds then Exit(1);
+  if A.Nanoseconds < B.Nanoseconds then Exit(-1);
+  if A.Nanoseconds > B.Nanoseconds then Exit(1);
+  Result := 0;
+end;
 
 function LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
 begin

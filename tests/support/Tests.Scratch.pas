@@ -57,12 +57,43 @@ procedure CreateSparseFile(const APath: string; const ASize: Int64);
   when the time cannot be set. }
 procedure SetFileModificationTime(const APath: string;
   const AUnixSeconds: Int64; const ANanoseconds: LongInt);
+{ SetFileModificationTime, then reads the time back through the platform's
+  own query (stat, or GetFileAttributesExW) and reports whether the
+  filesystem kept exactly the requested time, to the setter's resolution.
+  False when the filesystem keeps coarser times, cannot represent that
+  date, or refuses the time. Tests probe with it before they rely on
+  sub-second precision or an extreme date. }
+function FileModificationTimeIsKept(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt): Boolean;
+
+const
+  { 2300-01-01T00:00:00Z, past the 2262 limit of a signed 64-bit
+    nanosecond count since the Unix epoch. }
+  FarFutureUnixSeconds = Int64(10413792000);
+  { 1969-07-20T20:17:40Z, before the Unix epoch. }
+  PreEpochUnixSeconds = Int64(-14182940);
+
+type
+  { What the filesystem under the scratch base keeps of a set time. }
+  TTimestampSupport = record
+    { A time one millisecond into a second is read back exactly. }
+    SubSecond: Boolean;
+    { FarFutureUnixSeconds and PreEpochUnixSeconds are read back exactly. }
+    WideDates: Boolean;
+  end;
+
+{ Probes a scratch file with FileModificationTimeIsKept. Tests call it while
+  registering cases, to choose between a precision-specific case and its
+  coarse-timestamp counterpart, or to skip a date the filesystem cannot
+  store. }
+function ProbeTimestampSupport: TTimestampSupport;
 
 implementation
 
 uses
   {$IFDEF UNIX}
   BaseUnix,
+  InitC,
   {$ENDIF}
   Classes,
   DateUtils,
@@ -614,39 +645,77 @@ end;
 {$ENDIF}
 
 {$IFDEF MSWINDOWS}
-procedure SetFileModificationTime(const APath: string;
-  const AUnixSeconds: Int64; const ANanoseconds: LongInt);
 const
   { FILETIME ticks are 100 ns from 1601-01-01; the Unix epoch is this many
     seconds later. }
   UnixEpochFileTimeSeconds = 11644473600;
   FileTimeTicksPerSecond = 10000000;
   NanosecondsPerFileTimeTick = 100;
+
+function RequestedFileTimeTicks(const AUnixSeconds: Int64;
+  const ANanoseconds: LongInt): QWord;
+begin
+  Result := QWord(AUnixSeconds + UnixEpochFileTimeSeconds)
+    * FileTimeTicksPerSecond
+    + QWord(ANanoseconds div NanosecondsPerFileTimeTick);
+end;
+
+{ The Win32 error of a failed attempt, or 0. }
+function TrySetModificationTime(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt;
+  out AOperation: string): DWORD;
 var
   Handle: THandle;
   Ticks: QWord;
   Stamp: TFileTime;
-  Succeeded: Boolean;
 begin
-  Ticks := QWord(AUnixSeconds + UnixEpochFileTimeSeconds)
-    * FileTimeTicksPerSecond + QWord(ANanoseconds div NanosecondsPerFileTimeTick);
+  Result := 0;
+  Ticks := RequestedFileTimeTicks(AUnixSeconds, ANanoseconds);
   Stamp.dwLowDateTime := DWORD(Ticks and $FFFFFFFF);
   Stamp.dwHighDateTime := DWORD(Ticks shr 32);
+  AOperation := 'open';
   Handle := Windows.CreateFileW(PWideChar(ScratchExtendedPath(APath)),
     Windows.FILE_WRITE_ATTRIBUTES, Windows.FILE_SHARE_READ
     or Windows.FILE_SHARE_WRITE or Windows.FILE_SHARE_DELETE, nil,
     Windows.OPEN_EXISTING, Windows.FILE_FLAG_BACKUP_SEMANTICS, 0);
-  if Handle = Windows.INVALID_HANDLE_VALUE then
-    RaiseScratchError('SetFileModificationTime: failed to open "%s": %s',
-      APath);
+  if Handle = Windows.INVALID_HANDLE_VALUE then Exit(Windows.GetLastError);
   try
-    Succeeded := Windows.SetFileTime(Handle, nil, nil, @Stamp);
-    if not Succeeded then
-      RaiseScratchError('SetFileModificationTime: failed to stamp "%s": %s',
-        APath);
+    AOperation := 'stamp';
+    if not Windows.SetFileTime(Handle, nil, nil, @Stamp) then
+      Result := Windows.GetLastError;
   finally
     Windows.CloseHandle(Handle);
   end;
+end;
+
+procedure SetFileModificationTime(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt);
+var
+  Error: DWORD;
+  Operation: string;
+begin
+  Error := TrySetModificationTime(APath, AUnixSeconds, ANanoseconds,
+    Operation);
+  if Error <> 0 then
+    raise Exception.CreateFmt(
+      'SetFileModificationTime: failed to %s "%s": %s',
+      [Operation, APath, SysErrorMessage(Error)]);
+end;
+
+function FileModificationTimeIsKept(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt): Boolean;
+var
+  Operation: string;
+  Data: TWin32FileAttributeData;
+  Ticks: QWord;
+begin
+  if TrySetModificationTime(APath, AUnixSeconds, ANanoseconds,
+    Operation) <> 0 then Exit(False);
+  if not Windows.GetFileAttributesExW(PWideChar(ScratchExtendedPath(APath)),
+    GetFileExInfoStandard, @Data) then Exit(False);
+  Ticks := (QWord(Data.ftLastWriteTime.dwHighDateTime) shl 32)
+    or QWord(Data.ftLastWriteTime.dwLowDateTime);
+  Result := Ticks = RequestedFileTimeTicks(AUnixSeconds, ANanoseconds);
 end;
 {$ELSE}
 const
@@ -655,19 +724,67 @@ const
 function CUtimes(APath: PChar; ATimes: PTimeVal): cint; cdecl;
   external 'c' name 'utimes';
 
-procedure SetFileModificationTime(const APath: string;
-  const AUnixSeconds: Int64; const ANanoseconds: LongInt);
+{ The libc errno of a failed utimes, or 0. utimes is a libc call, so its
+  error is libc's errno, not the RTL's syscall errno that fpGetErrno reads
+  on Linux. }
+function TrySetModificationTime(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt): cint;
 var
   Times: array[0..1] of TTimeVal;
 begin
   Times[0].tv_sec := AUnixSeconds;
   Times[0].tv_usec := ANanoseconds div NanosecondsPerMicrosecond;
   Times[1] := Times[0];
-  if CUtimes(PChar(APath), @Times[0]) <> 0 then
+  if CUtimes(PChar(APath), @Times[0]) = 0 then Exit(0);
+  Result := fpgetCerrno;
+end;
+
+procedure SetFileModificationTime(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt);
+var
+  Error: cint;
+begin
+  Error := TrySetModificationTime(APath, AUnixSeconds, ANanoseconds);
+  if Error <> 0 then
     raise Exception.CreateFmt(
       'SetFileModificationTime: failed to stamp "%s": %s',
-      [APath, SysErrorMessage(fpGetErrno)]);
+      [APath, SysErrorMessage(Error)]);
+end;
+
+function FileModificationTimeIsKept(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt): Boolean;
+var
+  Info: BaseUnix.Stat;
+begin
+  if TrySetModificationTime(APath, AUnixSeconds, ANanoseconds) <> 0 then
+    Exit(False);
+  if FpStat(APath, Info) <> 0 then Exit(False);
+  Result := (Int64(Info.st_mtime) = AUnixSeconds)
+    and (Int64(Info.{$IFDEF LINUX}st_mtime_nsec{$ELSE}st_mtimensec{$ENDIF})
+      = Int64(ANanoseconds div NanosecondsPerMicrosecond)
+        * NanosecondsPerMicrosecond);
 end;
 {$ENDIF}
+
+function ProbeTimestampSupport: TTimestampSupport;
+const
+  ProbeSeconds = 1700000000;
+  ProbeNanoseconds = 501000000;
+var
+  Root, Probe: string;
+begin
+  Root := CreateScratchRoot('timestamp-probe');
+  try
+    Probe := IncludeTrailingPathDelimiter(Root) + 'probe.txt';
+    WriteTextFile(Probe, 'probe');
+    Result.SubSecond := FileModificationTimeIsKept(Probe, ProbeSeconds,
+      ProbeNanoseconds);
+    Result.WideDates := FileModificationTimeIsKept(Probe,
+      FarFutureUnixSeconds, 0)
+      and FileModificationTimeIsKept(Probe, PreEpochUnixSeconds, 0);
+  finally
+    RecursiveDelete(Root);
+  end;
+end;
 
 end.

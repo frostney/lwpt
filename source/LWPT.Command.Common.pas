@@ -399,12 +399,15 @@ end;
   the output is stale: equal times are rare at full resolution but common
   on filesystems that keep coarse ones (FAT, some network filesystems,
   HFS+ at one second), where an edit can carry the output's own time.
-  Never missing an edit costs at most one extra run. An input that
+  The command therefore re-runs until its output is strictly newer than
+  every input: usually once, but again on each invocation while the
+  equality persists, as when several invocations land in one coarse tick
+  or a generator leaves an unchanged output's time alone. An input that
   vanishes before it is read is stale too. }
 function HookIsStale(const AHook: THook;
   const AProjectRoot: string): Boolean;
 var
-  OutputStamp, InputStamp: Int64;
+  OutputStamp, InputStamp: TLWPTModificationStamp;
   i: Integer;
   Files: TStringList;
   OutputPath: string;
@@ -422,7 +425,8 @@ begin
       Exit(True);
     for i := 0 to Files.Count - 1 do
       if not LongPathModificationStamp(Files[i], InputStamp)
-        or (InputStamp >= OutputStamp) then Exit(True);
+        or (CompareModificationStamps(InputStamp, OutputStamp) >= 0) then
+        Exit(True);
     Result := False;
   finally
     Files.Free;

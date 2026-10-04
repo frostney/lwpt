@@ -54,6 +54,9 @@ const
   { An even base second: both sub-second stamps below share one FileAge
     tick, a whole second on Unix and a 2-second DOS tick on Windows. }
   StampBaseSeconds = 1700000000;
+  { Inputs two whole seconds before the marker stay older at any timestamp
+    precision, the 2-second DOS tick included. }
+  InputStampSeconds = StampBaseSeconds - 2;
   InputStampNanoseconds = 100000000;
   MarkerStampNanoseconds = 500000000;
   { One millisecond after the marker, in the same second (#367). }
@@ -222,9 +225,9 @@ begin
   { Explicit times instead of sleeping across a timestamp tick: every
     input is older than the marker, so the task skips. }
   WriteTextFile(FScratch + '/fresh-marker.txt', 'fresh-preserved');
-  SetFileModificationTime(FScratch + '/scripts/fresh.pas', StampBaseSeconds,
+  SetFileModificationTime(FScratch + '/scripts/fresh.pas', InputStampSeconds,
     InputStampNanoseconds);
-  SetFileModificationTime(FScratch + '/scripts/hello.pas', StampBaseSeconds,
+  SetFileModificationTime(FScratch + '/scripts/hello.pas', InputStampSeconds,
     InputStampNanoseconds);
   SetFileModificationTime(FScratch + '/fresh-marker.txt', StampBaseSeconds,
     MarkerStampNanoseconds);
@@ -234,7 +237,8 @@ begin
     .ToBe('fresh-preserved');
 
   { An input edit a millisecond after the marker, inside the same
-    FileAge tick, makes the task stale. }
+    FileAge tick, makes the task stale: newer where the filesystem keeps
+    sub-second times, and equal, which also runs, where it does not. }
   WriteTextFile(FScratch + '/scripts/fresh.pas',
     ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10);
   SetFileModificationTime(FScratch + '/scripts/fresh.pas', StampBaseSeconds,
