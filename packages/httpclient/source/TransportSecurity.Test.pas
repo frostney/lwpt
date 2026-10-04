@@ -5671,10 +5671,10 @@ end;
 
 { The recorder's port is baked into the loopback-AIA leaf, so the two must
   agree: a mismatch would leave the zero-request assertions vacuous wherever
-  no positive control runs. The port must also stay below every platform's
-  ephemeral range, where a concurrent test's outbound loopback connection
-  can take it (Tests.RetrievalRecorder). The URLs are IA5Strings, so they
-  appear verbatim in the DER. }
+  no positive control runs. The port must also stay below every
+  platform's default ephemeral range, where a concurrent test's outbound
+  loopback connection can take it (Tests.RetrievalRecorder). The URLs are
+  IA5Strings, so they appear verbatim in the DER. }
 procedure TTransportSecurityClientOptionTests.TestLoopbackAIAFixtureNamesRecorderPort;
 var
   Leaf: TBytes;
@@ -5798,7 +5798,7 @@ begin
     TestInconsistentOptionsRejected);
   Test('natively malformed anchors and identities are rejected before connecting',
     TestNativeMaterialRejectedBeforeConnecting);
-  Test('the loopback-AIA fixture names the recorder port below ephemeral ranges',
+  Test('the loopback-AIA fixture names the recorder port below default ephemeral ranges',
     TestLoopbackAIAFixtureNamesRecorderPort);
   {$IFDEF MSWINDOWS}
   Test('SChannel anchor verification never fetches certificate URLs',

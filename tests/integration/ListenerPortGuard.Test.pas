@@ -1,5 +1,5 @@
 { ListenerPortGuard.Test — a heuristic tripwire that keeps fixed TCP ports
-  in test code below every platform's ephemeral range.
+  in test code below every platform's default ephemeral range.
 
   The kernel hands ephemeral ports to every outbound connection that does
   not bind first: Linux from 32768-60999, Windows and macOS from
@@ -391,7 +391,7 @@ end;
 
 procedure TListenerPortGuard.SetupTests;
 begin
-  Test('repository test code keeps fixed ports below ephemeral ranges',
+  Test('repository test code keeps fixed ports below default ephemeral ranges',
     TestRepositoryKeepsFixedPortsBelowEphemeralRanges);
   Test('the scan covers the repository test tree', TestScanCoversTheTestTree);
   Test('the historical retrieval-recorder port is detected',
