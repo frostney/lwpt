@@ -71,7 +71,7 @@ begin
     end;
     for i := 0 to Directories.Count - 1 do
     begin
-      if not DirectoryExists(Directories[i]) then Continue;
+      if not LongPathDirectoryExists(Directories[i]) then Continue;
       if not RetiredExecutableSweepAllowed(ACtx.ProjectRoot,
         Directories[i]) then
       begin
@@ -173,9 +173,9 @@ begin
   TmpRoot := ResolveRepairPath(Ctx.ProjectRoot, ResolveTmpDir(Ctx.Manifest));
   LockPath := ResolveRepairPath(Ctx.ProjectRoot, INSTALL_LOCK);
 
-  if FileExists(LockPath) then
+  if LongPathFileExists(LockPath) then
   begin
-    if not DeleteFile(LockPath) then
+    if not LongPathDeleteFile(LockPath) then
       raise EConcurrencyError.CreateFmt(
         'repair: failed to remove stale install lock at %s', [LockPath]);
     WriteLn('repair: removed stale ', LockPath);

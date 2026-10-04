@@ -248,7 +248,9 @@ end;
 {$IFDEF MSWINDOWS}
 var Attributes: DWORD;
 begin
-  Attributes := GetFileAttributesW(PWideChar(UnicodeString(APath)));
+  { Extended-length spelling (#364): the check also serves committed proof
+    documents, whose project paths can pass the legacy path ceiling. }
+  Attributes := GetFileAttributesW(PWideChar(WindowsExtendedPath(APath)));
   Result := (Attributes <> INVALID_FILE_ATTRIBUTES)
     and ((Attributes and NON_REGULAR_ATTRIBUTES) = 0);
 end;

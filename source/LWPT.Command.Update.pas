@@ -41,7 +41,7 @@ begin
   RequireProjectLockfileSchema(Ctx);
   SetLength(Lock, 0);
   LockPath := IncludeTrailingPathDelimiter(Ctx.ProjectRoot) + LOCKFILE;
-  if FileExists(LockPath) then
+  if LongPathFileExists(LockPath) then
     Lock := LoadLockfile(LockPath);
 
   Entries := CollectOutdated(Ctx.Manifest, Lock, @ListRemoteRefs);

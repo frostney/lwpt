@@ -22,7 +22,9 @@
     8. Transitive build references with missing artifacts are removed.
     9. Retired executable images beside build outputs are removed.
    10. A build output directory reached through a link is never swept
-       (Unix; directory symlinks need no privilege there). }
+       (Unix; directory symlinks need no privilege there).
+   11. An abandoned session and a retired image whose paths pass the
+       Windows MAX_PATH are still reclaimed (#347). }
 
 program Repair.Test;
 
@@ -63,6 +65,7 @@ type
     procedure TestRepairRemovesTransitiveBuildReference;
     procedure TestRepairReclaimsWorkerRequests;
     procedure TestRepairRemovesRetiredExecutableImages;
+    procedure TestRepairReclaimsDeepSessionAndRetiredImage;
     {$IFDEF UNIX}
     procedure TestRepairSkipsRedirectedOutputDirectory;
     {$ENDIF}
@@ -380,6 +383,82 @@ begin
   end;
 end;
 
+{ Writes AContent through the Core long-path helpers: the RTL cannot create
+  a file past MAX_PATH on Windows. }
+procedure WriteLongFile(const APath, AContent: string);
+var Stream: TLWPTProtectedFileStream;
+begin
+  LongPathForceDirectories(ExtractFileDir(APath));
+  Stream := OpenProtectedFileStream(APath, fmCreate);
+  try
+    if AContent <> '' then Stream.WriteBuffer(AContent[1], Length(AContent));
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure TRepairE2E.TestRepairReclaimsDeepSessionAndRetiredImage;
+const
+  { Win32 MAX_PATH, including the terminating NUL. }
+  LEGACY_WINDOWS_MAX_PATH = 260;
+  { Deep, but still a valid working directory for the child process. }
+  PROJECT_PATH_LENGTH = 200;
+var
+  DeepRoot, Project, Output, Session, StatePath, JobFile, Retired: string;
+  Remaining: Integer;
+  R: TLwptResult;
+begin
+  DeepRoot := ExpandFileName(FScratch + '/deep');
+  Project := DeepRoot;
+  repeat
+    Remaining := PROJECT_PATH_LENGTH - Length(Project) - 1;
+    if Remaining < 1 then Break;
+    if Remaining > 48 then Remaining := 48;
+    Project := Project + '/' + StringOfChar('p', Remaining);
+  until False;
+  Output := 'out/' + StringOfChar('o', 48) + '/' + StringOfChar('o', 48);
+  try
+    LongPathForceDirectories(Project + '/source');
+    WriteLongFile(Project + '/lwpt.toml',
+      '[package]'#10 + 'name = "repair-deep"'#10 + 'version = "0.0.0"'#10
+      + 'units = ["source"]'#10 + #10 + '[build]'#10
+      + 'app = { source = "source/dummy.pas", output = "' + Output
+      + '/app" }'#10);
+    WriteLongFile(Project + '/source/dummy.pas',
+      'unit Dummy;'#10 + 'interface'#10 + 'implementation'#10 + 'end.'#10);
+
+    Session := Project + '/.lwpt/sessions/session-failed-'
+      + StringOfChar('s', 48);
+    StatePath := Session + '/session.state';
+    JobFile := Session + '/jobs/app/' + StringOfChar('j', 48)
+      + '/private-output';
+    Retired := Project + '/' + Output + '/' + RetiredExecutablePrefix
+      + '4242-1f1huft3e-7' + TmpPathExtension;
+    Expect<Boolean>(Length(StatePath) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+    Expect<Boolean>(Length(ExtractFileDir(Retired)) > LEGACY_WINDOWS_MAX_PATH)
+      .ToBe(True);
+    WriteLongFile(StatePath, '999999'#10'failed'#10'1'#10);
+    WriteLongFile(JobFile, 'incomplete');
+    WriteLongFile(Retired, 'old image');
+
+    R := RunLwpt(['repair'], Project, [
+      'LWPT_CACHE_DIR=' + FCacheRoot,
+      'LWPT_WORKER_STATE_DIR=' + FWorkerState,
+      'LWPT_WORKER_BUDGET=1'
+    ]);
+    if R.ExitCode <> 0 then WriteLn(R.Stdout, R.Stderr);
+    Expect<Integer>(R.ExitCode).ToBe(0);
+    Expect<Boolean>(LongPathDirectoryExists(Session)).ToBe(False);
+    Expect<Boolean>(LongPathFileExists(Retired)).ToBe(False);
+    Expect<Boolean>(Pos('removed 1 abandoned build session', R.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('removed 1 retired executable image(s), 0 still in '
+      + 'use', R.Stdout) > 0).ToBe(True);
+  finally
+    if LongPathDirectoryExists(DeepRoot) then WipeDir(DeepRoot);
+  end;
+end;
+
 {$IFDEF UNIX}
 procedure TRepairE2E.TestRepairSkipsRedirectedOutputDirectory;
 var
@@ -432,6 +511,8 @@ begin
     TestRepairReclaimsWorkerRequests);
   Test('repair removes retired executable images beside build outputs',
     TestRepairRemovesRetiredExecutableImages);
+  Test('repair reclaims a session and a retired image past MAX_PATH',
+    TestRepairReclaimsDeepSessionAndRetiredImage);
   {$IFDEF UNIX}
   Test('repair never sweeps a link-redirected build output directory',
     TestRepairSkipsRedirectedOutputDirectory);

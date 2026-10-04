@@ -129,6 +129,7 @@ type
     procedure TestDecision8RejectsForgedSignature;
     procedure TestFirstInstallRollsBackAfterLockWrite;
     procedure TestProofReplacementAndPruningRollBack;
+    procedure TestDeepProjectRetainsProofsPastMaxPath;
     procedure TestLockFloorNeverReachesPerUserState;
     procedure TestLaggingMirrorLackingHistoryIsStale;
     procedure TestEarlierOriginAdvanceSurvivesLaterFailure;
@@ -147,6 +148,10 @@ type
     Environment: array of string;
     Run: TLwptResult;
   end;
+
+const
+  { Win32 MAX_PATH, including the terminating NUL. }
+  LEGACY_WINDOWS_MAX_PATH = 260;
 
 function ReadText(const APath: string): string;
 begin
@@ -1744,6 +1749,146 @@ begin
   end;
 end;
 
+{ Issue #347: replacing committed registry proofs copies them below the
+  journaled rollback root as .lwpt/tmp/install-transaction.<..>/
+  rollback-p.<..>/sha256/<64 hex>.toml, about 160 characters below the
+  project root. The project root here is padded so that copy passes the
+  Win32 MAX_PATH ceiling while extraction, which keeps that ceiling by
+  design, still fits. A halt after retention leaves the copy on disk, so
+  its length is measured rather than assumed; repair then restores from it
+  and a clean install replaces the proofs through it. Per-user state and
+  the cache stay shallow: only project-owned state is deep. }
+procedure TInstallRegistry.TestDeepProjectRetainsProofsPastMaxPath;
+const
+  PROJECT_PATH_LENGTH = 130;
+  HALT_EXIT_CODE = 89;
+  RUN_TIMEOUT_MILLISECONDS = 180000;
+var
+  Registry: TSyntheticRegistry;
+  Origin: TSyntheticContact;
+  CaseRoot, Project, Before, Longest, Proof, LiveProofs: string;
+  Remaining: Integer;
+  Run: TLwptResult;
+
+  function RunDeep(const AArguments, AEnvironment: array of string): TLwptResult;
+  var Environment: array of string; Index: Integer;
+  begin
+    SetLength(Environment, 2 + Length(AEnvironment));
+    Environment[0] := PROJECT_NAME + '_REGISTRY_STATE_DIR=' + CaseRoot
+      + '/state';
+    Environment[1] := PROJECT_NAME + '_CACHE_DIR=' + CaseRoot + '/cache';
+    for Index := 0 to High(AEnvironment) do
+      Environment[2 + Index] := AEnvironment[Index];
+    Result := RunLwptTesting(AArguments, Project, Environment,
+      RUN_TIMEOUT_MILLISECONDS);
+    Expect<Boolean>(Result.TimedOut).ToBe(False);
+  end;
+
+  { Lock, cfg, modules and archives (with the committed proofs). }
+  function ProjectState: string;
+  begin
+    Result := SHA256File(Project + '/lwpt.lock')
+      + '|' + SHA256File(Project + '/lwpt.cfg')
+      + '|' + HashTree(Project + '/.lwpt/modules')
+      + '|' + HashTree(Project + '/.lwpt/archives');
+  end;
+
+  { The longest file path below ADirectory, walked with the Core helpers:
+    the RTL enumeration cannot reach past MAX_PATH on Windows. }
+  function LongestFile(const ADirectory: string): string;
+  var Entries: TLWPTDirectoryEntries; i: Integer; Candidate: string;
+  begin
+    Result := '';
+    Entries := ListDirectoryEntries(ADirectory, '*', faAnyFile);
+    for i := 0 to High(Entries) do
+    begin
+      if (Entries[i].Attr and faDirectory) <> 0 then
+        Candidate := LongestFile(ADirectory + '/' + Entries[i].Name)
+      else
+        Candidate := ADirectory + '/' + Entries[i].Name;
+      if Length(Candidate) > Length(Result) then Result := Candidate;
+    end;
+  end;
+
+begin
+  CaseRoot := NewCase('deep-proofs');
+  Project := ExpandFileName(CaseRoot + '/project');
+  Expect<Boolean>(Length(Project) + 2 < PROJECT_PATH_LENGTH).ToBe(True);
+  repeat
+    Remaining := PROJECT_PATH_LENGTH - Length(Project) - 1;
+    if Remaining < 1 then Break;
+    if Remaining > 48 then Remaining := 48;
+    Project := Project + '/' + StringOfChar('p', Remaining);
+  until False;
+  Expect<Boolean>(Length(Project) >= PROJECT_PATH_LENGTH - 1).ToBe(True);
+  Registry := NewRegistry(IDENTITY, Origin);
+  try
+    try
+      LongPathForceDirectories(Project + '/source');
+      WriteTextFile(Project + '/source/main.pas',
+        'program main;'#10 + '{$mode delphi}{$H+}'#10 + 'begin end.'#10);
+      Registry.AddPackage('json', '1.0.0',
+        RegistryPackageArchive('json', '1.0.0'), []);
+      Window(Registry);
+      WriteTextFile(Project + '/lwpt.toml', '[package]'#10
+        + 'name = "consumer"'#10 + 'version = "1.0.0"'#10
+        + 'units = ["source"]'#10
+        + Declaration('corp', Registry, Origin.BaseURL, [])
+        + '[dependencies]'#10 + 'json = "registry:json@^1.0.0"'#10);
+      ExpectSuccess('deep baseline', RunDeep(['install'], []));
+      Before := ProjectState;
+
+      { A new selection replaces the committed proof set. }
+      Registry.AddPackage('json', '1.1.0',
+        RegistryPackageArchive('json', '1.1.0'), []);
+      Window(Registry);
+      Run := RunDeep(['install'],
+        [PROJECT_NAME + '_TEST_HALT_AFTER_PROOF_RETAIN=1']);
+      if Run.ExitCode <> HALT_EXIT_CODE then
+        WriteLn('--- deep halt ---'#10, Output(Run), '---');
+      Expect<Integer>(Run.ExitCode).ToBe(HALT_EXIT_CODE);
+      Longest := LongestFile(Project + '/.' + PROGRAM_NAME + '/tmp');
+      WriteLn('  deepest retained path: ', Length(Longest), ' characters');
+      Expect<Boolean>(Length(Longest) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+      Expect<Boolean>(Pos('rollback-p', Longest) > 0).ToBe(True);
+      Expect<string>(ExtractFileExt(Longest)).ToBe('.toml');
+      { A proof document is named by its own hash. }
+      Expect<string>(SHA256File(Longest))
+        .ToBe(Copy(ExtractFileName(Longest), 1, 64));
+
+      { Damage the live proof set, so only a restore from the retained copy
+        past MAX_PATH can bring the baseline back. }
+      LiveProofs := Project + '/.' + PROGRAM_NAME
+        + '/archives/registry-proofs/sha256/';
+      WriteTextFile(LiveProofs + ExtractFileName(Longest), 'damaged'#10);
+      WriteTextFile(LiveProofs + StringOfChar('0', 64) + '.toml', 'extra'#10);
+      Expect<Boolean>(ProjectState <> Before).ToBe(True);
+
+      ExpectSuccess('deep repair', RunDeep(['repair'], []));
+      Expect<string>(ProjectState).ToBe(Before);
+      Expect<string>(LongestFile(Project + '/.' + PROGRAM_NAME + '/tmp'))
+        .ToBe('');
+
+      ExpectSuccess('deep replacement', RunDeep(['install'], []));
+      Expect<string>(EntryField(ReadText(Project + '/lwpt.lock'), 'json',
+        'resolvedRef')).ToBe('1.1.0');
+      Proof := Project + '/.' + PROGRAM_NAME
+        + '/archives/registry-proofs/sha256/'
+        + Copy(Registry.RecordHash('json', '1.1.0'), 8, 64) + '.toml';
+      Expect<Boolean>(LongPathFileExists(Proof)).ToBe(True);
+      Expect<string>(LongestFile(Project + '/.' + PROGRAM_NAME + '/tmp'))
+        .ToBe('');
+    finally
+      { The RTL scratch cleanup cannot remove a tree past MAX_PATH. }
+      if LongPathDirectoryExists(CaseRoot + '/project') then
+        WipeDir(CaseRoot + '/project');
+    end;
+  finally
+    Origin.Free;
+    Registry.Free;
+  end;
+end;
+
 procedure TInstallRegistry.TestProofReplacementAndPruningRollBack;
 var
   Registry: TSyntheticRegistry;
@@ -2360,6 +2505,8 @@ begin
     TestFirstInstallRollsBackAfterLockWrite);
   Test('rollback: proof replacement and pruning are restored on failure',
     TestProofReplacementAndPruningRollBack);
+  Test('a deep project retains, restores and replaces proofs past MAX_PATH',
+    TestDeepProjectRetainsProofsPastMaxPath);
   Test('an unsigned lock floor never reaches per-user state',
     TestLockFloorNeverReachesPerUserState);
   Test('#55: a lagging contact lacking newer history is stale, with a healthy '

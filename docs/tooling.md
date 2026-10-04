@@ -292,6 +292,20 @@ On the same filesystem, `rename(2)` is one syscall. Across filesystems (a Docker
 
 If EXDEV failures are persistent and the fallback is too slow, ensure `.lwpt/` lives on the same filesystem as the project root (don't bind-mount it).
 
+### Windows paths past MAX_PATH
+
+Toolkit state nests 64-character hash names: committed registry proofs, and rollback copies of proofs and modules below the journaled `.lwpt/tmp/install-transaction.*` root. In a deep checkout those paths pass the 260-character Win32 `MAX_PATH`, which the plain-path Win32 APIs and the FPC RTL file routines built on them enforce ([#347](https://github.com/frostney/lwpt/issues/347)). On Windows, `LWPT.Core`'s `LongPath*` primitives, `ListDirectoryEntries` and `OpenProtectedFileStream` therefore address every path by its extended-length spelling (`\\?\C:\...`, or `\\?\UNC\server\share\...`). `WindowsExtendedPath` builds that spelling from Win32's own parse of the ordinary path (`GetFullPathNameW`), so it names exactly what the ordinary path named: relative and root-relative paths resolve against the current drive or UNC directory, trailing dots and spaces fold, a reserved device name stays a device, and a trailing separator still names only a directory. On Unix the primitives delegate to the SysUtils routines of the same name.
+
+These paths use them:
+
+- the atomic helpers and everything they call: directory creation, enumeration and deletion, file open and copy, the EXDEV fallback, tree hashing, rollback retention and restore, and atomic replacement;
+- the install transaction (shared by `add`, `remove`, `update` and repair's lock upgrade): the install lock, the rollback journal and its crash recovery, resolver plan staging, archive staging and verification, registry proof publication and committed proof and lockfile reads, dependency manifest reads from staging, and object-store materialization into the project;
+- `lwpt repair`: the stale install lock, `.lwpt/tmp/`, abandoned build sessions (state, age, owner guard, root identity and ledger), and the retired-image sweep beside build outputs.
+
+Three limits remain by design. Archive extraction keeps the legacy budget (259 characters for a file, 247 for a directory) and fails before writing when an entry would exceed it, because an extracted module tree must stay usable by the compiler and by tools that are not long-path aware. Builds and tests stay bound by the compiler's own 255-character path limit ([#309](https://github.com/frostney/lwpt/issues/309)), so build-input fingerprinting and compilation use ordinary paths, and a project root that deep cannot build anyway. Per-user stores (the shared dependency cache, producer leases, registry consumer state, registry server data) and user files outside toolkit state (`lwpt format`, `lwpt init`, workspace discovery) are not covered.
+
+Toolkit-state streams take no `flock()` on Unix: `OpenProtectedFileStream` and the `AtomicWrite*` helpers open without FPC's share-mode lock, because an inherited flock wedged producer leases on Darwin (#312), and readers coordinate with writers through the install lock, producer leases and atomic rename rather than through advisory locks.
+
 ## Install lock + crash recovery
 
 `lwpt install` acquires a cross-process lock at `.lwpt/install.lock` before doing any work. On Unix, the file is created with `O_CREAT|O_EXCL` — the kernel guarantees only one process wins the create. A second concurrent `lwpt install` fails fast with `EConcurrencyError` naming the lock holder's PID. The lock is deleted by the normally-completing install; a crashed install leaves the lock file behind, and `lwpt repair` clears it only after using the validated pending journal to restore pre-transaction committed state.

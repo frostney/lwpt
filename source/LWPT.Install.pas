@@ -601,7 +601,7 @@ var
 begin
   FPath := APath;
   DstDir := ExtractFileDir(APath);
-  if DstDir <> '' then ForceDirectories(DstDir);
+  if DstDir <> '' then LongPathForceDirectories(DstDir);
 
   { Atomic create-if-not-exists. O_EXCL turns this into a kernel-level
     test-and-set: at most one process wins. Mode 0644 (readable by
@@ -651,7 +651,7 @@ begin
   begin
     FpClose(FFD);
     FFD := -1;
-    SysUtils.DeleteFile(FPath);   { release: file existence == lock held }
+    LongPathDeleteFile(FPath);   { release: file existence == lock held }
   end;
   inherited Destroy;
 end;
@@ -672,9 +672,9 @@ begin
   FPath := APath;
   FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
   DstDir := ExtractFileDir(APath);
-  if DstDir <> '' then ForceDirectories(DstDir);
+  if DstDir <> '' then LongPathForceDirectories(DstDir);
 
-  FHandle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+  FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
     Windows.GENERIC_READ or Windows.GENERIC_WRITE,
     Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
       or Windows.FILE_SHARE_DELETE, nil, Windows.CREATE_NEW,
@@ -689,11 +689,11 @@ begin
         [APath, SysErrorMessage(LastErr), LastErr]);
 
     Holder := 'unknown';
-    if FileExists(APath) then
+    if LongPathFileExists(APath) then
     begin
       SL := TStringList.Create;
       try
-        SL.LoadFromFile(APath);
+        LoadProtectedStrings(SL, APath);
         if SL.Count > 0 then Holder := Trim(SL[0]);
       finally
         SL.Free;
@@ -713,7 +713,7 @@ begin
     Windows.WriteFile(FHandle, PidLine[1], Length(PidLine),
       BytesWritten, nil);
   Windows.CloseHandle(FHandle);
-  FHandle := Windows.CreateFileW(PWideChar(UnicodeString(APath)),
+  FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
     Windows.GENERIC_READ,
     Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
       or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
@@ -730,7 +730,7 @@ begin
   begin
     Windows.CloseHandle(FHandle);
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    SysUtils.DeleteFile(FPath);
+    LongPathDeleteFile(FPath);
     raise EConcurrencyError.Create(
       'another ' + PROGRAM_NAME
       + ' install is in progress. Try again when it finishes.');
@@ -750,7 +750,7 @@ begin
     Windows.UnlockFileEx(FHandle, 0, 1, 0, Ov);
     Windows.CloseHandle(FHandle);
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    SysUtils.DeleteFile(FPath);
+    LongPathDeleteFile(FPath);
   end;
   inherited Destroy;
 end;
@@ -938,7 +938,7 @@ var
   procedure StageLocalCopy(const AMessage: string);
   begin
     StagePath := MakeTmpPath(ATmpRoot, 'local-' + ADep.Name);
-    ForceDirectories(StagePath);
+    LongPathForceDirectories(StagePath);
     try
       CopyDirTree(LocalPath, StagePath);
       if not AtomicMoveDir(StagePath, AUnitDir) then
@@ -948,7 +948,7 @@ var
     except
       on E: Exception do
       begin
-        if DirectoryExists(StagePath) then
+        if LongPathDirectoryExists(StagePath) then
           WipeDir(StagePath);
         raise;
       end;
@@ -1032,7 +1032,7 @@ begin
   AArchive := '';
   AArchiveHash := '';
   AResolvedURL := '';
-  ForceDirectories(AModulesRoot);
+  LongPathForceDirectories(AModulesRoot);
 
   { workspace: protocol resolution (ADR-0014 amendment "Workspaces"
     Q20=a strict semantics). Look up the dep by name in the root's
@@ -1078,7 +1078,7 @@ begin
   if ADep.SrcKind = skLocal then
   begin
     LocalPath := ResolveProjectPath(AProjectRoot, ADep.SrcLocator);
-    if not DirectoryExists(LocalPath) then
+    if not LongPathDirectoryExists(LocalPath) then
       raise EFetchError.CreateFmt(
         'local source for "%s" not found: %s', [ADep.Name, LocalPath]);
     { Every local/workspace dependency is a private copied candidate. The
@@ -1344,7 +1344,7 @@ begin
       GunzipStream(ArchiveIn, TarOut);
     except
       TarOut.Free;
-      SysUtils.DeleteFile(ATarPath);
+      LongPathDeleteFile(ATarPath);
       raise;
     end;
     TarOut.Free;
@@ -1428,9 +1428,13 @@ end;
 
 const
   {$IFDEF MSWINDOWS}
-  { LWPT is not long-path aware, so the Win32 file APIs keep the legacy
-    MAX_PATH budget: 259 characters for a file, and 247 for a directory,
-    whose creation reserves room for an 8.3 file name. }
+  { Extraction deliberately keeps the legacy Win32 MAX_PATH budget: 259
+    characters for a file, and 247 for a directory, whose creation reserves
+    room for an 8.3 file name. An extracted module tree must stay usable by
+    the compiler and by tools that are not long-path aware (#309), so an
+    over-long entry fails here, before extraction, with its cause named.
+    Toolkit-owned copies of that tree (rollback retention, EXDEV moves) use
+    the Core extended-length helpers and may nest deeper (#347). }
   ArchiveFilePathLimit = MAX_PATH - 1;
   ArchiveDirectoryPathLimit = MAX_PATH - 13;
   {$ELSE}
@@ -1922,11 +1926,11 @@ begin
 end;
 
 function ReadFileText(const APath: string): string;
-var Stream: TFileStream;
+var Stream: TLWPTProtectedFileStream;
 begin
   Result := '';
-  if not FileExists(APath) then Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  if not LongPathFileExists(APath) then Exit;
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     SetLength(Result, Stream.Size);
     if Length(Result) > 0 then Stream.ReadBuffer(Result[1], Length(Result));
@@ -1959,7 +1963,7 @@ begin
   SL := TStringList.Create;
   try
     RenderLock(SL, AResolved, ARegistryTables);
-    if FileExists(APath) and (ReadFileText(APath) = SL.Text) then Exit;
+    if LongPathFileExists(APath) and (ReadFileText(APath) = SL.Text) then Exit;
     AtomicWriteText(APath, ATmpRoot, SL);
   finally
     SL.Free;
@@ -2057,7 +2061,7 @@ var
   Entry : TResolved;
   Empty : TCustomSourceArray;
 begin
-  if not FileExists(APath) then
+  if not LongPathFileExists(APath) then
     raise ELockfileError.CreateFmt(
       'lockfile not found at %s. Run `lwpt install` to generate it.',
       [APath]);
@@ -2066,7 +2070,7 @@ begin
   Parser := TTOMLParser.Create;
   Root := nil;
   try
-    SL.LoadFromFile(APath);
+    LoadProtectedStrings(SL, APath);
     try
       Root := Parser.ParseDocument(SL.Text);
     except
@@ -2308,7 +2312,7 @@ end;
 procedure WriteTransactionState(const ARollbackRoot, AState: string);
 var Lines: TStringList;
 begin
-  ForceDirectories(ARollbackRoot);
+  LongPathForceDirectories(ARollbackRoot);
   Lines := TStringList.Create;
   try
     Lines.Add(AState);
@@ -2333,22 +2337,20 @@ begin
 end;
 
 function RollbackRootHasMarkers(const ARollbackRoot: string): Boolean;
-var SR: TSearchRec;
 begin
-  Result := SysUtils.FindFirst(ARollbackRoot + '/*.rollback',
-    faAnyFile, SR) = 0;
-  if Result then SysUtils.FindClose(SR);
+  Result := Length(ListDirectoryEntries(ARollbackRoot, '*.rollback',
+    faAnyFile)) > 0;
 end;
 
 function RecoverRollbackRoot(const ARollbackRoot: string): string;
 var
-  SR: TSearchRec;
+  Entries: TLWPTDirectoryEntries;
   BackupPath, Destination: string;
-  MarkerIndex: Integer;
+  EntryIndex, MarkerIndex: Integer;
   Markers: TStringList;
 begin
   Result := '';
-  if FileExists(ARollbackRoot + '/transaction.committed') then
+  if LongPathFileExists(ARollbackRoot + '/transaction.committed') then
   begin
     WipeDir(ARollbackRoot);
     Exit;
@@ -2356,16 +2358,10 @@ begin
   Markers := TStringList.Create;
   try
     Markers.Sorted := True;
-    if SysUtils.FindFirst(ARollbackRoot + '/*.rollback', faAnyFile, SR) = 0 then
-      try
-        repeat
-          if (SR.Name = '.') or (SR.Name = '..') then Continue;
-          Markers.Add(ARollbackRoot + '/'
-            + Copy(SR.Name, 1, Length(SR.Name) - Length('.rollback')));
-        until SysUtils.FindNext(SR) <> 0;
-      finally
-        SysUtils.FindClose(SR);
-      end;
+    Entries := ListDirectoryEntries(ARollbackRoot, '*.rollback', faAnyFile);
+    for EntryIndex := 0 to High(Entries) do
+      Markers.Add(ARollbackRoot + '/' + Copy(Entries[EntryIndex].Name, 1,
+        Length(Entries[EntryIndex].Name) - Length('.rollback')));
     for MarkerIndex := 0 to Markers.Count - 1 do
     begin
       BackupPath := Markers[MarkerIndex];
@@ -2392,25 +2388,23 @@ begin
 end;
 
 function RecoverPendingTransactions(const ATmpRoot: string): string;
-var SR: TSearchRec; Candidate, Failures: string;
+var
+  Entries: TLWPTDirectoryEntries;
+  i: Integer;
+  Candidate, Failures: string;
 begin
   Result := '';
-  if not DirectoryExists(ATmpRoot) then Exit;
-  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ATmpRoot) + '*',
-       faAnyFile, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        if (SR.Attr and faDirectory) = 0 then Continue;
-        Candidate := IncludeTrailingPathDelimiter(ATmpRoot) + SR.Name;
-        if not FileExists(Candidate + '/transaction.state') then Continue;
-        Failures := RecoverRollbackRoot(Candidate);
-        if Failures <> '' then
-          AppendRollbackFailure(Result, Failures);
-      until SysUtils.FindNext(SR) <> 0;
-    finally
-      SysUtils.FindClose(SR);
-    end;
+  if not LongPathDirectoryExists(ATmpRoot) then Exit;
+  Entries := ListDirectoryEntries(ATmpRoot, '*', faAnyFile);
+  for i := 0 to High(Entries) do
+  begin
+    if (Entries[i].Attr and faDirectory) = 0 then Continue;
+    Candidate := IncludeTrailingPathDelimiter(ATmpRoot) + Entries[i].Name;
+    if not LongPathFileExists(Candidate + '/transaction.state') then Continue;
+    Failures := RecoverRollbackRoot(Candidate);
+    if Failures <> '' then
+      AppendRollbackFailure(Result, Failures);
+  end;
 end;
 
 function CollectOrphanedPackagePaths(
@@ -2665,13 +2659,14 @@ const
   MAX_MANIFEST_SCAN_DEPTH = 16;
 var
   Current, Next, Hits: TStringList;
-  SR: TSearchRec;
-  i, Depth: Integer;
+  Entries: TLWPTDirectoryEntries;
+  i, EntryIndex, Depth: Integer;
+  Name: string;
   Base, RelPrefix: string;
 begin
   Result := False;
   ARelDir := '';
-  if not DirectoryExists(AUnitDir) then Exit;
+  if not LongPathDirectoryExists(AUnitDir) then Exit;
 
   Current := TStringList.Create;
   Next    := TStringList.Create;
@@ -2689,23 +2684,20 @@ begin
         RelPrefix := Current[i];
         if RelPrefix <> '' then
           Base := Base + RelPrefix + '/';
-        if FileExists(Base + MANIFEST_FILE) then
+        if LongPathFileExists(Base + MANIFEST_FILE) then
           Hits.Add(RelPrefix);
-        if SysUtils.FindFirst(Base + '*', faAnyFile or faSymLink, SR) = 0 then
-          try
-            repeat
-              { leading '.' also covers the '.' and '..' entries }
-              if (SR.Name <> '') and (SR.Name[1] = '.') then Continue;
-              if (SR.Attr and faSymLink) <> 0 then Continue;
-              if (SR.Attr and faDirectory) = 0 then Continue;
-              if RelPrefix = '' then
-                Next.Add(SR.Name)
-              else
-                Next.Add(RelPrefix + '/' + SR.Name);
-            until SysUtils.FindNext(SR) <> 0;
-          finally
-            SysUtils.FindClose(SR);
-          end;
+        Entries := ListDirectoryEntries(Base, '*', faAnyFile or faSymLink);
+        for EntryIndex := 0 to High(Entries) do
+        begin
+          Name := Entries[EntryIndex].Name;
+          if (Name <> '') and (Name[1] = '.') then Continue;
+          if (Entries[EntryIndex].Attr and faSymLink) <> 0 then Continue;
+          if (Entries[EntryIndex].Attr and faDirectory) = 0 then Continue;
+          if RelPrefix = '' then
+            Next.Add(Name)
+          else
+            Next.Add(RelPrefix + '/' + Name);
+        end;
       end;
       if Hits.Count = 1 then
       begin
@@ -3097,24 +3089,20 @@ end;
   checkout keeps no empty directory. }
 procedure CollectRegistryTreeEntries(const ARoot, ARel: string;
   AList: TStringList);
-var SR: TSearchRec; Rel: string;
+var Entries: TLWPTDirectoryEntries; i: Integer; Rel: string;
 begin
-  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ARoot) + ARel + '*',
-       faAnyFile or faSymLink, SR) = 0 then
-    try
-      repeat
-        if (SR.Name = '.') or (SR.Name = '..') then Continue;
-        Rel := ARel + SR.Name;
-        if (SR.Attr and faSymLink) <> 0 then
-          AList.Add('link:' + Rel)
-        else if (SR.Attr and faDirectory) <> 0 then
-          CollectRegistryTreeEntries(ARoot, Rel + '/', AList)
-        else
-          AList.Add('file:' + Rel);
-      until SysUtils.FindNext(SR) <> 0;
-    finally
-      SysUtils.FindClose(SR);
-    end;
+  Entries := ListDirectoryEntries(IncludeTrailingPathDelimiter(ARoot) + ARel,
+    '*', faAnyFile or faSymLink);
+  for i := 0 to High(Entries) do
+  begin
+    Rel := ARel + Entries[i].Name;
+    if (Entries[i].Attr and faSymLink) <> 0 then
+      AList.Add('link:' + Rel)
+    else if (Entries[i].Attr and faDirectory) <> 0 then
+      CollectRegistryTreeEntries(ARoot, Rel + '/', AList)
+    else
+      AList.Add('file:' + Rel);
+  end;
 end;
 
 { The SHA-256 of one file's content, normalized as tree hashing normalizes
@@ -3193,10 +3181,10 @@ procedure VerifyRederivedRegistryTree(const AArchive, ATmpRoot, AInstalled,
   ALockHash: string; const APackage: TLWPTRegistryPackage;
   const ADep: TDependency);
 var
-  Stream: TFileStream;
+  Stream: TLWPTProtectedFileStream;
   Scratch, Copied, Tree, Rederived, Installed, Difference: string;
 begin
-  if not FileExists(AArchive) then
+  if not LongPathFileExists(AArchive) then
     raise EVerifyError.CreateFmt('[frozen] committed archive for "%s" is '
       + 'missing at %s. Restore it from version control or run `%s install`.',
       [APackage.Name, AArchive, PROGRAM_NAME]);
@@ -3204,13 +3192,13 @@ begin
     in deep projects. }
   Scratch := MakeTmpPath(ATmpRoot, 'fz');
   try
-    ForceDirectories(Scratch);
+    LongPathForceDirectories(Scratch);
     Copied := Scratch + '/a.tgz';
     Tree := Scratch + '/t';
     if not CopyFileContent(AArchive, Copied) then
       raise EVerifyError.CreateFmt('[frozen] cannot read the committed '
         + 'archive for "%s" at %s', [APackage.Name, AArchive]);
-    Stream := TFileStream.Create(Copied, fmOpenRead or fmShareDenyNone);
+    Stream := OpenProtectedFileStream(Copied, fmOpenRead or fmShareDenyNone);
     try
       VerifyRegistryArtifact(APackage, Stream);
     finally
@@ -3251,7 +3239,7 @@ begin
         + 'control, or run `%s install --offline` to restore it from the '
         + 'archive.', [APackage.Name, Difference, AInstalled, PROGRAM_NAME]);
   finally
-    if DirectoryExists(Scratch) then WipeDir(Scratch);
+    if LongPathDirectoryExists(Scratch) then WipeDir(Scratch);
   end;
 end;
 
@@ -3346,7 +3334,7 @@ begin
     ArchiveHash := '';
     ResolvedURL := '';
 
-    if not DirectoryExists(UnitDir) then
+    if not LongPathDirectoryExists(UnitDir) then
       raise EFetchError.CreateFmt(
         '[frozen] missing extracted module for "%s" at %s '
         + '(required by %s). Run `lwpt install` without --frozen to '
@@ -3373,7 +3361,7 @@ begin
     R.Nodes[idx].Archive     := Archive;
     R.Nodes[idx].ArchiveHash := ArchiveHash;
     R.Nodes[idx].ResolvedURL := ResolvedURL;
-    if DirectoryExists(UnitDir) then
+    if LongPathDirectoryExists(UnitDir) then
       R.Nodes[idx].Hash := HashTree(UnitDir);
 
     { A registry node is proven from its committed selection proof and the
@@ -3659,10 +3647,10 @@ var
       ANode.Dep.SrcKind, AFetchRef);
     AArchiveHash := '';
     AResolvedURL := Entry.ResolvedURL;
-    ForceDirectories(ExtractFileDir(AArchive));
+    LongPathForceDirectories(ExtractFileDir(AArchive));
     ProjectArchive := ArchivePathForRef(AArchivesRoot, ANode.Name,
       ANode.Dep.SrcKind, Entry.Version);
-    if FileExists(ProjectArchive) then
+    if LongPathFileExists(ProjectArchive) then
     begin
       ActualHash := 'sha256:' + SHA256File(ProjectArchive);
       if ActualHash = Entry.ArchiveHash then
@@ -4217,7 +4205,7 @@ var
     ProjectArchive: string;
     Staged: Boolean;
     Bytes: TBytes;
-    Stream: TFileStream;
+    Stream: TLWPTProtectedFileStream;
     PriorEntry: TResolved;
   begin
     if not FindRegistryPackage(ANode.RegistryRecord, Package) then
@@ -4228,13 +4216,13 @@ var
     AUnitDir := IncludeTrailingPathDelimiter(PlanModules) + ANode.Name;
     AArchive := ArchivePathForRef(PlanArchives, ANode.Name, skRegistry,
       ANode.Version);
-    ForceDirectories(ExtractFileDir(AArchive));
+    LongPathForceDirectories(ExtractFileDir(AArchive));
     ProjectArchive := ArchivePathForRef(AArchivesRoot, ANode.Name, skRegistry,
       ANode.Version);
     Staged := False;
-    if FileExists(ACacheArchive) then
+    if LongPathFileExists(ACacheArchive) then
       Staged := CopyFileContent(ACacheArchive, AArchive)
-    else if FileExists(ProjectArchive)
+    else if LongPathFileExists(ProjectArchive)
        and ('sha256:' + SHA256File(ProjectArchive) = Package.ArchiveHash) then
     begin
       Staged := CopyFileContent(ProjectArchive, AArchive);
@@ -4268,16 +4256,16 @@ var
               '; the project archive remains authoritative');
         end;
     end;
-    Stream := TFileStream.Create(AArchive, fmOpenRead or fmShareDenyNone);
+    Stream := OpenProtectedFileStream(AArchive, fmOpenRead or fmShareDenyNone);
     try
       VerifyRegistryArtifact(Package, Stream);
     finally
       Stream.Free;
     end;
     AArchiveHash := Package.ArchiveHash;
-    if not FileExists(ACacheArchive) then
+    if not LongPathFileExists(ACacheArchive) then
     begin
-      ForceDirectories(ExtractFileDir(ACacheArchive));
+      LongPathForceDirectories(ExtractFileDir(ACacheArchive));
       if not CopyFileContent(AArchive, ACacheArchive) then
         raise EFetchError.CreateFmt(
           'failed to cache resolver candidate "%s"', [ANode.Name]);
@@ -4295,17 +4283,17 @@ var
 
   procedure RequireSignedRegistryArchive(const ANode: TResolveNode;
     const AArchive: string);
-  var Package: TLWPTRegistryPackage; Stream: TFileStream;
+  var Package: TLWPTRegistryPackage; Stream: TLWPTProtectedFileStream;
   begin
     if not FindRegistryPackage(ANode.RegistryRecord, Package)
        or (Package.Name <> ANode.Name) then
       raise EVerifyError.CreateFmt(
         '[offline] registry dependency "%s": locked record %s was not '
         + 'verified for it', [ANode.Name, ANode.RegistryRecord]);
-    if not FileExists(AArchive) then
+    if not LongPathFileExists(AArchive) then
       raise EFetchError.CreateFmt(
         '[offline] verified archive for "%s" is unavailable', [ANode.Name]);
-    Stream := TFileStream.Create(AArchive, fmOpenRead or fmShareDenyNone);
+    Stream := OpenProtectedFileStream(AArchive, fmOpenRead or fmShareDenyNone);
     try
       VerifyRegistryArtifact(Package, Stream);
     finally
@@ -4525,7 +4513,7 @@ var
     begin
       Committed := IncludeTrailingPathDelimiter(AModulesRoot) + R.Nodes[k].Name;
       Reason := '';
-      if not DirectoryExists(Committed) then
+      if not LongPathDirectoryExists(Committed) then
         Reason := 'is missing'
       else
         try
@@ -4571,7 +4559,7 @@ var
         end;
         RecheckPath := MakeTmpPath(PlanScratch,
           'preflight-' + R.Nodes[k].Name);
-        ForceDirectories(RecheckPath);
+        LongPathForceDirectories(RecheckPath);
         CopyDirTree(LivePath, RecheckPath);
         ApplyIncludeExclude(RecheckPath,
           R.Nodes[k].Dep.IncludeGlobs, R.Nodes[k].Dep.ExcludeGlobs);
@@ -4663,12 +4651,12 @@ begin
       if Round > 128 then
         raise EManifestError.Create(
           'dependency resolution did not reach a fixed point');
-      if DirectoryExists(PlanModules) then WipeDir(PlanModules);
-      if DirectoryExists(PlanArchives) then WipeDir(PlanArchives);
-      if DirectoryExists(PlanScratch) then WipeDir(PlanScratch);
-      ForceDirectories(PlanModules);
-      ForceDirectories(PlanArchives);
-      ForceDirectories(PlanScratch);
+      if LongPathDirectoryExists(PlanModules) then WipeDir(PlanModules);
+      if LongPathDirectoryExists(PlanArchives) then WipeDir(PlanArchives);
+      if LongPathDirectoryExists(PlanScratch) then WipeDir(PlanScratch);
+      LongPathForceDirectories(PlanModules);
+      LongPathForceDirectories(PlanArchives);
+      LongPathForceDirectories(PlanScratch);
       R := Default(TResolution);
       Queue := nil;
 
@@ -4738,7 +4726,7 @@ begin
             ArchiveHash, ResolvedURL)
         else if AOffline and IsNetworkBacked(R.Nodes[idx]) then
         begin
-          if FileExists(CacheArchive) then
+          if LongPathFileExists(CacheArchive) then
           begin
             { The candidate was staged for another dependency naming the same
               source and ref, so this node's own locked archive identity is
@@ -4762,7 +4750,7 @@ begin
               + R.Nodes[idx].Name;
             Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
               R.Nodes[idx].Dep.SrcKind, FetchRef);
-            ForceDirectories(ExtractFileDir(Archive));
+            LongPathForceDirectories(ExtractFileDir(Archive));
             if not CopyFileContent(CacheArchive, Archive) then
               raise EFetchError.CreateFmt(
                 '[offline] failed to restore staged candidate "%s"',
@@ -4774,7 +4762,7 @@ begin
           begin
             StageLockedArchive(R.Nodes[idx], FetchRef, UnitDir, Archive,
               ArchiveHash, ResolvedURL);
-            ForceDirectories(ExtractFileDir(CacheArchive));
+            LongPathForceDirectories(ExtractFileDir(CacheArchive));
             if not CopyFileContent(Archive, CacheArchive) then
               raise EFetchError.CreateFmt(
                 '[offline] failed to retain staged candidate "%s"',
@@ -4782,7 +4770,7 @@ begin
           end;
         end
         else if (R.Nodes[idx].Dep.SrcKind in [skGitHost, skURL])
-           and FileExists(CacheArchive) then
+           and LongPathFileExists(CacheArchive) then
         begin
           { The candidate may have been fetched for another dependency that
             names the same source and commit but has no locked identity of
@@ -4797,7 +4785,7 @@ begin
             + R.Nodes[idx].Name;
           Archive := ArchivePathForRef(PlanArchives, R.Nodes[idx].Name,
             R.Nodes[idx].Dep.SrcKind, FetchRef);
-          ForceDirectories(ExtractFileDir(Archive));
+          LongPathForceDirectories(ExtractFileDir(Archive));
           if not CopyFileContent(CacheArchive, Archive) then
             raise EFetchError.CreateFmt(
               'failed to restore cached resolver candidate "%s"',
@@ -4818,9 +4806,9 @@ begin
             AObjectStore,
             VerifyArchiveHash, VerifyContext,
             UnitDir, Archive, ArchiveHash, ResolvedURL);
-          if (Archive <> '') and FileExists(Archive) then
+          if (Archive <> '') and LongPathFileExists(Archive) then
           begin
-            ForceDirectories(ExtractFileDir(CacheArchive));
+            LongPathForceDirectories(ExtractFileDir(CacheArchive));
             if not CopyFileContent(Archive, CacheArchive) then
               raise EFetchError.CreateFmt(
                 'failed to cache resolver candidate "%s"',
@@ -4831,11 +4819,11 @@ begin
           per-user CAS, must also be the signed record's before extraction. }
         if AOffline and (R.Nodes[idx].Dep.SrcKind = skRegistry) then
           RequireSignedRegistryArchive(R.Nodes[idx], Archive);
-        if (Archive <> '') and FileExists(Archive) then
+        if (Archive <> '') and LongPathFileExists(Archive) then
         begin
           ExtractTmp := MakeTmpPath(PlanScratch,
             'extract-' + R.Nodes[idx].Name);
-          ForceDirectories(ExtractTmp);
+          LongPathForceDirectories(ExtractTmp);
           try
             ExtractArchive(Archive, ExtractTmp, '');
             if R.Nodes[idx].Dep.SrcKind = skRegistry then
@@ -4851,14 +4839,14 @@ begin
           except
             on E: Exception do
             begin
-              if DirectoryExists(ExtractTmp) then WipeDir(ExtractTmp);
+              if LongPathDirectoryExists(ExtractTmp) then WipeDir(ExtractTmp);
               raise EExtractError.CreateFmt(
                 'extract failed for "%s" from %s: %s',
                 [R.Nodes[idx].Name, Archive, E.Message]);
             end;
           end;
         end;
-        if (Archive = '') and DirectoryExists(UnitDir)
+        if (Archive = '') and LongPathDirectoryExists(UnitDir)
            and ((Length(R.Nodes[idx].Dep.IncludeGlobs) > 0)
              or (Length(R.Nodes[idx].Dep.ExcludeGlobs) > 0)) then
           ApplyIncludeExclude(UnitDir,
@@ -4868,7 +4856,7 @@ begin
         R.Nodes[idx].Archive := Archive;
         R.Nodes[idx].ArchiveHash := ArchiveHash;
         R.Nodes[idx].ResolvedURL := ResolvedURL;
-        if DirectoryExists(UnitDir) then
+        if LongPathDirectoryExists(UnitDir) then
           R.Nodes[idx].Hash := HashTree(UnitDir);
 
         if FindModuleManifest(UnitDir, ManifestRelDir) then
@@ -4964,7 +4952,7 @@ begin
     RegistryWarnings.Free;
     SeenSignatures.Free;
     VerifiedPins.Free;
-    if DirectoryExists(PlanRoot) then WipeDir(PlanRoot);
+    if LongPathDirectoryExists(PlanRoot) then WipeDir(PlanRoot);
   end;
 end;
 
@@ -5059,14 +5047,12 @@ end;
 
 { Size of a file by path, as a string; '0' if absent. }
 function FileSizeBytes(const APath: string): string;
-var SR: TSearchRec;
+var Entries: TLWPTDirectoryEntries;
 begin
   Result := '0';
-  if SysUtils.FindFirst(APath, faAnyFile, SR) = 0 then
-  begin
-    Result := IntToStr(SR.Size);
-    SysUtils.FindClose(SR);
-  end;
+  Entries := ListDirectoryEntries(ExtractFileDir(APath),
+    ExtractFileName(APath), faAnyFile);
+  if Length(Entries) > 0 then Result := IntToStr(Entries[0].Size);
 end;
 
 
@@ -5249,7 +5235,7 @@ begin
       if Lock.SrcKind = skLocal then Exit;
       Archive := ArchivePathForRef(AArchivesRoot, AGraphEntry.Name,
         Lock.SrcKind, Lock.Version);
-      if FileExists(Archive) then
+      if LongPathFileExists(Archive) then
         AGraphEntry.ArchiveHash := 'sha256:' + SHA256File(Archive);
       Exit;
     end;
@@ -5347,7 +5333,7 @@ begin
   Result := CollectOrphanedPackagePaths(AOldLock, ANewLock,
     AModulesRoot, AArchivesRoot, Paths);
   for i := 0 to High(Paths) do
-    if FileExists(Paths[i]) or DirectoryExists(Paths[i])
+    if LongPathFileExists(Paths[i]) or LongPathDirectoryExists(Paths[i])
        or IsDirSymlinkOrJunction(Paths[i]) then
     begin
       if not AtomicRemovePath(Paths[i]) then
@@ -6295,31 +6281,27 @@ end;
 function RegistryProofsCurrent(const ARoot: string;
   const ADocuments: TRegistryProofDocumentArray): Boolean;
 var
-  Search: TSearchRec;
-  Count, k: Integer;
+  Entries: TLWPTDirectoryEntries;
+  Count, i, k: Integer;
   Known: Boolean;
 begin
-  if not DirectoryExists(ARoot) then Exit(Length(ADocuments) = 0);
+  if not LongPathDirectoryExists(ARoot) then Exit(Length(ADocuments) = 0);
   Count := 0;
-  if SysUtils.FindFirst(ARoot + '/sha256/*', faAnyFile, Search) = 0 then
-    try
-      repeat
-        if (Search.Name = '.') or (Search.Name = '..') then Continue;
-        Known := False;
-        for k := 0 to High(ADocuments) do
-          if RegistryDigestHex(ADocuments[k].Hash) + '.toml' = Search.Name then
-          begin
-            Known := True;
-            Break;
-          end;
-        if not Known then Exit(False);
-        if SHA256File(ARoot + '/sha256/' + Search.Name)
-           <> Copy(Search.Name, 1, 64) then Exit(False);
-        Inc(Count);
-      until SysUtils.FindNext(Search) <> 0;
-    finally
-      SysUtils.FindClose(Search);
-    end;
+  Entries := ListDirectoryEntries(ARoot + '/sha256', '*', faAnyFile);
+  for i := 0 to High(Entries) do
+  begin
+    Known := False;
+    for k := 0 to High(ADocuments) do
+      if RegistryDigestHex(ADocuments[k].Hash) + '.toml' = Entries[i].Name then
+      begin
+        Known := True;
+        Break;
+      end;
+    if not Known then Exit(False);
+    if SHA256File(ARoot + '/sha256/' + Entries[i].Name)
+       <> Copy(Entries[i].Name, 1, 64) then Exit(False);
+    Inc(Count);
+  end;
   Result := Count = Length(ADocuments);
 end;
 
@@ -6336,14 +6318,21 @@ begin
   Root := IncludeTrailingPathDelimiter(AArchivesRoot) + REGISTRY_PROOFS_DIR;
   if RegistryProofsCurrent(Root, ADocuments) then Exit;
   { The retained copy nests sha256/<64 hex>.toml below the journaled
-    transaction root, so its hint stays short to keep deep projects inside
-    the legacy Windows path limit. The outputs are set only once the copy
-    is validated: a failed retention has nothing to restore. }
+    transaction root. Its hint stays short, but a deep project can still
+    pass the legacy Windows MAX_PATH here; the Core helpers address every
+    such path by its extended-length spelling (#347). The outputs are set
+    only once the copy is validated: a failed retention has nothing to
+    restore. }
   Backup := '';
   if not AtomicRetainPath(Root, ARollbackRoot, 'p', Backup) then
     raise EExtractError.Create('failed to retain registry proof rollback copy');
   ABackup := Backup;
   APublishedPath := Root;
+  {$IFDEF INSTALL_TESTING}
+  { Leaves the retained proof copy on disk for crash-recovery tests. }
+  if TestSeamValue('HALT_AFTER_PROOF_RETAIN') = '1' then
+    TerminateAbruptlyForTesting(89);
+  {$ENDIF}
   if Length(ADocuments) = 0 then
   begin
     if not AtomicRemovePath(Root) then
@@ -6351,7 +6340,7 @@ begin
     Exit;
   end;
   Staged := MakeTmpPath(ATmpRoot, 'p');
-  ForceDirectories(Staged + '/sha256');
+  LongPathForceDirectories(Staged + '/sha256');
   for k := 0 to High(ADocuments) do
     AtomicWriteBytes(Staged + '/sha256/' + RegistryDigestHex(ADocuments[k].Hash)
       + '.toml', ATmpRoot, ADocuments[k].Bytes);
@@ -6589,8 +6578,8 @@ begin
       if RecoveryFailures <> '' then
         raise EExtractError.Create('could not recover interrupted install:'
           + LineEnding + RecoveryFailures);
-      if DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
-      ForceDirectories(TmpRoot);
+      if LongPathDirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+      LongPathForceDirectories(TmpRoot);
       RollbackRoot := MakeTmpPath(TmpRoot, 'install-transaction');
       WriteTransactionState(RollbackRoot, 'pending');
       { Every rollback snapshot belongs to one journaled transaction root.
@@ -6613,9 +6602,9 @@ begin
       offline selection fallback. Mutation flows also use the same snapshot
       for their orphan diff after WriteLock replaces it. }
     OldLock := nil;
-    if FileExists(LockfilePath) then
+    if LongPathFileExists(LockfilePath) then
       OldLock := LoadLockfile(LockfilePath, Upgrade);
-    if Offline and not FileExists(LockfilePath) then
+    if Offline and not LongPathFileExists(LockfilePath) then
       raise ELockfileError.CreateFmt(
         '[offline] lockfile not found at %s. Run `lwpt install` online '
         + 'to resolve and lock dependencies first.', [LockfilePath]);
@@ -6863,7 +6852,7 @@ begin
                TestSeamValue('CORRUPT_ROLLBACK_FOR'))
              and (R.Nodes[i].UnitBackup <> '') then
           begin
-            ForceDirectories(R.Nodes[i].UnitBackup);
+            LongPathForceDirectories(R.Nodes[i].UnitBackup);
             TestCorruption := TStringList.Create;
             try
               TestCorruption.Add('corrupt');
@@ -6927,7 +6916,7 @@ begin
     if ProofsBackup <> '' then AtomicDiscardRetainedPath(ProofsBackup);
     if ManifestBackup <> '' then
       AtomicDiscardRetainedPath(ManifestBackup);
-    if DirectoryExists(RollbackRoot) then WipeDir(RollbackRoot);
+    if LongPathDirectoryExists(RollbackRoot) then WipeDir(RollbackRoot);
     { Per-user document eviction runs after the project transaction and
       only warns on failure: losing a document costs only re-transfer. }
     if Consumer <> nil then Consumer.EnforceStateBudget;
@@ -6952,7 +6941,7 @@ begin
         if (ProofsBackup <> '') and (ProofsPublished <> '') then
           TryRollbackRestore(ProofsBackup, ProofsPublished,
             'failed to restore registry proofs', RollbackFailures);
-        if (RollbackRoot <> '') and DirectoryExists(RollbackRoot)
+        if (RollbackRoot <> '') and LongPathDirectoryExists(RollbackRoot)
            and not RollbackRootHasMarkers(RollbackRoot) then
           WipeDir(RollbackRoot);
         if RollbackFailures <> '' then
