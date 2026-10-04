@@ -104,6 +104,17 @@ materialization and read-only `--frozen` verification are mutually exclusive.
 archives and extracted modules against `lwpt.lock` and never writes the lockfile.
 Some other package managers use "frozen" only to mean "don't write the lock".
 
+A local or workspace module is a copied snapshot of its source, so its
+committed tree and its `computedHash` can agree while both are stale. For
+each local and workspace dependency, `--frozen` therefore also re-derives the
+snapshot from the declared source path, with the dependency's `include` and
+`exclude` policy, and fails when it no longer matches the lock. An edit the
+policy filters out is not drift. A missing source fails, because the snapshot
+can't be proven current. The re-derived copy lives in private scratch below
+`.lwpt/tmp/` and is removed afterwards; nothing committed changes.
+`--offline` copies local and workspace sources again, so it refuses an edited
+source the same way rather than restoring the old snapshot.
+
 Registry dependencies follow the same two modes without contacting any
 registry. Both verify each locked selection from the signed documents
 committed under `.lwpt/archives/registry-proofs/` and the key pinned in
@@ -289,6 +300,15 @@ bar = { source = "owner/bar", version = "^1.0", include = ["src/**"] } # inline-
 **`HTTPS requires OpenSSL but it could not be loaded` (Linux only)** — install your distro's libssl package (`apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs`). LWPT loads it via `dlopen` at runtime. Windows + macOS do not hit this path (SChannel / SecureTransport are built into the OS — see [ADR-0016](./adr/0016-tls-backend-per-platform.md)).
 
 **`[frozen] missing extracted module for "<name>"`** — `lwpt install --frozen` requires `.lwpt/modules/<name>/` to be present. Run `lwpt install` (without `--frozen`) to fetch.
+
+**`[frozen] workspace package "<name>" at <path> changed after it was
+installed`** — the workspace source (or, for `local dependency "<name>"`, the
+local source) differs from the snapshot committed in `.lwpt/modules/<name>/`
+and `lwpt.lock`. The message names the first added, removed, or changed file.
+Run `lwpt install` and commit the updated `lwpt.lock` and
+`.lwpt/modules/<name>/`. `[offline] tree hash mismatch` with "local or
+workspace source changed after it was installed" is the same drift seen by
+`--offline`.
 
 **`[offline] verified archive for "<name>" is unavailable`** — neither the
 committed project archive nor the shared content-addressed cache contains the
