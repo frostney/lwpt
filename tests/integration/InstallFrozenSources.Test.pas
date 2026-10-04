@@ -55,8 +55,6 @@ type
     procedure TestOfflineRefusesEditedWorkspace;
   end;
 
-end;
-
 procedure TInstallFrozenSources.WritePackage(const ADirectory, AName,
   AManifestSuffix: string);
 begin
