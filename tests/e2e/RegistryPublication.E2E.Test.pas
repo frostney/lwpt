@@ -25,6 +25,7 @@ uses
   Tests.RegistryHTTP,
   Tests.RegistryOrigin,
   Tests.RegistryProcess,
+  Tests.RegistryServer,
   Tests.Scratch;
 
 type
@@ -43,14 +44,22 @@ type
 
   TRegistryPublicationE2E = class(TTestSuite)
   private
-    FScratch, FData, FBase: string;
+    { FBase is the contact URL and moves when a start relocates the port;
+      FIdentity is the origin identity fixed at initialization, which
+      records name. }
+    FScratch, FData, FBase, FIdentity: string;
     FPort: Word;
     FServe: TProcess;
     FOutputs: string;
-    { A `registry serve` child in FScratch that, on Linux, cannot outlive
-      this test program even when the program is killed. }
-    function NewServeProcess(const ABinary: string;
-      const AEnvironment: array of string): TProcess;
+    { Starts `registry serve` in FScratch through LaunchRegistryCLI: ready
+      only after this child announces that it bound FBase's port, and
+      moved to a fresh port (FBase and FPort change) when another process
+      took the chosen one. On Linux the child cannot outlive this test
+      program even when the program is killed. }
+    procedure LaunchServe(const ABinary: string;
+      const AEnvironment: array of string);
+    { Points the stopped origin at APort, e.g. one a test already holds. }
+    procedure MoveToPort(const APort: Word);
     { Removes a scratch root, retrying while exited children finish
       releasing their handles; a failure is reported, never raised. }
     procedure ReleaseScratch;
@@ -81,6 +90,7 @@ type
     procedure TestKilledUploadIsReclaimedOnlyAfterItsLeaseIsFree;
     procedure TestTLSListenerReadsRequestBodies;
     procedure TestExpiredUploadsAreReclaimedWhileServingAndAtRestart;
+    procedure TestStartRelocatesFromAHeldPort;
   end;
 
 constructor TRequestThread.Create(const APort: Word; const ATarget,
@@ -103,6 +113,18 @@ begin
   end;
 end;
 
+{ The port of a base URL of the form scheme://host:port[/path]. }
+function URLPort(const AURL: string): Word;
+var
+  Authority: string;
+begin
+  Authority := Copy(AURL, Pos('://', AURL) + 3, MaxInt);
+  if Pos('/', Authority) > 0 then
+    Authority := Copy(Authority, 1, Pos('/', Authority) - 1);
+  Result := StrToInt(Copy(Authority, LastDelimiter(':', Authority) + 1,
+    MaxInt));
+end;
+
 function CurrentUTC: string;
 begin
   Result := FormatDateTime('yyyy-mm-dd"T"hh:nn:ss"Z"',
@@ -119,6 +141,24 @@ begin
   Result := Run(['registry', 'init', '--data-dir', FData, '--base-url', FBase,
     '--port', IntToStr(FPort)]);
   Expect<Integer>(Result.ExitCode).ToBe(0);
+  FIdentity := FBase;
+end;
+
+procedure TRegistryPublicationE2E.LaunchServe(const ABinary: string;
+  const AEnvironment: array of string);
+begin
+  if FServe <> nil then raise Exception.Create('origin already serving');
+  FServe := LaunchRegistryCLI(FData, FBase, AEnvironment, FScratch, True,
+    ABinary);
+  FPort := URLPort(FBase);
+end;
+
+procedure TRegistryPublicationE2E.MoveToPort(const APort: Word);
+begin
+  if FServe <> nil then
+    raise Exception.Create('registry origin must be stopped before moving');
+  FBase := RelocateRegistryPortTo(FData, FBase, APort);
+  FPort := APort;
 end;
 
 procedure TRegistryPublicationE2E.StartServe(const ABinary: string;
@@ -126,45 +166,34 @@ procedure TRegistryPublicationE2E.StartServe(const ABinary: string;
 var
   Started: QWord;
   Ready: Boolean;
+  LastProbe: string;
 begin
-  FServe := NewServeProcess(ABinary, AEnvironment);
+  LaunchServe(ABinary, AEnvironment);
+  { The child owns the port now; its discovery must name this origin. }
   Started := GetTickCount64;
   Ready := False;
+  LastProbe := 'no probe';
   repeat
     FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
       + DrainAvailableStream(FServe.Stderr, 65536);
     try
-      Ready := RawHTTPRequest(FPort, 'GET', '/.well-known/' + RegistryProgramName
-        + '-registry', [], nil, False, 2000).Status = 200;
+      LastProbe := RawHTTPBodyText(RawHTTPRequest(FPort, 'GET', '/.well-known/'
+        + RegistryProgramName + '-registry', [], nil, False, 2000));
+      Ready := Pos('base_url = "' + FBase + '"', LastProbe) > 0;
+      LastProbe := Copy(LastProbe, 1, 512);
     except
-      Ready := False;
+      on E: Exception do LastProbe := Copy(E.Message, 1, 512);
     end;
     if Ready or not FServe.Running then Break;
     Sleep(20);
-  until GetTickCount64 - Started > 10000;
+  until GetTickCount64 - Started > RegistryReadyMilliseconds;
+  Ready := Ready and FServe.Running;
   if not Ready then
-    raise Exception.Create('registry serve did not become ready: ' + FOutputs);
-end;
-
-function TRegistryPublicationE2E.NewServeProcess(const ABinary: string;
-  const AEnvironment: array of string): TProcess;
-begin
-  Result := TProcess.Create(nil);
-  try
-    Result.Executable := ABinary;
-    Result.CurrentDirectory := FScratch;
-    Result.Options := [poUsePipes];
-    Result.Parameters.Add('registry');
-    Result.Parameters.Add('serve');
-    Result.Parameters.Add('--data-dir');
-    Result.Parameters.Add(FData);
-    if Length(AEnvironment) > 0 then
-      ConfigureProcessEnvironment(Result, AEnvironment);
-    BindRegistryChildToParent(Result);
-    Result.Execute;
-  except
-    Result.Free;
-    raise;
+  begin
+    StopServe;
+    raise Exception.Create('registry serve announced ' + FBase
+      + ' but did not serve its discovery; last probe: ' + LastProbe
+      + '; output: ' + FOutputs);
   end;
 end;
 
@@ -257,7 +286,7 @@ function TRegistryPublicationE2E.RecordText(const AName, AVersion: string;
   const AArchive: TBytes): string;
 begin
   Result := 'schema = "' + RegistryProgramName + '-registry-package-v1"' + #10
-    + 'origin = "' + FBase + '"' + #10
+    + 'origin = "' + FIdentity + '"' + #10
     + 'name = "' + AName + '"' + #10
     + 'version = "' + AVersion + '"' + #10
     + 'archive = "' + RegistryArtifactHash(AArchive) + '"' + #10
@@ -593,24 +622,13 @@ begin
     raise Exception.Create('curl did not exit and release its handles');
 end;
 
-function CurlStatus(const AArguments: array of string): string;
-var
-  StandardError: string;
-begin
-  {$IFDEF MSWINDOWS}
-  Result := CurlRequest(AArguments, 'NUL', StandardError);
-  {$ELSE}
-  Result := CurlRequest(AArguments, '/dev/null', StandardError);
-  {$ENDIF}
-end;
-
 procedure TRegistryPublicationE2E.ExpectCurl(const AExpected: string;
   const AArguments: array of string);
 var
   BodyPath, Status, StandardError, Body: string;
 begin
   BodyPath := FScratch + '/curl-response.bin';
-  if FileExists(BodyPath) then DeleteFile(BodyPath);
+  if FileExists(BodyPath) then SysUtils.DeleteFile(BodyPath);
   Status := CurlRequest(AArguments, BodyPath, StandardError);
   if Status <> AExpected then
   begin
@@ -642,7 +660,8 @@ const
   TLS_PASSWORD = 'test-only';
 var
   Init: TLwptResult;
-  Token, ArchivePath, RecordPath, Hex, Base: string;
+  Token, ArchivePath, RecordPath, Hex, Base, DiscoveryPath, LastProbe,
+    StandardError: string;
   Archive: TBytes;
   Stream: TFileStream;
   Started: QWord;
@@ -652,6 +671,7 @@ begin
   FPort := FindAvailableRegistryTestPort;
   Base := 'https://localhost:' + IntToStr(FPort);
   FBase := Base;
+  FIdentity := Base;
   FData := FScratch + '/tls-origin';
   Init := RunLwpt(['registry', 'init', '--data-dir', FData, '--base-url', Base,
     '--port', IntToStr(FPort), '--tls-pkcs12',
@@ -660,18 +680,35 @@ begin
     [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
   Expect<Integer>(Init.ExitCode).ToBe(0);
   Token := IssueToken(['--packages', 'tls-*']);
-  FServe := NewServeProcess(LwptBinaryPath,
-    [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+  LaunchServe(LwptBinaryPath, [TLS_PASSWORD_ENV + '=' + TLS_PASSWORD]);
+  { A start that recovered from a port collision moved the contact URL;
+    the identity records name stays FIdentity. }
+  Base := FBase;
+  { The announced child owns the port; its discovery must name this
+    origin's base URL. }
+  DiscoveryPath := FScratch + '/tls-discovery.toml';
+  LastProbe := 'no probe';
   Started := GetTickCount64;
   repeat
     FOutputs := FOutputs + DrainAvailableStream(FServe.Output, 65536)
       + DrainAvailableStream(FServe.Stderr, 65536);
-    Ready := CurlStatus([Base + '/.well-known/' + RegistryProgramName
-      + '-registry']) = '200';
+    SysUtils.DeleteFile(DiscoveryPath);
+    { CurlRequest returns only after curl has exited and released its
+      handles, so its exit, not the file's existence, completes the body;
+      a 200 means curl wrote it. }
+    LastProbe := CurlRequest([Base + '/.well-known/' + RegistryProgramName
+      + '-registry'], DiscoveryPath, StandardError);
+    Ready := (LastProbe = '200')
+      and (Pos('base_url = "' + Base + '"', ReadBinaryFile(DiscoveryPath)) > 0);
+    LastProbe := 'status ' + LastProbe + '; curl stderr: '
+      + Copy(StandardError, 1, 512);
     if Ready or not FServe.Running then Break;
     Sleep(50);
   until GetTickCount64 - Started > 15000;
-  Expect<Boolean>(Ready).ToBe(True);
+  if not Ready then
+    WriteLn(StdErr, 'TLS origin ', Base, ' did not serve its discovery; '
+      + 'last probe: ', LastProbe, '; output: ', FOutputs);
+  Expect<Boolean>(Ready and FServe.Running).ToBe(True);
   { A body spanning many TLS records, large enough that curl asks for
     100-continue. }
   SetLength(Archive, 2 * 1024 * 1024 + 11);
@@ -758,6 +795,59 @@ begin
   Expect<Boolean>(FileExists(Filler)).ToBe(False);
 end;
 
+{ Another listener holds the origin's port before it starts and answers
+  discovery for that base URL, so a start that trusted any 200 there would
+  publish to the wrong server. The start must wait for its own child's bind
+  announcement, recover onto a fresh port, and keep the identity that
+  records name. }
+procedure TRegistryPublicationE2E.TestStartRelocatesFromAHeldPort;
+var
+  Occupier: TRegistryTestServer;
+  Routes: TRegistryHTTPRouteArray;
+  Token, Identity, Collided, Discovery: string;
+  Archive: TBytes;
+begin
+  InitOrigin;
+  Identity := FIdentity;
+  Token := IssueToken(['--packages', 'moved-*']);
+  { The occupier binds a kernel-chosen port first and the origin is then
+    configured for it, so the collision is certain rather than raced. }
+  Occupier := TRegistryTestServer.Create(nil, True);
+  try
+    MoveToPort(Occupier.Port);
+    Collided := FBase;
+    SetLength(Routes, 1);
+    Routes[0] := RegistryRoute('/.well-known/' + RegistryProgramName
+      + '-registry', 'application/vnd.' + RegistryProgramName
+      + '.registry-discovery+toml', RawHTTPBytes('base_url = "' + Collided
+      + '"' + #10));
+    Occupier.SetRoutes(Routes);
+    Occupier.Start;
+    StartServe(LwptBinaryPath, []);
+    Expect<Boolean>(FBase <> Collided).ToBe(True);
+    Expect<Boolean>(FPort <> Occupier.Port).ToBe(True);
+    Expect<string>(FIdentity).ToBe(Identity);
+    { Readiness came from the child, never from the occupier. }
+    Expect<Integer>(Occupier.RequestCount).ToBe(0);
+    Discovery := RawHTTPBodyText(RawHTTPRequest(FPort, 'GET', '/.well-known/'
+      + RegistryProgramName + '-registry', [], nil, False));
+    Expect<Boolean>(Pos('base_url = "' + FBase + '"', Discovery) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('origin = "' + Identity + '"', Discovery) > 0)
+      .ToBe(True);
+    { Publication through the moved contact URL names the fixed identity. }
+    Archive := RawHTTPBytes('relocated archive');
+    Expect<Integer>(Upload(Archive, Token).Status).ToBe(201);
+    Expect<Integer>(PublishRecord('moved-lib', '1.0.0', Archive, Token).Status)
+      .ToBe(201);
+    Expect<Integer>(LatestSequence).ToBe(2);
+    Expect<Integer>(Occupier.RequestCount).ToBe(0);
+  finally
+    StopServe;
+    Occupier.Free;
+  end;
+end;
+
 procedure TRegistryPublicationE2E.SetupTests;
 begin
   Test('a CI token publishes to a running origin, then revocation applies',
@@ -771,6 +861,8 @@ begin
   Test('the TLS listener reads request bodies', TestTLSListenerReadsRequestBodies);
   Test('expired uploads are reclaimed while serving and at restart',
     TestExpiredUploadsAreReclaimedWhileServingAndAtRestart);
+  Test('a start whose port another listener holds relocates to its own',
+    TestStartRelocatesFromAHeldPort);
 end;
 
 begin
