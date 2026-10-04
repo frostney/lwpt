@@ -118,6 +118,18 @@ function  LongPathRemoveDir(const APath: string): Boolean;
 { SysUtils.FileAge: the DOS timestamp of a file's last write, or -1 for a
   missing path or a directory. }
 function  LongPathFileAge(const APath: string): LongInt;
+{ The last-write time of the file APath at the filesystem's own resolution,
+  as an ordered stamp for comparing two files on this host. Unix: stat's
+  st_mtime and its nanosecond field (links followed, as SysUtils.FileAge
+  does), as nanoseconds since the Unix epoch. Windows: the raw UTC
+  ftLastWriteTime of the entry itself (as SysUtils.FileAge reads it), in
+  100-nanosecond ticks since 1601, without FileAge's local-time and
+  2-second DOS conversion. False, with AStamp 0, for a missing path or a
+  directory. FileAge's whole-second (Unix) and 2-second (Windows) ticks
+  make two writes in one tick indistinguishable; this keeps their order
+  wherever the filesystem records it. }
+function  LongPathModificationStamp(const APath: string;
+  out AStamp: Int64): Boolean;
 { SysUtils.RenameFile: never replaces an existing destination on Windows. }
 function  LongPathRenameFile(const AOldPath, ANewPath: string): Boolean;
 { The entries of ADirectory whose names match AMask, with the attributes
@@ -1301,6 +1313,39 @@ end;
 {$ELSE}
 begin
   Result := SysUtils.FileAge(APath);
+end;
+{$ENDIF}
+
+function LongPathModificationStamp(const APath: string;
+  out AStamp: Int64): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Data: TWin32FileAttributeData;
+begin
+  AStamp := 0;
+  if APath = '' then Exit(False);
+  if not Windows.GetFileAttributesExW(PWideChar(WindowsExtendedPath(APath)),
+    GetFileExInfoStandard, @Data) then Exit(False);
+  if (Data.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+    Exit(False);
+  AStamp := Int64((QWord(Data.ftLastWriteTime.dwHighDateTime) shl 32)
+    or QWord(Data.ftLastWriteTime.dwLowDateTime));
+  Result := True;
+end;
+{$ELSE}
+const
+  NANOSECONDS_PER_SECOND = 1000000000;
+var
+  Info: BaseUnix.Stat;
+begin
+  AStamp := 0;
+  if APath = '' then Exit(False);
+  if (FpStat(APath, Info) <> 0) or fpS_ISDIR(Info.st_mode) then Exit(False);
+  { FPC 3.2.2 spells the field st_mtime_nsec on Linux and st_mtimensec on
+    the BSDs, Darwin included. }
+  AStamp := Int64(Info.st_mtime) * NANOSECONDS_PER_SECOND
+    + Int64(Info.{$IFDEF LINUX}st_mtime_nsec{$ELSE}st_mtimensec{$ENDIF});
+  Result := True;
 end;
 {$ENDIF}
 

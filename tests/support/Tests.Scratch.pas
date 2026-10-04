@@ -49,6 +49,14 @@ function TestCompilerExecutable: string;
 { Creates APath with length ASize without writing its bytes. On Windows the
   file is marked sparse first, so a large reservation costs no disk. }
 procedure CreateSparseFile(const APath: string; const ASize: Int64);
+{ Sets the last-write (and, on Unix, last-access) time of the existing file
+  APath to AUnixSeconds plus ANanoseconds after the Unix epoch, so a test can
+  order two files inside one SysUtils.FileAge tick without sleeping. Unix
+  keeps microseconds (utimes); Windows keeps 100-nanosecond ticks
+  (SetFileTime on the extended-length spelling). Raises, naming the path,
+  when the time cannot be set. }
+procedure SetFileModificationTime(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt);
 
 implementation
 
@@ -602,6 +610,63 @@ begin
     raise Exception.CreateFmt(
       'RecursiveDelete: failed to remove directory "%s": %s',
       [APath, SysErrorMessage(GetLastOSError)]);
+end;
+{$ENDIF}
+
+{$IFDEF MSWINDOWS}
+procedure SetFileModificationTime(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt);
+const
+  { FILETIME ticks are 100 ns from 1601-01-01; the Unix epoch is this many
+    seconds later. }
+  UnixEpochFileTimeSeconds = 11644473600;
+  FileTimeTicksPerSecond = 10000000;
+  NanosecondsPerFileTimeTick = 100;
+var
+  Handle: THandle;
+  Ticks: QWord;
+  Stamp: TFileTime;
+  Succeeded: Boolean;
+begin
+  Ticks := QWord(AUnixSeconds + UnixEpochFileTimeSeconds)
+    * FileTimeTicksPerSecond + QWord(ANanoseconds div NanosecondsPerFileTimeTick);
+  Stamp.dwLowDateTime := DWORD(Ticks and $FFFFFFFF);
+  Stamp.dwHighDateTime := DWORD(Ticks shr 32);
+  Handle := Windows.CreateFileW(PWideChar(ScratchExtendedPath(APath)),
+    Windows.FILE_WRITE_ATTRIBUTES, Windows.FILE_SHARE_READ
+    or Windows.FILE_SHARE_WRITE or Windows.FILE_SHARE_DELETE, nil,
+    Windows.OPEN_EXISTING, Windows.FILE_FLAG_BACKUP_SEMANTICS, 0);
+  if Handle = Windows.INVALID_HANDLE_VALUE then
+    RaiseScratchError('SetFileModificationTime: failed to open "%s": %s',
+      APath);
+  try
+    Succeeded := Windows.SetFileTime(Handle, nil, nil, @Stamp);
+    if not Succeeded then
+      RaiseScratchError('SetFileModificationTime: failed to stamp "%s": %s',
+        APath);
+  finally
+    Windows.CloseHandle(Handle);
+  end;
+end;
+{$ELSE}
+const
+  NanosecondsPerMicrosecond = 1000;
+
+function CUtimes(APath: PChar; ATimes: PTimeVal): cint; cdecl;
+  external 'c' name 'utimes';
+
+procedure SetFileModificationTime(const APath: string;
+  const AUnixSeconds: Int64; const ANanoseconds: LongInt);
+var
+  Times: array[0..1] of TTimeVal;
+begin
+  Times[0].tv_sec := AUnixSeconds;
+  Times[0].tv_usec := ANanoseconds div NanosecondsPerMicrosecond;
+  Times[1] := Times[0];
+  if CUtimes(PChar(APath), @Times[0]) <> 0 then
+    raise Exception.CreateFmt(
+      'SetFileModificationTime: failed to stamp "%s": %s',
+      [APath, SysErrorMessage(fpGetErrno)]);
 end;
 {$ENDIF}
 

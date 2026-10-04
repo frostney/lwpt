@@ -41,6 +41,12 @@ function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AConfigurationFile: string = CFG_FILE): TProcess;
 procedure AppendCompilerEnvironmentSearchPaths(
   var AUnitPaths, AIncludePaths: TStringArray);
+{ True when AHook must run: it declares no staleness gate (inputs plus
+  output), its output is missing, or an input is not older than the output.
+  Times are compared at full filesystem resolution; see HookIsStale in the
+  implementation for why an input as new as the output counts as stale. }
+function  HookIsStale(const AHook: THook;
+  const AProjectRoot: string): Boolean;
 function  RunUserTask(const ATask: THook; const AProjectRoot: string): Integer;
 procedure RunHooks(const APhase: string; const AHooks: THookArray;
   const AProjectRoot: string);
@@ -386,10 +392,19 @@ begin
   end;
 end;
 
+{ The gate compares full-resolution modification times (#367). FileAge
+  rounds to whole seconds on Unix and to 2-second DOS time on Windows, so
+  an input edited in the same tick as the output's last write looked as
+  old as the output and the edit was skipped. An input exactly as new as
+  the output is stale: equal times are rare at full resolution but common
+  on filesystems that keep coarse ones (FAT, some network filesystems,
+  HFS+ at one second), where an edit can carry the output's own time.
+  Never missing an edit costs at most one extra run. An input that
+  vanishes before it is read is stale too. }
 function HookIsStale(const AHook: THook;
   const AProjectRoot: string): Boolean;
 var
-  OutputAge: LongInt;
+  OutputStamp, InputStamp: Int64;
   i: Integer;
   Files: TStringList;
   OutputPath: string;
@@ -403,10 +418,11 @@ begin
     for i := 0 to High(AHook.Inputs) do
       ResolveInputExpression(AHook, AProjectRoot, AHook.Inputs[i], Files);
     OutputPath := ResolveProjectPath(AProjectRoot, AHook.Output);
-    if not FileExists(OutputPath) then Exit(True);
-    OutputAge := FileAge(OutputPath);
+    if not LongPathModificationStamp(OutputPath, OutputStamp) then
+      Exit(True);
     for i := 0 to Files.Count - 1 do
-      if FileAge(Files[i]) > OutputAge then Exit(True);
+      if not LongPathModificationStamp(Files[i], InputStamp)
+        or (InputStamp >= OutputStamp) then Exit(True);
     Result := False;
   finally
     Files.Free;

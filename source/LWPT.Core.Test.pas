@@ -31,6 +31,7 @@ uses
   LWPT.Manifest,
   LWPT.Registry.Consumer,
   TestingPascalLibrary,
+  Tests.Scratch,
   TOML;
 
 type
@@ -325,6 +326,7 @@ type
     procedure TestAtomicWritesAndMovesPastLimit;
     procedure TestCopyHashAndWipeTree;
     procedure TestRetainAndRestoreThroughDeepRollbackRoot;
+    procedure TestModificationStampKeepsSubSecondOrder;
     {$IFDEF MSWINDOWS}
     procedure TestExtendedPathSpelling;
     procedure TestExtendedPathKeepsWin32Meaning;
@@ -3850,6 +3852,48 @@ begin
 end;
 {$ENDIF}
 
+{ #367: two writes inside one FileAge tick keep their order, an equal time
+  stays equal, and a directory or missing path has no stamp. The times are
+  set explicitly, so no sleep is needed to cross a tick. }
+procedure TLongPathHelpers.TestModificationStampKeepsSubSecondOrder;
+const
+  { An even second, so the 2-second DOS tick FileAge reports on Windows
+    also covers both stamps below. }
+  BaseSeconds = 1700000000;
+  EarlierNanoseconds = 100000000;
+  LaterNanoseconds = 101000000;
+var
+  Dir, Earlier, Later, Twin: string;
+  EarlierStamp, LaterStamp, TwinStamp, Missing: Int64;
+begin
+  Dir := DeepPath('stamp');
+  Expect<Boolean>(LongPathForceDirectories(Dir)).ToBe(True);
+  Earlier := Dir + '/earlier.txt';
+  Later := Dir + '/later.txt';
+  Twin := Dir + '/twin.txt';
+  WriteLong(Earlier, 'a');
+  WriteLong(Later, 'b');
+  WriteLong(Twin, 'c');
+  SetFileModificationTime(Earlier, BaseSeconds, EarlierNanoseconds);
+  SetFileModificationTime(Later, BaseSeconds, LaterNanoseconds);
+  SetFileModificationTime(Twin, BaseSeconds, EarlierNanoseconds);
+
+  Expect<Boolean>(LongPathModificationStamp(Earlier, EarlierStamp))
+    .ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(Later, LaterStamp)).ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(Twin, TwinStamp)).ToBe(True);
+  { FileAge cannot tell the two writes apart; the stamp can. }
+  Expect<Integer>(LongPathFileAge(Later)).ToBe(LongPathFileAge(Earlier));
+  Expect<Boolean>(LaterStamp > EarlierStamp).ToBe(True);
+  Expect<Boolean>(TwinStamp = EarlierStamp).ToBe(True);
+
+  Expect<Boolean>(LongPathModificationStamp(Dir, Missing)).ToBe(False);
+  Expect<Boolean>(LongPathModificationStamp(Dir + '/absent.txt', Missing))
+    .ToBe(False);
+  Expect<Boolean>(Missing = 0).ToBe(True);
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'stamp');
+end;
+
 procedure TLongPathHelpers.SetupTests;
 begin
   Test('creates, lists, renames and deletes past MAX_PATH',
@@ -3860,6 +3904,8 @@ begin
     TestCopyHashAndWipeTree);
   Test('retains and restores through a rollback root past MAX_PATH',
     TestRetainAndRestoreThroughDeepRollbackRoot);
+  Test('orders sub-second modification stamps past MAX_PATH',
+    TestModificationStampKeepsSubSecondOrder);
   {$IFDEF MSWINDOWS}
   Test('spells absolute, UNC and relative extended-length paths',
     TestExtendedPathSpelling);
