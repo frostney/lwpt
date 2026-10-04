@@ -287,7 +287,8 @@ begin
       Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
         or Windows.FILE_SHARE_DELETE);
     try
-      Expect<string>(ReadBinaryFile(Path)).ToBe('complete = true' + #10);
+      { WriteTextFile uses the platform line ending. }
+      Expect<string>(Trim(ReadBinaryFile(Path))).ToBe('complete = true');
     finally
       Windows.CloseHandle(Handle);
     end;
@@ -318,7 +319,7 @@ begin
     Closer := THandleCloser.Create(Handle, 300);
     try
       StartedAt := GetTickCount64;
-      Expect<string>(ReadBinaryFile(Path)).ToBe('held = true' + #10);
+      Expect<string>(Trim(ReadBinaryFile(Path))).ToBe('held = true');
       Elapsed := GetTickCount64 - StartedAt;
       Expect<Boolean>(Elapsed >= 200).ToBe(True);
     finally
