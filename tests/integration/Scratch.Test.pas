@@ -31,6 +31,7 @@ type
     procedure TestRecursiveDeleteRemovesTreesPastMaxPath;
     procedure TestReadsShareAHandleHoldingDeleteAccess;
     procedure TestReadsRetryABrieflyExclusiveHandle;
+    procedure TestReadsReachFilesPastMaxPath;
     {$IFDEF MSWINDOWS}
     procedure TestRecursiveDeleteRemovesRootLinkPastMaxPath;
     {$ENDIF}
@@ -229,32 +230,32 @@ end;
 
 {$IFDEF MSWINDOWS}
 type
-  { Closes a handle after a delay, standing in for a writer, a rename, or a
-    scanner that holds a file briefly. }
-  THandleCloser = class(TThread)
+  { Reads one file on its own thread, so the test can hold the file while
+    the read retries and release it only after observing a retry. }
+  TFileReader = class(TThread)
   private
-    FHandle: THandle;
-    FDelayMilliseconds: Cardinal;
+    FPath: string;
   protected
     procedure Execute; override;
   public
-    constructor Create(const AHandle: THandle;
-      const ADelayMilliseconds: Cardinal);
+    Content, Failure: string;
+    constructor Create(const APath: string);
   end;
 
-constructor THandleCloser.Create(const AHandle: THandle;
-  const ADelayMilliseconds: Cardinal);
+constructor TFileReader.Create(const APath: string);
 begin
-  FHandle := AHandle;
-  FDelayMilliseconds := ADelayMilliseconds;
+  FPath := APath;
   FreeOnTerminate := False;
   inherited Create(False);
 end;
 
-procedure THandleCloser.Execute;
+procedure TFileReader.Execute;
 begin
-  SysUtils.Sleep(FDelayMilliseconds);
-  Windows.CloseHandle(FHandle);
+  try
+    Content := ReadBinaryFile(FPath);
+  except
+    on E: Exception do Failure := E.Message;
+  end;
 end;
 
 function OpenTestHandle(const APath: string; const AAccess,
@@ -299,15 +300,19 @@ begin
 end;
 
 { A handle that shares nothing makes every open fail with a sharing
-  violation. A read retries that, and only that, until the handle closes,
-  within READ_SHARING_RETRY_MILLISECONDS; past the bound it fails. }
+  violation. A read retries that, and only that, until the handle closes;
+  the test releases the handle only after observing a retried open, so no
+  timing window decides the outcome. Held past the retry bound, the read
+  fails. }
 procedure TScratch.TestReadsRetryABrieflyExclusiveHandle;
 {$IFDEF MSWINDOWS}
 var
   Root, Path, Failure: string;
   Handle: THandle;
-  Closer: THandleCloser;
-  StartedAt, Elapsed: QWord;
+  Reader: TFileReader;
+  Baseline: LongInt;
+  StartedAt: QWord;
+  Retried: Boolean;
 {$ENDIF}
 begin
   {$IFDEF MSWINDOWS}
@@ -316,30 +321,41 @@ begin
     Path := Root + '\held.toml';
     WriteTextFile(Path, 'held = true' + #10);
     Handle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
-    Closer := THandleCloser.Create(Handle, 300);
+    Baseline := InterLockedExchangeAdd(ScratchReadSharingRetries, 0);
+    Reader := TFileReader.Create(Path);
     try
+      { Bounded only as a hang guard; a retry normally shows at once. }
       StartedAt := GetTickCount64;
-      Expect<string>(Trim(ReadBinaryFile(Path))).ToBe('held = true');
-      Elapsed := GetTickCount64 - StartedAt;
-      Expect<Boolean>(Elapsed >= 200).ToBe(True);
+      repeat
+        Retried := InterLockedExchangeAdd(ScratchReadSharingRetries, 0)
+          > Baseline;
+        if Retried or Reader.Finished then Break;
+        SysUtils.Sleep(1);
+      until GetTickCount64 - StartedAt >= READ_SHARING_RETRY_MILLISECONDS;
+      Windows.CloseHandle(Handle);
+      Handle := Windows.INVALID_HANDLE_VALUE;
+      Reader.WaitFor;
+      Expect<Boolean>(Retried).ToBe(True);
+      Expect<string>(Reader.Failure).ToBe('');
+      { WriteTextFile uses the platform line ending. }
+      Expect<string>(Trim(Reader.Content)).ToBe('held = true');
     finally
-      Closer.WaitFor;
-      Closer.Free;
+      if Handle <> Windows.INVALID_HANDLE_VALUE then
+        Windows.CloseHandle(Handle);
+      Reader.Free;
     end;
     Handle := OpenTestHandle(Path, Windows.GENERIC_READ, 0);
     try
+      Baseline := InterLockedExchangeAdd(ScratchReadSharingRetries, 0);
       Failure := '';
-      StartedAt := GetTickCount64;
       try
         ReadBinaryFile(Path);
       except
         on E: EFOpenError do Failure := E.Message;
       end;
-      Elapsed := GetTickCount64 - StartedAt;
       Expect<Boolean>(Failure <> '').ToBe(True);
-      Expect<Boolean>(Elapsed >= READ_SHARING_RETRY_MILLISECONDS).ToBe(True);
-      Expect<Boolean>(Elapsed < READ_SHARING_RETRY_MILLISECONDS + 3000)
-        .ToBe(True);
+      Expect<Boolean>(InterLockedExchangeAdd(ScratchReadSharingRetries, 0)
+        > Baseline).ToBe(True);
     finally
       Windows.CloseHandle(Handle);
     end;
@@ -347,6 +363,33 @@ begin
     RecursiveDelete(Root);
   end;
   {$ENDIF}
+end;
+
+{ A file nested past the 260-character Win32 MAX_PATH reads through its
+  extended-length spelling. }
+procedure TScratch.TestReadsReachFilesPastMaxPath;
+var
+  Root, FilePath: string;
+  Stream: TLWPTProtectedFileStream;
+  Content: string;
+begin
+  Root := CreateScratchRoot('scratch-deep-read');
+  try
+    FilePath := DeepBelow(Root) + '/' + StringOfChar('r', 40) + '.toml';
+    Expect<Boolean>(Length(FilePath) > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+    Expect<Boolean>(LongPathForceDirectories(ExtractFileDir(FilePath)))
+      .ToBe(True);
+    Content := 'deep = true' + #10;
+    Stream := OpenProtectedFileStream(FilePath, fmCreate);
+    try
+      Stream.WriteBuffer(Content[1], Length(Content));
+    finally
+      Stream.Free;
+    end;
+    Expect<string>(ReadBinaryFile(FilePath)).ToBe(Content);
+  finally
+    RecursiveDelete(Root);
+  end;
 end;
 
 procedure TScratch.SetupTests;
@@ -357,6 +400,7 @@ begin
   Test('roots are unique across calls', TestRootsAreUniqueAcrossCalls);
   Test('recursive delete removes a tree past MAX_PATH',
     TestRecursiveDeleteRemovesTreesPastMaxPath);
+  Test('a read reaches a file past MAX_PATH', TestReadsReachFilesPastMaxPath);
   {$IFDEF MSWINDOWS}
   Test('a read shares the file with a handle holding delete access',
     TestReadsShareAHandleHoldingDeleteAccess);

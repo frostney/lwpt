@@ -59,6 +59,12 @@ procedure CreateSparseFile(const APath: string; const ASize: Int64);
 const
   READ_SHARING_RETRY_MILLISECONDS = 2000;
 
+var
+  { Test-only observation: incremented, atomically, each time
+    ReadBinaryFile retries an open that failed with a sharing violation,
+    so a test can prove a retry happened without timing it. }
+  ScratchReadSharingRetries: LongInt = 0;
+
 implementation
 
 uses
@@ -384,6 +390,8 @@ end;
 const
   ERROR_SHARING_VIOLATION_LWPT = 32;
 
+function ScratchExtendedPath(const APath: string): UnicodeString; forward;
+
 { Opens APath for reading with full sharing, retrying only a sharing
   violation within READ_SHARING_RETRY_MILLISECONDS. The caller closes the
   returned handle. }
@@ -393,7 +401,8 @@ var
   StartedAt: QWord;
   WidePath: UnicodeString;
 begin
-  WidePath := UnicodeString(ExpandFileName(APath));
+  { The extended-length spelling reaches files past MAX_PATH. }
+  WidePath := ScratchExtendedPath(APath);
   StartedAt := GetTickCount64;
   repeat
     Result := Windows.CreateFileW(PWideChar(WidePath), Windows.GENERIC_READ,
@@ -406,6 +415,7 @@ begin
       or (GetTickCount64 - StartedAt >= READ_SHARING_RETRY_MILLISECONDS) then
       raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
         [APath, SysErrorMessage(ErrorCode)]);
+    InterLockedIncrement(ScratchReadSharingRetries);
     SysUtils.Sleep(10);
   until False;
 end;
