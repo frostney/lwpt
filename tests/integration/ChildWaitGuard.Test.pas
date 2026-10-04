@@ -3,16 +3,17 @@
 
   A test that waits for a child without a deadline hangs its test program
   until CI's job bound cancels it, with no diagnostics. FPC 3.2.2 offers
-  three such waits: the parameterless TProcess.WaitOnExit, the poWaitOnExit
-  option (Execute then waits the same way), and TProcess.Terminate, whose
-  Unix implementation ends in an untimed WaitOnExit (fcl-process/src/unix/
-  process.inc). PR #363 bounded the registry family and #365 converted the
+  several such waits: the parameterless TProcess.WaitOnExit, the
+  poWaitOnExit option (Execute then waits the same way), TProcess.Terminate,
+  whose Unix implementation ends in an untimed WaitOnExit (fcl-process/src/
+  unix/process.inc), RunCommand and RunCommandInDir, which read to EOF and
+  wait without a deadline, SysUtils.ExecuteProcess, and a blocking waitpid. PR #363 bounded the registry family and #365 converted the
   remaining sites onto Tests.ProcessSupport (WaitForChildExit, FinishChild,
   ReapChild, TerminateChildProcess); this program fails the run when one of
   the shapes returns. A clean run is not proof that every wait is bounded.
 
   Files are scanned through Tests.SourceScan, so generated fixture programs
-  held in string literals are scanned as well. Four rules:
+  held in string literals are scanned as well. Six rules:
 
     parameterless-wait-on-exit  WaitOnExit without an argument list, or with
                                 an empty one, in an executable scope.
@@ -27,11 +28,28 @@
                                 X.Running, whose condition tests nothing
                                 else and whose body S has no Break, Exit,
                                 raise, or Halt.
+    unbounded-run-command       RunCommand, RunCommandInDir (or
+                                RunCommandIndir), or ExecuteProcess called
+                                in an executable scope; RunChildCommand is
+                                the bounded replacement.
+    blocking-waitpid            FpWaitPid or WaitPid with a literal 0 as its
+                                options argument, or WaitProcess, in an
+                                executable scope; WNOHANG polls pass.
 
   A finding's key is its receiver (the designator before .WaitOnExit,
   .Terminate, or .Running, or the one whose Options take poWaitOnExit), or
-  <self> for an unqualified call. Types are not resolved, so a Terminate
+  <self> for an unqualified call; for the last two rules it is the called
+  routine and the waited-for PID. Types are not resolved, so a Terminate
   method with an argument on another class would be reported; none exists.
+
+  Limits. Any WaitOnExit argument passes, INFINITE included. A Running poll
+  with any further condition passes, even one that cannot end it
+  (while P.Running = True). A Break, Exit, raise, or Halt anywhere in a
+  poll's body suppresses the finding, even when it belongs to a nested
+  loop. Fixture source is decoded only from concatenated literals and
+  spliced values, never from computed strings, and not recursively, while
+  a Pascal-looking diagnostic string can be read as fixture code. A wait
+  inside a helper the guard does not know is out of reach.
 
   Justified exceptions go in ChildWaitAllowlist. An allowance names one
   site, file, rule, routine, and key, and gives its reason. It fails the run
@@ -57,6 +75,8 @@ const
   RuleWaitOption = 'wait-on-exit-option';
   RuleProcessTerminate = 'process-terminate';
   RuleRunningPoll = 'unbounded-running-poll';
+  RuleRunCommand = 'unbounded-run-command';
+  RuleBlockingWaitpid = 'blocking-waitpid';
   RuleUnscannable = 'unscannable';
   SelfReceiver = '<self>';
   { The self-tests below embed violating snippets as literals. }
@@ -85,6 +105,8 @@ type
     procedure TestWaitOnExitOptionIsDetected;
     procedure TestProcessTerminateIsDetected;
     procedure TestUnboundedRunningPollsAreDetected;
+    procedure TestRunCommandsAreDetected;
+    procedure TestBlockingWaitpidIsDetected;
     procedure TestGeneratedFixturesAreScanned;
     procedure TestBoundedWaitsPass;
   end;
@@ -271,6 +293,27 @@ begin
   Result := -1;
 end;
 
+{ FpWaitPid(P, S, 0) or WaitPid(P, S, 0) blocks until P changes state;
+  WaitProcess(P) always does. AKey is P. }
+function IsBlockingWaitpid(const ATokens: TGuardTokens; AIndex: Integer;
+  out AKey: string): Boolean;
+var
+  Arguments: TTokenRanges;
+  Closed: Boolean;
+begin
+  Result := False;
+  AKey := '';
+  if not TokenIs(ATokens, AIndex + 1, '(') then Exit;
+  Arguments := CallArguments(ATokens, AIndex + 1, Closed);
+  if Length(Arguments) > 0 then AKey := RangeKey(ATokens, Arguments[0]);
+  if ATokens[AIndex].Text = 'waitprocess' then Exit(True);
+  if (ATokens[AIndex].Text <> 'fpwaitpid')
+     and (ATokens[AIndex].Text <> 'waitpid') then Exit;
+  Result := (Length(Arguments) = 3)
+    and (Arguments[2].First = Arguments[2].Last)
+    and TokenIs(ATokens, Arguments[2].First, '0');
+end;
+
 procedure ScanScope(const APath: string; const ALines: TStrings;
   const AScope: TGuardScope; var AFindings: TSourceFindings);
 var
@@ -296,6 +339,17 @@ begin
       and CallHasArguments(Tokens, Index) then
       AddFinding(AFindings, APath, ALines, Tokens[Index].Line,
         RuleProcessTerminate, AScope.Routine, ReceiverKey(Tokens, Index))
+    else if ((Tokens[Index].Text = 'runcommand')
+      or (Tokens[Index].Text = 'runcommandindir')
+      or (Tokens[Index].Text = 'executeprocess'))
+      and TokenIs(Tokens, Index + 1, '(')
+      and not IsDeclarationName(Tokens, Index) then
+      AddFinding(AFindings, APath, ALines, Tokens[Index].Line,
+        RuleRunCommand, AScope.Routine, Tokens[Index].Text)
+    else if IsBlockingWaitpid(Tokens, Index, Key)
+      and not IsDeclarationName(Tokens, Index) then
+      AddFinding(AFindings, APath, ALines, Tokens[Index].Line,
+        RuleBlockingWaitpid, AScope.Routine, Key)
     else if Tokens[Index].Text = 'while' then
     begin
       DoIndex := WhileDo(Tokens, Index);
@@ -563,6 +617,43 @@ begin
     + RuleRunningPoll + '@10:owner.process');
 end;
 
+procedure TChildWaitGuard.TestRunCommandsAreDetected;
+begin
+  Expect<string>(FindingsOf(
+      'program P;'#10
+    + 'procedure Probe;'#10
+    + 'begin'#10
+    + '  Expect<Boolean>(RunCommand(''/usr/bin/getconf'','#10
+    + '    [''_NPROCESSORS_ONLN''], Text)).ToBe(True);'#10
+    + '  RunCommandInDir(Dir, ''/bin/sh'', [''-c'', ''x''], Output, Status, []);'#10
+    + '  if RunCommandIndir(Dir, Compiler, [Source], Output, Status) <> 0 then'#10
+    + '    Halt(1);'#10
+    + '  Code := SysUtils.ExecuteProcess(''git'', ''status'');'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(
+      RuleRunCommand + '@4:runcommand,'
+    + RuleRunCommand + '@6:runcommandindir,'
+    + RuleRunCommand + '@7:runcommandindir,'
+    + RuleRunCommand + '@9:executeprocess');
+end;
+
+procedure TChildWaitGuard.TestBlockingWaitpidIsDetected;
+begin
+  { The zombie cleanup of InstallScript.E2E before #365. }
+  Expect<string>(FindingsOf(
+      'program P;'#10
+    + 'procedure Cleanup;'#10
+    + 'begin'#10
+    + '  FpWaitpid(Child, nil, 0);'#10
+    + '  WaitPid(Children[0], @Status, 0);'#10
+    + '  Code := WaitProcess(Child);'#10
+    + 'end;'#10
+    + 'begin end.'#10)).ToBe(
+      RuleBlockingWaitpid + '@4:child,'
+    + RuleBlockingWaitpid + '@5:children[0],'
+    + RuleBlockingWaitpid + '@6:child');
+end;
+
 procedure TChildWaitGuard.TestGeneratedFixturesAreScanned;
 begin
   { A nested build a generated test program starts and waits for (the
@@ -636,6 +727,10 @@ begin
     + '  { Child.WaitOnExit; Child.Terminate(1); }'#10
     + '  // Child.Options := [poWaitOnExit];'#10
     + '  WriteLn(''never call Child.WaitOnExit without a deadline'');'#10
+    + '  Status := RunChildCommand('''', ''/bin/sh'', [''-c'', ''x''], Output);'#10
+    + '  while FpWaitpid(Child, nil, WNOHANG) = 0 do'#10
+    + '    if Expired then Break;'#10
+    + '  FpWaitpid(Child, @Status, WNOHANG);'#10
     + 'end;'#10
     + 'begin end.'#10)).ToBe('');
 end;
@@ -657,6 +752,10 @@ begin
     TestProcessTerminateIsDetected);
   Test('Running polls without a deadline are detected',
     TestUnboundedRunningPollsAreDetected);
+  Test('RunCommand, RunCommandInDir, and ExecuteProcess are detected',
+    TestRunCommandsAreDetected);
+  Test('blocking waitpid calls are detected',
+    TestBlockingWaitpidIsDetected);
   Test('generated fixture programs are scanned',
     TestGeneratedFixturesAreScanned);
   Test('bounded waits pass', TestBoundedWaitsPass);

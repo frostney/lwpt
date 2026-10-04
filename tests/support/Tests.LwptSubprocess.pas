@@ -35,7 +35,11 @@
       (Tests.ProcessSupport): on Windows it runs in a kill-on-close Job
       Object of its own, so a timeout ends nested build and test children
       too; on Unix it stays in this program's process group and forwards
-      SIGTERM to the groups it owns (ADR-0025).
+      SIGTERM to the groups it owns (ADR-0025). The job is emergency
+      cleanup, never evidence: a child that returns while a member of its
+      job still runs raises ELwptRunSurvivors naming those processes, so a
+      cancellation test cannot pass on this helper's cleanup instead of
+      LWPT's.
 
   Surface — kept minimal:
 
@@ -70,6 +74,8 @@ const
 type
   { A RunLwpt child outlived its deadline and was terminated. }
   ELwptRunTimeout = class(Exception);
+  { A RunLwpt child returned while descendants it started still ran. }
+  ELwptRunSurvivors = class(Exception);
 
   TLwptResult = record
     ExitCode: Integer;
@@ -87,7 +93,8 @@ type
   with the same key. ATimeoutMilliseconds bounds the run; zero (and the
   overloads without it) selects LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS. A
   run past its deadline raises ELwptRunTimeout after its child has been
-  terminated, so a caller in a thread must catch it. }
+  terminated, and a child that returns while processes it started still
+  run raises ELwptRunSurvivors, so a caller in a thread must catch both. }
 function RunLwpt(const AArgs: array of string;
   const AInDir: string = ''): TLwptResult; overload;
 function RunLwpt(const AArgs: array of string;
@@ -403,6 +410,7 @@ var
   SavedDir: string;
   WorkerLeaseTokenEnvironment: string;
   ForwardedWorkerLease, Terminated: Boolean;
+  Survivors: string;
   StartedAt, Deadline: QWord;
   {$IFDEF MSWINDOWS}
   ExitedDrainDeadline: QWord;
@@ -468,6 +476,9 @@ begin
           + CapturedOutputTail(Result.Stderr) + LineEnding
           + '--- end captured output ---');
       end;
+      { Checked at once: anything the child started has had to end before
+        it returned. }
+      Survivors := OwnedChildSurvivors(P);
       { Final drain after exit. Normal Windows completion keeps its
         historical EOF barrier, bounded, because live descendants can lock
         fixture working directories; Unix completion stays nonblocking
@@ -489,6 +500,15 @@ begin
         ExitCode collapses most failures to 0. ExitStatus is nonzero on
         genuine failure either way, so trust it when ExitCode claims
         success. }
+      if Survivors <> '' then
+        raise ELwptRunSurvivors.Create('lwpt subprocess returned while '
+          + 'processes it started still ran (' + Survivors + '): '
+          + QuotedChildCommandLine(P) + ' (in ' + AInDir + ')' + LineEnding
+          + '--- captured stdout ---' + LineEnding
+          + CapturedOutputTail(Result.Stdout) + LineEnding
+          + '--- captured stderr ---' + LineEnding
+          + CapturedOutputTail(Result.Stderr) + LineEnding
+          + '--- end captured output ---');
       Result.ProcessExitCode := P.ExitCode;
       Result.ProcessExitStatus := P.ExitStatus;
       Result.ExitCode := Result.ProcessExitCode;

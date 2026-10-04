@@ -1845,8 +1845,8 @@ var
   Values : TStringList;
   ExpectedCount : Integer;
 begin
-  Expect<Boolean>(RunCommand('/usr/sbin/sysctl',
-    ['-n', 'hw.logicalcpu'], ProcessorCountText)).ToBe(True);
+  Expect<Integer>(RunChildCommand('', '/usr/sbin/sysctl',
+    ['-n', 'hw.logicalcpu'], ProcessorCountText)).ToBe(0);
   ExpectedCount := StrToInt(Trim(ProcessorCountText));
   Expect<Boolean>(ExpectedCount > 0).ToBe(True);
   OutputPath := FScratch + '/default-budget';
@@ -1867,8 +1867,8 @@ var
   Values : TStringList;
   ExpectedCount : Integer;
 begin
-  Expect<Boolean>(RunCommand('/usr/bin/getconf',
-    ['_NPROCESSORS_ONLN'], ProcessorCountText)).ToBe(True);
+  Expect<Integer>(RunChildCommand('', '/usr/bin/getconf',
+    ['_NPROCESSORS_ONLN'], ProcessorCountText)).ToBe(0);
   ExpectedCount := StrToInt(Trim(ProcessorCountText));
   Expect<Boolean>(ExpectedCount > 0).ToBe(True);
   OutputPath := FScratch + '/default-budget';

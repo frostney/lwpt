@@ -866,7 +866,16 @@ begin
     Expect<Boolean>(ProcessGroupHasLiveMembers(Child, Child)).ToBe(False);
     Expect<Boolean>(ProcessIsLive(Child)).ToBe(False);
   finally
-    FpWaitpid(Child, nil, 0);
+    { Bounded: the child normally is the observed zombie already; one that
+      is not is killed first. }
+    if Child > 0 then
+    begin
+      FpKill(Child, SIGKILL);
+      StartedAt := GetTickCount64;
+      while (FpWaitpid(Child, nil, WNOHANG) = 0)
+        and (GetTickCount64 - StartedAt < 5000) do
+        Sleep(5);
+    end;
   end;
   {$ELSE}
   Expect<Boolean>(True).ToBe(True);

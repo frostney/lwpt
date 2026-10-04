@@ -140,19 +140,46 @@ function TerminateChildHandle(AProcess: THandle;
   external 'kernel32.dll' name 'TerminateProcess';
 {$ENDIF}
 
-{ A bounded replacement for poWaitOnExit, which waits forever for a child
-  that never exits. Running is a nonblocking status query that also reaps
-  the child on Unix, so ExitCode then decodes its status. A child past the
-  deadline is killed and reported as an error. }
+{ Appends the bytes a poUsePipes child has written so far, never waiting
+  for more: a snapshot of what is available, so a continuous writer cannot
+  keep the caller from its deadline. }
+procedure DrainChildOutput(AProcess: TProcess; var AOutput: string);
+var
+  Buffer: array[0..4095] of Byte;
+  Available, Count: Integer;
+begin
+  if not (poUsePipes in AProcess.Options) then Exit;
+  Available := AProcess.Output.NumBytesAvailable;
+  while Available > 0 do
+  begin
+    Count := Available;
+    if Count > SizeOf(Buffer) then Count := SizeOf(Buffer);
+    Count := AProcess.Output.Read(Buffer[0], Count);
+    if Count <= 0 then Break;
+    SetLength(AOutput, Length(AOutput) + Count);
+    Move(Buffer[0], AOutput[Length(AOutput) - Count + 1], Count);
+    Dec(Available, Count);
+  end;
+end;
+
+{ A bounded replacement for poWaitOnExit and RunCommand, which wait forever
+  for a child that never exits. Running is a nonblocking status query that
+  also reaps the child on Unix, so ExitCode then decodes its status. A
+  poUsePipes child's output is drained into AOutput meanwhile. A child past
+  the deadline is killed and reported as an error. }
 function FinishChildWithin(AProcess: TProcess;
-  const ATimeoutMilliseconds: QWord): Integer;
+  const ATimeoutMilliseconds: QWord; var AOutput: string): Integer; overload;
 var
   StartedAt: QWord;
 begin
   StartedAt := GetTickCount64;
   while AProcess.Running
     and (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
+  begin
+    DrainChildOutput(AProcess, AOutput);
     Sleep(10);
+  end;
+  DrainChildOutput(AProcess, AOutput);
   if AProcess.Running then
   begin
     {$IFDEF UNIX}
@@ -170,6 +197,38 @@ begin
   Result := AProcess.ExitCode;
   if (Result = 0) and (AProcess.ExitStatus <> 0) then
     Result := AProcess.ExitStatus;
+end;
+
+function FinishChildWithin(AProcess: TProcess;
+  const ATimeoutMilliseconds: QWord): Integer; overload;
+var
+  Unused: string;
+begin
+  Unused := '';
+  Result := FinishChildWithin(AProcess, ATimeoutMilliseconds, Unused);
+end;
+
+{ RunCommand on this executable, bounded, with standard error merged into
+  AOutput. }
+function RunSelfWithin(const AArguments: array of string;
+  out AOutput: string): Integer;
+var
+  ProcessInstance: TProcess;
+  Index: Integer;
+begin
+  AOutput := '';
+  ProcessInstance := TProcess.Create(nil);
+  try
+    ProcessInstance.Executable := ExpandFileName(ParamStr(0));
+    for Index := 0 to High(AArguments) do
+      ProcessInstance.Parameters.Add(AArguments[Index]);
+    ProcessInstance.Options := [poUsePipes, poStderrToOutPut];
+    ProcessInstance.Execute;
+    Result := FinishChildWithin(ProcessInstance, CHILD_TIMEOUT_MILLISECONDS,
+      AOutput);
+  finally
+    ProcessInstance.Free;
+  end;
 end;
 
 function TSubcommandRegistrySuite.RunCompletionChild(
@@ -270,8 +329,7 @@ begin
   Expect<Integer>(RunCompletionChild(False)).ToBe(0);
   { Help for a command without options still completes and links to the
     program-wide command list, using the consumer's program name. }
-  Expect<Boolean>(RunCommand(ExpandFileName(ParamStr(0)),
-    ['alpha', '--help'], HelpOutput)).ToBe(True);
+  Expect<Integer>(RunSelfWithin(['alpha', '--help'], HelpOutput)).ToBe(0);
   Expect<Boolean>(Pos('fixture alpha', HelpOutput) > 0).ToBe(True);
   Expect<Boolean>(Pos('options:', HelpOutput) = 0).ToBe(True);
   Expect<Boolean>(Pos('run "fixture --help" to see all commands',

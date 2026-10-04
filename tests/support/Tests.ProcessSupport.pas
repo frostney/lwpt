@@ -60,6 +60,9 @@ const
 type
   { A child outlived the deadline of a FinishChild call and was terminated. }
   EChildProcessTimeout = class(Exception);
+  { A child started with ExecuteOwnedChild finished while members of its
+    Job Object or process group still ran; see OwnedChildSurvivors. }
+  EChildProcessSurvivors = class(Exception);
 
 function ProcessIsRunning(const APID: Integer): Boolean;
 
@@ -72,10 +75,13 @@ function DrainAvailableStream(AStream: TInputPipeStream;
 procedure DrainChildPipes(AProcess: TProcess; var AStdout, AStderr: string);
 
 { Polls, bounded, until AProcess has exited. On Windows an exited child is
-  then waited for, bounded by the same allowance, until its handle rundown
-  completes, so its working directory and files are released. True when it
-  exited. The variant with output drains a poUsePipes child meanwhile; the
-  other leaves its pipes for the caller to read. }
+  then waited for, within what remains of the allowance, until its handle
+  rundown completes, so its working directory and files are released; a
+  zero allowance is a nonblocking check. True when it exited. The variant
+  with output drains a poUsePipes child meanwhile. The other never reads
+  the pipes: use it only for a child without pipes or one whose pipes
+  another reader owns (a reader thread), because a child that fills an
+  unread pipe cannot exit. }
 function WaitForChildExit(AProcess: TProcess;
   const ATimeoutMilliseconds: QWord): Boolean; overload;
 function WaitForChildExit(AProcess: TProcess; var AStdout, AStderr: string;
@@ -86,8 +92,9 @@ function WaitForChildExit(AProcess: TProcess; var AStdout, AStderr: string;
   AKillMilliseconds more, reaping it through WaitForChildExit. A child
   started with ExecuteOwnedChild is ended with its process group or Job
   Object, and True then also means that no member survives. A poUsePipes
-  child has its pipes drained into AStdout and AStderr meanwhile. Returns
-  False when it still had not exited; the caller owns and frees AProcess. }
+  child has its pipes drained into AStdout and AStderr meanwhile, or
+  discarded by the variant without them. Returns False when it still had
+  not exited; the caller owns and frees AProcess. }
 function TerminateChildProcess(AProcess: TProcess; var AStdout,
   AStderr: string;
   const AGraceMilliseconds: QWord = CHILD_TERMINATION_GRACE_MILLISECONDS;
@@ -112,7 +119,12 @@ function ChildProcessExitCode(AProcess: TProcess): Integer;
 { Waits for a started child to finish within ATimeoutMilliseconds and
   returns ChildProcessExitCode. A child past its deadline is ended through
   TerminateChildProcess and EChildProcessTimeout is raised, naming
-  ADescription, the command line, and any drained output. }
+  ADescription, the command line, and any drained output. A poUsePipes
+  child is drained while it runs, into AStdout and AStderr or, by the
+  variant without them, discarded, so a full pipe never blocks it; a caller
+  whose pipes another reader owns uses WaitForChildExit instead. An owned
+  child that finishes while members of its tree still run raises
+  EChildProcessSurvivors naming them, before freeing it would end them. }
 function FinishChild(AProcess: TProcess;
   const ATimeoutMilliseconds: QWord = CHILD_COMPLETION_TIMEOUT_MILLISECONDS;
   const ADescription: string = ''): Integer; overload;
@@ -126,8 +138,28 @@ function QuotedChildCommandLine(AProcess: TProcess): string;
 function CapturedOutputTail(const AText: string): string;
 
 { Cleanup: gives a started child ATimeoutMilliseconds to exit, then ends it
-  through TerminateChildProcess. Never raises for a child that will not
-  stop; True when it is gone. A nil or never-started AProcess is gone. }
+  through TerminateChildProcess, draining and discarding a poUsePipes
+  child's output throughout. Never raises for a child that will not stop;
+  True when it is gone. A nil or never-started AProcess is gone. }
+
+{ Runs AExecutable with AArguments in ADirectory (the current directory when
+  empty) and returns its exit code, its standard output and error merged
+  into AOutput: the bounded replacement for RunCommand and RunCommandInDir,
+  which wait without a deadline. A child past ATimeoutMilliseconds is ended
+  and EChildProcessTimeout is raised; a child that cannot start raises
+  EProcess. }
+function RunChildCommand(const ADirectory, AExecutable: string;
+  const AArguments: array of string; out AOutput: string;
+  const ATimeoutMilliseconds: QWord = CHILD_COMPLETION_TIMEOUT_MILLISECONDS):
+  Integer;
+
+{ After a child started with ExecuteOwnedChild has exited: the members of
+  its Job Object (Windows) or of its own process group (Linux) that still
+  run, as 'pid 123, pid 456', or '' when none do. A survivor is evidence that
+  the child returned while descendants it started still ran, which kill-on
+  close and group termination would otherwise end without trace. Other
+  children, and other platforms, report ''. }
+function OwnedChildSurvivors(AProcess: TProcess): string;
 function ReapChild(AProcess: TProcess;
   const ATimeoutMilliseconds: QWord = CHILD_COMPLETION_TIMEOUT_MILLISECONDS):
   Boolean;
@@ -164,6 +196,7 @@ uses
 {$IFDEF MSWINDOWS}
 const
   JobObjectBasicAccountingInformationClass = 1;
+  JobObjectBasicProcessIdListClass = 3;
   JobObjectExtendedLimitInformationClass = 9;
   JobObjectLimitKillOnJobClose = $00002000;
   { JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 112 bytes on Win32 and 144 on
@@ -307,8 +340,21 @@ begin
   Result := nil;
 end;
 
+{ What is left of ATimeoutMilliseconds since AStartedAt; zero once spent. }
+function RemainingMilliseconds(const AStartedAt,
+  ATimeoutMilliseconds: QWord): DWord;
+var
+  Elapsed: QWord;
+begin
+  Elapsed := GetTickCount64 - AStartedAt;
+  if Elapsed >= ATimeoutMilliseconds then Exit(0);
+  if ATimeoutMilliseconds - Elapsed > High(DWord) then Exit(High(DWord));
+  Result := DWord(ATimeoutMilliseconds - Elapsed);
+end;
+
 { Polls Running, draining when ADrain, until the child exits or the
-  allowance passes, then (Windows) waits, bounded, for the handle rundown. }
+  allowance passes, then (Windows) waits for the handle rundown within what
+  remains of it. }
 function PollChildExit(AProcess: TProcess; const ADrain: Boolean;
   var AStdout, AStderr: string; const ATimeoutMilliseconds: QWord): Boolean;
 var
@@ -328,7 +374,8 @@ begin
   {$IFDEF MSWINDOWS}
   { The handle is signalled only after the exited child's rundown. }
   if Result then
-    Result := AProcess.WaitOnExit(CHILD_KILL_MILLISECONDS);
+    Result := AProcess.WaitOnExit(RemainingMilliseconds(StartedAt,
+      ATimeoutMilliseconds));
   {$ENDIF}
 end;
 
@@ -498,7 +545,9 @@ begin
       Break;
     Sleep(ProcessPollMilliseconds);
   until False;
-  if Result then Result := AProcess.WaitOnExit(CHILD_KILL_MILLISECONDS);
+  if Result then
+    Result := AProcess.WaitOnExit(RemainingMilliseconds(StartedAt,
+      ATimeoutMilliseconds));
 end;
 {$ENDIF}
 
@@ -686,11 +735,22 @@ end;
 
 function FinishChild(AProcess: TProcess; var AStdout, AStderr: string;
   const ATimeoutMilliseconds: QWord; const ADescription: string): Integer;
+var
+  Description, Survivors: string;
 begin
   if not WaitForChildExit(AProcess, AStdout, AStderr,
     ATimeoutMilliseconds) then
     RaiseChildTimeout(AProcess, AStdout, AStderr, ATimeoutMilliseconds,
       ADescription);
+  Survivors := OwnedChildSurvivors(AProcess);
+  if Survivors <> '' then
+  begin
+    Description := ADescription;
+    if Description = '' then Description := 'child process';
+    raise EChildProcessSurvivors.Create(Description + ' finished while '
+      + 'processes it started still ran (' + Survivors + '): '
+      + QuotedChildCommandLine(AProcess));
+  end;
   Result := ChildProcessExitCode(AProcess);
 end;
 
@@ -699,24 +759,113 @@ function FinishChild(AProcess: TProcess; const ATimeoutMilliseconds: QWord;
 var
   Stdout, Stderr: string;
 begin
-  { Nothing is drained: a caller with pipes reads them after the exit, so
-    only a timed-out child's remaining output is reported. }
-  if not WaitForChildExit(AProcess, ATimeoutMilliseconds) then
-  begin
-    Stdout := '';
-    Stderr := '';
-    RaiseChildTimeout(AProcess, Stdout, Stderr, ATimeoutMilliseconds,
-      ADescription);
-  end;
-  Result := ChildProcessExitCode(AProcess);
+  { Output is drained so a full pipe cannot block the child, and only
+    reported, as a tail, when it times out. }
+  Stdout := '';
+  Stderr := '';
+  Result := FinishChild(AProcess, Stdout, Stderr, ATimeoutMilliseconds,
+    ADescription);
 end;
 
 function ReapChild(AProcess: TProcess;
   const ATimeoutMilliseconds: QWord): Boolean;
+var
+  Discarded: string;
 begin
   if (AProcess = nil) or (AProcess.ProcessID <= 0) then Exit(True);
-  Result := WaitForChildExit(AProcess, ATimeoutMilliseconds)
-    or TerminateChildProcess(AProcess);
+  Discarded := '';
+  Result := WaitForChildExit(AProcess, Discarded, Discarded,
+    ATimeoutMilliseconds) or TerminateChildProcess(AProcess, Discarded,
+    Discarded);
 end;
+
+function RunChildCommand(const ADirectory, AExecutable: string;
+  const AArguments: array of string; out AOutput: string;
+  const ATimeoutMilliseconds: QWord): Integer;
+var
+  Index: Integer;
+  MergedIntoOutput: string;
+  Process: TProcess;
+begin
+  AOutput := '';
+  Process := TProcess.Create(nil);
+  try
+    Process.Executable := AExecutable;
+    for Index := 0 to High(AArguments) do
+      Process.Parameters.Add(AArguments[Index]);
+    if ADirectory <> '' then Process.CurrentDirectory := ADirectory;
+    Process.Options := [poUsePipes, poStderrToOutPut];
+    Process.Execute;
+    MergedIntoOutput := '';
+    Result := FinishChild(Process, AOutput, MergedIntoOutput,
+      ATimeoutMilliseconds, ExtractFileName(AExecutable));
+  finally
+    Process.Free;
+  end;
+end;
+
+function OwnedChildSurvivors(AProcess: TProcess): string;
+{$IFDEF MSWINDOWS}
+const
+  ListCapacity = 256;
+var
+  Tree: TChildProcessTree;
+  { JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORD counts, then ULONG_PTR IDs
+    at offset 8 on Win32 and Win64 alike. }
+  List: array[0..1 + ListCapacity * (SizeOf(PtrUInt) div 4)] of DWord;
+  Count, Index: Integer;
+  Id: PtrUInt;
+begin
+  Result := '';
+  Tree := ChildTreeOf(AProcess);
+  if (Tree = nil) or (Tree.FJob = 0)
+     or not JobHasActiveProcesses(Tree.FJob) then Exit;
+  FillChar(List, SizeOf(List), 0);
+  if not QueryTestJobInformation(Tree.FJob,
+    JobObjectBasicProcessIdListClass, @List[0], SizeOf(List), nil)
+     and (List[1] = 0) then
+    Exit('job members that could not be listed');
+  Count := List[1];
+  for Index := 0 to Count - 1 do
+  begin
+    Move(PByte(@List[0])[8 + Index * SizeOf(PtrUInt)], Id, SizeOf(Id));
+    if Result <> '' then Result := Result + ', ';
+    Result := Result + 'pid ' + IntToStr(Id);
+  end;
+  if List[0] > DWord(Count) then
+    Result := Result + ' and ' + IntToStr(List[0] - DWord(Count)) + ' more';
+  if Result = '' then Result := 'job members that could not be listed';
+end;
+{$ELSE}
+{$IFDEF LINUX}
+var
+  Tree: TChildProcessTree;
+  Search: TSearchRec;
+  Pid, Parent, Group: LongInt;
+  State: Char;
+begin
+  Result := '';
+  Tree := ChildTreeOf(AProcess);
+  if (Tree = nil) or not Tree.FOwnProcessGroup then Exit;
+  if FindFirst('/proc/*', faDirectory, Search) <> 0 then Exit;
+  try
+    repeat
+      Pid := StrToIntDef(Search.Name, 0);
+      if (Pid <= 0) or not ReadProcessStat(Pid, State, Parent, Group)
+         or (Group <> AProcess.ProcessID)
+         or (State = 'Z') or (State = 'X') then Continue;
+      if Result <> '' then Result := Result + ', ';
+      Result := Result + 'pid ' + IntToStr(Pid);
+    until FindNext(Search) <> 0;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+{$ELSE}
+begin
+  Result := '';
+end;
+{$ENDIF}
+{$ENDIF}
 
 end.

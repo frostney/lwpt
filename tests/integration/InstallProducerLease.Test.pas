@@ -55,24 +55,6 @@ begin
   if Length(ABytes) > 0 then Move(ABytes[0], Result[1], Length(ABytes));
 end;
 
-function ReadStream(const AStream: TStream): string;
-var
-  Buffer: array[0..4095] of Byte;
-  Count, Offset: Integer;
-begin
-  Result := '';
-  Offset := 0;
-  repeat
-    Count := AStream.Read(Buffer, SizeOf(Buffer));
-    if Count > 0 then
-    begin
-      SetLength(Result, Offset + Count);
-      Move(Buffer[0], Result[Offset + 1], Count);
-      Inc(Offset, Count);
-    end;
-  until Count <= 0;
-end;
-
 procedure WriteRoot(const ARoot: string);
 begin
   ForceDirectories(ARoot + '/source');
@@ -156,14 +138,20 @@ end;
 
 function TInstallProducerLease.FinishInstall(const AProcess: TProcess;
   out AOutput: string): Integer;
+var
+  Stdout, Stderr: string;
 begin
-  if not WaitForChildExit(AProcess, PROCESS_TIMEOUT_MILLISECONDS) then
+  Stdout := '';
+  Stderr := '';
+  { Both pipes are drained while the install runs, so neither can fill. }
+  if not WaitForChildExit(AProcess, Stdout, Stderr,
+    PROCESS_TIMEOUT_MILLISECONDS) then
   begin
-    TerminateChildProcess(AProcess);
-    AOutput := 'install process timed out';
+    TerminateChildProcess(AProcess, Stdout, Stderr);
+    AOutput := 'install process timed out' + LineEnding + Stdout + Stderr;
     Exit(-1);
   end;
-  AOutput := ReadStream(AProcess.Output) + ReadStream(AProcess.Stderr);
+  AOutput := Stdout + Stderr;
   Result := ChildProcessExitCode(AProcess);
 end;
 

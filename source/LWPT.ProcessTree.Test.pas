@@ -110,17 +110,23 @@ function CRaise(const ASignal: LongInt): LongInt; cdecl;
   {$ENDIF}
 {$ENDIF}
 
+{ Reads a snapshot of the bytes available at entry, never more, so a child
+  that writes continuously cannot keep the caller from its deadline. }
 function DrainPipe(const AStream: TInputPipeStream): string;
 var
   Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
-  BytesRead: Integer;
+  Available, BytesRead, ReadSize: Integer;
 begin
   Result := '';
-  while AStream.NumBytesAvailable > 0 do
+  Available := AStream.NumBytesAvailable;
+  while Available > 0 do
   begin
-    BytesRead := AStream.Read(Buffer[0], SizeOf(Buffer));
+    ReadSize := SizeOf(Buffer);
+    if Available < ReadSize then ReadSize := Available;
+    BytesRead := AStream.Read(Buffer[0], ReadSize);
     if BytesRead <= 0 then Break;
     AppendRawBytes(Result, Buffer[0], BytesRead);
+    Dec(Available, BytesRead);
   end;
 end;
 

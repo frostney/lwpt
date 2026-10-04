@@ -27,6 +27,7 @@ uses
   TestingPascalLibrary,
   Tests.HTTPMockServer,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch,
   Tests.TarSynth;
 
@@ -323,8 +324,8 @@ var ScriptPath: string;
 begin
   ScriptPath := AWorkDir + '/guard.sh';
   WriteTextFile(ScriptPath, AScript);
-  RunCommandInDir(AWorkDir, '/bin/sh', ['-c', 'bash ./guard.sh 2>&1'],
-    AOutput, Result, []);
+  Result := RunChildCommand(AWorkDir, '/bin/sh',
+    ['-c', 'bash ./guard.sh 2>&1'], AOutput);
 end;
 
 { Clean staged binaries pass; a test build fails; a binary the scanner

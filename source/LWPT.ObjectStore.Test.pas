@@ -33,6 +33,9 @@ const
   START_BARRIER_TIMEOUT_MS = 10000;
   ADMIT_CHILD_TIMEOUT_MS = 5000;
   ADMIT_CHILD_TERMINATION_TIMEOUT_MS = 2000;
+  { The admitter starts no descendants, so its pipes reach EOF as it exits;
+    this only bounds a reader whose writer something else retained. }
+  ADMIT_READER_EOF_TIMEOUT_MS = 10000;
   CONTENTION_ITERATIONS = 16;
   DIAGNOSTIC_STREAM_BYTES = 256 * 1024;
   STDOUT_TAIL_MARKER = 'object-store-stdout-tail';
@@ -341,6 +344,28 @@ begin
   end;
 end;
 
+{ Joins a reader thread that ends at pipe EOF, bounded. A reader still
+  blocked past the deadline cannot be stopped or freed (freeing joins it),
+  so exiting the test process is the only bounded cleanup. }
+procedure JoinAdmitterReader(const AReader: TProcessStreamReader;
+  const AStream: string);
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while not AReader.Finished
+    and (GetTickCount64 - StartedAt < ADMIT_READER_EOF_TIMEOUT_MS) do
+    Sleep(10);
+  if not AReader.Finished then
+  begin
+    WriteLn('OBJECT STORE ADMITTER [retained pipe] ', AStream,
+      ' did not reach EOF within ', ADMIT_READER_EOF_TIMEOUT_MS,
+      ' ms after the admitter exited');
+    Halt(1);
+  end;
+  AReader.WaitFor;
+end;
+
 function FinishAdmitter(const AProcess: TProcess;
   const APhasePrefix: string): TAdmitterResult;
 var
@@ -376,8 +401,8 @@ begin
     if not WaitForChildExit(AProcess, ADMIT_CHILD_TERMINATION_TIMEOUT_MS) then
       AbortForUnreapedAdmitter(AProcess, APhasePrefix, TerminationSent,
         TerminationError);
-    StdoutReader.WaitFor;
-    StderrReader.WaitFor;
+    JoinAdmitterReader(StdoutReader, 'stdout');
+    JoinAdmitterReader(StderrReader, 'stderr');
     if StdoutReader.ErrorMessage <> '' then
       raise Exception.Create('could not read object-store admitter stdout: '
         + StdoutReader.ErrorMessage);

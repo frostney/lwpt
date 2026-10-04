@@ -1283,7 +1283,11 @@ begin
   WriteTextFile(FScratch + '/tests/A.Nested.Test.pas',
       'program Nested' + PROJECT_NAME + 'Fixture;'#10
     + '{$mode delphi}{$H+}'#10
-    + 'uses Process, SysUtils;'#10
+    + 'uses {$IFDEF UNIX}BaseUnix,{$ENDIF} Process, SysUtils;'#10
+    + '{$IFDEF MSWINDOWS}'#10
+    + 'function TerminateProcess(AProcess: THandle; ACode: LongWord):'#10
+    + '  LongBool; stdcall; external ''kernel32.dll'';'#10
+    + '{$ENDIF}'#10
     + 'var Child: TProcess; Entry: string; Index: Integer;'#10
     + '  MarkerFile: Text; StartedAt: QWord;'#10
     + 'begin'#10
@@ -1344,6 +1348,26 @@ begin
     + '    while Child.Running and (GetTickCount64 - StartedAt < '
     + IntToStr(NestedFixtureWaitMilliseconds) + ') do'#10
     + '      Sleep(10);'#10
+    { The bail under test cancels this fixture long before the deadline.
+      Reaching it means the cancellation failed: end the nested build,
+      which forwards SIGTERM to its compiler on Unix, and fail. }
+    + '    if Child.Running then'#10
+    + '    begin'#10
+    + '      {$IFDEF UNIX}FpKill(Child.ProcessID, SIGTERM);{$ENDIF}'#10
+    + '      {$IFDEF MSWINDOWS}TerminateProcess(Child.ProcessHandle, 1);'#10
+    + '      {$ENDIF}'#10
+    + '      StartedAt := GetTickCount64;'#10
+    + '      while Child.Running and (GetTickCount64 - StartedAt < 10000)'#10
+    + '        do Sleep(10);'#10
+    + '      {$IFDEF UNIX}if Child.Running then'#10
+    + '        FpKill(Child.ProcessID, SIGKILL);{$ENDIF}'#10
+    + '      StartedAt := GetTickCount64;'#10
+    + '      while Child.Running and (GetTickCount64 - StartedAt < 5000)'#10
+    + '        do Sleep(10);'#10
+    + '      WriteLn(''nested build outlived its ' + IntToStr(
+      NestedFixtureWaitMilliseconds) + ' ms deadline'');'#10
+    + '      ExitCode := 4;'#10
+    + '    end;'#10
     + '  finally'#10
     + '    Child.Free;'#10
     + '  end;'#10

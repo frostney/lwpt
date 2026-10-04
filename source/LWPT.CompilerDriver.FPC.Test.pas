@@ -153,6 +153,7 @@ end;
 function RunProbeTimeoutProxy(const AGrandchildPIDPath: string): Integer;
 var
   Grandchild: TProcess;
+  StartedAt: QWord;
 begin
   {$IFDEF UNIX}
   FpSignal(SIGTERM, SignalHandler(SIG_IGN));
@@ -163,7 +164,11 @@ begin
     Grandchild.Parameters.Add(ProbeTimeoutGrandchildOption);
     Grandchild.Parameters.Add(AGrandchildPIDPath);
     Grandchild.Execute;
-    while not PayloadIsReadable(AGrandchildPIDPath) and Grandchild.Running do
+    { A safety bound only: the probe timeout under test ends this proxy
+      long before its own sleep, which is as long. }
+    StartedAt := GetTickCount64;
+    while not PayloadIsReadable(AGrandchildPIDPath) and Grandchild.Running
+      and (GetTickCount64 - StartedAt < ProbeTimeoutSleepMilliseconds) do
       Sleep(ProcessPollMilliseconds);
     Sleep(ProbeTimeoutSleepMilliseconds);
   finally
