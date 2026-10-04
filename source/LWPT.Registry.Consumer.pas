@@ -351,11 +351,11 @@ end;
 
 function ReadBoundedDocument(const APath, AHash: string;
   const AMaximumBytes: Int64): TBytes;
-var Stream: TFileStream;
+var Stream: TLWPTProtectedFileStream;
 begin
   Result := nil;
-  if not FileExists(APath) then Exit;
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  if not LongPathFileExists(APath) then Exit;
+  Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
   try
     if (Stream.Size > AMaximumBytes)
        or (Stream.Size > MaximumRegistryDocumentBytes) then Exit;
@@ -469,7 +469,7 @@ end;
 
 function ReadLockedRegistryDocument(const AArchivesRoot, AStateRoot,
   AHash: string; const AAllowance: Int64): TBytes;
-var Path: string; Stream: TFileStream;
+var Path: string; Stream: TLWPTProtectedFileStream;
 
   procedure RaiseDocument(const ACode, AMessage: string);
   var Error: ELWPTRegistryDocumentError;
@@ -488,7 +488,7 @@ begin
     raise ELWPTRegistryError.CreateStable('proof_limit_exceeded',
       'the committed selection proof exceeds the verification byte budget');
   Path := RegistryProofPath(AArchivesRoot, AHash);
-  if not FileExists(Path) then
+  if not LongPathFileExists(Path) then
   begin
     if AStateRoot <> '' then
     begin
@@ -503,7 +503,7 @@ begin
     RaiseDocument('registry_proof_missing',
       'committed proof document ' + Path + ' is missing');
   end;
-  Stream := TFileStream.Create(Path, fmOpenRead or fmShareDenyNone);
+  Stream := OpenProtectedFileStream(Path, fmOpenRead or fmShareDenyNone);
   try
     if Stream.Size > AAllowance then
       raise ELWPTRegistryError.CreateStable('proof_limit_exceeded',
@@ -840,12 +840,12 @@ var
   Index: Integer;
 begin
   Result := nil;
-  if not FileExists(APath) then Exit;
+  if not LongPathFileExists(APath) then Exit;
   Lines := TStringList.Create;
   Parser := TTOMLParser.Create;
   Root := nil;
   try
-    Lines.LoadFromFile(APath);
+    LoadProtectedStrings(Lines, APath);
     try
       Root := Parser.ParseDocument(Lines.Text);
     except

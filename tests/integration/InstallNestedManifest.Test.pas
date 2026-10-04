@@ -54,6 +54,32 @@ type
     procedure TestAmbiguousManifestsFallBackToModuleRoot;
   end;
 
+  { Issue #347: a local dependency whose nested manifest fits MAX_PATH
+    where it is installed, but not in the resolver staging copy below
+    .lwpt/tmp, which adds the plan directory to every path. Discovery and
+    the manifest read both go through the Core long-path helpers there. }
+  TDeepStagedManifest = class(TTestSuite)
+  private
+    FOrigDir, FScratch, FRoot, FNested: string;
+  protected
+    procedure BeforeAll; override;
+    procedure AfterAll;  override;
+  public
+    procedure SetupTests; override;
+    procedure TestStagedManifestPastMaxPathIsRead;
+  end;
+
+const
+  { Win32 MAX_PATH, including the terminating NUL. }
+  LEGACY_WINDOWS_MAX_PATH = 260;
+  { The installed manifest's length: inside MAX_PATH, and inside the
+    247-character directory budget for its parent. }
+  INSTALLED_MANIFEST_LENGTH = 245;
+  { The shortest resolver plan directory MakeTmpPath can name
+    ('resolver-plan.<pid>.<8 base36 stamp digits>.<sequence>.tmp'), as the
+    staging copy inserts it below .lwpt/tmp. }
+  SHORTEST_PLAN_INSERT = '/tmp/resolver-plan.0.00000000.0.tmp';
+
 function ReadFileText(const APath: string): string;
 var SL: TStringList;
 begin
@@ -197,6 +223,89 @@ begin
     .ToBe(False);
 end;
 
+{ ── deep staged manifest ─────────────────────────────────────────── }
+
+procedure TDeepStagedManifest.BeforeAll;
+var Installed: string; Remaining: Integer;
+begin
+  FOrigDir := GetCurrentDir;
+  FScratch := CreateScratchRoot('install-deep-manifest');
+  FRoot := FScratch + '/root';
+  FNested := '';
+  Installed := ExpandFileName(FRoot) + '/.lwpt/modules/deep-leaf';
+  repeat
+    Remaining := INSTALLED_MANIFEST_LENGTH - Length(Installed + FNested)
+      - Length('/lwpt.toml') - 1;
+    if Remaining < 1 then Break;
+    if Remaining > 48 then Remaining := 48;
+    FNested := FNested + '/' + StringOfChar('n', Remaining);
+  until False;
+  Delete(FNested, 1, 1);
+
+  { The source tree stays shallow; only toolkit staging is deep. }
+  WriteTextFile(FScratch + '/deepsrc/' + FNested + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "deep-leaf"'#10
+    + 'version = "1.0.0"'#10
+    + 'units = ["src"]'#10
+    + #10
+    + '[dependencies]'#10
+    + 'deep-child = "../deepchild"'#10);
+  WriteTextFile(FScratch + '/deepsrc/' + FNested + '/src/DeepLeaf.pas',
+    'unit DeepLeaf;'#10'interface'#10'implementation'#10'end.'#10);
+  WriteTextFile(FScratch + '/deepchild/lwpt.toml',
+      '[package]'#10
+    + 'name = "deep-child"'#10
+    + 'version = "1.0.0"'#10
+    + 'units = ["src"]'#10);
+  WriteTextFile(FScratch + '/deepchild/src/DeepChild.pas',
+    'unit DeepChild;'#10'interface'#10'implementation'#10'end.'#10);
+  WriteTextFile(FRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "deep-root"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src"]'#10
+    + #10
+    + '[dependencies]'#10
+    + 'deep-leaf = "../deepsrc"'#10);
+  WriteTextFile(FRoot + '/src/RootMain.pas',
+    'unit RootMain;'#10'interface'#10'implementation'#10'end.'#10);
+end;
+
+procedure TDeepStagedManifest.AfterAll;
+begin
+  SetCurrentDir(FOrigDir);
+  { The RTL scratch cleanup cannot remove a tree past MAX_PATH. }
+  if LongPathDirectoryExists(FScratch) then WipeDir(FScratch);
+end;
+
+procedure TDeepStagedManifest.TestStagedManifestPastMaxPathIsRead;
+var Installed, Cfg: string;
+begin
+  Installed := ExpandFileName(FRoot) + '/.lwpt/modules/deep-leaf/' + FNested
+    + '/lwpt.toml';
+  Expect<Boolean>(Length(Installed) < LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+  Expect<Boolean>(Length(Installed) + Length(SHORTEST_PLAN_INSERT)
+    > LEGACY_WINDOWS_MAX_PATH).ToBe(True);
+
+  SetCurrentDir(FRoot);
+  CmdInstall('lwpt.toml', False);
+
+  Expect<Boolean>(FileExists(Installed)).ToBe(True);
+  Cfg := ReadFileText(FRoot + '/lwpt.cfg');
+  { The nested manifest was read from staging: its units dir and its own
+    dependency both reached the cfg. }
+  Expect<Boolean>(Pos('-Fu.lwpt/modules/deep-leaf/' + FNested + '/src', Cfg)
+    > 0).ToBe(True);
+  Expect<Boolean>(Pos('-Fu.lwpt/modules/deep-child/src', Cfg) > 0).ToBe(True);
+end;
+
+procedure TDeepStagedManifest.SetupTests;
+begin
+  Test('install: a nested manifest read from staging past MAX_PATH',
+    TestStagedManifestPastMaxPathIsRead);
+end;
+
 procedure TInstallNestedManifest.SetupTests;
 begin
   Test('install: filtered module tree keeps its repo-relative prefix',
@@ -212,6 +321,8 @@ end;
 begin
   TestRunnerProgram.AddSuite(TInstallNestedManifest.Create(
     'install: nested dep manifest discovery'));
+  TestRunnerProgram.AddSuite(TDeepStagedManifest.Create(
+    'install: deep staged dependency manifest'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

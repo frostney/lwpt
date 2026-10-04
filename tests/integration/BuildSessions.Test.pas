@@ -288,6 +288,19 @@ var
   Project, ManifestRoot, EnvironmentRoot, RelativeEnvironmentRoot: string;
   Run: TLwptResult;
   Ledger: string;
+
+  { Session directories under the project's default root. Listed with the
+    Core helpers: on Windows the root's children pass MAX_PATH. }
+  function ProjectSessionCount: Integer;
+  var Entries: TLWPTDirectoryEntries; Index: Integer;
+  begin
+    Result := 0;
+    Entries := ListDirectoryEntries(Project + '/' + BUILD_SESSIONS_DIR, 's-*',
+      faAnyFile);
+    for Index := 0 to High(Entries) do
+      if (Entries[Index].Attr and faDirectory) <> 0 then Inc(Result);
+  end;
+
 begin
   Project := FScratch + '/deep-project';
   while Length(Project) < 205 do
@@ -312,13 +325,16 @@ begin
   DumpRunFailure('deep default session root', Run, 1);
   Expect<Integer>(Run.ExitCode).ToBe(1);
   {$IFNDEF MSWINDOWS}
-  { Windows can hit its own directory-path ceiling while constructing the
-    default session before LWPT reaches the FPC file-buffer guard. The
-    non-zero default and both successful relocation paths remain portable;
-    Unix pins the specific compiler-budget diagnostic reproduced in #96. }
+  { Unix pins the specific compiler-budget diagnostic reproduced in #96.
+    Before #347, Windows failed earlier, constructing the default session's
+    owner guard past MAX_PATH; it now builds the session like Unix, but the
+    diagnostic is not yet pinned there. }
   Expect<Boolean>(Pos('compiler staging path is too long', Run.Stderr) > 0)
     .ToBe(True);
   {$ENDIF}
+  { The failed default session stays behind for diagnosis, as on every
+    platform, until repair reclaims it. }
+  Expect<Integer>(ProjectSessionCount).ToBe(1);
 
   WriteTextFile(Project + '/lwpt.toml',
       '[package]'#10
@@ -347,6 +363,9 @@ begin
   Ledger := ReadBinaryFile(Project + '/' + BUILD_SESSION_ROOT_LEDGER);
   Expect<Boolean>(Pos(ExpandFileName(ManifestRoot), Ledger) > 0).ToBe(True);
   Expect<Boolean>(Pos(ExpandFileName(EnvironmentRoot), Ledger) > 0).ToBe(True);
+  { Relocation keeps every new session out of the deep project: only the
+    ledger and its lock are project-local. }
+  Expect<Integer>(ProjectSessionCount).ToBe(1);
 
   RecursiveDelete(Project);
   RecursiveDelete(ManifestRoot);
