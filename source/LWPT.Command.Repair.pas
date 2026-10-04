@@ -21,6 +21,8 @@ uses
   LWPT.Install,
   LWPT.Manifest,
   LWPT.ObjectStore,
+  LWPT.Registry.Consumer,
+  LWPT.Registry.ConsumerStore,
   LWPT.WorkerBudget;
 
 function LooksLikeAbsolutePath(const APath: string): Boolean;
@@ -115,6 +117,45 @@ begin
       ' lockfile; left unchanged');
 end;
 
+{ Reports the per-user registry document store (ADR-0051). Repair removes
+  nothing there: installs enforce the budget, and no command removes state
+  files. }
+procedure ReportRegistryDocumentStore;
+var Root: string; Report: TLWPTRegistryStoreReport;
+begin
+  Root := RegistryStateRoot;
+  if not DirectoryExists(RegistryStateDocumentsDirectory(Root)) then
+  begin
+    WriteLn('repair: no per-user registry document store at ', Root);
+    Exit;
+  end;
+  Report := InspectRegistryStateStoreAt(Root);
+  WriteLn('repair: per-user registry document store ', Root, ' holds ',
+    Report.Documents, ' document(s), ', Report.DocumentBytes, ' byte(s), for ',
+    Report.StateFiles, ' origin state file(s)');
+  if Report.Analyzed then
+    WriteLn('repair: ', Report.LiveDocuments, ' live document(s) (',
+      Report.LiveBytes, ' byte(s)) in accepted histories; ',
+      Report.EvictableDocuments, ' evictable (', Report.EvictableBytes,
+      ' byte(s)) under a budget of ', Report.BudgetBytes, ' byte(s) (',
+      REGISTRY_STATE_MAX_BYTES_ENV, ')')
+  else
+    WriteLn('repair: nothing in the registry document store is evictable: ',
+      Report.Incomplete);
+  { Documents an install could not remove, for example while another
+    process held them open, show up here as bytes over the budget. }
+  if Report.Analyzed and (Report.EvictableBytes > Report.BudgetBytes) then
+    WriteLn('repair: ', Report.EvictableBytes - Report.BudgetBytes,
+      ' evictable byte(s) exceed the budget; the next online install evicts ',
+      'them unless another process holds them open');
+  if Report.IgnoredEntries > 0 then
+    WriteLn('repair: ignored ', Report.IgnoredEntries, ' foreign entry(ies) in ',
+      'the registry document store');
+  WriteLn('repair: removed nothing from per-user registry state; installs ',
+    'evict least-recently-used documents beyond the budget and never remove ',
+    'state files');
+end;
+
 procedure CmdRepair(const AManifestPath: string);
 var
   Ctx : TManifestContext;
@@ -192,6 +233,8 @@ begin
       'object manifests')
   else
     WriteLn('repair: verified the shared-cache LRU index');
+
+  ReportRegistryDocumentStore;
 
   Upgraded := UpgradeLegacyLockfile(Ctx);
 

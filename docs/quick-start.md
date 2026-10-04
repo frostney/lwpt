@@ -337,7 +337,9 @@ from the new pin.
 Cleans `.lwpt/tmp/`, any stale install lock, and abandoned or failed sessions
 from the default and identity-verified historical build-session roots, then
 reclaims abandoned per-user worker requests and reports the remaining budget
-state. Live build/test sessions are retained.
+state. Live build/test sessions are retained. It also reports the per-user
+registry document store's size, live and evictable documents, and budget, and
+removes nothing there.
 Repair never touches the last successfully published build output. It
 changes `.lwpt/modules/`, `.lwpt/archives/`, and `lwpt.lock` only when the
 lockfile is schema v3: it then upgrades the lockfile to v4 without network
