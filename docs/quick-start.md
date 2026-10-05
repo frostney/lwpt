@@ -334,10 +334,11 @@ from the new pin.
 ./build/lwpt repair
 ```
 
-Takes over the install lock once its owner has exited, and fails without
-changing anything while an install or another repair holds it. Holding the
-lock, it restores an interrupted install and cleans `.lwpt/tmp/`. It then
-cleans abandoned or failed sessions
+Takes over the install lock only once it can prove its owner has exited, and
+otherwise fails without changing anything, naming the holder or the file to
+delete by hand ([ADR-0053](./adr/0053-install-lock-ownership-and-reclamation.md)).
+Holding the lock, it restores an interrupted install and cleans `.lwpt/tmp/`.
+It then cleans abandoned or failed sessions
 from the default and identity-verified historical build-session roots, then
 reclaims abandoned per-user worker requests and reports the remaining budget
 state. Live build/test sessions are retained. It also reports the per-user
