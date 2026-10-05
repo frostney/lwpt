@@ -42,7 +42,12 @@
   is opened, a second acquisition of a registered path fails before it
   opens anything, and the owner record is read and written through the
   locked descriptor. Diagnostic reads by a contender happen only in a
-  process that holds no lock on that path. }
+  process that holds no lock on that path.
+
+  Every open of the lock file goes through OpenProtectedDescriptor, never
+  SysUtils.FileOpen or TFileStream: those take flock(2), which on Darwin
+  shares one lock list with fcntl record locks, so they fail with EAGAIN
+  while an owner holds its record lock. }
 unit LWPT.InstallLock;
 
 {$I Shared.inc}

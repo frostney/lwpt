@@ -98,6 +98,14 @@ contender use a read-only open in a process that holds no lock on that
 path. Windows byte-range locks belong to the handle, so the identity check's
 second handle is harmless there.
 
+Every open of the lock file is a plain `open(2)` (`OpenProtectedDescriptor`),
+never `SysUtils.FileOpen` or `TFileStream`, which take `flock(2)`. On Darwin
+`flock` and `fcntl` locks share one lock list, so a `flock` on a held lock
+file fails with `EAGAIN`; on Linux they are independent. Readers of a lock
+file in tests follow the same rule. LWPT 0.7.0 is unaffected: its install
+read the holder's PID through a plain `open(2)`, and its repair never opened
+the file.
+
 ### Compatibility boundary
 
 - 0.7.0 `lwpt repair` still deletes the lock file unconditionally; nothing
