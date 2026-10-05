@@ -79,17 +79,26 @@ the command reference.
 
 ## Self-host
 
-LWPT's own `lwpt.toml` registers itself:
+LWPT's own `lwpt.toml` registers itself with two build entries (excerpt; the
+version tracks the current release):
 
 ```toml
 [package]
 name = "lwpt"
-version = "0.1.0"
+version = "0.7.0"
 units = ["source"]
 
 [build]
-lwpt = { source = "source/lwpt.pas", output = "build/lwpt" }
+lwpt = { source = "source/{item.name}.pas", output = "build/{item.name}" }
+lwpt-testing = { source = "source/lwpt.pas",
+                 output = "build/lwpt-testing",
+                 flags = ["-dINSTALL_TESTING"] }
 ```
+
+The `lwpt-testing` entry compiles the test-seam binary
+([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)); the manifest's
+`[prebuild]` hook stamps `source/Version.inc` and its `[pretest]` hook
+rebuilds `lwpt-testing` before every `lwpt test`.
 
 `./build/lwpt build` first probes and validates the requested target, then the
 FPC driver produces:
@@ -180,8 +189,8 @@ shaping belong to `TLWPTFPCCompilerDriver.ClassifyFailure`.
 ### The current executable
 
 Clean never deletes the current executable. Publication uses the platform's
-atomic replacement operation (`rename(2)` on Unix and `MoveFileEx` with
-replace/write-through on Windows), after the replacement candidate has
+atomic replacement operation (`rename(2)` on Unix and `ReplaceFileW` on Windows, falling back to
+`MoveFileExW` with write-through only when the destination does not exist), after the replacement candidate has
 finished compiling in its session. If the operating system refuses the
 replacement, LWPT reports publication failure and retains the completed
 candidate for diagnosis rather than deleting the last successful executable.
@@ -246,7 +255,7 @@ shortform = "src/quicktool.pas"                   # bare-string shorthand
   combines a bounded readable prefix with a hash of the full entry identity,
   preventing sanitisation collisions without creating unbounded paths.
 
-LWPT's own `lwpt.toml` is the reference: one `lwpt` build entry.
+LWPT's own `lwpt.toml` is the reference: two build entries, `lwpt` and `lwpt-testing`.
 
 ## Session staging and public outputs
 
@@ -311,7 +320,7 @@ publication; its whole-build postbuild consequently runs once after all
 selected outputs publish. Artifact transformations therefore belong in the
 per-entry hook. See ADR-0023.
 
-Successful sessions remove compiler jobs and compiled hooks but retain stable
+Successful sessions remove compiler jobs but retain stable
 job logs and completed state for diagnosis. Failed, stale, or interrupted
 sessions retain their private diagnostics. `lwpt repair` removes inactive
 sessions only after their OS-held owner guard is absent; malformed state fails

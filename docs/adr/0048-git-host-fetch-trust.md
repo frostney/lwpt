@@ -1,6 +1,8 @@
 # Git-host fetch trust: destination policy and locked ref identity
 
 > **Amended by [ADR-0051](./0051-registry-dependency-sources.md):** registry contacts are destinations too. Each registry request allows only the contact's own host, requires HTTPS, refuses non-global addresses, and follows no redirects, so a 3xx is a request-layer failure that advances to the next contact. Manifest-declared contacts are public-only under the same address rule; plain `http://localhost` is accepted only by the `lwpt-testing` build ([ADR-0044](./0044-test-seams-only-in-test-builds.md)). Archives are fetched only from the contact that produced the verified proof and must hash to the signed record's `archive` digest.
+>
+> **Lockfile schema v4 ([ADR-0052](./0052-lockfile-schema-v4-framed-tree-digest.md)):** the lock is now schema v4. `resolvedRefKind` is unchanged there; the references below to additive schema-v3 evidence and early schema-v3 locks describe the lock when this record was accepted.
 
 ## Executive Summary
 

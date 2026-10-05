@@ -107,8 +107,11 @@ function RunLwpt(const AArgs: array of string;
 
 { RunLwpt against the test-flavoured binary (LwptTestingBinaryPath) for this
   one call; the configured binary is restored afterwards. Use it only for
-  runs that set an LWPT_TEST_* variable, so every other case keeps
-  exercising the binary users run. }
+  runs that set an LWPT_TEST_* variable or that depend on a compile-time
+  test behavior with no variable (registry installs against localhost
+  HTTP contacts, which only the INSTALL_TESTING build accepts; see
+  AllowLocalhostContacts in LWPT.Registry.Consumer), so every other case
+  keeps exercising the binary users run. }
 function RunLwptTesting(const AArgs: array of string;
   const AInDir: string;
   const AExtraEnv: array of string): TLwptResult; overload;

@@ -1,5 +1,7 @@
 # Define a versioned compiler-neutral build request and target model
 
+> **Status note (2026-10-05):** FPC is no longer the only compiler adapter. Built-in drivers for Delphi ([#140](https://github.com/frostney/lwpt/pull/140)), Blaise ([#141](https://github.com/frostney/lwpt/pull/141)), and Lakon ([#142](https://github.com/frostney/lwpt/pull/142)) ship beside FPC behind the driver seam of [ADR-0029](./0029-fpc-compiler-driver.md), selected through root compiler profiles ([ADR-0030](./0030-root-compiler-profiles.md)); other driver IDs use the out-of-process protocol. FPC remains LWPT's own implementation compiler.
+
 ## Executive Summary
 
 - Build intent is represented by `TLWPTBuildRequest`, not compiler arguments.

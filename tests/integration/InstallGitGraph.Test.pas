@@ -491,7 +491,7 @@ begin
   WriteTextFile(FFixtureRoot + '/requests.log', '');
 
   Run := RunInstall(Root, ['install', '--offline']);
-  DumpRunFailure('offline early v3 restore', Run, 0);
+  DumpRunFailure('offline restore without identity fields', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Boolean>(FileExists(Root
@@ -515,7 +515,7 @@ begin
     '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
     + 'units = ["source"]'#10);
   Run := RunInstall(Root, ['install']);
-  DumpRunFailure('offline early v3 SHA seed', Run, 0);
+  DumpRunFailure('offline SHA seed', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   RemoveAdditiveIdentityFields(Root + '/lwpt.lock');
   LockText := ReadBinaryFile(Root + '/lwpt.lock');
@@ -527,7 +527,7 @@ begin
   WriteTextFile(FFixtureRoot + '/requests.log', '');
 
   Run := RunInstall(Root, ['install', '--offline']);
-  DumpRunFailure('offline early v3 SHA restore', Run, 0);
+  DumpRunFailure('offline SHA restore without identity fields', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadBinaryFile(Root + '/lwpt.lock')).ToBe(LockText);
   Expect<Boolean>(FileExists(Root
@@ -689,8 +689,9 @@ begin
   RemoveResolvedCommit(Root + '/lwpt.lock');
   LockBefore := ReadBinaryFile(Root + '/lwpt.lock');
 
-  { An early schema-v3 lock records no commit, so the move is caught by the
-    archive it pinned: the new commit serves different bytes. }
+  { A lock without the optional commit field (as repair carries from early
+    v3) records no commit, so the move is caught by the archive it pinned:
+    the new commit serves different bytes. }
   WriteRefs('shared', 'tag|v1.0.0|' + MUTATED_SHARED_COMMIT + '|'#10);
   WriteArchive('shared', MUTATED_SHARED_COMMIT,
     '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.1"'#10
@@ -1389,7 +1390,8 @@ begin
   Expect<Integer>(RequestCount(
     'archive|shared|' + SHARED_COMMIT)).ToBe(0);
 
-  { The same graph is genuinely ambiguous in an early v3 lock: its named
+  { The same graph is genuinely ambiguous in a v4 lock without the optional
+    identity fields (as repair carries from early v3): its named
     ref and SHA constraint cannot be proven equivalent without the additive
     authoritative commit field. Frozen mode must explain regeneration. }
   RemoveAdditiveIdentityFields(Root + '/lwpt.lock');
@@ -1478,9 +1480,11 @@ begin
     TestOfflineManifestDriftFailsBeforePublication);
   Test('offline rejects compatible manifest drift before publication starts',
     TestOfflineCompatibleDriftFailsBeforePublication);
-  Test('offline accepts an unambiguous early schema-v3 lock',
+  Test('offline accepts an unambiguous v4 lock without the optional '
+    + 'identity fields (as repair carries from early v3)',
     TestOfflineAcceptsUnambiguousEarlyV3Lock);
-  Test('offline derives an early schema-v3 SHA identity from the locked ref',
+  Test('offline derives a SHA identity from the locked ref of a v4 lock '
+    + 'without the optional identity fields (as repair carries from early v3)',
     TestOfflineAcceptsEarlyV3SHAIdentity);
   Test('offline restores local and workspace dependencies from their paths',
     TestOfflineRestoresLocalAndWorkspaceDependencies);

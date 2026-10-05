@@ -2,8 +2,9 @@ name: PR
 
 # Fast PR gate. Mirrors the GocciaScript pattern: ci.yml runs
 # automatically only on push to main, so pr.yml is the sole automatic
-# pre-merge signal a PR sees. Every PR also needs a green manual ci.yml
-# run on its exact head (ORCHESTRATION.md).
+# pre-merge signal a PR sees; its delivery-admission job is the ruleset's
+# required check. Delivery policy (ORCHESTRATION.md), not the ruleset,
+# also asks for a green manual ci.yml run on every PR's exact head.
 #
 #   pr.yml      — every PR, whatever its base branch:
 #                 Ubuntu native bootstrap + install + format --check + build +
@@ -16,17 +17,19 @@ name: PR
 #                 windows-latest. Typical wall-clock
 #                 < 10 min on a warm toolchain cache (hard caps per job/step).
 #   ci.yml      — full 6-target cross-build + per-platform native test
-#                 runs (including E2E paths on every platform). Required
-#                 as a manual run on every PR's exact head before merge,
-#                 and runs again on the push to main. One allow-listed
+#                 runs (including E2E paths on every platform). Delivery
+#                 policy asks for a manual run on every PR's exact head
+#                 before merge (not ruleset-enforced), and it runs again on
+#                 the push to main, covering the full native matrix. One allow-listed
 #                 diagnostic slice is also dispatchable on any ref.
 #   release.yml — tag-triggered cross-build + package + publish.
 #
 # Trade-off, deliberate: this automatic gate stays cheap enough to run
 # on every push, so it omits x86_64-darwin, aarch64-linux, i386-win32,
-# and non-Linux e2e. Those legs are not post-merge only: every PR also
-# needs a green manual ci.yml run on its exact head before merge
-# (ORCHESTRATION.md), because the automatic gate alone repeatedly let
+# and non-Linux e2e. Those legs are not post-merge only: delivery policy
+# (ORCHESTRATION.md) also asks for a green manual ci.yml run on every PR's
+# exact head before merge, though the ruleset enforces only
+# delivery-admission, because the automatic gate alone repeatedly let
 # Intel-Darwin, i386 and cross-toolchain breaks reach main. The gate
 # covers Linux ordinary+E2E, aarch64-darwin ordinary, and win64
 # offline (#102 extended the original Ubuntu+win64 gate).
@@ -43,7 +46,7 @@ name: PR
 # process env) and compile breaks in test sources, which lwpt test
 # compiles with the native FPC. #102 added the next two carve-outs
 # (the Linux E2E step and the darwin-test leg below) after the
-# #84/#105 escape classes. Left to the required manual ci.yml run:
+# #84/#105 escape classes. Left to the delivery-policy manual ci.yml run:
 # the i386-win32 leg, E2E paths on non-Linux platforms,
 # bootstrap.bat, and the x86_64-darwin / aarch64-linux permutations.
 #
@@ -154,7 +157,7 @@ jobs:
       # they are not rerun here as accidental stress. Clean DNS/
       # connect failures self-skip (transient third-party downtime);
       # content, protocol, and TLS failures remain blocking, which is
-      # the point. The required manual ci.yml run and the push to main
+      # the point. The delivery-policy manual ci.yml run and the push to main
       # run these paths on every platform.
       - name: lwpt test --bail=0 (E2E project paths, live network)
         # Run even when the ordinary queue failed, so one run reports both;
@@ -204,7 +207,7 @@ jobs:
   # invisible to the Linux-only gate. Native
   # bootstrap via brew keeps this independent of the cross-toolchain
   # cache. Ordinary paths only; E2E stays on the Linux leg above and in
-  # the required manual ci.yml run. Cost bound: ~5-6 min warm (brew fpc
+  # the delivery-policy manual ci.yml run. Cost bound: ~5-6 min warm (brew fpc
   # ~40 s + bootstrap ~1 min + ordinary tests). The remaining
   # ci.yml-only legs (x86_64-darwin, aarch64-linux, i386-win32) run in
   # that manual run rather than on every push.
@@ -258,7 +261,7 @@ jobs:
   # matrix runs automatically only on push to main, and manually once
   # on the PR's final head, so this job reports a Windows-only compile
   # error inside {$IFDEF WINDOWS} blocks on every push instead of only
-  # at that required manual run (see the header comment). One target is
+  # at that delivery-policy manual run (see the header comment). One target is
   # enough: win32 and win64 share the same {$IFDEF WINDOWS} sources,
   # and the failure class is compile-time. The produced lwpt.exe is
   # uploaded for the windows-test job below, which runs the ordinary
@@ -386,7 +389,7 @@ jobs:
   # (junction-vs-symlink installs, path handling, subprocess
   # environment handling) and compile breaks in test sources, which
   # lwpt test compiles with the native FPC at run time (Q22=b).
-  # The required manual ci.yml run (and the push to main) owns the
+  # The delivery-policy manual ci.yml run (and the push to main) owns the
   # i386-win32 leg, E2E paths on non-Linux platforms, and the
   # bootstrap.bat smoke.
   windows-test:

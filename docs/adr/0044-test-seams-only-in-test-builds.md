@@ -1,5 +1,20 @@
 # Test fetch and fault seams exist only in test builds
 
+> **Amended 2026-10-05, test-only behaviours and seam coverage:**
+> `INSTALL_TESTING` also compiles behaviours into the test binary that no
+> variable selects. The first is
+> `AllowLocalhostContacts` in `LWPT.Registry.Consumer`, which lets
+> `build/lwpt-testing` accept a plain-HTTP `localhost` registry contact that
+> `build/lwpt` refuses ([ADR-0051](./0051-registry-dependency-sources.md)).
+> Test runs that need such a behaviour spawn the test binary through
+> `RunLwptTesting` without setting a seam variable; the registry install
+> tests do this. The rule "only runs that set a seam variable use the test
+> binary" below therefore admits this exception. `TestSeamIsolation.Test.pas`
+> checks every marker in `tests/test-seam-markers.txt` against both binaries,
+> but runs only representative seams against both (the Git fixture
+> directory, the archive origin, and one fault-injection variable), not each
+> seam.
+
 ## Executive Summary
 
 - Every toolkit-read `LWPT_TEST_*` variable, and every fault-injection

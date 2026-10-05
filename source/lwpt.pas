@@ -882,7 +882,8 @@ begin
 
     SetLength(InstallOpts, 3);
     InstallOpts[0] := TFlagOption.Create('frozen',
-      'CI mode: refuse to update the lockfile, refuse network, verify hashes');
+      'Verify the lockfile and committed state without network access; never '
+      + 'update them');
     InstallOpts[1] := TFlagOption.Create('offline',
       'Restore locked dependency state without network access');
     InstallOpts[2] := TFlagOption.Create('accept-moved-tags',
@@ -995,7 +996,7 @@ begin
     RegistryOpts[8] := TStringOption.Create('upstream',
       'Canonical upstream base URL (required for mirror init)');
     RegistryOpts[9] := TStringOption.Create('key-id',
-      'Pinned origin root ed25519 key ID (required for mirror init and publish)');
+      'Pinned origin root Ed25519 key ID (required for mirror init and publish)');
     RegistryOpts[10] := TStringOption.Create('public-key',
       'Pinned origin root public key in hex: encoding (required for mirror init and publish)');
     RegistryOpts[11] := TStringOption.Create('from-key',

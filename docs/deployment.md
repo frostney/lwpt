@@ -16,7 +16,7 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 | Tier | Targets | What "supported" means |
 |------|---------|------------------------|
 | **Tier 1** | `x86_64-linux`, `aarch64-linux`, `x86_64-win64`, `aarch64-darwin`, `x86_64-darwin` | Full LWPT self-test on every push to `main` (`ci.yml` runs the repository's ordinary and E2E path selectors natively on each without repeating programs). Pre-built binaries published per release tag. |
-| **Tier 1 (build + smoke)** | `i386-win32` | Cross-built + tested on a `windows-latest` runner alongside `x86_64-win64`. The 32-bit binary is published per release. |
+| **Tier 1 (32-bit Windows)** | `i386-win32` | Cross-built and then tested natively on a `windows-latest` runner alongside `x86_64-win64`: `ci.yml` runs the same ordinary and E2E path selectors as the other Tier 1 targets. The 32-bit binary is published per release. |
 | **Tier 2** | Other Win64 SKUs (server, arm64) | CI is x86_64 only at the Windows runner level; arm64-windows would need separate runners. |
 | **Tier 3** | FreeBSD, OpenBSD, Linux ARM32, NetBSD, others | Documented as "should work, no automation". Issues accepted but not blocking. No published binaries. PRs to elevate to Tier 1 welcome. |
 
@@ -84,9 +84,10 @@ and refuses a genuine IPv6 destination. [ADR-0048](./adr/0048-git-host-fetch-tru
 lists the blocks and the globally reachable exceptions.
 
 LWPT derives each dependency's policy in `LWPT.FetchPolicy` and applies it to
-ref listing (install, `outdated`, `update`) and archive download. Every
-dependency request requires HTTPS, and every hop must resolve to a globally
-reachable address:
+ref listing (install, `outdated`, `update`), commit-pin reachability proof
+requests (git smart-HTTP upload-pack, [ADR-0047](./adr/0047-commit-pins-must-be-reachable.md)),
+and archive download. Every dependency request requires HTTPS, and every hop
+must resolve to a globally reachable address:
 
 | Source | Allowed hosts |
 | --- | --- |
@@ -95,6 +96,7 @@ reachable address:
 | `bitbucket:` | `bitbucket.org` |
 | `[sources.<name>]` custom host | The hosts named by its `archive` and `git` templates |
 | Direct `https://` archive URL | Any host |
+| `registry:` | The contact's own host only (each mirror or origin contact URL from `[registries.<alias>]`); registry requests follow no redirects ([ADR-0051](./adr/0051-registry-dependency-sources.md)) |
 
 The address rule has no exception. Private, loopback, link-local, and other
 non-globally-reachable destinations are refused for every dependency fetch,
@@ -136,7 +138,7 @@ Server accept has the same story per [ADR-0033](./adr/0033-schannel-server-tls-a
 
 ### macOS: Secure Transport and Network.framework (no Homebrew dependency)
 
-The `Darwin` client branch of `TransportSecurity.pas` calls into Apple's SecureTransport framework, which is built into every macOS install. No `brew install openssl@3`, no `DYLD_LIBRARY_PATH` shenanigans, no library version pinning. macOS release archives ship the binary alone, same shape as the Windows archives (without the `.exe` suffix).
+The `Darwin` client branch of `TransportSecurity.pas` calls into Apple's SecureTransport framework, which is built into every macOS install. No `brew install openssl@3`, no `DYLD_LIBRARY_PATH` shenanigans, no library version pinning. macOS release archives bundle no libraries: like every release archive, they contain the binary (without the `.exe` suffix) plus the bundled documentation (`README.md`, `CONTEXT.md`, `CONTRIBUTING.md`, `AGENTS.md`, and a `docs/` subset).
 
 Darwin implements `TTransportSecurityServerContext` with the public Secure
 Transport server API and the same feed/drain state-machine contract used by
@@ -155,8 +157,9 @@ on macOS 26 and newer. On macOS 15 and older it selects the portable registry
 socket listener, which delegates TLS to the HTTPClient Secure Transport server
 backend and therefore shares the same request parsing, routing, resource, and
 shutdown behavior as Windows and Unix. The selector reads the public runtime
-Darwin kernel release returned by `uname`: kernel 24 uses Secure Transport,
-while kernel 25 and newer uses Network.framework. It does not synthesize a
+Darwin kernel release returned by `uname`: kernel 24 and older (below 25)
+uses Secure Transport, while kernel 25 and newer uses Network.framework. The
+dispatch applies only to the registry's HTTPS listener. It does not synthesize a
 macOS marketing version, depend on compatibility-sensitive Foundation
 reporting, or inspect CPU architecture. On the Secure Transport compatibility
 path, initialization accepts only `localhost` or a canonical IPv4 address so
@@ -202,7 +205,9 @@ If `lwpt install` fails with `HTTPS requires OpenSSL but it could not be loaded`
 3. **Tag the merge commit.** `git tag -a 0.1.0 -m 0.1.0` on the post-merge `main` commit (no `v` prefix — SemVer 2.0.0 canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md); `v0.1.0` is also accepted by `release.yml` as a courtesy). Pre-release tags use the `0.1.0-rc.1` form (auto-detected by `release.yml` and published as `prerelease: true`).
 4. **`release.yml` triggers.** Mirrors `ci.yml`'s cross-build matrix exactly
    (same flag set, same toolchain cache key). The publish job then waits at the
-   protected `release` environment for explicit approval.
+   protected `release` environment for explicit approval: the environment
+   requires review by `frostney`, and repository admins can bypass it
+   (`can_admins_bypass: true`).
 5. **GitHub Release published by CI.** After approval, the workflow packages
    each target as `tar.gz` (Unix) / `zip` (Windows), generates a SHA-256
    checksums file, and extracts release notes from the committed `CHANGELOG.md`

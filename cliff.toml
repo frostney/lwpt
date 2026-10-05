@@ -98,6 +98,8 @@ commit_parsers = [
   # bare). The imperative-English parsers above remain for the
   # pre-conventional history.
   { message = "^feat(\\([^()]+\\))?!?: ",      group = "New Features" },
+  # CI and delivery-tooling fixes change no shipped behaviour.
+  { message = "^fix\\((ci|delivery)\\)!?: ",     group = "Internal" },
   { message = "^fix(\\([^()]+\\))?!?: ",       group = "Bug Fixes" },
   { message = "^perf(\\([^()]+\\))?!?: ",      group = "Performance" },
   { message = "^docs(\\([^()]+\\))?!?: ",      group = "Documentation" },

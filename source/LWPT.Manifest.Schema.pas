@@ -417,7 +417,7 @@ const
       Description: 'Canonical HTTPS origin identity.'),
     (Name: 'key-id'; ValueKind: mvkString; Requirement: mrRequired;
       DefaultValue: ''; Scope: mscRootOnly; InvalidPolicy: mipError;
-      NonEmpty: True; Description: 'Pinned Ed25519 root key id '
+      NonEmpty: True; Description: 'Pinned Ed25519 root key ID '
       + '(`ed25519:<sha256 of the key>`).'),
     (Name: 'public-key'; ValueKind: mvkString; Requirement: mrRequired;
       DefaultValue: ''; Scope: mscRootOnly; InvalidPolicy: mipError;
@@ -448,7 +448,8 @@ const
       InvalidPolicy: mipIgnoreAsAbsent; NonEmpty: False;
       Description: 'Compiler entry-point path.'),
     (Name: 'output'; ValueKind: mvkString; Requirement: mrOptional;
-      DefaultValue: 'build/<name>'; Scope: mscAllManifests;
+      DefaultValue: 'source path without extension; shorthand: '
+      + 'build/<package name>'; Scope: mscAllManifests;
       InvalidPolicy: mipIgnoreAsAbsent; NonEmpty: False;
       Description: 'Published executable path.'),
     (Name: 'depends'; ValueKind: mvkStringArray; Requirement: mrOptional;
