@@ -68,7 +68,6 @@ type
     destructor Destroy; override;
     function JobRoot(const AName: string): string;
     function JobLogReference(const AName: string): string;
-    function HookRoot: string;
     function SessionReference: string;
     procedure WriteJobLog(const AName, AOutput: string);
     procedure Finish(ASuccess: Boolean; const ADetail: string = '');
@@ -1432,12 +1431,6 @@ begin
     + BuildSessionPathKey(AName) + ObservabilityLogExtension;
 end;
 
-function TLWPTBuildSession.HookRoot: string;
-begin
-  Result := FSessionRoot + '/hooks';
-  LongPathForceDirectories(Result);
-end;
-
 function TLWPTBuildSession.SessionReference: string;
 begin
   if FDefaultSessionsRoot then
@@ -1474,7 +1467,7 @@ begin
   if ASuccess then
   begin
     { The guard lives beside session directories, so it remains observable
-      while private compiler and hook staging is removed on every platform.
+      while private compiler staging is removed on every platform.
       Stable job logs remain until lwpt repair reclaims the completed session. }
     HasLogs := LongPathDirectoryExists(FSessionRoot
       + ObservabilityLogsDirectory);
@@ -1483,8 +1476,6 @@ begin
     begin
       if LongPathDirectoryExists(FSessionRoot + '/jobs') then
         WipeDir(FSessionRoot + '/jobs');
-      if LongPathDirectoryExists(FSessionRoot + '/hooks') then
-        WipeDir(FSessionRoot + '/hooks');
       WriteState('completed');
     end
     else

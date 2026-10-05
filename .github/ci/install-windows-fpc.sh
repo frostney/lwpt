@@ -98,6 +98,9 @@ cygpath -w "${host_bin_dir}" >> "${GITHUB_PATH}"
 LWPT_FPC_VALUE=$(cygpath -w "${test_compiler}")
 echo "LWPT_FPC=$LWPT_FPC_VALUE" >> "${GITHUB_ENV}"
 
+# LWPT itself no longer reads LWPT_INSTANTFPC: hooks run InstantFPC from
+# PATH. The variable is published only as a diagnostic, printed by
+# LWPT.CompilerDriver.FPC.Test when bare instantfpc fails to resolve.
 instantfpc_bin=$(find "${host_bin_dir}" -name instantfpc.exe -type f 2>/dev/null | head -1 || true)
 if [ -n "${instantfpc_bin}" ]; then
   echo "LWPT_INSTANTFPC=$(cygpath -w "${instantfpc_bin}")" >> "${GITHUB_ENV}"
