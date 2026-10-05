@@ -64,6 +64,10 @@ The `lwpt install --offline` mode that restores the locked graph without network
 The single `lwpt install` operation that, under the install lock, resolves dependencies, materialises toolkit state, verifies frozen state when requested, and commits lockfile/cfg changes as one coherent update. It is LWPT's atomic-ish toolkit-state update, not a database transaction.
 *Avoid*: "install process", "install pipeline", "transaction" alone.
 
+**Install lock**:
+The project's `.lwpt/install.lock`, shared by the *install transaction* and `lwpt repair` (ADR-0053). Creating the file exclusively is the mutual exclusion; a kernel record lock on it, held by the owner until it has removed the file, is the liveness signal. Repair takes over a left-behind lock only when that record lock proves the owner dead, and otherwise fails without changes. Unlike a *producer lease*, the file itself outlives a crashed owner.
+*Avoid*: "stale lock" for a lock whose owner is not proven dead, "PID file" (the PID is diagnostic only).
+
 **Zero-install**:
 The default property of every LWPT project: after `git clone`, `fpc @lwpt.cfg` builds the project without running `lwpt install` first. Achieved by committing `.lwpt/modules/` and `.lwpt/archives/`. See ADR-0002.
 *Avoid*: "checked-in deps" (Yarn's term), "vendored" (retired per ADR-0017 — see *Vendored*).

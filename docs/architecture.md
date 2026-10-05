@@ -336,7 +336,7 @@ See [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) for the full design ra
 | `.lwpt/archives/<dep>-<safe-ref>.tar.gz` | **Committed** | Source-of-truth tarballs, named after the resolved ref (tag or SHA) with characters outside `[A-Za-z0-9._-]` replaced by `_`; a URL source uses `<dep>-url.tar.gz`. Used for hash verification on `--frozen` and exact reconstruction by `install --offline`. |
 | `.lwpt/archives/registry-proofs/sha256/<hex>.toml` | **Committed** | Exact bytes of each registry origin's locked selection proof: checkpoint, signature envelope, rotation triplets, head snapshot, and selected records ([ADR-0051](./adr/0051-registry-dependency-sources.md)). A set derived from `lwpt.lock`: the install transaction stages exactly the referenced documents, publishes them with the lockfile and cfg, and removes unreferenced ones. `--frozen` and `--offline` verify each registry selection from these documents and the manifest pin without network; `--offline` restores a missing document from the per-user document store by hash. Follows the `[lwpt] archives-dir` override. The deepest path an install writes is a retained proof document below the journaled transaction root, about 170 characters below the project root, so without Windows long-path support keep project roots under about 85 characters ([#347](https://github.com/frostney/lwpt/issues/347)). |
 | `.lwpt/tmp/` | Gitignored | Install workspace and journaled rollback copies. A normal or offline materializing install, or `lwpt repair`, recovers pending state before ordinary residue cleanup. Frozen verification recovers and cleans nothing; it only creates, and removes on exit, a uniquely named scratch directory in which it re-derives each registry module from its archive and each local or workspace module from its source. An interrupted run's scratch is reclaimed by the next materializing install or `lwpt repair`. |
-| `.lwpt/install.lock` | Gitignored | Cross-process install lock. Created with O_CREAT\|O_EXCL by the first `lwpt install`; a second concurrent install fails with `EConcurrencyError` naming the lock holder's PID. Deleted by the normally-completing install; a crashed install leaves it for the user to clear via `lwpt repair`. Windows lock uses `LockFileEx`. |
+| `.lwpt/install.lock` | Gitignored | Cross-process install lock (`LWPT.InstallLock`, [ADR-0053](./adr/0053-install-lock-ownership-and-reclamation.md)). Created with O_CREAT\|O_EXCL (Windows: `CREATE_NEW`) by `lwpt install` or `lwpt repair`, whose kernel record lock on it (`fcntl`; Windows: `LockFileEx`) is the liveness signal; a second concurrent install fails with `EConcurrencyError` naming the lock holder's PID. Deleted by the normally-completing owner; a crashed owner leaves it, and `lwpt repair` takes it over only when the record lock proves that owner dead. See [`tooling.md`](./tooling.md#install-lock--crash-recovery). |
 | `.lwpt/sessions/<session-id>/` | Gitignored | Build/test compiler staging. Every invocation owns distinct, bounded, hash-qualified job, unit, and executable paths. Completed sessions retain stable job logs until `lwpt repair`; failed/crashed sessions retain their private diagnostics. The sibling `locks/` directory contains stable publication-lock files and per-session owner guards. |
 | `.lwpt/session-roots` | Gitignored | Atomic schema-versioned ledger of exact identity-verified relocated session namespaces used by `lwpt repair`. |
 | `.lwpt/workers/` | Gitignored | Repository fallback for machine-wide worker-budget leases ([ADR-0021](./adr/0021-machine-wide-worker-budget.md)), used only when `LWPT_WORKER_STATE_DIR` is unset and the per-user default below the application config directory is not writable. |
@@ -371,7 +371,7 @@ subclasses:
 | `EExtractError` | Archive parse failures, tar corruption, missing archive, atomic-move failure |
 | `ELockfileError` | Corrupt TOML in `lwpt.lock`, schema version mismatch, or missing lockfile when `--frozen` or `--offline` |
 | `EManifestError` | TOML errors, missing required keys, unsatisfiable constraints, unknown source kinds |
-| `EConcurrencyError` | Concurrent `lwpt install` — second process fails fast naming the first's PID |
+| `EConcurrencyError` | Concurrent `lwpt install`, or `lwpt repair` against a live install lock — second process fails fast naming the first's PID |
 | `ELWPTWorkerBudgetError` | Invalid worker-budget configuration, ownership, lease, or delegation state |
 | `ELWPTBuildRequestError` | Unsupported contract schemas, invalid build requests/results/capabilities, or invalid compiler compatibility constraints |
 | `ELWPTCompilerDriverError` | Compiler probe, target dispatch, or request/capability mismatch failures |
@@ -412,6 +412,7 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 
 `source/` carries LWPT-internal code (`lwpt.pas`, `LWPT.Core.pas`,
 `LWPT.Manifest.pas`, `LWPT.Manifest.Schema.pas`, `LWPT.Install.pas`,
+`LWPT.InstallLock.pas` (the install lock install and repair share),
 `LWPT.WorkerBudget.pas`,
 `LWPT.Command.*.pas`, `LWPT.CompilerDriver.pas`,
 `LWPT.CompilerDriver.FPC.pas`, `LWPT.CompilerDriver.Delphi.pas`,

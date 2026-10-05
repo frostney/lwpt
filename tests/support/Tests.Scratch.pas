@@ -47,7 +47,9 @@ procedure RecursiveDelete(const APath: string);
 { Reads a whole file as raw bytes. It shares read, write, and delete
   access, the way LWPT's own registry readers do, so a file the toolkit
   publishes with an atomic rename can be read while that rename still
-  holds its handle. On Windows a sharing violation from a briefly held
+  holds its handle. On Unix it takes no flock(2), so it can read a file
+  whose fcntl(2) record lock another process holds, such as a held
+  install lock on Darwin. On Windows a sharing violation from a briefly held
   handle (the rename's own write-through, a scanner) is retried for up to
   READ_SHARING_RETRY_MILLISECONDS before the open fails. }
 function ReadBinaryFile(const APath: string): string;
@@ -127,6 +129,10 @@ uses
 
 const
   ScratchBase = 'build/tests/tmp';
+  {$IFDEF UNIX}
+  { FD_CLOEXEC, which the Linux RTL does not declare. }
+  CLOSE_ON_EXEC = 1;
+  {$ENDIF}
   ReapPrefix = '.reap-';
   StaleAgeDays = 7;
   DeadOwnerGraceMSec = 10 * 60 * 1000;
@@ -476,7 +482,9 @@ var
   Handle: THandle;
   Stream: THandleStream;
   {$ELSE}
-  Stream: TFileStream;
+  Descriptor: cint;
+  ErrorCode: cint;
+  Stream: THandleStream;
   {$ENDIF}
 begin
   {$IFDEF MSWINDOWS}
@@ -493,12 +501,29 @@ begin
     Windows.CloseHandle(Handle);
   end;
   {$ELSE}
-  Stream := TFileStream.Create(APath, fmOpenRead or fmShareDenyNone);
+  { A plain open(2), never SysUtils.FileOpen: FileOpen takes flock(2), which
+    on Darwin shares one lock list with fcntl(2) record locks and fails with
+    EAGAIN while LWPT's install lock holds its record lock (#384). }
+  repeat
+    Descriptor := FpOpen(PChar(APath), O_RDONLY);
+  until (Descriptor >= 0) or (FpGetErrNo <> ESysEINTR);
+  if Descriptor < 0 then
+  begin
+    ErrorCode := FpGetErrNo;
+    raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
+      [APath, SysErrorMessage(ErrorCode)]);
+  end;
+  FpFcntl(Descriptor, F_SetFd, CLOSE_ON_EXEC);
   try
-    SetLength(Result, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+    Stream := THandleStream.Create(Descriptor);
+    try
+      SetLength(Result, Stream.Size);
+      if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
+    finally
+      Stream.Free;
+    end;
   finally
-    Stream.Free;
+    FpClose(Descriptor);
   end;
   {$ENDIF}
 end;

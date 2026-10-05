@@ -1,5 +1,10 @@
 # Install transaction module
 
+> **Amended by [ADR-0053](./0053-install-lock-ownership-and-reclamation.md):**
+> `LWPT.InstallLock` owns the install lock, and the install transaction and
+> `lwpt repair` share it. The "Lock is implementation detail" consequence
+> below describes the module when this record was accepted.
+
 `LWPT.Core.pas` previously owned manifest intake, the whole install path, and most subcommand behavior: manifest parsing, workspace discovery, install locking, tmp cleanup, dependency resolution, fetching/materialising modules and archives, frozen verification, lockfile/cfg writing, build/test/format/init/repair/run command behavior, and low-level helpers. We deepened this into dedicated modules: `LWPT.Manifest` owns manifest intent plus its path context, `LWPT.Install` owns the install transaction, `LWPT.Command.*` modules own command-level behavior, and `LWPT.Formatter` owns the formatting engine. `LWPT.Core` becomes shared project identity, error hierarchy, and low-level helpers only.
 
 ## Considered Options

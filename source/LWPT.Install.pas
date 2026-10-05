@@ -171,6 +171,7 @@ uses
   LWPT.GitPack,
   LWPT.GitProtocol,
   LWPT.Gzip,
+  LWPT.InstallLock,
   LWPT.ObjectStore,
   LWPT.ProducerLease,
   LWPT.Registry.Consumer,
@@ -199,21 +200,6 @@ begin
   {$ENDIF}
 end;
 {$ENDIF}
-
-type
-  TInstallLock = class
-  private
-    FPath: string;
-    {$IFDEF UNIX}
-    FFD: LongInt;
-    {$ENDIF}
-    {$IFDEF MSWINDOWS}
-    FHandle: THandle;
-    {$ENDIF}
-  public
-    constructor Create(const APath: string);
-    destructor Destroy; override;
-  end;
 
 { Semver is provided by the vendored Semver unit — a full
   node-semver port (ParseRange, Satisfies, MaxSatisfying, RangeIntersects).
@@ -577,186 +563,6 @@ end;
   the source remains untouched until the copy completes. ADR-0002
   consequences mentions this; docs/tooling.md is the canonical reference.
   =========================================================================== }
-{ ── TInstallLock ──────────────────────────────────────────────────── }
-
-{ Cross-process install lock. Uses O_CREAT|O_EXCL for atomic create-
-  if-not-exists — the kernel guarantees only one process wins the
-  create. If the file already exists, we read its PID for diagnostics
-  and raise EConcurrencyError pointing the user at `lwpt repair` for
-  stale locks (e.g. a crashed previous install).
-
-  Unlike flock-based locking, the file is NOT auto-released on process
-  crash — the file persists until explicitly deleted. `lwpt repair`
-  removes it, as does the destructor of a normally-completing lock.
-  The recovery message is explicit about this. }
-
-{$IFDEF UNIX}
-constructor TInstallLock.Create(const APath: string);
-var
-  Holder: AnsiString;
-  Buf: array[0..63] of AnsiChar;
-  N, i: LongInt;
-  PidLine: AnsiString;
-  DstDir: string;
-begin
-  FPath := APath;
-  DstDir := ExtractFileDir(APath);
-  if DstDir <> '' then LongPathForceDirectories(DstDir);
-
-  { Atomic create-if-not-exists. O_EXCL turns this into a kernel-level
-    test-and-set: at most one process wins. Mode 0644 (readable by
-    others for diagnostics). }
-  FFD := FpOpen(PChar(APath), O_RDWR or O_CREAT or O_EXCL, &644);
-  if FFD < 0 then
-  begin
-    { File exists. Read the PID for the diagnostic. The lock is held
-      by either a live concurrent install or a crashed previous one;
-      we can't tell the difference cheaply, so we point the user at
-      `lwpt repair`. }
-    Holder := 'unknown';
-    FFD := FpOpen(PChar(APath), O_RDONLY, 0);
-    if FFD >= 0 then
-    begin
-      N := FpRead(FFD, Buf[0], SizeOf(Buf) - 1);
-      FpClose(FFD);
-      if N > 0 then
-      begin
-        for i := 0 to N - 1 do
-          if (Buf[i] = #10) or (Buf[i] = #13) then
-          begin N := i; Break; end;
-        if N > 0 then
-        begin
-          SetLength(Holder, N);
-          Move(Buf[0], Holder[1], N);
-        end;
-      end;
-    end;
-    FFD := -1;
-    raise EConcurrencyError.CreateFmt(
-      'another ' + PROGRAM_NAME
-      + ' install is in progress (lock holder PID: %s) — '
-      + 'or the previous install crashed without releasing the lock. '
-      + 'If you''re certain no other process is running, '
-      + 'run `' + PROGRAM_NAME + ' repair` to clear the stale lock.',
-      [string(Holder)]);
-  end;
-
-  { Write our PID so a concurrent contender gets a useful diagnostic. }
-  PidLine := AnsiString(IntToStr(GetProcessID)) + AnsiChar(#10);
-  FpWrite(FFD, PidLine[1], Length(PidLine));
-end;
-
-destructor TInstallLock.Destroy;
-begin
-  if FFD >= 0 then
-  begin
-    FpClose(FFD);
-    FFD := -1;
-    LongPathDeleteFile(FPath);   { release: file existence == lock held }
-  end;
-  inherited Destroy;
-end;
-{$ELSE}
-constructor TInstallLock.Create(const APath: string);
-const
-  LOCKFILE_EXCLUSIVE_LOCK_LWPT = $00000002;
-  LOCKFILE_FAIL_IMMEDIATELY_LWPT = $00000001;
-  LOCKFILE_LOCK_OFFSET_LWPT = 1024;
-var
-  Holder, DstDir: string;
-  SL: TStringList;
-  PidLine: AnsiString;
-  BytesWritten: DWORD;
-  LastErr: DWORD;
-  Ov: TOverlapped;
-begin
-  FPath := APath;
-  FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-  DstDir := ExtractFileDir(APath);
-  if DstDir <> '' then LongPathForceDirectories(DstDir);
-
-  FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
-    Windows.GENERIC_READ or Windows.GENERIC_WRITE,
-    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
-      or Windows.FILE_SHARE_DELETE, nil, Windows.CREATE_NEW,
-    Windows.FILE_ATTRIBUTE_NORMAL, 0);
-  if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
-  begin
-    LastErr := Windows.GetLastError;
-    if (LastErr <> Windows.ERROR_FILE_EXISTS)
-      and (LastErr <> Windows.ERROR_ALREADY_EXISTS) then
-      raise ELWPTError.CreateFmt(
-        'failed to create install lock %s: %s (code %d)',
-        [APath, SysErrorMessage(LastErr), LastErr]);
-
-    Holder := 'unknown';
-    if LongPathFileExists(APath) then
-    begin
-      SL := TStringList.Create;
-      try
-        LoadProtectedStrings(SL, APath);
-        if SL.Count > 0 then Holder := Trim(SL[0]);
-      finally
-        SL.Free;
-      end;
-    end;
-    raise EConcurrencyError.CreateFmt(
-      'another ' + PROGRAM_NAME
-      + ' install is in progress (lock holder PID: %s) — '
-      + 'or the previous install crashed without releasing the lock. '
-      + 'If you''re certain no other process is running, '
-      + 'run `' + PROGRAM_NAME + ' repair` to clear the stale lock.',
-      [Holder]);
-  end;
-
-  PidLine := AnsiString(IntToStr(GetProcessID)) + AnsiChar(#10);
-  if Length(PidLine) > 0 then
-    Windows.WriteFile(FHandle, PidLine[1], Length(PidLine),
-      BytesWritten, nil);
-  Windows.CloseHandle(FHandle);
-  FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
-    Windows.GENERIC_READ,
-    Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
-      or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
-    Windows.FILE_ATTRIBUTE_NORMAL, 0);
-  if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
-    raise EConcurrencyError.CreateFmt(
-      'failed to reopen %s after creating the install lock', [APath]);
-
-  FillChar(Ov, SizeOf(Ov), 0);
-  Ov.Offset := LOCKFILE_LOCK_OFFSET_LWPT;
-  if not Windows.LockFileEx(FHandle,
-    LOCKFILE_EXCLUSIVE_LOCK_LWPT or LOCKFILE_FAIL_IMMEDIATELY_LWPT,
-    0, 1, 0, Ov) then
-  begin
-    Windows.CloseHandle(FHandle);
-    FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    LongPathDeleteFile(FPath);
-    raise EConcurrencyError.Create(
-      'another ' + PROGRAM_NAME
-      + ' install is in progress. Try again when it finishes.');
-  end;
-end;
-
-destructor TInstallLock.Destroy;
-const
-  LOCKFILE_LOCK_OFFSET_LWPT = 1024;
-var
-  Ov: TOverlapped;
-begin
-  if FHandle <> THandle(Windows.INVALID_HANDLE_VALUE) then
-  begin
-    FillChar(Ov, SizeOf(Ov), 0);
-    Ov.Offset := LOCKFILE_LOCK_OFFSET_LWPT;
-    Windows.UnlockFileEx(FHandle, 0, 1, 0, Ov);
-    Windows.CloseHandle(FHandle);
-    FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    LongPathDeleteFile(FPath);
-  end;
-  inherited Destroy;
-end;
-{$ENDIF}
-
 { FetchToCache writes the archive atomically into
   ArchivesRoot/<name>-<version>.tar.gz via the tmp dir, and sets
   UnitDir = ModulesRoot/<name>. The graph resolver is responsible
@@ -6591,7 +6397,7 @@ var
   R   : TResolution;
   Resolved : TResolvedArray;
   LockEntries, OldLock : TResolvedArray;
-  Lock : TInstallLock;
+  Lock : TLWPTInstallLock;
   ObjectStore : TLWPTImmutableObjectStore;
   ModulesRoot, ArchivesRoot, TmpRoot, CfgPath, LockPath, LockfilePath,
     ManifestPath, RollbackRoot, RecoveryFailures, RollbackFailures : string;
@@ -6649,7 +6455,7 @@ begin
     other form is refused before anything is touched. }
   if Upgrade then RequireMachineWrittenLockForm(ReadFileText(LockfilePath));
 
-  Lock := TInstallLock.Create(LockPath);
+  Lock := TLWPTInstallLock.Create(LockPath, INSTALL_LOCK_HOLDER_INSTALL);
   ObjectStore := nil;
   Consumer := nil;
   Locked := nil;

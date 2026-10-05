@@ -106,7 +106,8 @@ function RunLwpt(const AArgs: array of string;
   const ATimeoutMilliseconds: QWord): TLwptResult; overload;
 
 { RunLwpt against the test-flavoured binary (LwptTestingBinaryPath) for this
-  one call; the configured binary is restored afterwards. Use it only for
+  one call, without changing the configured binary, so concurrent RunLwpt
+  calls on other threads keep starting it. Use it only for
   runs that set an LWPT_TEST_* variable or that depend on a compile-time
   test behavior with no variable (registry installs against localhost
   HTTP contacts, which only the INSTALL_TESTING build accepts; see
@@ -217,20 +218,21 @@ begin
     LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS);
 end;
 
+function RunLwptBinary(const ABinaryPath: string;
+  const AArgs: array of string; const AInDir: string;
+  const AExtraEnv: array of string;
+  const ATimeoutMilliseconds: QWord): TLwptResult; forward;
+
+{ The binary is passed to this one run, never through the configured path,
+  so a test-binary run on one thread cannot change which binary a
+  concurrent RunLwpt starts. }
 function RunLwptTesting(const AArgs: array of string;
   const AInDir: string;
   const AExtraEnv: array of string;
   const ATimeoutMilliseconds: QWord): TLwptResult;
-var
-  SavedBinaryPath: string;
 begin
-  SavedBinaryPath := GLwptBinaryPath;
-  GLwptBinaryPath := LwptTestingBinaryPath;
-  try
-    Result := RunLwpt(AArgs, AInDir, AExtraEnv, ATimeoutMilliseconds);
-  finally
-    GLwptBinaryPath := SavedBinaryPath;
-  end;
+  Result := RunLwptBinary(LwptTestingBinaryPath, AArgs, AInDir, AExtraEnv,
+    ATimeoutMilliseconds);
 end;
 
 function ExpectedExe(const APath: string): string;
@@ -407,6 +409,15 @@ function RunLwpt(const AArgs: array of string;
   const AInDir: string;
   const AExtraEnv: array of string;
   const ATimeoutMilliseconds: QWord): TLwptResult;
+begin
+  Result := RunLwptBinary(LwptBinaryPath, AArgs, AInDir, AExtraEnv,
+    ATimeoutMilliseconds);
+end;
+
+function RunLwptBinary(const ABinaryPath: string;
+  const AArgs: array of string; const AInDir: string;
+  const AExtraEnv: array of string;
+  const ATimeoutMilliseconds: QWord): TLwptResult;
 var
   P: TProcess;
   i: Integer;
@@ -430,7 +441,7 @@ begin
 
   P := TProcess.Create(nil);
   try
-    P.Executable := LwptBinaryPath;
+    P.Executable := ABinaryPath;
     for i := 0 to High(AArgs) do P.Parameters.Add(AArgs[i]);
     P.Options := [poUsePipes];
     if AInDir <> '' then P.CurrentDirectory := AInDir;
