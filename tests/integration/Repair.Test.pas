@@ -798,7 +798,9 @@ begin
 end;
 
 { Asserts a refused repair: exit 1 naming ANeedle, the lock and a tmp
-  orphan unchanged. }
+  orphan unchanged. ALockBefore must be read in its own statement before
+  repair runs: FPC may evaluate a later argument, such as a repair run,
+  before an earlier one. }
 procedure ExpectRefusedRepair(const ALabel, ANeedle, ALockPath,
   ALockBefore, AOrphan: string; const ARun: TLwptResult);
 begin
@@ -811,7 +813,7 @@ begin
 end;
 
 procedure TRepairE2E.TestRepairRefusesLegacyLock;
-var Project, LockPath, Orphan: string;
+var Project, LockPath, Orphan, Before: string; R: TLwptResult;
 begin
   { An older binary recorded only its PID and held no record lock. A PID
     that names no local process proves nothing: that owner may run in
@@ -821,9 +823,10 @@ begin
   Orphan := Project + '/.lwpt/tmp/orphan';
   WriteTextFile(LockPath, UNUSED_PID);
   WriteTextFile(Orphan, 'residue');
+  Before := ReadBinaryFile(LockPath);
+  R := RunRepair(Project);
   ExpectRefusedRepair('repair against a PID-only lock',
-    'was written by an older ' + PROGRAM_NAME, LockPath,
-    ReadBinaryFile(LockPath), Orphan, RunRepair(Project));
+    'was written by an older ' + PROGRAM_NAME, LockPath, Before, Orphan, R);
 end;
 
 procedure TRepairE2E.TestRepairReclaimsRecordLockWithReusedPID;
@@ -873,7 +876,7 @@ begin
 end;
 
 procedure TRepairE2E.TestRepairRefusesLockWithoutOwnerRecord;
-var Project, LockPath, Orphan: string;
+var Project, LockPath, Orphan, Before: string; R: TLwptResult;
 begin
   { Its creator may still be starting, or may have died before writing a
     record; no age proves which. }
@@ -883,15 +886,17 @@ begin
   WriteTextFile(LockPath, '');
   WriteTextFile(Orphan, 'residue');
   SetFileModificationTime(LockPath, DateTimeToUnix(Now, False) - 3600, 0);
+  Before := ReadBinaryFile(LockPath);
+  R := RunRepair(Project);
   ExpectRefusedRepair('repair against a lock without an owner record',
-    'has no owner record', LockPath, ReadBinaryFile(LockPath), Orphan,
-    RunRepair(Project));
+    'has no owner record', LockPath, Before, Orphan, R);
 end;
 
 procedure TRepairE2E.TestRepairRefusesWithoutRecordLocks;
 var
-  Project, LockPath, Orphan: string;
+  Project, LockPath, Orphan, Before: string;
   Environment: TStringArray;
+  R: TLwptResult;
 begin
   { Without a record lock nothing proves the owner dead or keeps a second
     repair out, so even a dead owner's record stays. }
@@ -903,9 +908,10 @@ begin
   Environment := RepairEnvironment;
   Insert(PROJECT_NAME + '_TEST_RECORD_LOCK_UNSUPPORTED=1', Environment,
     Length(Environment));
+  Before := ReadBinaryFile(LockPath);
+  R := RunLwptTesting(['repair'], Project, Environment);
   ExpectRefusedRepair('repair without record locks', 'keeps no record locks',
-    LockPath, ReadBinaryFile(LockPath), Orphan,
-    RunLwptTesting(['repair'], Project, Environment));
+    LockPath, Before, Orphan, R);
 end;
 
 procedure TRepairE2E.TestDisplacedCreatorFails;
