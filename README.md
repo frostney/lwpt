@@ -16,7 +16,7 @@ lwpt build     compile manifest build entries   [--mode dev|release] [--clean] [
 lwpt format    format uses-clauses + identifiers   [--check]
 lwpt duplication report manifest-scoped Pascal token clones   [--json]
 lwpt test      discover, compile and run *.Test.pas files   [--jobs N] [--bail N]
-lwpt repair    reclaim install, build-session, and worker-lease residue
+lwpt repair    reclaim install, build-session, and worker-lease residue, and upgrade a v3 lockfile to v4
 lwpt registry  run a self-hosted registry origin or verified mirror, or publish to one   <init|sync|verify|rotate-key|publish|issue-token|revoke-token|serve>
 lwpt run       invoke a user-declared run task (or alias a subcommand)
 lwpt health    report Pascal complexity and optional Git hotspots   [--json] [--hotspots]
@@ -145,6 +145,7 @@ horse-mw     = { source = "HashLoad/horse", version = "^4.0.0", include = ["src/
 horse-no-tests = { source = "HashLoad/horse", version = "^4.0.0", exclude = ["tests/**", "examples/**"] }
 # Custom hosts via [sources.<name>] — gitea/forgejo/self-hosted/etc.
 mylib        = "gitea:team/mylib@^1.0.0"                # uses the [sources.gitea] entry below
+json         = "registry:json@^1.2.0"                   # signed registry record (ADR-0051); see [registries] below
 
 [sources]
 # Per-project custom prefix definitions. Each entry is an inline
@@ -154,13 +155,30 @@ mylib        = "gitea:team/mylib@^1.0.0"                # uses the [sources.gite
 # See ADR-0009 §"Custom hosts".
 gitea = { archive = "https://git.example.com/{user}/{repository}/archive/{ref}.tar.gz", git = "https://git.example.com/{user}/{repository}.git" }
 
+[registries]
+# Registry origins that `registry:` dependencies resolve through (ADR-0051).
+# Root manifest only. `default` is optional with exactly one registry.
+default = "corp"
+
+[registries.corp]
+identity   = "https://packages.example.com"        # optional; advertised by the contacts, then locked
+# The trust pin: the origin's root key. EXAMPLE VALUES ONLY: a valid,
+# throwaway pair whose private key was discarded. Replace both with your
+# origin's root pin, its `keys/ed25519-*.toml` record's key_id and public_key
+# (see docs/registry-deployment.md); key-id is "ed25519:" + the SHA-256 of
+# the raw 32-byte public key.
+key-id     = "ed25519:77790c39520108490b51dd825c9c84dc009f92ac5d1b94d68f19c9d11cca3675"
+public-key = "hex:fd49e4bc086e9b5203d162066dc459ca66478324dc3b39d4e202460c0bc3e724"
+origin     = "https://packages.example.com"        # origin contact; defaults to identity
+mirrors    = ["https://mirror.example.net/lwpt"]   # optional; tried first, in this order
+
 [build]
 # Single-binary shorthand: `[build] source = "..."` defaults the
 # entry name to [package].name and the output to build/<entry-name>.
 # Multi-binary form (used here): one inline table per entry.
 cli  = { source = "src/cli.pas", output = "bin/cli",
          target = { os = "linux", architecture = "aarch64",
-                    abi = "gnu", environment = "" } }
+                    abi = "", environment = "" } }
 tool = { source = "src/tool.pas", output = "bin/tool", compiler = "custom" }
 delphi-tool = { source = "src/tool.dpr", output = "bin/tool.exe", compiler = "delphi-win64" }
 
@@ -226,7 +244,7 @@ include = ["tests/**/*.pas"]
 exclude = ["src/legacy/Vendored.pas"]
 ```
 
-Source kinds: `skGitHost` (default `github`, with `gitlab:` / `bitbucket:` / any user-declared `[sources.<name>]` prefix), `skURL` (any `https://...`), `skLocal` (any path or `local:` prefix). Version specs go through the LWPT-canonical `Semver` unit (a node-semver port adapted from GocciaScript's earlier copy) for ranges + exact matches, then fall through to literal Git tag / commit-SHA lookup. Tag listing uses git smart-HTTP `info/refs?service=git-upload-pack` — works against any git host with one URL pattern, no JSON, no auth tokens. Custom hosts (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server) plug in via the `[sources]` table — no code change needed. See [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md).
+Source kinds: `skGitHost` (default `github`, with `gitlab:` / `bitbucket:` / any user-declared `[sources.<name>]` prefix), `skURL` (any `https://...`), `skLocal` (any path or `local:` prefix), `skWorkspace` (`workspace:*` or `workspace:^X.Y.Z`, naming a member discovered through `[workspaces]`), and `skRegistry` (`registry:[<alias>/]<package>`, selected from the registry snapshot named by the signed checkpoint of an origin declared in the root `[registries]` table; see [ADR-0051](./docs/adr/0051-registry-dependency-sources.md)). Version specs go through the LWPT-canonical `Semver` unit (a node-semver port adapted from GocciaScript's earlier copy) for ranges + exact matches, then fall through to literal Git tag / commit-SHA lookup. Tag listing uses git smart-HTTP `info/refs?service=git-upload-pack` — works against any git host with one URL pattern, no JSON, no auth tokens. Custom hosts (Gitea, Forgejo, self-hosted GitHub Enterprise / GitLab / Bitbucket Server) plug in via the `[sources]` table — no code change needed. See [ADR-0009](./docs/adr/0009-source-syntax-and-tag-resolution.md).
 
 ## Writing tests
 
@@ -325,7 +343,8 @@ story.
 - [`AGENTS.md`](./AGENTS.md) — contributor instructions for AI assistants changing LWPT itself.
 - [`docs/adr/`](./docs/adr/) — architectural decision records.
 - [`docs/spikes/`](./docs/spikes/) — point-in-time snapshots of
-  investigations (e.g. the archived HTTP registry spike that informs
+  investigations (e.g. the archived HTTP registry spike, prior art for the
+  self-hosted registry that shipped under
   [issue #29](https://github.com/frostney/lwpt/issues/29)).
 
 - [`docs/`](./docs/) — full set of canonical docs: `architecture.md`,

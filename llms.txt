@@ -1,7 +1,9 @@
 # LWPT
 
-> A Pascal toolkit for dependency management, builds, tests, CLI libraries,
-> formatting, health, duplication, run tasks, lifecycle hooks, and agent sync.
+> A Pascal toolkit for dependency management (including dependency updates and
+> a self-hosted signed package registry), builds, tests, CLI libraries,
+> formatting, health, duplication, run tasks, lifecycle hooks, repair, and
+> agent sync.
 
 Use the consumer guide when creating a project with LWPT. The contributor guide
 and AGENTS.md govern changes to LWPT itself. Run `lwpt --help` for the installed
@@ -16,6 +18,10 @@ released packages; main-branch references may describe newer behavior.
 
 ## Capabilities
 
+- [Registry dependencies](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0051-registry-dependency-sources.md): Consume `registry:` dependencies from a pinned, signed registry origin.
+- [Registry deployment](https://raw.githubusercontent.com/frostney/lwpt/main/docs/registry-deployment.md): Run a registry origin or mirror and publish packages with `lwpt registry`.
+- [Dependency updates](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0039-outdated-update-subcommands.md): `lwpt outdated` and `lwpt update` for git-host dependencies.
+- [Recovery](https://raw.githubusercontent.com/frostney/lwpt/main/docs/quick-start.md#common-errors): `lwpt repair` recovers interrupted installs and residue and upgrades a v3 lockfile.
 - [Build system](https://raw.githubusercontent.com/frostney/lwpt/main/docs/build-system.md): Build entries and lifecycle integration.
 - [Testing](https://raw.githubusercontent.com/frostney/lwpt/main/docs/testing.md): Native test programs, selectors, and compiled-test reuse.
 - [Code style](https://raw.githubusercontent.com/frostney/lwpt/main/docs/code-style.md): Formatter behavior and source scope.

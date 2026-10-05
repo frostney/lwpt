@@ -254,8 +254,8 @@ begin
       LOCKFILE, '.')
   else
     WriteLn('repair complete. Project install recovery and per-user '
-      + 'shared-cache recovery completed without touching committed project '
-      + 'archives.');
+      + 'shared-cache recovery completed; committed project state changed '
+      + 'only if an interrupted install was rolled back.');
 end;
 
 end.

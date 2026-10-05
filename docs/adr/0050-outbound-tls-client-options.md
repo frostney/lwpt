@@ -7,6 +7,11 @@
 
 ## Executive Summary
 
+> Amended by [Offline anchor evaluation](#amendment-offline-anchor-evaluation):
+> anchors are evaluated first and offline on every backend, so on Windows the
+> exclusive-anchor engine now runs before the system engine, and macOS
+> evaluates the anchors before any system-store re-evaluation.
+
 - **One options record, zero value unchanged.** `TTransportSecurityClientOptions`
   carries trust anchors, a trust mode, a PKCS#12 client identity, and
   `InsecureSkipVerify`. A zero-valued record takes exactly the code path of

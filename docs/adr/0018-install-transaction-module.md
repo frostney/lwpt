@@ -1,5 +1,10 @@
 # Install transaction module
 
+> **Amended by [ADR-0053](./0053-install-lock-ownership-and-reclamation.md):**
+> `LWPT.InstallLock` owns the install lock, and the install transaction and
+> `lwpt repair` share it. The "Lock is implementation detail" consequence
+> below describes the module when this record was accepted.
+
 `LWPT.Core.pas` previously owned manifest intake, the whole install path, and most subcommand behavior: manifest parsing, workspace discovery, install locking, tmp cleanup, dependency resolution, fetching/materialising modules and archives, frozen verification, lockfile/cfg writing, build/test/format/init/repair/run command behavior, and low-level helpers. We deepened this into dedicated modules: `LWPT.Manifest` owns manifest intent plus its path context, `LWPT.Install` owns the install transaction, `LWPT.Command.*` modules own command-level behavior, and `LWPT.Formatter` owns the formatting engine. `LWPT.Core` becomes shared project identity, error hierarchy, and low-level helpers only.
 
 ## Considered Options
@@ -20,7 +25,7 @@
 - **Formatter rename:** the formatting engine moves from `LWPT.Format` to `LWPT.Formatter`; the command-level format scope lives in `LWPT.Command.Format`.
 - **Hooks stay outside:** `[preinstall]` runs before the install transaction starts; `[postinstall]` runs after it ends. The install lock is not held while arbitrary lifecycle scripts run.
 - **Frozen stays verification-only:** `lwpt install --frozen` refuses network, refuses lockfile/cfg updates, and verifies committed toolkit state. It does not re-materialise missing modules from committed archives.
-- **Lock is implementation detail:** the install lock is owned by the install transaction module, not exposed as a caller-coordinated type. (Amended by [ADR-0053](0053-install-lock-ownership-and-reclamation.md): `LWPT.InstallLock` owns the lock, and the install transaction and `lwpt repair` share it.)
+- **Lock is implementation detail:** the install lock is owned by the install transaction module, not exposed as a caller-coordinated type.
 - **Lockfile and cfg writes move behind the seam:** non-frozen transactions write `lwpt.lock` and cfg after successful materialisation; frozen transactions write neither.
 - **Result is compact:** the transaction returns outcome data such as package count, lockfile path, and cfg path. It does not expose the full resolution graph as the public result.
 - **Types move by ownership:** `LWPT.Core.pas` keeps project identity constants, the error hierarchy, and shared helpers that are not manifest-, install-, command-, or formatter-specific. `LWPT.Manifest.pas` gets the manifest model and context. `LWPT.Install.pas` gets `TInstallTransactionResult`, install lock implementation, resolver nodes, fetch/materialise logic, lockfile read/write, cfg write, frozen verification, and `ExtractArchive`.

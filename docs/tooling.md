@@ -11,7 +11,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   `LWPT_WORKER_*` settings below. `--jobs=<n>` is the invocation ceiling; the
   machine budget remains authoritative across processes and worktrees.
 - **Worker capacity is coordinated across worktrees.** The internal worker-budget module uses per-user, reclaimable filesystem leases. Its default budget is the host's logical processor count; `LWPT_WORKER_BUDGET` overrides it.
-- **TLS is platform-native on Windows and macOS in both directions.** Clients use SChannel on Windows, SecureTransport on macOS, and system OpenSSL on other Unix. Server accept is native SChannel on Windows and requires runtime-loaded OpenSSL 3 or newer on Unix-not-Darwin; macOS servers use Network.framework. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), [ADR-0024](./adr/0024-openssl-server-tls-accept.md), and [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md).
+- **TLS is platform-native on Windows and macOS in both directions.** Clients use SChannel on Windows, SecureTransport on macOS, and system OpenSSL on other Unix. Server accept is native SChannel on Windows, Secure Transport on macOS, and requires runtime-loaded OpenSSL 3 or newer on Unix-not-Darwin. Only the registry's HTTPS listener uses Network.framework, and only on Darwin kernel 25 and newer (macOS 26 and newer); on kernel 24 and older it uses the portable listener with Secure Transport. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), [ADR-0024](./adr/0024-openssl-server-tls-accept.md), [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), and [ADR-0043](./adr/0043-self-hosted-registry-origin.md); see [`deployment.md`](./deployment.md#tls-backends-per-platform).
 - **EXDEV-rename failures fall back safely.** When `.lwpt/tmp/` and a file destination end up on different filesystems, `AtomicMoveFile` copies into an unaddressed sibling on the destination filesystem and atomically replaces the destination before deleting the source. Directory moves retain their recursive copy-then-delete fallback.
 - **Compiler outputs are session-private.** Build and test invocations write
   below the resolved project-owned build-session root; only a successful,
@@ -125,6 +125,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_CACHE_MAX_BYTES` | Aggregate regular-file byte budget for the complete per-user shared cache, including objects, references, control files, producer metadata, staging, and quarantine. This is user-owned process configuration, not a project manifest setting. `0` disables new admissions and lets repair evict all unleased objects. | `10737418240` (10 GiB) |
 | `LWPT_REGISTRY_STATE_DIR` | Root of per-user registry consumer state: accepted-state files under `origins/` and the authenticated document store under `documents/`. | the platform application-config directory's `registry/` subdirectory |
 | `LWPT_REGISTRY_STATE_MAX_BYTES` | Byte budget for evictable documents in the per-user registry document store. Documents in a stored origin state's accepted history are never evicted and never counted; beyond the budget, installs evict the least recently used of the rest. `0` keeps only accepted histories. An integer from 0 through 9223372036854775807; anything else fails registry acquisition (before any request) and `lwpt repair` with `registry_state_budget_invalid`. | `67108864` (64 MiB) |
+| `LWPT_REGISTRY_TOKEN` | Publication token read by `lwpt registry publish` when `--token-env` is not given; `--token-env=<name>` reads a different variable instead. Never written to disk or printed. | unset |
 | `LWPT_SESSION_DIR` | Build/test session base; relative values resolve from the invocation working directory and override `[lwpt].sessions-dir` | unset |
 | `LWPT_WORKER_BUDGET` | Maximum aggregate LWPT workers for this user and machine | logical processor count |
 | `LWPT_WORKER_STATE_DIR` | Override the worker coordinator state root; an explicit unwritable path fails rather than falling back | the platform application-config directory's `workers/` subdirectory, with automatic fallback to the repository's `.lwpt/workers/` when that default is unwritable |
@@ -134,14 +135,15 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `FPC_TARGET_CPU` | Requested compiler target processor. A non-host value is probed and passed as `-P<value>`; unavailable dispatch fails without fallback. | unset (host CPU) |
 | `FPC_TARGET_OS` | Requested compiler target operating system. A non-host value is probed and passed as `-T<value>`; unavailable targets fail without fallback. | unset (host OS) |
 | `LWPT_FPC` | Path to the FPC binary; overrides `PATH` lookup. The bare `FPC` variable is honoured as a fallback. | unset (`fpc` on `PATH`) |
-| `LWPT_INSTANTFPC` | Path to the InstantFPC binary; overrides `PATH` lookup. The bare `INSTANTFPC` variable is honoured as a fallback. | unset (`instantfpc` on `PATH`) |
 | `LWPT_FPC_UNIT_PATHS` | Path-separator-delimited unit directories appended as `-Fu`/`-Fi` to every compile (CI uses it for non-standard FPC installs; see the prose below) | unset |
 | `LWPT_COMPILER_TIMEOUT_MS` | Positive compiler-process timeout in milliseconds; capability probes retain their fixed 30-second deadline | 30 minutes |
 | `LWPT_HEARTBEAT_INTERVAL_MS` | Diagnostic tuning knob: build/test heartbeat interval; values are clamped to the default ceiling | `30000` |
-| `PATH` | Must contain `fpc`, `instantfpc`, `lefthook` | system default |
+| `PATH` | Must contain `fpc`, `instantfpc`, `lefthook`; `git` too for `lwpt health --hotspots`, the only command that runs it | system default |
 | `LWPT_BUILD_ENTRY` | Per-entry postbuild hook context: selected build-entry name | supplied by LWPT |
 | `LWPT_BUILD_OUTPUT` | Per-entry postbuild hook context: session-private candidate path; transform this file before publication | supplied by LWPT |
 | `LWPT_BUILD_PUBLIC_OUTPUT` | Per-entry postbuild hook context: requested manifest output path | supplied by LWPT |
+| `LWPT_PROCESS_TREE_PARENT`, `LWPT_PROCESS_TREE_STATUS_HANDLE`, `LWPT_PROCESS_TREE_CONTROL_HANDLE`, `LWPT_PROCESS_TREE_CHANNEL_TOKEN` | Internal: set by LWPT on managed child processes for cascading process-tree cancellation ([ADR-0025](./adr/0025-cascading-process-tree-cancellation.md)); do not configure | set by LWPT |
+| `TESTING_PASCAL_LIBRARY_INVENTORY`, `TESTING_PASCAL_LIBRARY_INVENTORY_EXECUTABLE`, `TESTING_PASCAL_LIBRARY_ACTIVE_CASE_FILE` | Internal: set by `lwpt test` on test programs for inventory-only listing and active-case diagnostics, read by the `testing` package; do not configure | set by `lwpt test` |
 
 ## Per-user dependency archive cache
 
@@ -273,7 +275,7 @@ Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), the `TransportSecurity` 
 - **macOS.** **SecureTransport** via Apple's framework (built into every macOS install). No Homebrew dependency, no `DYLD_LIBRARY_PATH` setup.
 - **Linux** (and other Unix-not-Darwin). **System OpenSSL** loaded at runtime via `DynLibs.LoadLibrary`. Install the distro's libssl package: `apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs` / equivalent. No special configuration beyond that — the library is usually already present (every distro pulls it in transitively via `curl`, `git`, `wget`, etc.).
 
-The per-platform selection above is the **client** (outbound) story. The **server accept** path added per [ADR-0024](./adr/0024-openssl-server-tls-accept.md) is nonblocking memory-BIO OpenSSL on Unix-not-Darwin and, per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), nonblocking native SChannel on Windows with an identical observable contract. Its primary input is a maximum 16 MiB caller-supplied PKCS#12 byte array; it privately copies and wipes those bytes, while the path overload opens once without following links and delegates. Strict validation of validity, explicit server purpose, leaf/CA constraints, and bundled chain coherence is the default; conformant leaves may omit basic constraints, while bundled issuers must carry them. `tsivPermissive` is an explicit self-signed development option and neither mode consults platform system trust. Atomic reload publishes a fully built immutable snapshot, existing connections retain their original reference, and a failed reload preserves the active snapshot. Listeners stop and join `Begin` and `Reload` callers before closing the holder; established connections can outlive it through retained snapshots. The API converts passphrases to UTF-8 and wipes temporary copies, installs intermediate certificates, and exposes WANT states plus `tssPeerClosed`. `Active` becomes true only after authentication. Retained ciphertext drains before another protocol operation, its returned span stays stable until consumed, and WANT-write plaintext is retained internally for a nil, zero-length resume call. Consumers must enforce a handshake deadline and byte budget. macOS servers use Network.framework.
+The per-platform selection above is the **client** (outbound) story. The **server accept** path added per [ADR-0024](./adr/0024-openssl-server-tls-accept.md) is nonblocking memory-BIO OpenSSL on Unix-not-Darwin, per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md) nonblocking native SChannel on Windows, and native Secure Transport on macOS, each with an identical observable contract. Its primary input is a maximum 16 MiB caller-supplied PKCS#12 byte array; it privately copies and wipes those bytes, while the path overload opens once without following links and delegates. Strict validation of validity, explicit server purpose, leaf/CA constraints, and bundled chain coherence is the default; conformant leaves may omit basic constraints, while bundled issuers must carry them. `tsivPermissive` is an explicit self-signed development option and neither mode consults platform system trust. Atomic reload publishes a fully built immutable snapshot, existing connections retain their original reference, and a failed reload preserves the active snapshot. Listeners stop and join `Begin` and `Reload` callers before closing the holder; established connections can outlive it through retained snapshots. The API converts passphrases to UTF-8 and wipes temporary copies, installs intermediate certificates, and exposes WANT states plus `tssPeerClosed`. `Active` becomes true only after authentication. Retained ciphertext drains before another protocol operation, its returned span stays stable until consumed, and WANT-write plaintext is retained internally for a nil, zero-length resume call. Consumers must enforce a handshake deadline and byte budget. Network.framework is used only by the registry's HTTPS listener on Darwin kernel 25 and newer, which bypasses this server context ([ADR-0043](./adr/0043-self-hosted-registry-origin.md); see [`deployment.md`](./deployment.md#tls-backends-per-platform)).
 
 If `lwpt install` fails on Linux with `HTTPS requires OpenSSL but it could not be loaded`, install the distro's libssl package. Windows + macOS never hit this path on the client side. Documented in [`quick-start.md`](./quick-start.md).
 
@@ -370,19 +372,18 @@ Per-entry postbuild hooks run before publication with the private candidate
 in `LWPT_BUILD_OUTPUT`, the requested path in `LWPT_BUILD_PUBLIC_OUTPUT`, and
 the entry name in `LWPT_BUILD_ENTRY`. Runtime retargeting also maps existing
 `{item.output}`-expanded hook fields to the private candidate. Hook failure
-keeps the candidate private, and hook definitions, scripts, and declared
-inputs are revalidated before publication. For dependency-free manifests, the
+keeps the candidate private, and hook definitions, commands, arguments, and
+declared inputs are revalidated before publication. For dependency-free manifests, the
 whole-build postbuild hook runs against all staged outputs and gates batch
 publication. A declared build-entry graph publishes prerequisites progressively;
-its whole-build postbuild runs once after all selected outputs publish. Unix lifecycle
-hooks use an InstantFPC cache below the owning session. Windows compiles those
-hooks directly into the same private hook root. Compiler directories use
+its whole-build postbuild runs once after all selected outputs publish.
+Lifecycle hooks are never compiled: each runs its declared `command` with its
+`args` directly as a child process. Compiler directories use
 bounded readable prefixes plus hashes of their full source identities, so
 different paths cannot collide after sanitisation.
 
 Each session holds an OS owner guard from before it becomes visible until final
-state is written. Successful completion removes compiler jobs and compiled hooks
-but retains stable job logs; `lwpt repair` removes only unlocked sessions and
+state is written. Successful completion removes compiler jobs but retains stable job logs; `lwpt repair` removes only unlocked sessions and
 conservatively retains live guards even when their state file is malformed.
 Repair also deletes retired executable images (`.lwpt-retired-*.tmp`) that a
 Windows build publication left beside a declared build output because the
@@ -450,4 +451,3 @@ it is not exposed to consumer projects.
 | Item | Status | Comes back in |
 | --- | --- | --- |
 | Markdown linting (`markdownlint-cli2` + `.markdownlint-cli2.jsonc`) | Wired in `pr.yml` docs job | Keep blocking; fix Markdown drift rather than making the job advisory |
-| Self-hosted origin-and-mirror HTTP registry | Protocol specified in [`registry-spec.md`](./registry-spec.md); implementation tracked in [issue #29](https://github.com/frostney/lwpt/issues/29) | The archived `docs/spikes/http-registry-spike.md` is consumer prior art, not the current protocol |

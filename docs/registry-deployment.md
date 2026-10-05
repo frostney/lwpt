@@ -175,8 +175,9 @@ reconfiguration for one data directory from one container at a time.
 The server prints `registry <identity> listening at <base-url>` once it has
 bound its port. It writes diagnostics, such as a failed checkpoint renewal or
 audit write, to stderr with a request ID. There is no per-request access
-log. Use a proxy's log for that. Every mutating request writes an audit
-record under `audit/` in the volume.
+log. Use a proxy's log for that. On an origin, every mutating request writes an audit
+record under `audit/` in the volume; a mirror refuses mutating requests without writing an audit
+record.
 
 **Health.** The image's `HEALTHCHECK` passes only when the local listener
 serves this data directory's discovery document under the configured base
@@ -214,7 +215,14 @@ Mirrors keep serving during the restart.
   environment holds it for the life of the process. Only the same UID and
   a sufficiently privileged root can read `/proc/<pid>/environ`, and they
   can already read the mounted password file, so the environment copy
-  exposes nothing the file does not.
+  exposes nothing the file does not. Once the TLS identity is loaded,
+  `registry serve` zeroes its own string copies of the password before
+  the listener starts; the OpenSSL backend's UTF-8 copy and the SChannel
+  backend's character array are zeroed too. That narrows the exposure
+  without removing it. Other representations are not zeroed, a known
+  limit: the environment itself, the Core Foundation password strings on
+  macOS (Secure Transport and Network.framework), and the copy of the
+  environment entry that FPC's Windows environment lookup makes.
 - **Publication tokens.** Issue one per publisher and scope it to package
   patterns. The token is printed once and stored only as a hash:
 
@@ -342,7 +350,7 @@ reference in [`architecture.md`](./architecture.md).
 | Path | Contents | Notes |
 | --- | --- | --- |
 | `registry.toml` | Identity, base URL, listener, TLS paths, mirror pin | Needed to open the store. Back up the read-only host copy too; it must match the volume's. |
-| `state/current.toml` | The activation pointer: sequence, snapshot, checkpoint, signature, clock floor | Defines what the registry serves |
+| `state/current.toml` | The activation pointer: sequence, snapshot, checkpoint, signature; a mirror also records its trust pin, last sync, and clock floor | Defines what the registry serves |
 | `keys/` | Public key records and the **private signing seeds** | Secret. Encrypt the backup and preserve owner-only permissions. |
 | `auth/tokens/` | Token metadata and secret hashes | Owner-only. A restore reinstates the tokens it contains. |
 | `objects/`, `records/`, `snapshots/`, `checkpoints/`, `rotations/`, `proofs/` | Immutable, content-addressed, and signed content | Never rewritten, never pruned on an origin |
@@ -434,6 +442,10 @@ and installation verify the whole chain. The 64 MiB budget is therefore
 reached after roughly 1,300 published versions or yank changes on one
 origin. This figure is estimated from the document sizes, not measured.
 Beyond it, the origin refuses the publication that would exceed the budget.
+That refusal currently reaches the client as a retryable HTTP 503
+`temporary_failure`, so `lwpt registry publish` makes all five attempts before
+failing with `temporary_failure` rather than a capacity-specific code; a
+distinct code is follow-up work.
 Verification time grows with history too. Plan capacity accordingly. A
 retention or checkpointed-history design would need a protocol change.
 

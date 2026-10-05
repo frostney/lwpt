@@ -64,7 +64,6 @@ type
 function  TestSeamValue(const AName: string): string;
 {$ENDIF}
 function  FPCExecutable: string;
-function  InstantFPCExecutable: string;
 procedure AddEnvUnitPathParameters(AParameters: TStrings);
 function  NativePath(const APath: string): string;
 function  SanitisePathSegment(const AValue: string): string;
@@ -475,7 +474,7 @@ end;
 
 function FPCExecutable: string;
 begin
-  Result := SysUtils.GetEnvironmentVariable('LWPT_FPC');
+  Result := SysUtils.GetEnvironmentVariable(PROJECT_NAME + '_FPC');
   if Result = '' then
     Result := SysUtils.GetEnvironmentVariable('FPC');
   if Result <> '' then
@@ -484,20 +483,6 @@ begin
   Result := 'fpc.exe';
   {$ELSE}
   Result := 'fpc';
-  {$ENDIF}
-end;
-
-function InstantFPCExecutable: string;
-begin
-  Result := SysUtils.GetEnvironmentVariable('LWPT_INSTANTFPC');
-  if Result = '' then
-    Result := SysUtils.GetEnvironmentVariable('INSTANTFPC');
-  if Result <> '' then
-    Exit;
-  {$IFDEF MSWINDOWS}
-  Result := 'instantfpc.exe';
-  {$ELSE}
-  Result := 'instantfpc';
   {$ENDIF}
 end;
 
@@ -517,7 +502,7 @@ var
   Raw, Part : string;
   StartAt, i : Integer;
 begin
-  Raw := SysUtils.GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
+  Raw := SysUtils.GetEnvironmentVariable(PROJECT_NAME + '_FPC_UNIT_PATHS');
   if Raw = '' then
     Exit;
 

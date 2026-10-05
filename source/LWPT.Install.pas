@@ -1870,7 +1870,8 @@ var
 begin
   if not LongPathFileExists(APath) then
     raise ELockfileError.CreateFmt(
-      'lockfile not found at %s. Run `lwpt install` to generate it.',
+      'lockfile not found at %s. Run `' + PROGRAM_NAME
+      + ' install` to generate it.',
       [APath]);
 
   SL := TStringList.Create;
@@ -1883,7 +1884,8 @@ begin
     except
       on E: ETOMLParseError do
         raise ELockfileError.CreateFmt(
-          'lockfile %s is corrupt: %s. Delete it and run `lwpt install` '
+          'lockfile %s is corrupt: %s. Delete it and run `' + PROGRAM_NAME
+          + ' install` '
           + 'to regenerate from the manifest.', [APath, E.Message]);
     end;
   finally
@@ -3200,7 +3202,8 @@ begin
            Item.CustomSources, AProjectRoot) then
         raise EVerifyError.CreateFmt(
           '[frozen] requirements for "%s" name different canonical '
-          + 'sources. Run `lwpt install` without --frozen to resolve '
+          + 'sources. Run `' + PROGRAM_NAME
+          + ' install` without --frozen to resolve '
           + 'the graph again.', [Item.Dep.Name]);
       Continue;   { already expanded; constraint recorded above }
     end;
@@ -3214,8 +3217,9 @@ begin
     if not LongPathDirectoryExists(UnitDir) then
       raise EFetchError.CreateFmt(
         '[frozen] missing extracted module for "%s" at %s '
-        + '(required by %s). Run `lwpt install` without --frozen to '
-        + 'fetch, or restore the committed .lwpt/modules tree.',
+        + '(required by %s). Run `' + PROGRAM_NAME
+        + ' install` without --frozen to '
+        + 'fetch, or restore the committed ' + MODULES_DIR + ' tree.',
         [Item.Dep.Name, UnitDir, Item.RequiredBy]);
     { LWPT never installs links: extraction materializes archive links as
       copies, and local copies read file links through and drop directory
@@ -3477,17 +3481,20 @@ var
     if not FindPriorLock(ANode, Entry) then
       raise EVerifyError.CreateFmt(
         '[offline] dependency "%s" has no compatible lock entry for '
-        + 'its current source. Run `lwpt install` online to resolve it.',
+        + 'its current source. Run `' + PROGRAM_NAME
+        + ' install` online to resolve it.',
         [ANode.Name]);
     if not PriorSelectionSatisfies(ANode, Entry) then
       raise EVerifyError.CreateFmt(
         '[offline] locked version "%s" no longer satisfies the manifest '
-        + 'requirements for "%s". Run `lwpt install` online to resolve '
+        + 'requirements for "%s". Run `' + PROGRAM_NAME
+        + ' install` online to resolve '
         + 'the changed graph.', [Entry.Version, ANode.Name]);
     if Entry.ArchiveHash = '' then
       raise EVerifyError.CreateFmt(
         '[offline] lock entry for "%s" has no archive hash. Run '
-        + '`lwpt install` online to regenerate compatible locked evidence.',
+        + '`' + PROGRAM_NAME
+        + ' install` online to regenerate compatible locked evidence.',
         [ANode.Name]);
     AState.RefName := Entry.Version;
     AState.CommitSHA := LockedCommitIdentity(Entry);
@@ -3545,7 +3552,8 @@ var
       if not AUpgrade then
         raise EVerifyError.CreateFmt(
           '[offline] archive hash mismatch for "%s": disk=%s lockfile=%s. '
-          + 'Restore the committed archive or run `lwpt install` online.',
+          + 'Restore the committed archive or run `' + PROGRAM_NAME
+          + ' install` online.',
           [ANode.Name, ActualHash, Entry.ArchiveHash]);
     end;
     Failure := omfObjectMissing;
@@ -3575,7 +3583,7 @@ var
     raise EFetchError.CreateFmt(
       '[offline] verified archive for "%s" is unavailable '
       + '(expected %s; cache result: %s). Restore the committed archive '
-      + 'or run `lwpt install` online to seed the cache.',
+      + 'or run `' + PROGRAM_NAME + ' install` online to seed the cache.',
       [ANode.Name, Entry.ArchiveHash,
        ObjectMaterializeFailureName(Failure)]);
   end;
@@ -3829,8 +3837,8 @@ var
   { The locked archive digest that a fresh download for ANode must
     reproduce, or '' when the selection is not the locked identity. Same
     commit means same bytes. A lock without a recorded commit is compared by
-    ref name, which is how a tag moved behind an early schema-v3 lock is
-    caught. }
+    ref name, which is how a tag moved behind a v4 lock without the optional
+    identity fields (as repair carries from early v3) is caught. }
   function ExpectedVerifyHash(const ANode: TResolveNode;
     out AContext: string): string;
   var Entry: TResolved; LockedCommit: string;
@@ -3897,8 +3905,8 @@ var
     RepoURL := GitRepoURL(ANode.Dep, ANode.CustomSources);
     Result := VerifiedPins.Values[RepoURL + '@' + LowerCase(ACommit)];
     if Result <> '' then Exit;
-    { Only an entry that records its proof is trusted; a v3 entry without
-      `reachableFrom` predates proofs and is proven now. }
+    { Only an entry that records its proof is trusted; an entry without
+      `reachableFrom` (carried from a pre-proof v3 lock) is proven now. }
     if FindPriorLock(ANode, Entry)
        and SameText(LockedCommitIdentity(Entry), ACommit)
        and IsProvingRefName(Entry.ReachableFrom) then
@@ -4971,14 +4979,16 @@ begin
     if not FindLockEntry(AResolved[i].Name, Lock) then
       raise EVerifyError.CreateFmt(
         '[frozen] manifest declares "%s" but lockfile has no entry. '
-        + 'Run `lwpt install` (without --frozen) to regenerate the lockfile.',
+        + 'Run `' + PROGRAM_NAME
+        + ' install` (without --frozen) to regenerate the lockfile.',
         [AResolved[i].Name]);
 
     if AResolved[i].Hash <> Lock.Hash then
       raise EVerifyError.CreateFmt(
         '[frozen] tree hash mismatch for "%s": disk=%s lockfile=%s. '
         + 'The modules tree was modified after install. Restore from '
-        + 'the committed .lwpt/modules/ or re-run `lwpt install`.',
+        + 'the committed ' + MODULES_DIR + '/ or re-run `' + PROGRAM_NAME
+        + ' install`.',
         [AResolved[i].Name, AResolved[i].Hash, Lock.Hash]);
 
     { Archive hash check, but only when both sides have one. Local
@@ -4988,8 +4998,9 @@ begin
       if AResolved[i].ArchiveHash <> Lock.ArchiveHash then
         raise EVerifyError.CreateFmt(
           '[frozen] archive hash mismatch for "%s": disk=%s lockfile=%s. '
-          + 'The .lwpt/archives/ tarball was modified after install. '
-          + 'Restore it from version control or re-run `lwpt install`.',
+          + 'The ' + ARCHIVES_DIR + '/ tarball was modified after install. '
+          + 'Restore it from version control or re-run `' + PROGRAM_NAME
+          + ' install`.',
           [AResolved[i].Name, AResolved[i].ArchiveHash, Lock.ArchiveHash]);
   end;
 
@@ -4999,7 +5010,8 @@ begin
       raise EVerifyError.CreateFmt(
         '[frozen] lockfile has "%s" but no manifest dep + child manifest '
         + 'reaches it. The dep was removed from the manifest tree but '
-        + 'the lockfile not regenerated. Run `lwpt install` without --frozen.',
+        + 'the lockfile not regenerated. Run `' + PROGRAM_NAME
+        + ' install` without --frozen.',
         [ALockEntries[i].Name]);
 end;
 
@@ -5045,7 +5057,8 @@ begin
     if not FindLockEntry(AResolved[i].Name, Lock) then
       raise EVerifyError.CreateFmt(
         '[offline] manifest graph reaches "%s" but the lockfile has no '
-        + 'entry. Run `lwpt install` online to resolve the changed graph.',
+        + 'entry. Run `' + PROGRAM_NAME
+        + ' install` online to resolve the changed graph.',
         [AResolved[i].Name]);
     if ((Lock.SourceIdentity <> '')
         and (AResolved[i].SourceIdentity <> Lock.SourceIdentity))
@@ -5053,14 +5066,14 @@ begin
         and (AResolved[i].SrcOriginal <> Lock.SrcOriginal)) then
       raise EVerifyError.CreateFmt(
         '[offline] source or extraction policy changed for "%s". Run '
-        + '`lwpt install` online to resolve the changed graph.',
+        + '`' + PROGRAM_NAME + ' install` online to resolve the changed graph.',
         [AResolved[i].Name]);
     if (Lock.ConstraintFingerprint <> '')
        and (AResolved[i].ConstraintFingerprint <>
          Lock.ConstraintFingerprint) then
       raise EVerifyError.CreateFmt(
         '[offline] accumulated constraints changed for "%s". Run '
-        + '`lwpt install` online to resolve the changed graph.',
+        + '`' + PROGRAM_NAME + ' install` online to resolve the changed graph.',
         [AResolved[i].Name]);
     LockCommit := LockedCommitIdentity(Lock);
     if (AResolved[i].Version <> Lock.Version)
@@ -5069,7 +5082,7 @@ begin
        or (AResolved[i].RegistryRecord <> Lock.RegistryRecord) then
       raise EVerifyError.CreateFmt(
         '[offline] locked resolution identity changed for "%s". Run '
-        + '`lwpt install` online to resolve the changed graph.',
+        + '`' + PROGRAM_NAME + ' install` online to resolve the changed graph.',
         [AResolved[i].Name]);
     { The v3-to-v4 upgrade never consults a v3 computedHash: it is the
       value the #352 flaw lets a forged tree match (ADR-0052). A local or
@@ -5098,7 +5111,8 @@ begin
     if not GraphHasEntry(ALockEntries[i].Name) then
       raise EVerifyError.CreateFmt(
         '[offline] lockfile has "%s" but the manifest graph does not '
-        + 'reach it. Run `lwpt install` online to resolve the changed graph.',
+        + 'reach it. Run `' + PROGRAM_NAME
+        + ' install` online to resolve the changed graph.',
         [ALockEntries[i].Name]);
 end;
 
@@ -6492,7 +6506,8 @@ begin
       OldLock := LoadLockfile(LockfilePath, Upgrade);
     if Offline and not LongPathFileExists(LockfilePath) then
       raise ELockfileError.CreateFmt(
-        '[offline] lockfile not found at %s. Run `lwpt install` online '
+        '[offline] lockfile not found at %s. Run `' + PROGRAM_NAME
+        + ' install` online '
         + 'to resolve and lock dependencies first.', [LockfilePath]);
 
     { --frozen and --offline bind registry identities from the manifest
@@ -6584,13 +6599,15 @@ begin
           if CurrentSourceIdentity <> FrozenLock.SourceIdentity then
             raise EVerifyError.CreateFmt(
               '[frozen] source or extraction policy changed for "%s". '
-              + 'Run `lwpt install` without --frozen to resolve again.',
+              + 'Run `' + PROGRAM_NAME
+              + ' install` without --frozen to resolve again.',
               [Resolved[i].Name]);
         end
         else if FrozenLock.SrcOriginal <> Resolved[i].SrcOriginal then
           raise EVerifyError.CreateFmt(
             '[frozen] legacy v3 source evidence is ambiguous for "%s". '
-            + 'Run `lwpt install` without --frozen to regenerate the '
+            + 'Run `' + PROGRAM_NAME
+            + ' install` without --frozen to regenerate the '
             + 'machine-written lockfile; do not edit it.',
             [Resolved[i].Name]);
         if (FrozenLock.ConstraintFingerprint <> '')
@@ -6598,7 +6615,8 @@ begin
              FrozenLock.ConstraintFingerprint) then
           raise EVerifyError.CreateFmt(
             '[frozen] accumulated constraints changed for "%s". '
-            + 'Run `lwpt install` without --frozen to resolve again.',
+            + 'Run `' + PROGRAM_NAME
+            + ' install` without --frozen to resolve again.',
             [Resolved[i].Name]);
         Resolved[i].Version := FrozenLock.Version;
         Resolved[i].CommitSHA := FrozenLock.CommitSHA;
@@ -6621,7 +6639,8 @@ begin
             raise EVerifyError.CreateFmt(
               '[frozen] legacy v3 lock entry "%s" combines a mutable '
               + 'or named ref with a SHA constraint but records no '
-              + 'authoritative commit identity. Run `lwpt install` '
+              + 'authoritative commit identity. Run `' + PROGRAM_NAME
+              + ' install` '
               + 'without --frozen to regenerate the machine-written '
               + 'lockfile; do not edit it.', [Resolved[i].Name]);
         end;
@@ -6653,7 +6672,8 @@ begin
                  and (FrozenLock.Version <> R.Nodes[i].Specs[j]) then
                 raise EVerifyError.CreateFmt(
                   '[frozen] legacy v3 locked ref "%s" does not prove '
-                  + 'literal ref "%s" for "%s". Run `lwpt install` '
+                  + 'literal ref "%s" for "%s". Run `' + PROGRAM_NAME
+                  + ' install` '
                   + 'without --frozen to regenerate authoritative '
                   + 'identity evidence.', [FrozenLock.Version,
                   R.Nodes[i].Specs[j], Resolved[i].Name]);

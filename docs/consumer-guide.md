@@ -233,6 +233,10 @@ Generated state belongs to `lwpt install`; do not hand-edit its contents.
 | --- | --- | --- |
 | Initialize or adopt a project | `lwpt init`, `lwpt init --adopt` | `lwpt init --help` |
 | Resolve, add, or remove dependencies | `lwpt install`, `lwpt add`, `lwpt remove` | [Manifest and packages](../README.md#manifest) |
+| Find and apply newer git-host dependency versions | `lwpt outdated`, `lwpt update` | [Outdated and update](adr/0039-outdated-update-subcommands.md) |
+| Consume packages from a self-hosted registry | `registry:` dependencies and a root `[registries]` table | [Registry dependencies](adr/0051-registry-dependency-sources.md) |
+| Run a registry origin or mirror, or publish to one | `lwpt registry` | [Registry deployment](registry-deployment.md) |
+| Recover from an interrupted install or upgrade a v3 lockfile | `lwpt repair` | `lwpt repair --help` |
 | Parse application arguments and provide help | `cli` package | [CLI public types](../packages/cli/source/CLI.Options.pas), [subcommands](../packages/cli/source/CLI.Subcommands.pas) |
 | Build selected binaries | `lwpt build` | [Build system](build-system.md) |
 | Run native tests | `testing` package and `lwpt test` | [Testing](testing.md) |

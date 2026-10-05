@@ -37,6 +37,7 @@ uses
   SysUtils,
 
   LWPT.Core,
+  LWPT.Registry.Crypto,
   LWPT.Registry.Filesystem;
 
 {$linkframework Network}
@@ -1114,13 +1115,6 @@ begin
   end;
 end;
 
-procedure WipeAnsiString(var AValue: AnsiString);
-begin
-  if Length(AValue) > 0 then
-    FillChar(AValue[1], Length(AValue) * SizeOf(AnsiChar), 0);
-  AValue := '';
-end;
-
 procedure WriteTemporaryKeychainCleanupReport(const AMessage: string);
 begin
   WriteLn(StdErr, AMessage);
@@ -1365,12 +1359,9 @@ begin
   finally
     if Length(Bytes) > 0 then FillChar(Bytes[0], Length(Bytes), 0);
     Bytes := nil;
-    if Length(EncodedPassphrase) > 0 then
-      FillChar(EncodedPassphrase[1], Length(EncodedPassphrase)
-        * SizeOf(AnsiChar), 0);
-    EncodedPassphrase := '';
-    WipeAnsiString(KeychainPassphrase);
-    WipeAnsiString(KeychainPathNonce);
+    WipeSecretString(EncodedPassphrase);
+    WipeSecretString(KeychainPassphrase);
+    WipeSecretString(KeychainPathNonce);
     FillChar(KeychainPasswordRandom, SizeOf(KeychainPasswordRandom), 0);
     FillChar(KeychainPathRandom, SizeOf(KeychainPathRandom), 0);
     if IdentityReference <> nil then CFRelease(IdentityReference);
@@ -1578,9 +1569,7 @@ begin
     Server := TNetworkFrameworkRegistryServer.Create(AStore, APKCS12Path,
       APassphrase, AStopFlag, AHandler);
   finally
-    if Length(APassphrase) > 0 then
-      FillChar(APassphrase[1], Length(APassphrase) * SizeOf(Char), 0);
-    APassphrase := '';
+    WipeSecretString(APassphrase);
   end;
   try
     Server.Run;
@@ -1594,13 +1583,14 @@ initialization
 
 {$ELSE}
 
+uses
+  LWPT.Registry.Crypto;
+
 procedure RunNetworkFrameworkRegistryServer(AStore: TLWPTRegistryStore;
   const APKCS12Path: string; var APassphrase: string; AStopFlag: PBoolean;
   AHandler: TLWPTRegistryMutationHandler);
 begin
-  if Length(APassphrase) > 0 then
-    FillChar(APassphrase[1], Length(APassphrase) * SizeOf(Char), 0);
-  APassphrase := '';
+  WipeSecretString(APassphrase);
   raise ELWPTRegistryError.CreateStable('tls_unavailable',
     'Network.framework registry transport is available only on macOS');
 end;
