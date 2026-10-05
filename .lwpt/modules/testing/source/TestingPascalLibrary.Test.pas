@@ -156,6 +156,17 @@ var
   MarkerRunner: TTestRunner;
   MarkerResult: TTestResult;
 begin
+  { The parent strips its inventory request from this child's environment.
+    An inherited request would make this same executable list its cases
+    instead of running them, or add a second record to the parent's output. }
+  if (GetEnvironmentVariable(TEST_INVENTORY_ENVIRONMENT) <> '')
+     or (GetEnvironmentVariable(
+       TEST_INVENTORY_EXECUTABLE_ENVIRONMENT) <> '') then
+  begin
+    WriteLn(ErrOutput, 'FATAL: active-case marker child inherited the ',
+      'inventory request');
+    Halt(22);
+  end;
   ActiveCaseMarkerPath := GetEnvironmentVariable(
     TEST_ACTIVE_CASE_FILE_ENVIRONMENT);
   MarkerRunner := TTestRunner.Create;
@@ -172,8 +183,26 @@ begin
   end;
 end;
 
+function IsInventoryRequestEntry(const AEntry: string): Boolean;
+var
+  Name: string;
+  Separator: Integer;
+begin
+  Separator := Pos('=', AEntry);
+  if Separator = 0 then Name := AEntry
+  else Name := Copy(AEntry, 1, Separator - 1);
+  {$IFDEF MSWINDOWS}
+  Result := SameText(Name, TEST_INVENTORY_ENVIRONMENT)
+    or SameText(Name, TEST_INVENTORY_EXECUTABLE_ENVIRONMENT);
+  {$ELSE}
+  Result := (Name = TEST_INVENTORY_ENVIRONMENT)
+    or (Name = TEST_INVENTORY_EXECUTABLE_ENVIRONMENT);
+  {$ENDIF}
+end;
+
 procedure TestActiveCaseMarkerProtocol;
 var
+  EnvironmentEntry: string;
   EnvironmentIndex: Integer;
   MarkerProcess: TProcess;
 begin
@@ -184,7 +213,11 @@ begin
     MarkerProcess.Executable := ParamStr(0);
     MarkerProcess.Parameters.Add(ACTIVE_CASE_CHILD_ARGUMENT);
     for EnvironmentIndex := 1 to GetEnvironmentVariableCount do
-      MarkerProcess.Environment.Add(GetEnvironmentString(EnvironmentIndex));
+    begin
+      EnvironmentEntry := GetEnvironmentString(EnvironmentIndex);
+      if not IsInventoryRequestEntry(EnvironmentEntry) then
+        MarkerProcess.Environment.Add(EnvironmentEntry);
+    end;
     MarkerProcess.Environment.Values[TEST_ACTIVE_CASE_FILE_ENVIRONMENT] :=
       ActiveCaseMarkerPath;
     MarkerProcess.Options := [poWaitOnExit];
@@ -209,7 +242,11 @@ begin
     Halt(0);
   end;
   TestInventoryProtocol;
-  TestActiveCaseMarkerProtocol;
+  { Inventory-only mode lists registrations without running test bodies, and
+    the marker check spawns a child process, so it is a test body. The
+    inventory request itself is consumed by the first Runner.Run below. }
+  if CurrentTestInventoryMode <> TEST_INVENTORY_MODE_ONLY then
+    TestActiveCaseMarkerProtocol;
   WriteLn('TestingPascalLibrary canary starting');
 
   if not Assigned(TestRunnerProgram) then
