@@ -175,10 +175,13 @@ function RunChildCommand(const ADirectory, AExecutable: string;
 
   The settle period exists because membership lags exit. Windows documents
   that a job's ActiveProcesses count drops only once a terminated process
-  has exited and all references to it are released, and a member can stay
-  counted, or listed, briefly after the call that ended it returned. A
-  console host or a just-reaped descendant can likewise end a moment after
-  the child. Members that have already exited never count. Members that
+  has exited and all references to it are released, so a member can stay
+  counted, or listed, briefly after the call that ended it returned. Native
+  CI reported members just after lwpt children that start no process had
+  returned; which processes they were is not established. A console host
+  or a just-reaped descendant could likewise end a moment after the child.
+  Members whose process object is signalled have exited and never count
+  (ProcessHandleHasExited on Windows, procfs state on Linux). Members that
   still run are polled until none remain or the period ends, so the result
   is immediate when the tree is empty and costs at most the period when it
   is not. A descendant that outlives the child by less than the period is
@@ -201,6 +204,15 @@ function ReapChild(AProcess: TProcess;
   AProcess must not have been executed and must not run suspended. }
 procedure ExecuteOwnedChild(AProcess: TProcess;
   const AOwnProcessGroup: Boolean = False);
+
+{$IFDEF MSWINDOWS}
+{ Whether the process behind AHandle, which must carry SYNCHRONIZE, has
+  exited, decided by the signalled process object. An exit code cannot
+  decide it: a process may exit with STILL_ACTIVE (259), the code
+  GetExitCodeProcess also reports for one that still runs. False when the
+  state cannot be read, so an uninspectable process counts as running. }
+function ProcessHandleHasExited(const AHandle: THandle): Boolean;
+{$ENDIF}
 
 {$IFDEF LINUX}
 { Reads a process's state, parent, and process group from procfs. False
@@ -846,6 +858,11 @@ begin
 end;
 
 {$IFDEF MSWINDOWS}
+function ProcessHandleHasExited(const AHandle: THandle): Boolean;
+begin
+  Result := Windows.WaitForSingleObject(AHandle, 0) = Windows.WAIT_OBJECT_0;
+end;
+
 { 'pid N (image path)' for an open job member. }
 function JobMemberDescription(const AHandle: THandle;
   const APID: PtrUInt): string;
@@ -882,7 +899,7 @@ var
   Id: PtrUInt;
   Member: THandle;
   InJob: BOOL;
-  ExitCode, ErrorCode: DWORD;
+  ErrorCode: DWORD;
 
   procedure Add(const AText: string);
   begin
@@ -913,8 +930,8 @@ begin
     { The exited child: its TProcess holds its handle, so its PID cannot
       name another process yet. }
     if Id = AChildPID then Continue;
-    Member := Windows.OpenProcess(Windows.PROCESS_QUERY_LIMITED_INFORMATION,
-      False, DWORD(Id));
+    Member := Windows.OpenProcess(Windows.PROCESS_QUERY_LIMITED_INFORMATION
+      or Windows.SYNCHRONIZE, False, DWORD(Id));
     if Member = 0 then
     begin
       ErrorCode := Windows.GetLastError;
@@ -928,9 +945,7 @@ begin
       { A PID freed and reused since the listing names an outsider. }
       if IsTestProcessInJob(Member, AJob, InJob) and not InJob then
         Continue;
-      if Windows.GetExitCodeProcess(Member, ExitCode)
-         and (ExitCode <> Windows.STILL_ACTIVE) then
-        Continue;
+      if ProcessHandleHasExited(Member) then Continue;
       Add(JobMemberDescription(Member, Id));
     finally
       Windows.CloseHandle(Member);

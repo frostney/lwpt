@@ -2,7 +2,8 @@
   against real children of this executable.
 
   Each case re-runs this program in a child mode: one that writes past pipe
-  capacity to both streams, one that sleeps, one that leaves a descendant
+  capacity to both streams, one that sleeps, one that exits with a given
+  code (259, Windows' STILL_ACTIVE), one that leaves a descendant
   running after it returns, one that leaves a descendant that ends shortly
   after it, and one that holds a sleeping descendant. The survivor cases
   are the falsification of process-tree ownership: an owned child that
@@ -23,6 +24,9 @@ uses
   Classes,
   Process,
   SysUtils,
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
 
   TestingPascalLibrary,
   Tests.LwptSubprocess,
@@ -35,6 +39,9 @@ const
   SleepSwitch = '--process-support-sleep';
   SurvivorSwitch = '--process-support-spawn-survivor';
   BriefSwitch = '--process-support-spawn-brief';
+  ExitSwitch = '--process-support-exit';
+  { Windows' STILL_ACTIVE: an exit code that reads as still running. }
+  StillActiveExitCode = 259;
   HolderSwitch = '--process-support-hold-descendant';
   { Past every platform's anonymous-pipe capacity (64 KiB on Linux and
     macOS, a few KiB to 64 KiB on Windows). }
@@ -68,6 +75,7 @@ type
     procedure TestFinishChildReportsASurvivingDescendant;
     procedure TestFinishChildToleratesADescendantEndingWithinTheSettle;
     procedure TestReapChildEndsAnOwnedTreesSurvivor;
+    procedure TestProcessExitingWithStillActiveHasExited;
     procedure TestRunLwptReportsASurvivingDescendant;
   end;
 
@@ -137,6 +145,8 @@ begin
     Descendant.Free;
     Halt(0);
   end;
+  if (ParamCount = 2) and (ParamStr(1) = ExitSwitch) then
+    Halt(StrToInt(ParamStr(2)));
   if (ParamCount = 2) and (ParamStr(1) = BriefSwitch) then
   begin
     { Returns at once; its descendant ends shortly after, like a console
@@ -407,6 +417,43 @@ begin
   end;
 end;
 
+procedure TProcessSupportTests.TestProcessExitingWithStillActiveHasExited;
+{$IFDEF MSWINDOWS}
+var
+  Exited, Sleeper: TProcess;
+  ExitCode: DWORD;
+begin
+  { Survivor classification of a job member: a process that exits with
+    STILL_ACTIVE must count as gone, so it cannot be reported as running
+    while the job still lists it. The live sleeper is the control. }
+  Exited := SelfChild([ExitSwitch, IntToStr(StillActiveExitCode)], []);
+  Sleeper := SelfChild([SleepSwitch, IntToStr(DescendantSleepMilliseconds)],
+    []);
+  try
+    Exited.Execute;
+    Sleeper.Execute;
+    Expect<Boolean>(Windows.WaitForSingleObject(Exited.ProcessHandle,
+      CaseTimeoutMilliseconds) = Windows.WAIT_OBJECT_0).ToBe(True);
+    ExitCode := 0;
+    Expect<Boolean>(Windows.GetExitCodeProcess(Exited.ProcessHandle,
+      ExitCode)).ToBe(True);
+    { The ambiguity under test: the exit code reads as still running. }
+    Expect<Integer>(Integer(ExitCode)).ToBe(StillActiveExitCode);
+    Expect<Boolean>(ProcessHandleHasExited(Exited.ProcessHandle))
+      .ToBe(True);
+    Expect<Boolean>(ProcessHandleHasExited(Sleeper.ProcessHandle))
+      .ToBe(False);
+  finally
+    TerminateChildProcess(Sleeper);
+    Sleeper.Free;
+    Exited.Free;
+  end;
+end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
 procedure TProcessSupportTests.TestRunLwptReportsASurvivingDescendant;
 var
   DescendantPID: Integer;
@@ -460,6 +507,14 @@ begin
   {$ENDIF}
   Test('ReapChild ends the surviving descendant of an exited owned child',
     TestReapChildEndsAnOwnedTreesSurvivor);
+  {$IFDEF MSWINDOWS}
+  Test('a process that exits with STILL_ACTIVE counts as exited',
+    TestProcessExitingWithStillActiveHasExited);
+  {$ELSE}
+  Skip('a process that exits with STILL_ACTIVE counts as exited',
+    TestProcessExitingWithStillActiveHasExited,
+    'STILL_ACTIVE is a Windows exit-code ambiguity');
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   Test('RunLwpt reports a descendant that outlives its child',
     TestRunLwptReportsASurvivingDescendant);
