@@ -18,7 +18,51 @@ type
     procedure TestSmallOrderForgeryIsRejected;
     procedure TestNonCanonicalPointEncodingsAreRejected;
     procedure TestSHA512EmptyVector;
+    procedure TestWipeOverwritesOnlyOwnedAnsiBuffers;
+    procedure TestWipeOverwritesOnlyOwnedUnicodeBuffers;
   end;
+
+procedure TRegistryCryptoContract.TestWipeOverwritesOnlyOwnedAnsiBuffers;
+var
+  Literal, Other, Secret: AnsiString;
+begin
+  Secret := 'tls-password-' + AnsiString(IntToStr(Random(1000)));
+  UniqueString(Secret);
+  Expect<Boolean>(WipeSecretString(Secret)).ToBe(True);
+  Expect<Integer>(Length(Secret)).ToBe(0);
+
+  Secret := 'shared-password-' + AnsiString(IntToStr(Random(1000)));
+  Other := Secret;
+  Expect<Boolean>(WipeSecretString(Secret)).ToBe(False);
+  Expect<Integer>(Length(Secret)).ToBe(0);
+  Expect<Boolean>(Pos(AnsiString('shared-password-'), Other) = 1).ToBe(True);
+
+  Literal := 'read-only literal';
+  Expect<Boolean>(WipeSecretString(Literal)).ToBe(False);
+  Expect<Integer>(Length(Literal)).ToBe(0);
+  Expect<Boolean>(WipeSecretString(Literal)).ToBe(False);
+end;
+
+procedure TRegistryCryptoContract.TestWipeOverwritesOnlyOwnedUnicodeBuffers;
+var
+  Literal, Other, Secret: UnicodeString;
+begin
+  Secret := 'tls-password-' + UnicodeString(IntToStr(Random(1000)));
+  UniqueString(Secret);
+  Expect<Boolean>(WipeSecretString(Secret)).ToBe(True);
+  Expect<Integer>(Length(Secret)).ToBe(0);
+
+  Secret := 'shared-password-' + UnicodeString(IntToStr(Random(1000)));
+  Other := Secret;
+  Expect<Boolean>(WipeSecretString(Secret)).ToBe(False);
+  Expect<Integer>(Length(Secret)).ToBe(0);
+  Expect<Boolean>(Pos(UnicodeString('shared-password-'), Other) = 1)
+    .ToBe(True);
+
+  Literal := 'read-only literal';
+  Expect<Boolean>(WipeSecretString(Literal)).ToBe(False);
+  Expect<Integer>(Length(Literal)).ToBe(0);
+end;
 
 procedure TRegistryCryptoContract.TestRFC8032EmptyMessageVector;
 var
@@ -149,6 +193,10 @@ begin
   Test('noncanonical field encodings are rejected',
     TestNonCanonicalPointEncodingsAreRejected);
   Test('SHA-512 empty-message vector is exact', TestSHA512EmptyVector);
+  Test('secret wipe overwrites only an owned AnsiString buffer',
+    TestWipeOverwritesOnlyOwnedAnsiBuffers);
+  Test('secret wipe overwrites only an owned UnicodeString buffer',
+    TestWipeOverwritesOnlyOwnedUnicodeBuffers);
 end;
 
 begin
