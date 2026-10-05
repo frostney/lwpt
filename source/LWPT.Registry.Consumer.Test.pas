@@ -5,12 +5,15 @@ program LWPT.Registry.Consumer.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Windows,
   {$ENDIF}
   Classes,
   SysUtils,
+
+  Tests.ProcessSupport,
 
   LWPT.Core,
   LWPT.Manifest,
@@ -68,6 +71,7 @@ type
     procedure TestLockedSelectionLoadingIsBounded;
     procedure TestStateReadsDuringConcurrentPublication;
     procedure TestAbsentStateIsReadUnderThePublisherLease;
+    procedure TestTimeoutEndsTheProgramWithoutFinalization;
     {$IFDEF MSWINDOWS}
     procedure TestStateReadsShareAPublisherDeleteHandle;
     {$ENDIF}
@@ -894,6 +898,30 @@ const
     always fits; only a stuck one exceeds it. }
   RACE_WAIT_MILLISECONDS = 2 * RegistryStateLeaseWaitMilliseconds;
 
+const
+  RACE_ABORT_EXIT_CODE = 3;
+  RACE_ABORT_PROBE_ARGUMENT = '--race-abort-probe';
+
+{ Reports AWhat on stderr and ends the process at once, with no exit
+  procedures and no unit finalization. A worker thread that outlived its
+  bound may still be running and may touch unit state (the producer-lease
+  globals, the contention hook), so neither later tests nor finalization
+  may run beneath it; lwpt test reports the program as failed with this
+  line. }
+procedure AbortTestProgram(const AWhat: string);
+begin
+  Flush(Output);
+  WriteLn(ErrOutput, 'FATAL: ', AWhat, '; ending the test program without '
+    + 'finalization');
+  Flush(ErrOutput);
+  {$IFDEF UNIX}
+  FpExit(RACE_ABORT_EXIT_CODE);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows.ExitProcess(RACE_ABORT_EXIT_CODE);
+  {$ENDIF}
+end;
+
 { The publisher's per-origin lease, or a failure naming the key once
   RACE_WAIT_MILLISECONDS pass without it. }
 function AwaitStateLease(ACoordinator: TLWPTProducerLeaseCoordinator;
@@ -912,9 +940,11 @@ begin
   until False;
 end;
 
-{ True once AThread has finished, False when AMilliseconds pass first. A
-  finished thread's WaitFor and Free return at once; neither is called on
-  one that has not finished, because both join without a limit. }
+{ True once AThread has finished Execute, False when AMilliseconds pass
+  first. Free on a finished thread still joins the operating-system thread
+  (pthread_join on Unix), which returns once the thread function, already
+  past Execute, exits; Free on a thread that has not finished would join
+  without a limit, so it is never called on one. }
 function AwaitThreadFinished(AThread: TThread;
   const AMilliseconds: QWord): Boolean;
 var StartedAt: QWord;
@@ -952,7 +982,7 @@ var
   Lease: TLWPTProducerLease;
   Loaded: TLWPTRegistryConsumerState;
   Batch, Round, Index, Failures: Integer;
-  Started, Stuck: Boolean;
+  Started: Boolean;
 begin
   Root := FScratch + '/state-read-race';
   MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
@@ -962,7 +992,6 @@ begin
   Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
   Reader := TStateReadThread.Create(True);
   Started := False;
-  Stuck := False;
   try
     Reader.Root := Root;
     Reader.Identity := RACE_IDENTITY;
@@ -1010,8 +1039,9 @@ begin
         Sleep(3 * PRODUCER_LEASE_POLL_MILLISECONDS);
     end;
     InterLockedExchange(Reader.Done, 1);
-    Stuck := not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS);
-    Expect<Boolean>(Stuck).ToBe(False);
+    if not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS) then
+      AbortTestProgram(Format('registry consumer race test: the reader '
+        + 'thread did not finish within %d ms', [RACE_WAIT_MILLISECONDS]));
     RegistryStateLeaseContendedTestHook := nil;
     Expect<string>(Failure).ToBe('');
     Expect<Integer>(Failures).ToBe(0);
@@ -1022,21 +1052,18 @@ begin
     Expect<Integer>(Reader.MissedDocuments).ToBe(0);
     Expect<Boolean>(Reader.Reads > 0).ToBe(True);
   finally
-    { Stops a reader an exception left running. A reader never started is
-      started so that it sees Done and returns: freeing a suspended
-      thread would also join without a limit. }
+    { An exception (a failed publication's lease wait included) can leave
+      the reader running: stop it, starting one never started so that it
+      sees Done and returns, since a suspended thread cannot finish. One
+      that outlives the bound ends the program; see AbortTestProgram. }
     InterLockedExchange(Reader.Done, 1);
     if not Started then Reader.Start;
-    if not Stuck then
-      Stuck := not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS);
-    { A reader still running past the bound has already failed the test:
-      it is leaked, and the hook it may still call stays assigned, rather
-      than joined without a limit. }
-    if not Stuck then
-    begin
-      RegistryStateLeaseContendedTestHook := nil;
-      Reader.Free;
-    end;
+    if not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS) then
+      AbortTestProgram(Format('registry consumer race test: the reader '
+        + 'thread did not finish within %d ms after a failure',
+        [RACE_WAIT_MILLISECONDS]));
+    RegistryStateLeaseContendedTestHook := nil;
+    Reader.Free;
     Coordinator.Free;
   end;
   Expect<Boolean>(LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
@@ -1168,6 +1195,38 @@ begin
 end;
 {$ENDIF}
 
+{ Run with RACE_ABORT_PROBE_ARGUMENT, the program installs an exit procedure
+  and calls AbortTestProgram, as a race-test timeout does. Halt would run
+  that exit procedure, then unit finalization; AbortTestProgram must end
+  the process before either, with its exit code and its stderr line. }
+procedure MarkExitProcedureRan;
+begin
+  WriteLn('exit procedure ran');
+  Flush(Output);
+end;
+
+procedure RunRaceAbortProbe;
+begin
+  ExitProc := @MarkExitProcedureRan;
+  AbortTestProgram('race abort probe');
+  WriteLn('abort returned');
+  Flush(Output);
+end;
+
+procedure TRegistryConsumerTests.TestTimeoutEndsTheProgramWithoutFinalization;
+var
+  Captured: string;
+  Code: Integer;
+begin
+  Code := RunChildCommand('', ParamStr(0), [RACE_ABORT_PROBE_ARGUMENT],
+    Captured);
+  Expect<Integer>(Code).ToBe(RACE_ABORT_EXIT_CODE);
+  Expect<Boolean>(Pos('FATAL: race abort probe; ending the test program '
+    + 'without finalization', Captured) > 0).ToBe(True);
+  Expect<Boolean>(Pos('exit procedure ran', Captured) > 0).ToBe(False);
+  Expect<Boolean>(Pos('abort returned', Captured) > 0).ToBe(False);
+end;
+
 procedure TRegistryConsumerTests.SetupTests;
 begin
   Test('registry sources parse in bare and inline-table forms',
@@ -1219,6 +1278,8 @@ begin
     + 'them', TestStateReadsDuringConcurrentPublication);
   Test('a state file a publisher has moved aside is read under its lease, '
     + 'never as fresh state', TestAbsentStateIsReadUnderThePublisherLease);
+  Test('a race-test timeout ends the program without exit procedures or '
+    + 'finalization', TestTimeoutEndsTheProgramWithoutFinalization);
   {$IFDEF MSWINDOWS}
   Test('per-user state and documents read beside a publisher holding '
     + 'delete access', TestStateReadsShareAPublisherDeleteHandle);
@@ -1226,6 +1287,11 @@ begin
 end;
 
 begin
+  if (ParamCount = 1) and (ParamStr(1) = RACE_ABORT_PROBE_ARGUMENT) then
+  begin
+    RunRaceAbortProbe;
+    Halt(1);
+  end;
   TestRunnerProgram.AddSuite(TRegistryConsumerTests.Create(
     'registry consumer: manifest, state, and locked selection'));
   TestRunnerProgram.Run;
