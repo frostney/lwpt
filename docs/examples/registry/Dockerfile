@@ -7,7 +7,10 @@
 # compiles LWPT; `./build/lwpt build` remains the only way LWPT builds
 # itself. The operating guide is docs/registry-deployment.md.
 #
-# Build (the digests are in the release's lwpt-<version>-checksums.txt):
+# The defaults below pin the latest release and its published SHA-256
+# digests, so `docker build -t lwpt-registry docs/examples/registry` works
+# as is. To use another release, override all three (the digests are in the
+# release's lwpt-<version>-checksums.txt):
 #
 #   docker build \
 #     --build-arg LWPT_VERSION=<version> \
@@ -24,9 +27,9 @@
 ARG BASE_IMAGE=debian:bookworm-slim
 
 FROM ${BASE_IMAGE} AS fetch
-ARG LWPT_VERSION=""
-ARG LWPT_SHA256_LINUX_X64=""
-ARG LWPT_SHA256_LINUX_ARM64=""
+ARG LWPT_VERSION="0.8.0"
+ARG LWPT_SHA256_LINUX_X64="b9b7989f3e3be67c354f9c9767964fe68fd9a42e13bdac634dd24d95393cc9a2"
+ARG LWPT_SHA256_LINUX_ARM64="533696b4903d0b887b63829338b987c66d87cf7023d1ee7b2c827866c414e33b"
 # CI overrides this with a loopback server holding a release-shaped archive
 # of the exact commit under test; the checksum pin is the integrity check.
 ARG LWPT_RELEASE_BASE_URL=https://github.com/frostney/lwpt/releases/download
