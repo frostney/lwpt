@@ -85,6 +85,7 @@ type
     procedure TestInvalidTestSelectorsFailBeforePretest;
     procedure TestInventorySkipsHooksAndTestBodies;
     procedure TestCommittedInventoryMismatchFailsActionably;
+    procedure TestInventoryFailureReportsExitCodeAndOutput;
     procedure TestEmptyDiscoveryRejectsStaleInventory;
   end;
 
@@ -920,6 +921,34 @@ begin
   end;
 end;
 
+procedure TCLIOptionsE2E.TestInventoryFailureReportsExitCodeAndOutput;
+var
+  R: TLwptResult;
+begin
+  WriteTextFile(FScratch + '/source/InventoryFailure.Test.pas',
+    'program InventoryFailure.Test;'#10 +
+    '{$mode delphi}{$H+}'#10 +
+    'begin'#10 +
+    '  WriteLn(''inventory probe startup output'');'#10 +
+    '  WriteLn(ErrOutput, ''inventory probe startup failed'');'#10 +
+    '  Halt(7);'#10 +
+    'end.'#10);
+  try
+    R := RunLwpt(['test', '--inventory',
+      'source/InventoryFailure.Test.pas', '--jobs=1'], FScratch);
+    Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('test inventory failed for '
+      + '"source/InventoryFailure.Test.pas": test executable exited with '
+      + 'code 7; last output lines:', R.Stderr) > 0).ToBe(True);
+    Expect<Boolean>(Pos('inventory probe startup output', R.Stderr) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('inventory probe startup failed', R.Stderr) > 0)
+      .ToBe(True);
+  finally
+    DeleteFile(FScratch + '/source/InventoryFailure.Test.pas');
+  end;
+end;
+
 procedure TCLIOptionsE2E.TestEmptyDiscoveryRejectsStaleInventory;
 var
   ProjectPath: string;
@@ -1013,6 +1042,8 @@ begin
     TestInventorySkipsHooksAndTestBodies);
   Test('committed inventory mismatches fail with expected and actual counts',
     TestCommittedInventoryMismatchFailsActionably);
+  Test('a program failing in inventory mode reports its exit code and output',
+    TestInventoryFailureReportsExitCodeAndOutput);
   Test('empty discovery rejects a stale committed inventory',
     TestEmptyDiscoveryRejectsStaleInventory);
 end;
