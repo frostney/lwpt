@@ -4031,8 +4031,8 @@ var
   { The locked archive digest that a fresh download for ANode must
     reproduce, or '' when the selection is not the locked identity. Same
     commit means same bytes. A lock without a recorded commit is compared by
-    ref name, which is how a tag moved behind an early schema-v3 lock is
-    caught. }
+    ref name, which is how a tag moved behind a v4 lock without the optional
+    identity fields (as repair carries from early v3) is caught. }
   function ExpectedVerifyHash(const ANode: TResolveNode;
     out AContext: string): string;
   var Entry: TResolved; LockedCommit: string;
@@ -4099,8 +4099,8 @@ var
     RepoURL := GitRepoURL(ANode.Dep, ANode.CustomSources);
     Result := VerifiedPins.Values[RepoURL + '@' + LowerCase(ACommit)];
     if Result <> '' then Exit;
-    { Only an entry that records its proof is trusted; a v3 entry without
-      `reachableFrom` predates proofs and is proven now. }
+    { Only an entry that records its proof is trusted; an entry without
+      `reachableFrom` (carried from a pre-proof v3 lock) is proven now. }
     if FindPriorLock(ANode, Entry)
        and SameText(LockedCommitIdentity(Entry), ACommit)
        and IsProvingRefName(Entry.ReachableFrom) then

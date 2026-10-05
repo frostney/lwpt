@@ -360,9 +360,10 @@ end;
 procedure TInstallLocalDiamond.TestLegacyV3FrozenSucceeds;
 var LockBefore, LockAfter: string; Raised: Boolean;
 begin
-  { Early schema-v3 locks have complete source/ref/hash evidence but not
-    the later additive resolver identity fields. An unambiguous local graph
-    remains valid and must verify without regeneration. }
+  { A v4 lock without the optional identity fields (as repair carries from
+    early v3) has complete source/ref/hash evidence but not the additive
+    resolver identity fields. An unambiguous local graph remains valid and
+    must verify without regeneration. }
   RemoveAdditiveIdentityFields(FRoot + '/lwpt.lock');
   LockBefore := ReadFileText(FRoot + '/lwpt.lock');
   Raised := False;
@@ -392,7 +393,8 @@ begin
     TestManifestPathInstallUsesManifestDirectory);
   Test('install --frozen: succeeds + leaves the lockfile unchanged',
     TestFrozenSucceedsWithoutRewritingLock);
-  Test('install --frozen: accepts an unambiguous early schema-v3 lock',
+  Test('install --frozen: accepts an unambiguous v4 lock without the '
+    + 'optional identity fields (as repair carries from early v3)',
     TestLegacyV3FrozenSucceeds);
 end;
 
