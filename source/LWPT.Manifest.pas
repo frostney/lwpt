@@ -2092,7 +2092,7 @@ begin
       if TomlIsString(TomlGet(BuildNode, 'source')) then
       begin
         { Single-entry shorthand. The item gets name = package
-          name; output defaults to "build/<name>" when absent. }
+          name; output defaults to "build/<package name>" when absent. }
         Entry := Default(TLWPTBuildEntry);
         Entry.Name   := Result.Name;
         if AIsRoot then ValidateBuildEntryName(Entry.Name);

@@ -318,8 +318,9 @@ begin
   Expect<Boolean>(FileExists(HealthyPath)).ToBe(True);
   Expect<Boolean>(Pos('removed 1 corrupt shared-cache object',
     R.Stdout) > 0).ToBe(True);
-  Expect<Boolean>(Pos('shared-cache recovery completed without touching '
-    + 'committed project archives', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('shared-cache recovery completed; committed project '
+    + 'state changed only if an interrupted install was rolled back',
+    R.Stdout) > 0).ToBe(True);
 
   R := RunRepair;
   Expect<Integer>(R.ExitCode).ToBe(0);
