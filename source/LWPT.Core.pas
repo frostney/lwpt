@@ -230,15 +230,28 @@ procedure EndProcessHandleSetup;
 type
   { Owns its handle. On Unix the descriptor is close-on-exec and carries no
     flock share-mode lock; on Windows the handle is non-inheritable and keeps
-    TFileStream's share modes. }
+    TFileStream's share modes, except as OpenProtectedFileStream describes
+    for shared reads. }
   TLWPTProtectedFileStream = class(THandleStream)
   public
     destructor Destroy; override;
   end;
 
+const
+  { Bounds how long a Windows shared read retries a sharing violation. }
+  PROTECTED_READ_SHARING_RETRY_MILLISECONDS = 1000;
+
 { TFileStream.Create equivalent for toolkit state. AMode takes the same
   fmCreate / fmOpenRead / fmOpenWrite / fmOpenReadWrite values; Unix ignores
-  share flags. Raises EFCreateError or EFOpenError. }
+  share flags. Raises EFCreateError or EFOpenError.
+  A shared read (fmOpenRead or fmShareDenyNone) on Windows shares read,
+  write, and delete access, as a Unix descriptor does. FPC's
+  fmShareDenyNone shares only read and write, so it conflicts with the
+  delete access an atomic replacement holds: the write-through rename keeps
+  its handle open while the new file is already visible, and ReplaceFileW
+  refuses to replace a file that a reader holds without delete sharing.
+  Such a read also retries ERROR_SHARING_VIOLATION, and only that, for up
+  to PROTECTED_READ_SHARING_RETRY_MILLISECONDS before it fails. }
 function  OpenProtectedFileStream(const APath: string;
   const AMode: Word): TLWPTProtectedFileStream;
 { Replaces AStrings with the file's lines through OpenProtectedFileStream. }
@@ -263,6 +276,14 @@ var
   { Test-only: runs inside the guard once a Unix descriptor is protected, so
     a test can inspect its close-on-exec flag. Production must leave it nil. }
   ProtectedOpenAfterProtectionTestHook: TLWPTProtectedDescriptorTestHook;
+  { Test-only observation: incremented, atomically, each time a Windows
+    shared read retries an open that failed with a sharing violation. }
+  ProtectedReadSharingRetries: LongInt = 0;
+  { Test-only: when set, a Windows shared read calls it on the reading
+    thread after each sharing-violation failure and before it sleeps, so a
+    test can release the conflicting handle at exactly that point.
+    Production code must leave it nil. }
+  ProtectedReadSharingRetryTestHook: TLWPTProtectedOpenTestHook;
 
 type
   { phfContended: the thread's non-blocking attempt failed because another
@@ -1841,7 +1862,9 @@ begin
   DstDir := ExtractFileDir(ADst);
   if DstDir <> '' then LongPathForceDirectories(DstDir);
   { One same-filesystem replacement is the common path. Unlike renaming the
-    old destination aside first, this never creates a reader-visible gap. }
+    old destination aside first, it creates no reader-visible gap on Unix; on
+    Windows ReplaceFileW can leave the path briefly absent (see
+    ReplaceFileInOneOperation). }
   if AtomicReplaceFile(ASrc, ADst) then Exit(True);
 
   { EXDEV (or its Windows equivalent): copy to a unique sibling on the
@@ -2103,10 +2126,15 @@ end;
 {$ENDIF}
 
 { Replace a file in one filesystem operation. Unlike AtomicMoveFile this
-  helper never renames the old destination aside, because doing so creates
-  an observable missing-path window. It is intentionally strict: callers
-  must stage the source on the same filesystem as the destination.
-  ARetireInUseBackup is set only by AtomicReplaceExecutable. }
+  helper never renames the old destination aside itself. On Unix rename(2)
+  leaves no missing-path window. On Windows ReplaceFileW moves the replaced
+  file to its backup name before moving the replacement in (its
+  ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 contract; Wine does both renames on
+  every call), so a reader can briefly find the path absent. Readers that
+  must not mistake that for a missing file coordinate with the writer; see
+  docs/tooling.md. It is intentionally strict: callers must stage the
+  source on the same filesystem as the destination. ARetireInUseBackup is
+  set only by AtomicReplaceExecutable. }
 function ReplaceFileInOneOperation(const ASrc, ADst: string;
   ARetireInUseBackup: Boolean): Boolean;
 var
@@ -2374,6 +2402,48 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF MSWINDOWS}
+const
+  PROTECTED_READ_SHARING_RETRY_SLEEP_MILLISECONDS = 10;
+
+{ Opens AWidePath for reading with read, write, and delete sharing, so
+  neither an atomic replacement's rename handle nor a later replacement
+  conflicts with it. Only ERROR_SHARING_VIOLATION, which a briefly held
+  handle without read sharing (a replacement's own handle, a scanner)
+  produces, is retried, within PROTECTED_READ_SHARING_RETRY_MILLISECONDS.
+  Returns INVALID_HANDLE_VALUE with the last error set on failure. APath
+  names the file for the test hook. The handle is non-inheritable. }
+function OpenSharedReadHandle(const AWidePath: UnicodeString;
+  const APath: string): THandle;
+var
+  ErrorCode: DWORD;
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  repeat
+    Result := Windows.CreateFileW(PWideChar(AWidePath), Windows.GENERIC_READ,
+      Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE
+        or Windows.FILE_SHARE_DELETE, nil, Windows.OPEN_EXISTING,
+      Windows.FILE_ATTRIBUTE_NORMAL, 0);
+    if Result <> THandle(Windows.INVALID_HANDLE_VALUE) then Exit;
+    ErrorCode := Windows.GetLastError;
+    if (ErrorCode <> Windows.ERROR_SHARING_VIOLATION)
+      or (GetTickCount64 - StartedAt
+        >= PROTECTED_READ_SHARING_RETRY_MILLISECONDS) then
+    begin
+      Windows.SetLastError(ErrorCode);
+      Exit;
+    end;
+    {$IFDEF OBJECTSTORE_TESTING}
+    InterLockedIncrement(ProtectedReadSharingRetries);
+    if Assigned(ProtectedReadSharingRetryTestHook) then
+      ProtectedReadSharingRetryTestHook(APath);
+    {$ENDIF}
+    SysUtils.Sleep(PROTECTED_READ_SHARING_RETRY_SLEEP_MILLISECONDS);
+  until False;
+end;
+{$ENDIF}
+
 function OpenProtectedFileStream(const APath: string;
   const AMode: Word): TLWPTProtectedFileStream;
 var
@@ -2419,6 +2489,14 @@ begin
       PROTECTED_CREATE_PERMISSIONS);
     if Handle = THandle(-1) then
       raise EFCreateError.CreateFmt('Unable to create file "%s": %s',
+        [APath, SysErrorMessage(GetLastOSError)]);
+  end
+  else if ((AMode and 3) = fmOpenRead)
+    and ((AMode and $F0) = fmShareDenyNone) then
+  begin
+    Handle := OpenSharedReadHandle(WindowsExtendedPath(APath), APath);
+    if Handle = THandle(-1) then
+      raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
         [APath, SysErrorMessage(GetLastOSError)]);
   end
   else
@@ -3240,10 +3318,8 @@ var Handle: THandle; WidePath: UnicodeString;
 begin
   WidePath := WindowsExtendedChild(WindowsExtendedPath(ADirectory),
     TreePathToWide(ARelPath));
-  { Non-inheritable (no security attributes), as every toolkit handle. }
-  Handle := CreateFileW(PWideChar(WidePath), GENERIC_READ,
-    FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE, nil,
-    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+  { The shared read OpenProtectedFileStream uses for every other path. }
+  Handle := OpenSharedReadHandle(WidePath, ARelPath);
   if Handle = INVALID_HANDLE_VALUE then
     raise EFOpenError.CreateFmt('Unable to open file "%s": %s',
       [EscapeTreePath(ARelPath), SysErrorMessage(GetLastOSError)]);

@@ -5,13 +5,21 @@ program LWPT.Registry.Consumer.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
   {$ENDIF}
   Classes,
   SysUtils,
 
+  Tests.ProcessSupport,
+
   LWPT.Core,
   LWPT.Manifest,
+  LWPT.ProducerLease,
   LWPT.Registry.Consumer,
+  LWPT.Registry.ConsumerStore,
   LWPT.Registry.Verification,
   TestingPascalLibrary,
   Tests.RegistryConsumer,
@@ -61,6 +69,12 @@ type
     procedure TestConcurrentStateMergesAreMonotonic;
     procedure TestRotationChainLoadingIsBounded;
     procedure TestLockedSelectionLoadingIsBounded;
+    procedure TestStateReadsDuringConcurrentPublication;
+    procedure TestAbsentStateIsReadUnderThePublisherLease;
+    procedure TestTimeoutEndsTheProgramWithoutFinalization;
+    {$IFDEF MSWINDOWS}
+    procedure TestStateReadsShareAPublisherDeleteHandle;
+    {$ENDIF}
   end;
 
   TMergeThread = class(TThread)
@@ -69,6 +83,20 @@ type
   public
     Root, Identity, KeyId, PublicKey, Error: string;
     Sequence: Integer;
+  end;
+
+  { Reads per-user state, and the document being published, without the
+    producer lease until the publisher sets Done. }
+  TStateReadThread = class(TThread)
+  protected
+    procedure Execute; override;
+  public
+    Root, Identity, KeyId: string;
+    Sequence: Int64;
+    Documents: TStringArray;
+    Completed, Done: LongInt;
+    Reads, Absences, Failures, MissedDocuments, WrongStates: Integer;
+    Failure: string;
   end;
 
 procedure TRegistryConsumerTests.BeforeAll;
@@ -793,6 +821,412 @@ begin
   end;
 end;
 
+const
+  RACE_IDENTITY = 'https://packages.example.com';
+
+{ Accepted state at ASequence, its timestamps rising with it. }
+function SequencedState(const AKeyId, APublicKey: string;
+  const ASequence: Integer): TLWPTRegistryConsumerState;
+begin
+  Result := Default(TLWPTRegistryConsumerState);
+  Result.State.KeyId := AKeyId;
+  Result.State.PublicKey := APublicKey;
+  Result.State.Sequence := ASequence;
+  Result.State.Snapshot := 'sha256:' + StringOfChar('a', 56)
+    + LowerCase(IntToHex(ASequence, 8));
+  Result.State.CheckpointHash := 'sha256:' + StringOfChar('b', 56)
+    + LowerCase(IntToHex(ASequence, 8));
+  Result.State.PublishedAt := Format('2026-10-01T%.2d:%.2d:00Z',
+    [ASequence div 60, ASequence mod 60]);
+  Result.State.ExpiresAt := '2026-10-02T00:00:00Z';
+  Result.State.ClockFloor := Result.State.PublishedAt;
+end;
+
+function RaceDocument(const AIndex: Integer): TLWPTRegistryDocumentArray;
+begin
+  SetLength(Result, 1);
+  Result[0].Bytes := BytesOf('race document ' + IntToStr(AIndex) + #10);
+end;
+
+procedure TStateReadThread.Execute;
+var
+  State: TLWPTRegistryConsumerState;
+  Next: LongInt;
+  Present: Boolean;
+begin
+  repeat
+    try
+      if LoadRegistryConsumerStateAt(Root, Identity, KeyId, State) then
+      begin
+        Inc(Reads);
+        if State.State.Sequence <> Sequence then Inc(WrongStates);
+      end
+      else Inc(Absences);
+      { The document the publisher is renaming into place now. Documents
+        are written once and never removed here, so one that exists must
+        read whole. }
+      Next := InterLockedExchangeAdd(Completed, 0);
+      if Next <= High(Documents) then
+      begin
+        Present := RegistryStoreFileIsRegular(RegistryStateDocumentPath(Root,
+          Documents[Next]));
+        if Present and (LoadRegistryStateDocument(Root, Documents[Next])
+          = nil) then Inc(MissedDocuments);
+      end;
+    except
+      on E: Exception do
+      begin
+        Inc(Failures);
+        if Failure = '' then Failure := E.ClassName + ': ' + E.Message;
+      end;
+    end;
+  until InterLockedExchangeAdd(Done, 0) <> 0;
+end;
+
+var
+  { Set by the reader thread whenever it waits for the publisher's lease. }
+  RaceReaderWaiting: LongInt = 0;
+
+procedure NoteRaceReaderWaiting(const AKey: string);
+begin
+  InterLockedExchange(RaceReaderWaiting, 1);
+end;
+
+const
+  { Bounds every wait in the race test. A reader iteration can itself wait
+    RegistryStateLeaseWaitMilliseconds for the lease, so a finishing reader
+    always fits; only a stuck one exceeds it. }
+  RACE_WAIT_MILLISECONDS = 2 * RegistryStateLeaseWaitMilliseconds;
+
+const
+  RACE_ABORT_EXIT_CODE = 3;
+  RACE_ABORT_PROBE_ARGUMENT = '--race-abort-probe';
+
+{ Reports AWhat on stderr and ends the process at once, with no exit
+  procedures and no unit finalization. A worker thread that outlived its
+  bound may still be running and may touch unit state (the producer-lease
+  globals, the contention hook), so neither later tests nor finalization
+  may run beneath it; lwpt test reports the program as failed with this
+  line. }
+procedure AbortTestProgram(const AWhat: string);
+begin
+  Flush(Output);
+  WriteLn(ErrOutput, 'FATAL: ', AWhat, '; ending the test program without '
+    + 'finalization');
+  Flush(ErrOutput);
+  {$IFDEF UNIX}
+  FpExit(RACE_ABORT_EXIT_CODE);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows.ExitProcess(RACE_ABORT_EXIT_CODE);
+  {$ENDIF}
+end;
+
+{ The publisher's per-origin lease, or a failure naming the key once
+  RACE_WAIT_MILLISECONDS pass without it. }
+function AwaitStateLease(ACoordinator: TLWPTProducerLeaseCoordinator;
+  const AKey: string): TLWPTProducerLease;
+var StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  repeat
+    Result := ACoordinator.TryAcquire(AKey, 'test state publisher');
+    if Result <> nil then Exit;
+    if GetTickCount64 - StartedAt >= RACE_WAIT_MILLISECONDS then
+      raise Exception.CreateFmt(
+        'the test publisher could not take lease %s within %d ms',
+        [AKey, RACE_WAIT_MILLISECONDS]);
+    Sleep(1);
+  until False;
+end;
+
+{ True once AThread has finished Execute, False when AMilliseconds pass
+  first. Free on a finished thread still joins the operating-system thread
+  (pthread_join on Unix), which returns once the thread function, already
+  past Execute, exits; Free on a thread that has not finished would join
+  without a limit, so it is never called on one. }
+function AwaitThreadFinished(AThread: TThread;
+  const AMilliseconds: QWord): Boolean;
+var StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while not AThread.Finished do
+  begin
+    if GetTickCount64 - StartedAt >= AMilliseconds then Exit(False);
+    Sleep(10);
+  end;
+  Result := True;
+end;
+
+{ Another project's install publishes per-user state and documents while
+  this install reads them without the producer lease (#372). The publisher
+  runs the primitive a merge uses, under the per-origin lease a merge
+  holds: each round first-publishes a new document and replaces the state
+  file with AtomicWriteBytes. Neither side may fail for the other. Every
+  state read returns the published state: never absent, never torn, never
+  an open error (on Windows a sharing violation, or the moment ReplaceFileW
+  has moved the old file aside, which the reader waits out under the
+  lease). No existing document is unreadable, and every publication
+  commits. FPC's fmShareDenyNone, which does not share delete access,
+  failed both sides on Windows. }
+procedure TRegistryConsumerTests.TestStateReadsDuringConcurrentPublication;
+const
+  BATCHES = 40;
+  ROUNDS = 10;
+  STATE_SEQUENCE = 9;
+var
+  Root, StatePath, Failure: string;
+  StateBytes, DocumentBytes: TBytes;
+  Reader: TStateReadThread;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Lease: TLWPTProducerLease;
+  Loaded: TLWPTRegistryConsumerState;
+  Batch, Round, Index, Failures: Integer;
+  Started: Boolean;
+begin
+  Root := FScratch + '/state-read-race';
+  MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    SequencedState(FKeyID, FPublicKey, STATE_SEQUENCE), nil, nil);
+  StatePath := RegistryStatePathAt(Root, RACE_IDENTITY, FKeyID);
+  StateBytes := BytesOf(ReadBinaryFile(StatePath));
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
+  Reader := TStateReadThread.Create(True);
+  Started := False;
+  try
+    Reader.Root := Root;
+    Reader.Identity := RACE_IDENTITY;
+    Reader.KeyId := FKeyID;
+    Reader.Sequence := STATE_SEQUENCE;
+    SetLength(Reader.Documents, BATCHES * ROUNDS);
+    for Index := 0 to High(Reader.Documents) do
+      Reader.Documents[Index] :=
+        SHA256BytesPrefixed(RaceDocument(Index)[0].Bytes);
+    RaceReaderWaiting := 0;
+    RegistryStateLeaseContendedTestHook := NoteRaceReaderWaiting;
+    Reader.Start;
+    Started := True;
+    Failures := 0;
+    Failure := '';
+    Index := 0;
+    for Batch := 1 to BATCHES do
+    begin
+      Lease := AwaitStateLease(Coordinator, RegistryStateLeaseKey(StatePath));
+      try
+        for Round := 1 to ROUNDS do
+        begin
+          try
+            DocumentBytes := RaceDocument(Index)[0].Bytes;
+            AtomicWriteBytes(RegistryStateDocumentPath(Root,
+              Reader.Documents[Index]), Root + '/tmp', DocumentBytes);
+            AtomicWriteBytes(StatePath, Root + '/tmp', StateBytes);
+          except
+            on E: Exception do
+            begin
+              Inc(Failures);
+              Failure := E.Message;
+            end;
+          end;
+          InterLockedIncrement(Reader.Completed);
+          Inc(Index);
+        end;
+      finally
+        Lease.Free;
+      end;
+      { A reader waiting for the lease polls every
+        PRODUCER_LEASE_POLL_MILLISECONDS; let it in before the next batch so
+        it keeps reading during publication instead of only after it. }
+      if InterLockedExchange(RaceReaderWaiting, 0) <> 0 then
+        Sleep(3 * PRODUCER_LEASE_POLL_MILLISECONDS);
+    end;
+    InterLockedExchange(Reader.Done, 1);
+    if not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS) then
+      AbortTestProgram(Format('registry consumer race test: the reader '
+        + 'thread did not finish within %d ms', [RACE_WAIT_MILLISECONDS]));
+    RegistryStateLeaseContendedTestHook := nil;
+    Expect<string>(Failure).ToBe('');
+    Expect<Integer>(Failures).ToBe(0);
+    Expect<string>(Reader.Failure).ToBe('');
+    Expect<Integer>(Reader.Failures).ToBe(0);
+    Expect<Integer>(Reader.Absences).ToBe(0);
+    Expect<Integer>(Reader.WrongStates).ToBe(0);
+    Expect<Integer>(Reader.MissedDocuments).ToBe(0);
+    Expect<Boolean>(Reader.Reads > 0).ToBe(True);
+  finally
+    { An exception (a failed publication's lease wait included) can leave
+      the reader running: stop it, starting one never started so that it
+      sees Done and returns, since a suspended thread cannot finish. One
+      that outlives the bound ends the program; see AbortTestProgram. }
+    InterLockedExchange(Reader.Done, 1);
+    if not Started then Reader.Start;
+    if not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS) then
+      AbortTestProgram(Format('registry consumer race test: the reader '
+        + 'thread did not finish within %d ms after a failure',
+        [RACE_WAIT_MILLISECONDS]));
+    RegistryStateLeaseContendedTestHook := nil;
+    Reader.Free;
+    Coordinator.Free;
+  end;
+  Expect<Boolean>(LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    Loaded)).ToBe(True);
+  Expect<Int64>(Loaded.State.Sequence).ToBe(STATE_SEQUENCE);
+end;
+
+var
+  { The publisher the contention hook completes: its lease, and the state
+    file it has moved aside mid-replacement. }
+  AbsencePublisherLease: TLWPTProducerLease = nil;
+  AbsenceStatePath: string = '';
+  AbsenceContentions: Integer = 0;
+
+procedure CompleteReplacementOnContention(const AKey: string);
+begin
+  Inc(AbsenceContentions);
+  if AbsencePublisherLease = nil then Exit;
+  if not RenameFile(AbsenceStatePath + '.aside', AbsenceStatePath) then
+    raise Exception.Create('fixture: could not restore the state file');
+  FreeAndNil(AbsencePublisherLease);
+end;
+
+{ CR-1 of #372, deterministic: a publisher holds the per-origin lease and has
+  moved the old state file aside, as ReplaceFileW does mid-replacement. A
+  lease-free read must not take that moment for a fresh state directory,
+  which would drop the per-user sequence prior and let an older, still
+  valid checkpoint in. The read meets the publisher's lease, the contention
+  hook completes the replacement on the reading thread, and the read then
+  returns the stored sequence 9, which keeps a sequence 8 checkpoint stale
+  against a lock that records only 3. A state that is really absent, with
+  no publisher, reads as absent without waiting. The read runs on the test
+  thread, and if the hook ever stopped releasing the lease it would fail
+  with registry_state_locked after RegistryStateLeaseWaitMilliseconds. }
+procedure TRegistryConsumerTests.TestAbsentStateIsReadUnderThePublisherLease;
+var
+  Root: string;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Loaded, Locked, Prior: TLWPTRegistryConsumerState;
+  Found: Boolean;
+begin
+  Root := FScratch + '/state-absence';
+  MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    SequencedState(FKeyID, FPublicKey, 9), nil, nil);
+  AbsenceStatePath := RegistryStatePathAt(Root, RACE_IDENTITY, FKeyID);
+  AbsenceContentions := 0;
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
+  try
+    AbsencePublisherLease := Coordinator.TryAcquire(
+      RegistryStateLeaseKey(AbsenceStatePath), 'test publisher');
+    Expect<Boolean>(AbsencePublisherLease <> nil).ToBe(True);
+    Expect<Boolean>(RenameFile(AbsenceStatePath,
+      AbsenceStatePath + '.aside')).ToBe(True);
+    RegistryStateLeaseContendedTestHook := CompleteReplacementOnContention;
+    try
+      Found := LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+        Loaded);
+    finally
+      RegistryStateLeaseContendedTestHook := nil;
+      if AbsencePublisherLease <> nil then
+      begin
+        RenameFile(AbsenceStatePath + '.aside', AbsenceStatePath);
+        FreeAndNil(AbsencePublisherLease);
+      end;
+    end;
+    Expect<Boolean>(Found).ToBe(True);
+    Expect<Int64>(Loaded.State.Sequence).ToBe(9);
+    Expect<Boolean>(AbsenceContentions > 0).ToBe(True);
+    Locked := SequencedState(FKeyID, FPublicKey, 3);
+    Prior := MergeRegistryAcceptedStates(Loaded, Locked);
+    Expect<Int64>(Prior.State.Sequence).ToBe(9);
+    { Another origin's state was never written: absent at once. }
+    AbsenceContentions := 0;
+    Expect<Boolean>(LoadRegistryConsumerStateAt(Root,
+      'https://other.example.com', FKeyID, Loaded)).ToBe(False);
+    Expect<Integer>(AbsenceContentions).ToBe(0);
+  finally
+    Coordinator.Free;
+  end;
+end;
+
+{$IFDEF MSWINDOWS}
+const
+  DELETE_ACCESS_TEST = $00010000;
+
+{ The handle a write-through rename keeps, with delete access, while the
+  file it renamed is already visible. }
+function HoldPublisherHandle(const APath: string): THandle;
+begin
+  Result := Windows.CreateFileW(PWideChar(WindowsExtendedPath(APath)),
+    DELETE_ACCESS_TEST or Windows.GENERIC_READ, Windows.FILE_SHARE_READ
+      or Windows.FILE_SHARE_WRITE or Windows.FILE_SHARE_DELETE, nil,
+    Windows.OPEN_EXISTING, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+  if Result = Windows.INVALID_HANDLE_VALUE then RaiseLastOSError;
+end;
+
+{ The deterministic half of the race above: with the publisher's handle
+  held, the state file and a document both read. }
+procedure TRegistryConsumerTests.TestStateReadsShareAPublisherDeleteHandle;
+var
+  Root, Hash: string;
+  History: TLWPTRegistryDocumentArray;
+  Loaded: TLWPTRegistryConsumerState;
+  StateHandle, DocumentHandle: THandle;
+  Bytes: TBytes;
+begin
+  Root := FScratch + '/state-read-delete-handle';
+  History := RaceDocument(1);
+  Hash := SHA256BytesPrefixed(History[0].Bytes);
+  MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+    SequencedState(FKeyID, FPublicKey, 7), nil, History);
+  StateHandle := HoldPublisherHandle(RegistryStatePathAt(Root, RACE_IDENTITY,
+    FKeyID));
+  try
+    DocumentHandle := HoldPublisherHandle(RegistryStateDocumentPath(Root,
+      Hash));
+    try
+      Expect<Boolean>(LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
+        Loaded)).ToBe(True);
+      Expect<Int64>(Loaded.State.Sequence).ToBe(7);
+      Bytes := LoadRegistryStateDocument(Root, Hash);
+      Expect<Integer>(Length(Bytes)).ToBe(Length(History[0].Bytes));
+    finally
+      Windows.CloseHandle(DocumentHandle);
+    end;
+  finally
+    Windows.CloseHandle(StateHandle);
+  end;
+end;
+{$ENDIF}
+
+{ Run with RACE_ABORT_PROBE_ARGUMENT, the program installs an exit procedure
+  and calls AbortTestProgram, as a race-test timeout does. Halt would run
+  that exit procedure, then unit finalization; AbortTestProgram must end
+  the process before either, with its exit code and its stderr line. }
+procedure MarkExitProcedureRan;
+begin
+  WriteLn('exit procedure ran');
+  Flush(Output);
+end;
+
+procedure RunRaceAbortProbe;
+begin
+  ExitProc := @MarkExitProcedureRan;
+  AbortTestProgram('race abort probe');
+  WriteLn('abort returned');
+  Flush(Output);
+end;
+
+procedure TRegistryConsumerTests.TestTimeoutEndsTheProgramWithoutFinalization;
+var
+  Captured: string;
+  Code: Integer;
+begin
+  Code := RunChildCommand('', ParamStr(0), [RACE_ABORT_PROBE_ARGUMENT],
+    Captured);
+  Expect<Integer>(Code).ToBe(RACE_ABORT_EXIT_CODE);
+  Expect<Boolean>(Pos('FATAL: race abort probe; ending the test program '
+    + 'without finalization', Captured) > 0).ToBe(True);
+  Expect<Boolean>(Pos('exit procedure ran', Captured) > 0).ToBe(False);
+  Expect<Boolean>(Pos('abort returned', Captured) > 0).ToBe(False);
+end;
+
 procedure TRegistryConsumerTests.SetupTests;
 begin
   Test('registry sources parse in bare and inline-table forms',
@@ -840,9 +1274,24 @@ begin
     TestLockedSelectionLoadingIsBounded);
   Test('rotation chains load within count and byte limits and refuse repeats',
     TestRotationChainLoadingIsBounded);
+  Test('per-user state and documents read while another install publishes '
+    + 'them', TestStateReadsDuringConcurrentPublication);
+  Test('a state file a publisher has moved aside is read under its lease, '
+    + 'never as fresh state', TestAbsentStateIsReadUnderThePublisherLease);
+  Test('a race-test timeout ends the program without exit procedures or '
+    + 'finalization', TestTimeoutEndsTheProgramWithoutFinalization);
+  {$IFDEF MSWINDOWS}
+  Test('per-user state and documents read beside a publisher holding '
+    + 'delete access', TestStateReadsShareAPublisherDeleteHandle);
+  {$ENDIF}
 end;
 
 begin
+  if (ParamCount = 1) and (ParamStr(1) = RACE_ABORT_PROBE_ARGUMENT) then
+  begin
+    RunRaceAbortProbe;
+    Halt(1);
+  end;
   TestRunnerProgram.AddSuite(TRegistryConsumerTests.Create(
     'registry consumer: manifest, state, and locked selection'));
   TestRunnerProgram.Run;

@@ -40,8 +40,8 @@ program	*	source/LWPT.CompilerDriver.FPC.Test.pas	1	21
 program	windows/*	source/LWPT.CompilerDriver.FPC.Test.pas	1	20
 program	*	source/LWPT.CompilerDriver.Lakon.Test.pas	1	17
 program	*	source/LWPT.CompilerRegistry.Test.pas	1	11
-program	*	source/LWPT.Core.Test.pas	23	182
-program	windows/*	source/LWPT.Core.Test.pas	23	188
+program	*	source/LWPT.Core.Test.pas	24	184
+program	windows/*	source/LWPT.Core.Test.pas	24	193
 program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10
@@ -61,7 +61,8 @@ program	*	source/LWPT.ManifestEdit.Test.pas	5	31
 program	*	source/LWPT.Observability.Test.pas	1	6
 program	*	source/LWPT.ObjectStore.Test.pas	1	14
 program	unix/*	source/LWPT.ObjectStore.Test.pas	1	15
-program	*	source/LWPT.Registry.Consumer.Test.pas	1	24
+program	*	source/LWPT.Registry.Consumer.Test.pas	1	27
+program	windows/*	source/LWPT.Registry.Consumer.Test.pas	1	28
 program	*	source/LWPT.Registry.ConsumerStore.Test.pas	1	17
 program	*	source/LWPT.Registry.Crypto.Test.pas	1	6
 program	*	source/LWPT.Registry.Incoming.Test.pas	1	11
