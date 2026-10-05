@@ -2,9 +2,10 @@
 
 ## Status
 
-Proposed for issue [#384](https://github.com/frostney/lwpt/issues/384),
-milestone 0.8.0. Amends [ADR-0018](0018-install-transaction-module.md),
-which kept the install lock private to the install transaction module.
+Accepted on 2026-10-05 by the maintainer. Issue
+[#384](https://github.com/frostney/lwpt/issues/384), milestone 0.8.0. Amends
+[ADR-0018](0018-install-transaction-module.md), which kept the install lock
+private to the install transaction module.
 
 ## Executive Summary
 
