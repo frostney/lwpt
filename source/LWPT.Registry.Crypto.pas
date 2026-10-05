@@ -37,6 +37,14 @@ function BytesToHex(const ABytes; const ALength: Integer): string;
 function HexToBytes(const AValue: string; var ABytes;
   const ALength: Integer): Boolean;
 function SHA512Hex(const AData: TBytes): string;
+{ Overwrites a secret string's characters with zeros over its full byte
+  length, then empties the variable. Only a uniquely owned buffer is
+  overwritten: a shared buffer also belongs to another holder and a literal
+  is read-only, so those are released untouched. Callers that need the wipe
+  call UniqueString when they first take the secret. Returns True when a
+  buffer was overwritten. }
+function WipeSecretString(var AValue: AnsiString): Boolean; overload;
+function WipeSecretString(var AValue: UnicodeString): Boolean; overload;
 
 implementation
 
@@ -120,6 +128,24 @@ begin
     Result[Index * 2 + 1] := HEX[(Bytes[Index] shr 4) + 1];
     Result[Index * 2 + 2] := HEX[(Bytes[Index] and $0f) + 1];
   end;
+end;
+
+function WipeSecretString(var AValue: AnsiString): Boolean;
+begin
+  { Pointer(AValue)^ writes in place; AValue[1] would first copy a shared
+    buffer and wipe only the copy. }
+  Result := (Length(AValue) > 0) and (StringRefCount(AValue) = 1);
+  if Result then
+    FillChar(Pointer(AValue)^, Length(AValue) * SizeOf(AnsiChar), 0);
+  AValue := '';
+end;
+
+function WipeSecretString(var AValue: UnicodeString): Boolean;
+begin
+  Result := (Length(AValue) > 0) and (StringRefCount(AValue) = 1);
+  if Result then
+    FillChar(Pointer(AValue)^, Length(AValue) * SizeOf(WideChar), 0);
+  AValue := '';
 end;
 
 function HexNibble(const AValue: Char): Integer;

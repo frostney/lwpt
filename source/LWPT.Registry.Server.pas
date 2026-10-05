@@ -177,6 +177,7 @@ uses
   LWPT.Registry.Server.NetworkFramework,
   {$ENDIF}
   LWPT.Registry.Audit,
+  LWPT.Registry.Crypto,
   LWPT.Registry.Filesystem,
   LWPT.Registry.Publication,
   LWPT.Registry.Verification,
@@ -2140,9 +2141,8 @@ var
   {$ELSE}
   Timeout: LongInt;
   {$ENDIF}
-  {$IFDEF DARWIN}
   Passphrase: string;
-  {$ENDIF}
+  WidePassphrase: UnicodeString;
   TLSServerContext: TTransportSecurityServerContext;
 begin
   {$IFDEF MSWINDOWS}
@@ -2152,29 +2152,35 @@ begin
   TLSServerContext := nil;
   if StartsText('https://', FStore.Config.BaseURL) then
   begin
-    {$IFDEF DARWIN}
-    Passphrase := SysUtils.GetEnvironmentVariable(
-      FStore.Config.TLSPasswordEnvironment);
-    if CurrentRegistryDarwinTLSTransport = rdttNetworkFramework then
-    begin
-      RunNetworkFrameworkRegistryServer(FStore,
-        FStore.Config.TLSPKCS12Path, Passphrase, @FStopping, FHandler);
-      Exit;
-    end;
+    { Both copies of the PKCS#12 password are held in uniquely owned
+      variables and wiped before the listener run loop begins, on success
+      and on failure. The process environment still holds the password for
+      the life of the process, so this narrows the exposure without
+      removing it; docs/registry-deployment.md lists the other copies this
+      does not reach. }
+    Passphrase := '';
+    WidePassphrase := '';
     try
+      Passphrase := SysUtils.GetEnvironmentVariable(
+        FStore.Config.TLSPasswordEnvironment);
+      UniqueString(Passphrase);
+      {$IFDEF DARWIN}
+      if CurrentRegistryDarwinTLSTransport = rdttNetworkFramework then
+      begin
+        { Wipes Passphrase before its run loop begins. }
+        RunNetworkFrameworkRegistryServer(FStore,
+          FStore.Config.TLSPKCS12Path, Passphrase, @FStopping, FHandler);
+        Exit;
+      end;
+      {$ENDIF}
+      WidePassphrase := UnicodeString(Passphrase);
+      UniqueString(WidePassphrase);
       TLSServerContext := TTransportSecurityServerContext.Create(
-        FStore.Config.TLSPKCS12Path, UnicodeString(Passphrase));
+        FStore.Config.TLSPKCS12Path, WidePassphrase);
     finally
-      if Length(Passphrase) > 0 then
-        FillChar(Passphrase[1], Length(Passphrase) * SizeOf(Char), 0);
-      Passphrase := '';
+      WipeSecretString(WidePassphrase);
+      WipeSecretString(Passphrase);
     end;
-    {$ELSE}
-    TLSServerContext := TTransportSecurityServerContext.Create(
-      FStore.Config.TLSPKCS12Path,
-      UnicodeString(SysUtils.GetEnvironmentVariable(
-        FStore.Config.TLSPasswordEnvironment)));
-    {$ENDIF}
   end;
   ListenHost := FStore.Config.ListenAddress;
   if SameText(ListenHost, 'localhost') then ListenHost := '127.0.0.1';

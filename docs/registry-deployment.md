@@ -215,7 +215,14 @@ Mirrors keep serving during the restart.
   environment holds it for the life of the process. Only the same UID and
   a sufficiently privileged root can read `/proc/<pid>/environ`, and they
   can already read the mounted password file, so the environment copy
-  exposes nothing the file does not.
+  exposes nothing the file does not. Once the TLS identity is loaded,
+  `registry serve` zeroes its own string copies of the password before
+  the listener starts; the OpenSSL backend's UTF-8 copy and the SChannel
+  backend's character array are zeroed too. That narrows the exposure
+  without removing it. Other representations are not zeroed, a known
+  limit: the environment itself, the Core Foundation password strings on
+  macOS (Secure Transport and Network.framework), and the copy of the
+  environment entry that FPC's Windows environment lookup makes.
 - **Publication tokens.** Issue one per publisher and scope it to package
   patterns. The token is printed once and stored only as a hash:
 
