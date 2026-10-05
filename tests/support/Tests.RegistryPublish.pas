@@ -17,6 +17,7 @@ uses
   SysUtils,
 
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.RegistryHTTP,
   Tests.RegistryProcess;
 
@@ -615,12 +616,7 @@ end;
 procedure TPublishOrigin.Kill;
 begin
   if FServe = nil then Exit;
-  {$IFDEF UNIX}
-  FpKill(FServe.ProcessID, SIGKILL);
-  {$ELSE}
-  { TerminateProcess; the Windows unit would shadow SysUtils.FindClose. }
-  FServe.Terminate(1);
-  {$ENDIF}
+  KillChildProcess(FServe);
   StopGracefully;
 end;
 

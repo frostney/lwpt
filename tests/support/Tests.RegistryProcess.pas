@@ -92,6 +92,7 @@ uses
   {$ENDIF}
   Classes,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.RegistryServer;
 
 {$IFDEF LINUX}

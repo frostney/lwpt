@@ -45,6 +45,7 @@ uses
   LWPT.Command.Install,
   LWPT.Core,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 type
@@ -293,9 +294,9 @@ begin
     P.Parameters.Add('mklink /J "' +
       StringReplace(ModulePath, '/', '\', [rfReplaceAll]) + '" "' +
       StringReplace(TargetPath, '/', '\', [rfReplaceAll]) + '"');
-    P.Options := [poWaitOnExit];
     P.Execute;
-    Expect<Integer>(P.ExitStatus).ToBe(0);
+    Expect<Integer>(FinishChild(P, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+      'mklink')).ToBe(0);
   finally
     P.Free;
   end;

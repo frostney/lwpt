@@ -16,6 +16,7 @@ uses
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -105,16 +106,18 @@ begin
   { On Windows, Running reads GetExitCodeProcess, which publishes the final
     status before the kernel runs down the child's handles. Until then the
     child's working-directory handle still blocks deleting that directory.
-    The process handle is signalled only after the rundown, so wait for it
-    before reporting the exit. On Unix, Running has already reaped the child
-    and WaitOnExit returns at once. }
-  if not Result then FProcess.WaitOnExit;
+    The process handle is signalled only after the rundown, so wait for it,
+    bounded, before reporting the exit; a rundown still pending reports the
+    child as running, so the caller's own deadline applies. On Unix, Running
+    has already reaped the child and the wait returns at once. }
+  if not Result then
+    Result := not WaitForChildExit(FProcess, CHILD_KILL_MILLISECONDS);
 end;
 
 function TChild.Status: Integer;
 begin
   Drain;
-  Result := FProcess.ExitStatus;
+  Result := ChildProcessExitCode(FProcess);
 end;
 
 procedure Mark(const ARoot, AName: string);

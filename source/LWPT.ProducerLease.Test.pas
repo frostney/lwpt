@@ -15,6 +15,7 @@ uses
   LWPT.Core,
   LWPT.ProducerLease,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -207,8 +208,8 @@ begin
   try
     Child := StartChild('abandon', TEST_KEY, Abandoned, ReleasePath);
     try
-      Child.WaitOnExit;
-      Expect<Integer>(Child.ExitStatus).ToBe(0);
+      Expect<Integer>(FinishChild(Child, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+        'abandoning waiter')).ToBe(0);
       Expect<Boolean>(WaitForFile(Abandoned)).ToBe(True);
     finally
       Child.Free;
@@ -244,8 +245,8 @@ begin
       FreeAndNil(Owner);
       Expect<Boolean>(WaitForFile(Acquired)).ToBe(True);
       WriteTextFile(ReleasePath, 'release');
-      Child.WaitOnExit;
-      Expect<Integer>(Child.ExitStatus).ToBe(0);
+      Expect<Integer>(FinishChild(Child, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+        'released waiter')).ToBe(0);
     finally
       Child.Free;
     end;
@@ -267,8 +268,8 @@ begin
   Child := StartChild('crash', TEST_KEY, Acquired, ReleasePath);
   try
     Expect<Boolean>(WaitForFile(Acquired)).ToBe(True);
-    Child.WaitOnExit;
-    Expect<Integer>(Child.ExitStatus).ToBe(77);
+    Expect<Integer>(FinishChild(Child, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+      'crashing producer')).ToBe(77);
   finally
     Child.Free;
   end;
