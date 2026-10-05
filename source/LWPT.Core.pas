@@ -475,7 +475,7 @@ end;
 
 function FPCExecutable: string;
 begin
-  Result := SysUtils.GetEnvironmentVariable('LWPT_FPC');
+  Result := SysUtils.GetEnvironmentVariable(PROJECT_NAME + '_FPC');
   if Result = '' then
     Result := SysUtils.GetEnvironmentVariable('FPC');
   if Result <> '' then
@@ -517,7 +517,7 @@ var
   Raw, Part : string;
   StartAt, i : Integer;
 begin
-  Raw := SysUtils.GetEnvironmentVariable('LWPT_FPC_UNIT_PATHS');
+  Raw := SysUtils.GetEnvironmentVariable(PROJECT_NAME + '_FPC_UNIT_PATHS');
   if Raw = '' then
     Exit;
 
