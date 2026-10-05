@@ -28,7 +28,11 @@ uses
 
 const
   { Bounds the redirect case's request and its origin mock's completion.
-    Both return as soon as the origin has answered. }
+    Both return as soon as the origin has answered. 30 s is a mitigation,
+    not a root-cause fix: native Windows CI once exceeded the earlier 2 s
+    on the allowed first hop, for a reason not established, and the same
+    run showed a slow mock teardown, whose unbounded Stop and WaitFor are
+    tracked in #380. }
   RedirectRequestDeadlineMilliseconds = 30000;
 
 type
@@ -250,8 +254,8 @@ begin
       { The mock servers are plaintext loopback endpoints; only the host
         rule is under test here. The deadline only bounds a hang: the
         allowed first hop to the origin must complete within it before the
-        redirect can be refused, so it is generous enough for a loaded
-        runner that is slow to schedule the mock's serving thread. }
+        redirect can be refused, so it is generous (see
+        RedirectRequestDeadlineMilliseconds). }
       O.Destination.RequireHTTPS := False;
       O.Destination.PrivateAddressPolicy := papAllow;
       O.RequestTimeoutMilliseconds := RedirectRequestDeadlineMilliseconds;
