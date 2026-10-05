@@ -2155,8 +2155,9 @@ begin
     { Both copies of the PKCS#12 password are held in uniquely owned
       variables and wiped before the listener run loop begins, on success
       and on failure. The process environment still holds the password for
-      the life of the process (docs/registry-deployment.md), so this narrows
-      the exposure without removing it. }
+      the life of the process, so this narrows the exposure without
+      removing it; docs/registry-deployment.md lists the other copies this
+      does not reach. }
     Passphrase := '';
     WidePassphrase := '';
     try

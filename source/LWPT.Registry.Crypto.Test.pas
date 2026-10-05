@@ -22,14 +22,87 @@ type
     procedure TestWipeOverwritesOnlyOwnedUnicodeBuffers;
   end;
 
+{ A memory manager installed only around one WipeSecretString call. Its
+  FreeMem inspects the block that holds the watched payload just before the
+  block returns to the heap, so a test sees whether every payload byte was
+  overwritten rather than only that the variable became empty. }
+var
+  WatchedPayload: PByte;
+  WatchedLength: PtrUInt;
+  WatchedFreed, WatchedZero: Boolean;
+  PreviousMemoryManager: TMemoryManager;
+
+procedure InspectWatchedBlock(const ABlock: Pointer);
+var
+  Index: PtrUInt;
+begin
+  if (WatchedPayload = nil) or WatchedFreed then Exit;
+  { The payload follows the string header inside the freed block. }
+  if (PtrUInt(WatchedPayload) <= PtrUInt(ABlock))
+    or (PtrUInt(WatchedPayload) - PtrUInt(ABlock) > 64) then Exit;
+  WatchedFreed := True;
+  WatchedZero := True;
+  for Index := 0 to WatchedLength - 1 do
+    if WatchedPayload[Index] <> 0 then
+    begin
+      WatchedZero := False;
+      Break;
+    end;
+end;
+
+function WatchingFreeMem(P: Pointer): PtrUInt;
+begin
+  InspectWatchedBlock(P);
+  Result := PreviousMemoryManager.Freemem(P);
+end;
+
+function WatchingFreeMemSize(P: Pointer; ASize: PtrUInt): PtrUInt;
+begin
+  InspectWatchedBlock(P);
+  Result := PreviousMemoryManager.FreememSize(P, ASize);
+end;
+
+procedure BeginWatchingFree(const APayload: Pointer;
+  const AByteLength: PtrUInt);
+var
+  Watching: TMemoryManager;
+begin
+  WatchedPayload := APayload;
+  WatchedLength := AByteLength;
+  WatchedFreed := False;
+  WatchedZero := False;
+  GetMemoryManager(PreviousMemoryManager);
+  Watching := PreviousMemoryManager;
+  Watching.Freemem := WatchingFreeMem;
+  Watching.FreememSize := WatchingFreeMemSize;
+  SetMemoryManager(Watching);
+end;
+
+procedure EndWatchingFree;
+begin
+  SetMemoryManager(PreviousMemoryManager);
+  WatchedPayload := nil;
+end;
+
 procedure TRegistryCryptoContract.TestWipeOverwritesOnlyOwnedAnsiBuffers;
 var
   Literal, Other, Secret: AnsiString;
+  Wiped: Boolean;
 begin
-  Secret := 'tls-password-' + AnsiString(IntToStr(Random(1000)));
+  { UTF-8 bytes of a non-ASCII password, made dynamic and unique. }
+  Secret := AnsiString(#$C3#$A4'-tls-'#$C3#$9F'-')
+    + AnsiString(IntToStr(1000 + Random(1000)));
   UniqueString(Secret);
-  Expect<Boolean>(WipeSecretString(Secret)).ToBe(True);
+  BeginWatchingFree(Pointer(Secret), Length(Secret) * SizeOf(AnsiChar));
+  try
+    Wiped := WipeSecretString(Secret);
+  finally
+    EndWatchingFree;
+  end;
+  Expect<Boolean>(Wiped).ToBe(True);
   Expect<Integer>(Length(Secret)).ToBe(0);
+  Expect<Boolean>(WatchedFreed).ToBe(True);
+  Expect<Boolean>(WatchedZero).ToBe(True);
 
   Secret := 'shared-password-' + AnsiString(IntToStr(Random(1000)));
   Other := Secret;
@@ -46,11 +119,23 @@ end;
 procedure TRegistryCryptoContract.TestWipeOverwritesOnlyOwnedUnicodeBuffers;
 var
   Literal, Other, Secret: UnicodeString;
+  Wiped: Boolean;
 begin
-  Secret := 'tls-password-' + UnicodeString(IntToStr(Random(1000)));
+  { a-umlaut, sharp s and a surrogate pair, so every code unit has a
+    nonzero high byte to overwrite. }
+  Secret := UnicodeString(#$00E4#$00DF#$D83D#$DE00'-')
+    + UnicodeString(IntToStr(1000 + Random(1000)));
   UniqueString(Secret);
-  Expect<Boolean>(WipeSecretString(Secret)).ToBe(True);
+  BeginWatchingFree(Pointer(Secret), Length(Secret) * SizeOf(WideChar));
+  try
+    Wiped := WipeSecretString(Secret);
+  finally
+    EndWatchingFree;
+  end;
+  Expect<Boolean>(Wiped).ToBe(True);
   Expect<Integer>(Length(Secret)).ToBe(0);
+  Expect<Boolean>(WatchedFreed).ToBe(True);
+  Expect<Boolean>(WatchedZero).ToBe(True);
 
   Secret := 'shared-password-' + UnicodeString(IntToStr(Random(1000)));
   Other := Secret;
@@ -193,9 +278,9 @@ begin
   Test('noncanonical field encodings are rejected',
     TestNonCanonicalPointEncodingsAreRejected);
   Test('SHA-512 empty-message vector is exact', TestSHA512EmptyVector);
-  Test('secret wipe overwrites only an owned AnsiString buffer',
+  Test('secret wipe zeroes an owned AnsiString buffer before freeing it',
     TestWipeOverwritesOnlyOwnedAnsiBuffers);
-  Test('secret wipe overwrites only an owned UnicodeString buffer',
+  Test('secret wipe zeroes an owned UnicodeString buffer before freeing it',
     TestWipeOverwritesOnlyOwnedUnicodeBuffers);
 end;
 
