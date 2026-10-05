@@ -1,5 +1,18 @@
 # Verified registry mirror activation
 
+> **Status note (2026-10-05):** Three statements below describe the code at
+> acceptance. `registry sync` is no longer the only acquirer: the registry
+> consumer behind `lwpt install`, `add`, `remove`, and `update`
+> ([ADR-0051](./0051-registry-dependency-sources.md)) and `registry publish`'s
+> verification ([ADR-0049](./0049-registry-remote-publication.md)) also verify
+> in acquisition mode, so they inherit the lifetime ceiling and the
+> clock-rollback floor. Executable contact selection from
+> [issue #62](https://github.com/frostney/lwpt/issues/62) has shipped: an
+> install tries a registry's contacts in order and moves on after a request
+> failure or a stale contact. Finally, `keys/root.seed` is not only a legacy
+> file: `registry init` still writes the initial origin seed there, and only
+> keys created by `rotate-key` use `keys/ed25519-<hash>.seed`.
+
 [Issue #55](https://github.com/frostney/lwpt/issues/55) extends the existing
 `registry` command family from [ADR-0043](0043-self-hosted-registry-origin.md).
 `registry init --role mirror` requires an explicit origin identity, upstream

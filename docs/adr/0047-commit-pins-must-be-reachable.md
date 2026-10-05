@@ -1,5 +1,7 @@
 # Commit-SHA pins must be reachable from an advertised branch or tag
 
+> **Lockfile schema v4 ([ADR-0052](./0052-lockfile-schema-v4-framed-tree-digest.md)):** the lock is now schema v4. `reachableFrom` is unchanged there; the references below to an additive schema-v3 field and to an unchanged v3 schema describe the lock when this record was accepted.
+
 Issue [#303](https://github.com/frostney/lwpt/issues/303) found that a dependency pinned to a commit SHA installed whatever the host's archive endpoint served for that id. GitHub and GitLab serve commits that exist only in forks, pull requests, or merge requests under the upstream repository's name, so `actions/checkout@c7d749a2d57b4b375d1ebcd17cfbfb60c676f18e` (Chainguard's documented imposter commit) installed fork code that looks like upstream. When every requirement for a dependency was a SHA, resolution skipped ref listing entirely.
 
 This ADR amends [ADR-0009](./0009-source-syntax-and-tag-resolution.md) and the AGENTS.md hard constraint "Git sources use HTTP archive endpoints, not the git protocol". Archives remain the only source of dependency content. The git smart-HTTP upload-pack service, already used for tag listing, may now also carry commits-only reachability proofs.

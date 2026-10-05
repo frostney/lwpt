@@ -1,5 +1,16 @@
 # Delivery is skill-owned; the repository keeps one gate
 
+> **Amended 2026-10-05, workflow write scope:** the consequence "no workflow
+> writes to pull requests" overstates it. `.github/workflows/lwpt-update.yml`,
+> the reusable dependency updater from
+> [ADR-0039](./0039-outdated-update-subcommands.md) (added in #231, before
+> this record), holds `pull-requests: write` and creates or edits the
+> dependency-update pull request for its bot-owned branch when a caller
+> invokes it or it is dispatched manually. It is not triggered by pull
+> requests and runs no pull-request code. No delivery workflow writes to
+> pull requests, and every workflow that runs pull-request code keeps
+> read-only permissions.
+
 Supersedes [ADR-0032](./0032-managed-delivery-state-and-proof.md).
 
 ADR-0032 gave LWPT a repository-owned delivery state machine. A

@@ -1,5 +1,16 @@
 # Self-hosted registry origin lifecycle
 
+> **Extended by [ADR-0045](./0045-verified-registry-mirror.md) and
+> [ADR-0049](./0049-registry-remote-publication.md).** The `registry` command
+> family is no longer only `init|serve`. ADR-0045 adds the mirror role
+> (`registry init --role mirror`), `registry sync`, `registry verify`, and
+> local `registry rotate-key`. ADR-0049 adds remote publication:
+> `registry publish`, `registry issue-token`, `registry revoke-token`, and
+> authenticated publication requests on `registry serve`.
+> [ADR-0051](./0051-registry-dependency-sources.md) specifies the consumer
+> side. The Darwin transport selector below picks Secure Transport for every
+> kernel release below 25, not only kernel 24.
+
 Issue [#53](https://github.com/frostney/lwpt/issues/53) turns the registry
 protocol from [a wire contract](../registry-spec.md) into an origin that the
 LWPT executable can initialize and run. The command surface is
