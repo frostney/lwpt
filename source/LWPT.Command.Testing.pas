@@ -1444,6 +1444,66 @@ begin
   end;
 end;
 
+{ The last non-blank lines of a job's captured output, one indented line each,
+  with control characters neutralized so a child's terminal escapes cannot
+  rewrite the diagnostic. }
+function OutputTail(const AOutput: string): string;
+const
+  MaximumLines = 10;
+  MaximumLineLength = 200;
+var
+  First, i: Integer;
+  Lines: TStringList;
+begin
+  Result := '';
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AOutput;
+    while (Lines.Count > 0) and (Trim(Lines[Lines.Count - 1]) = '') do
+      Lines.Delete(Lines.Count - 1);
+    First := Lines.Count - MaximumLines;
+    if First < 0 then First := 0;
+    for i := First to Lines.Count - 1 do
+      Result := Result + LineEnding + '    '
+        + BoundedSingleLine(Lines[i], MaximumLineLength);
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ Why a job produced no inventory record. A program that exits nonzero has no
+  scheduler message of its own, so the reason is its exit code plus the tail
+  of what it printed. }
+function TestJobFailureReason(const AJob: TTestJob): string;
+var
+  Output, Tail: string;
+begin
+  Output := AJob.RunOutput;
+  case AJob.Status of
+    tjsCompileFailed:
+      begin
+        Result := 'compilation failed';
+        if AJob.ErrorMessage <> '' then
+          Result := Result + ': ' + AJob.ErrorMessage;
+        Output := AJob.CompileOutput;
+      end;
+    tjsRunFailed:
+      if AJob.ErrorMessage <> '' then Result := AJob.ErrorMessage
+      else
+        Result := 'test executable exited with code '
+          + IntToStr(AJob.ExitCode);
+    tjsCancelled:
+      Result := 'cancelled before its inventory record was read';
+    tjsWorkerError:
+      Result := AJob.ErrorMessage;
+  else
+    Result := 'did not complete';
+  end;
+  if Result = '' then Result := 'unknown failure';
+  Tail := OutputTail(Output);
+  if Tail <> '' then Result := Result + '; last output lines:' + Tail;
+end;
+
 function TTestScheduler.InventoryJSON(const AProjectRoot: string): string;
 var
   i: Integer;
@@ -1461,7 +1521,7 @@ begin
     if FJobs[i].Status <> tjsPassed then
       raise ELWPTError.CreateFmt(
         'test inventory failed for "%s": %s',
-        [DisplayPath, FJobs[i].ErrorMessage]);
+        [DisplayPath, TestJobFailureReason(FJobs[i])]);
     Result := Result + Separator + '{"path":' + JSONString(DisplayPath)
       + ',"suites":' + IntToStr(FJobs[i].InventorySuites)
       + ',"cases":' + IntToStr(FJobs[i].InventoryCases) + '}';
