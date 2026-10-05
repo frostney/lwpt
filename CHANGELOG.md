@@ -1,6 +1,103 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.8.0] - 2026-10-05
+
+### Upgrade notes
+
+- **Lockfile schema v4 (breaking).** 0.8.0 reads only schema v4 lockfiles, which use a framed tree digest (ADR-0052). `install`, `add`, `remove`, `update` and `outdated` refuse a v3 `lwpt.lock`. Run `lwpt repair` once in each project and commit the updated `lwpt.lock` (#355).
+- **Upgrade every lwpt install, including pinned ones.** A 0.7.0 `lwpt build` or `lwpt test` can wedge the shared per-user worker budget. It writes a request with `pid=0` and empty `lease-tokens` that claims the whole budget, which stalls every other lwpt on the machine. 0.8.0 can't wedge this way (#312). If a pre-0.8.0 run hangs with such a request, terminate it: its PID is the prefix of the request's file name.
+- **Leftover 0.7.0 install locks.** `lwpt repair` now reclaims `.lwpt/install.lock` only when a kernel record lock proves its owner has exited (ADR-0053). A lock left by a crashed 0.7.0 install has no such record, so repair names the file. Delete it by hand once no install or repair is running for the project.
+
+### Bug Fixes
+
+- fix(repair): reclaim the install lock only from a provably dead owner and hold it while recovering (#392)
+- fix(registry): wipe the TLS identity password on every platform (#390)
+- fix(registry): share delete access on Windows reads and never treat transient state absence as fresh (#383)
+- fix(test): make lwpt test --inventory work on the repository and explain failures (#382)
+- fix(install): verify local and workspace snapshots against their sources under --frozen (#379)
+- fix(hooks): judge hook and task staleness by full-resolution modification times (#369)
+- fix(build): make the stamp-version hook safe under concurrent self-builds (#362)
+- fix(core): address toolkit state by extended-length paths on Windows (#364)
+- fix(build): serialize version-include generation across concurrent builds (#360)
+- fix(httpclient): verify TLS trust anchors offline so SChannel never blocks on network retrieval (#346)
+- fix(test): join test workers before freeing what they share (#341)
+- fix(process-tree): stop and join signal forwarders before runtime shutdown (#337)
+- fix(build): self-host on Windows: bootstrap writes lwpt.exe and rebuilds replace the running image (#336)
+- fix(install): end crash-injection seams without running finalization (#332)
+- fix(install): extract archives without paszlib's 255-character path limit (#328)
+- fix(workers): detect the Linux online processor count for the default budget (#325)
+- fix(format): keep comments and strings out of the rename passes (#307)
+- fix(install): harden git-host fetches against redirects, moved tags and test seams (#308)
+- fix(test): wait for BuildFairness children to release their handles on Windows (#311)
+- fix(process): let a child that closes stdin early decide the result (#305)
+- fix(workers): keep coordinator state readable when children inherit locks (#312)
+- fix(process-tree): accept Darwin's spurious setpgid EPERM once the group exists (#310)
+- fix(build): preserve FIFO position while polling worker capacity (#296)
+- fix(workers): detect the macOS logical CPU budget (#295)
+- fix(cli): improve help discovery and consumer documentation (#293)
+- fix(test): transfer PID payload read ownership in TestScheduling (#291)
+- fix(format): preserve uses clauses that carry comments (#289)
+- fix(process-tree): harden Windows pipe validation (#290)
+- fix(cache): prevent inherited locks and isolate Ctrl-Break delivery (#273)
+- fix(cache): recover repeated staged verification interrupts (#272)
+- fix(cache): retry transient staged verification opens (#265)
+- fix(test): transfer WorkerBudget marker ownership (#263)
+- fix(cache): preserve transitive build references (#259)
+
+### Documentation
+
+- docs: sync documentation and records with shipped behavior for 0.8.0 (#391)
+- docs(registry): container deployment guide and registry end-to-end matrix (#56) (#357)
+- docs(adr): propose lockfile schema v4 with a framed tree digest (ADR-0052, #352) (#353)
+- docs(adr): propose registry dependency sources (ADR-0051, #62) (#340)
+- docs(adr): propose ADR-0049 registry remote publication (#54) (#334)
+- docs(orchestration): cap lane waits at five minutes (#326)
+
+### Internal
+
+- test: bound every child-process wait in test code and guard it (#368)
+- test(httpclient): move the retrieval recorder below every ephemeral port range (#373)
+- test: share delete access when reading files a live writer may be renaming on Windows (#371)
+- test(registry): relocate publication origins and bound every registry child wait (#363)
+- test: hand cross-process payloads over through their completion marker, and guard the pattern (#359)
+- test(support): give tarsynth gzip temp files unique names (#354)
+- test(registry): start Registry.E2E servers on kernel-chosen ports (#348)
+- ci(windows): compile x86_64-win64 test programs as win64 (#335)
+- ci: replace managed delivery with the known-good-route skills (#315)
+- test(cache): bound the scale test relative to one cache walk (#327)
+- chore(skills): refresh known-good-route workflows (#304)
+- ci: run the full test queue so one run reports every failure (#306)
+- chore(ci): inherit CodeRabbit's central frostney config (#298)
+- test: expose Darwin scheduling failures (#277)
+- fix(ci): extend focused scheduling diagnostic budget (#261)
+- ci: add trusted Linux scheduling observability (#270)
+- fix(delivery): accept exact no-code review skips (#267)
+- test: stabilize scheduling fixture startup (#256)
+- test(cache): preserve ObjectStore child failure diagnostics (#252)
+- test: make sibling fanout proof structural (#255)
+- test: stabilize scheduling fixture phases (#251)
+
+### New Features
+
+- feat(registry): bound the per-user registry document store (#366)
+- feat(registry): publish packages with registry dependencies (#62, ADR-0049 decision 4 lift) (#356)
+- feat(install): lockfile schema v4 with a framed tree digest (ADR-0052) (#355)
+- feat(registry): lwpt registry publish client (#54 slice 3) (#350)
+- feat(install): verify and restore registry dependencies under --frozen and --offline (#62 slice B, #226) (#351)
+- feat(install): consume registry dependencies online (#62 slice A) (#344)
+- feat(registry): authenticated remote publication, server side (#54 slice 2) (#343)
+- feat(archive): canonical tar.gz writer, bounded zip reader, and publication archive validation (#54 slice 1) (#342)
+- feat(httpclient): outbound TLS client options (trust anchors, client identity, insecure mode, peer certificate) (#339)
+- feat(registry): enforce a maximum checkpoint lifetime and a clock-rollback floor (#333)
+- feat(registry): add verified read-only mirrors and signed key rotation (#292)
+- feat(install): accept commit pins only when reachable from upstream refs (#316)
+- feat(registry): add self-hosted content-addressed origin (#253)
+- feat(install): add locked offline materialization (#283)
+
+### Performance
+
+- perf(cache): load the lifecycle index and judge admissions in near-linear time (#297)
 ## [0.7.0] - 2026-08-23
 
 ### Bug Fixes

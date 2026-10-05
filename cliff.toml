@@ -7,6 +7,11 @@
 #   git-cliff --latest --strip header        # just the latest tag's entries
 #   git-cliff -o CHANGELOG.md                # regenerate the whole file
 #
+# Upgrade notes for a release come from its annotated tag message; while
+# preparing the release PR, pass the same text with --with-tag-message:
+#
+#   git-cliff --tag <version> --with-tag-message "$(cat notes.md)" -o CHANGELOG.md
+#
 # The commit parsers are permissive (no Conventional Commits required) —
 # they bin messages by leading verb. release.yml publishes the matching
 # section from CHANGELOG.md as the GitHub Release notes.
@@ -24,6 +29,13 @@ body = """
   ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else -%}
   ## [Unreleased]
+{% endif -%}
+{#- A release's upgrade notes are its annotated tag message (or
+   --with-tag-message while preparing the release PR). Only messages that
+   start with a Markdown heading are rendered, so tags whose message is just
+   the version add nothing. -#}
+{%- if message and message is starting_with("### ") %}
+{{ message | trim }}
 {% endif -%}
 
 {% for group, commits in commits | group_by(attribute="group") %}
