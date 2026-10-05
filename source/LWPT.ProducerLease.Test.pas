@@ -85,16 +85,18 @@ begin
       until Assigned(Lease)
     else
       Lease := Coordinator.TryAcquire(Key, 'child producer');
+    { Every early end leaves through EndProcessAbruptly: Halt would
+      finalize the runtime beneath the lease's heartbeat thread. }
     if Mode = 'abandon' then
     begin
-      if Assigned(Lease) then Halt(72);
+      if Assigned(Lease) then EndProcessAbruptly(72);
       WriteTextFile(AcquiredPath, 'abandoned');
       Exit(True);
     end;
-    if not Assigned(Lease) then Halt(73);
+    if not Assigned(Lease) then EndProcessAbruptly(73);
     WriteTextFile(AcquiredPath, 'acquired');
-    if Mode = 'crash' then Halt(77);
-    if not WaitForMarker(ReleasePath) then Halt(74);
+    if Mode = 'crash' then EndProcessAbruptly(77);
+    if not WaitForMarker(ReleasePath) then EndProcessAbruptly(74);
   finally
     Lease.Free;
     Coordinator.Free;

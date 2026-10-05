@@ -5,7 +5,6 @@ program LWPT.Registry.Consumer.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
-  BaseUnix,
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Windows,
@@ -914,12 +913,7 @@ begin
   WriteLn(ErrOutput, 'FATAL: ', AWhat, '; ending the test program without '
     + 'finalization');
   Flush(ErrOutput);
-  {$IFDEF UNIX}
-  FpExit(RACE_ABORT_EXIT_CODE);
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Windows.ExitProcess(RACE_ABORT_EXIT_CODE);
-  {$ENDIF}
+  EndProcessAbruptly(RACE_ABORT_EXIT_CODE);
 end;
 
 { The publisher's per-origin lease, or a failure naming the key once
