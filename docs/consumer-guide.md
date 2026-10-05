@@ -27,7 +27,7 @@ the matching archive from [LWPT releases](https://github.com/frostney/lwpt/relea
 placing its executable on `PATH`. See the [platform support](deployment.md)
 reference for supported targets.
 
-The example below uses released **0.7.0** packages. Documentation on `main` can
+The example below uses released **0.8.0** packages. Documentation on `main` can
 describe newer commands; installed help and release tags identify the version
 you are using. Update dependency pins deliberately and regenerate the lockfile.
 
@@ -52,8 +52,8 @@ version = "0.1.0"
 units = ["source"]
 
 [dependencies]
-cli = { source = "frostney/lwpt", version = "0.7.0", include = ["packages/cli/**"] }
-testing = { source = "frostney/lwpt", version = "0.7.0", include = ["packages/testing/**"] }
+cli = { source = "frostney/lwpt", version = "0.8.0", include = ["packages/cli/**"] }
+testing = { source = "frostney/lwpt", version = "0.8.0", include = ["packages/testing/**"] }
 
 [build]
 hello = { source = "source/hello.pas", output = "build/hello" }

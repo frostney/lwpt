@@ -229,7 +229,7 @@ See the [README manifest section](../README.md#manifest) for an annotated exampl
 ```toml
 # lwpt.toml — non-monorepo consumer
 [dependencies]
-testing = { source = "frostney/lwpt", version = "0.7.0", include = ["packages/testing/**"] }
+testing = { source = "frostney/lwpt", version = "0.8.0", include = ["packages/testing/**"] }
 ```
 
 Include filters keep the repo-relative path prefix, so the filtered tree lands at `.lwpt/modules/testing/packages/testing/…`. That's fine: the resolver finds the package's `lwpt.toml` wherever it sits in the module tree (the shallowest one wins; if two manifests tie at the same minimal depth there is no defensible winner, so the resolver falls back to manifest-less module-root behavior — `-Fu`/`-Fi` point at the module root and no transitive deps are walked), reads its `units` array, and emits `-Fu`/`-Fi` paths relative to the module root — no extra configuration in the consumer manifest.
