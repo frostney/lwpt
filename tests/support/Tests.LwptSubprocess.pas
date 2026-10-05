@@ -37,9 +37,9 @@
       too; on Unix it stays in this program's process group and forwards
       SIGTERM to the groups it owns (ADR-0025). The job is emergency
       cleanup, never evidence: a child that returns while a member of its
-      job still runs raises ELwptRunSurvivors naming those processes, so a
-      cancellation test cannot pass on this helper's cleanup instead of
-      LWPT's.
+      job still runs once OWNED_TREE_SETTLE_MILLISECONDS have passed raises
+      ELwptRunSurvivors naming those processes, so a cancellation test
+      cannot pass on this helper's cleanup instead of LWPT's.
 
   Surface — kept minimal:
 
@@ -476,9 +476,10 @@ begin
           + CapturedOutputTail(Result.Stderr) + LineEnding
           + '--- end captured output ---');
       end;
-      { Checked at once: anything the child started has had to end before
-        it returned. }
-      Survivors := OwnedChildSurvivors(P);
+      { Anything the child started has had to end before it returned;
+        members that end within the settle period, such as one still
+        being torn down, are not survivors (see OwnedChildSurvivors). }
+      Survivors := OwnedChildSurvivors(P, Result.Stdout, Result.Stderr);
       { Final drain after exit. Normal Windows completion keeps its
         historical EOF barrier, bounded, because live descendants can lock
         fixture working directories; Unix completion stays nonblocking
@@ -501,8 +502,10 @@ begin
         genuine failure either way, so trust it when ExitCode claims
         success. }
       if Survivors <> '' then
-        raise ELwptRunSurvivors.Create('lwpt subprocess returned while '
-          + 'processes it started still ran (' + Survivors + '): '
+        raise ELwptRunSurvivors.Create('lwpt subprocess (pid '
+          + IntToStr(P.ProcessID) + ') returned while processes it started '
+          + 'still ran ' + IntToStr(OWNED_TREE_SETTLE_MILLISECONDS)
+          + ' ms later (' + Survivors + '): '
           + QuotedChildCommandLine(P) + ' (in ' + AInDir + ')' + LineEnding
           + '--- captured stdout ---' + LineEnding
           + CapturedOutputTail(Result.Stdout) + LineEnding

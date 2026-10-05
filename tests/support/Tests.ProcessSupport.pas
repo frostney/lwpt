@@ -56,6 +56,9 @@ const
     default (Tests.LwptSubprocess), whose measured basis is recorded in
     docs/testing.md, and stays well inside a CI job's bound. }
   CHILD_COMPLETION_TIMEOUT_MILLISECONDS = 300000;
+  { How long OwnedChildSurvivors lets an exited owned child's remaining
+    members finish before it reports them; see there. }
+  OWNED_TREE_SETTLE_MILLISECONDS = 5000;
 
 type
   { A child outlived the deadline of a FinishChild call and was terminated. }
@@ -164,11 +167,32 @@ function RunChildCommand(const ADirectory, AExecutable: string;
 
 { After a child started with ExecuteOwnedChild has exited: the members of
   its Job Object (Windows) or of its own process group (Linux) that still
-  run, as 'pid 123, pid 456', or '' when none do. A survivor is evidence that
-  the child returned while descendants it started still ran, which kill-on
-  close and group termination would otherwise end without trace. Other
-  children, and other platforms, report ''. }
-function OwnedChildSurvivors(AProcess: TProcess): string;
+  run once ASettleMilliseconds have passed, as 'pid 123 (image), pid 456
+  (image)', or '' when none do. A survivor is evidence that the child
+  returned while descendants it started still ran, which kill-on-close and
+  group termination would otherwise end without trace. Other children, and
+  other platforms, report '' at once.
+
+  The settle period exists because membership lags exit. Windows documents
+  that a job's ActiveProcesses count drops only once a terminated process
+  has exited and all references to it are released, and a member can stay
+  counted, or listed, briefly after the call that ended it returned. A
+  console host or a just-reaped descendant can likewise end a moment after
+  the child. Members that have already exited never count. Members that
+  still run are polled until none remain or the period ends, so the result
+  is immediate when the tree is empty and costs at most the period when it
+  is not. A descendant that outlives the child by less than the period is
+  not reported: fixtures that prove LWPT ended its descendants must keep
+  them running far longer (ProcessSupport.Test holds them for 60 s). The
+  variant with output drains a poUsePipes child meanwhile, so a trailing
+  writer cannot block on a full pipe. }
+function OwnedChildSurvivors(AProcess: TProcess;
+  const ASettleMilliseconds: QWord = OWNED_TREE_SETTLE_MILLISECONDS): string;
+  overload;
+function OwnedChildSurvivors(AProcess: TProcess; var AStdout,
+  AStderr: string;
+  const ASettleMilliseconds: QWord = OWNED_TREE_SETTLE_MILLISECONDS): string;
+  overload;
 function ReapChild(AProcess: TProcess;
   const ATimeoutMilliseconds: QWord = CHILD_COMPLETION_TIMEOUT_MILLISECONDS):
   Boolean;
@@ -244,6 +268,9 @@ function QueryTestJobInformation(const AJob: THandle;
   const AInformationClass: DWORD; const AInformation: Pointer;
   const AInformationLength: DWORD; const AReturnLength: PDWORD): BOOL;
   stdcall; external 'kernel32.dll' name 'QueryInformationJobObject';
+function IsTestProcessInJob(const AProcess, AJob: THandle;
+  out AResult: BOOL): BOOL; stdcall;
+  external 'kernel32.dll' name 'IsProcessInJob';
 {$ENDIF}
 
 {$IFDEF UNIX}
@@ -751,13 +778,15 @@ begin
     ATimeoutMilliseconds) then
     RaiseChildTimeout(AProcess, AStdout, AStderr, ATimeoutMilliseconds,
       ADescription);
-  Survivors := OwnedChildSurvivors(AProcess);
+  Survivors := OwnedChildSurvivors(AProcess, AStdout, AStderr);
   if Survivors <> '' then
   begin
     Description := ADescription;
     if Description = '' then Description := 'child process';
-    raise EChildProcessSurvivors.Create(Description + ' finished while '
-      + 'processes it started still ran (' + Survivors + '): '
+    raise EChildProcessSurvivors.Create(Description + ' (pid '
+      + IntToStr(AProcess.ProcessID) + ') finished while processes it '
+      + 'started still ran ' + IntToStr(OWNED_TREE_SETTLE_MILLISECONDS)
+      + ' ms later (' + Survivors + '): '
       + QuotedChildCommandLine(AProcess));
   end;
   Result := ChildProcessExitCode(AProcess);
@@ -816,69 +845,197 @@ begin
   end;
 end;
 
-function OwnedChildSurvivors(AProcess: TProcess): string;
 {$IFDEF MSWINDOWS}
+{ 'pid N (image path)' for an open job member. }
+function JobMemberDescription(const AHandle: THandle;
+  const APID: PtrUInt): string;
+var
+  Image: array[0..1023] of WideChar;
+  ImageLength: DWORD;
+  ImagePath: UnicodeString;
+begin
+  ImageLength := Length(Image);
+  if Windows.QueryFullProcessImageNameW(AHandle, 0, @Image[0],
+    @ImageLength) then
+  begin
+    SetString(ImagePath, PWideChar(@Image[0]), ImageLength);
+    Result := 'pid ' + IntToStr(APID) + ' (' + string(ImagePath) + ')';
+  end
+  else
+    Result := 'pid ' + IntToStr(APID) + ' (image unavailable)';
+end;
+
+{ The members of AJob, other than the exited child AChildPID, that have not
+  exited, as described by OwnedChildSurvivors; '' when none have. Members
+  the job counts but cannot list or inspect are reported too, so an
+  unreadable job never passes for an empty one. }
+function RunningJobMembers(const AJob: THandle;
+  const AChildPID: PtrUInt): string;
 const
   ListCapacity = 256;
 var
-  Tree: TChildProcessTree;
+  Accounting: TJobAccountingInformation;
   { JOBOBJECT_BASIC_PROCESS_ID_LIST: two DWORD counts, then ULONG_PTR IDs
     at offset 8 on Win32 and Win64 alike. }
   List: array[0..1 + ListCapacity * (SizeOf(PtrUInt) div 4)] of DWord;
   Count, Index: Integer;
   Id: PtrUInt;
+  Member: THandle;
+  InJob: BOOL;
+  ExitCode, ErrorCode: DWORD;
+
+  procedure Add(const AText: string);
+  begin
+    if Result <> '' then Result := Result + ', ';
+    Result := Result + AText;
+  end;
+
 begin
   Result := '';
-  Tree := ChildTreeOf(AProcess);
-  if (Tree = nil) or (Tree.FJob = 0)
-     or not JobHasActiveProcesses(Tree.FJob) then Exit;
+  FillChar(Accounting, SizeOf(Accounting), 0);
+  if not QueryTestJobInformation(AJob,
+    JobObjectBasicAccountingInformationClass, @Accounting,
+    SizeOf(Accounting), nil) then
+    Exit('job members that could not be counted');
+  if Accounting.ActiveProcesses = 0 then Exit;
   FillChar(List, SizeOf(List), 0);
-  if not QueryTestJobInformation(Tree.FJob,
+  { A list longer than the buffer fails with ERROR_MORE_DATA but still
+    fills it; the members past it are counted below. }
+  if not QueryTestJobInformation(AJob,
     JobObjectBasicProcessIdListClass, @List[0], SizeOf(List), nil)
      and (List[1] = 0) then
-    Exit('job members that could not be listed');
+    Exit(IntToStr(Accounting.ActiveProcesses)
+      + ' job members that could not be listed');
   Count := List[1];
   for Index := 0 to Count - 1 do
   begin
     Move(PByte(@List[0])[8 + Index * SizeOf(PtrUInt)], Id, SizeOf(Id));
-    if Result <> '' then Result := Result + ', ';
-    Result := Result + 'pid ' + IntToStr(Id);
+    { The exited child: its TProcess holds its handle, so its PID cannot
+      name another process yet. }
+    if Id = AChildPID then Continue;
+    Member := Windows.OpenProcess(Windows.PROCESS_QUERY_LIMITED_INFORMATION,
+      False, DWORD(Id));
+    if Member = 0 then
+    begin
+      ErrorCode := Windows.GetLastError;
+      { ERROR_INVALID_PARAMETER: no such process any more. }
+      if ErrorCode <> Windows.ERROR_INVALID_PARAMETER then
+        Add('pid ' + IntToStr(Id) + ' (not inspectable: '
+          + SysErrorMessage(ErrorCode) + ')');
+      Continue;
+    end;
+    try
+      { A PID freed and reused since the listing names an outsider. }
+      if IsTestProcessInJob(Member, AJob, InJob) and not InJob then
+        Continue;
+      if Windows.GetExitCodeProcess(Member, ExitCode)
+         and (ExitCode <> Windows.STILL_ACTIVE) then
+        Continue;
+      Add(JobMemberDescription(Member, Id));
+    finally
+      Windows.CloseHandle(Member);
+    end;
   end;
+  { Counted but not listed: the listing omits members that are being torn
+    down, and those past the buffer. }
   if List[0] > DWord(Count) then
-    Result := Result + ' and ' + IntToStr(List[0] - DWord(Count)) + ' more';
-  if Result = '' then Result := 'job members that could not be listed';
+    Add(IntToStr(List[0] - DWord(Count)) + ' unlisted job member(s)');
 end;
-{$ELSE}
+{$ENDIF}
+
 {$IFDEF LINUX}
+{ procfs comm of APid, or '' once it has gone. }
+function ProcessCommand(const APid: LongInt): string;
 var
-  Tree: TChildProcessTree;
+  CommFile: TextFile;
+begin
+  Result := '';
+  AssignFile(CommFile, '/proc/' + IntToStr(APid) + '/comm');
+  {$I-}
+  Reset(CommFile);
+  {$I+}
+  if IOResult <> 0 then Exit;
+  {$I-}
+  ReadLn(CommFile, Result);
+  {$I+}
+  if IOResult <> 0 then Result := '';
+  CloseFile(CommFile);
+  Result := Trim(Result);
+end;
+
+{ The live members of process group AGroup, as described by
+  OwnedChildSurvivors; '' when none. }
+function RunningGroupMembers(const AGroup: LongInt): string;
+var
   Search: TSearchRec;
   Pid, Parent, Group: LongInt;
   State: Char;
+  Command: string;
 begin
   Result := '';
-  Tree := ChildTreeOf(AProcess);
-  if (Tree = nil) or not Tree.FOwnProcessGroup then Exit;
   if FindFirst('/proc/*', faDirectory, Search) <> 0 then Exit;
   try
     repeat
       Pid := StrToIntDef(Search.Name, 0);
       if (Pid <= 0) or not ReadProcessStat(Pid, State, Parent, Group)
-         or (Group <> AProcess.ProcessID)
+         or (Group <> AGroup)
          or (State = 'Z') or (State = 'X') then Continue;
+      Command := ProcessCommand(Pid);
+      if Command = '' then Command := 'command unavailable';
       if Result <> '' then Result := Result + ', ';
-      Result := Result + 'pid ' + IntToStr(Pid);
+      Result := Result + 'pid ' + IntToStr(Pid) + ' (' + Command + ')';
     until FindNext(Search) <> 0;
   finally
     SysUtils.FindClose(Search);
   end;
 end;
-{$ELSE}
+{$ENDIF}
+
+{ One survivor reading of an owned tree; '' for a tree that cannot be
+  listed here. }
+function OwnedTreeRunningMembers(AProcess: TProcess;
+  const ATree: TChildProcessTree): string;
 begin
   Result := '';
+  {$IFDEF MSWINDOWS}
+  if ATree.FJob <> 0 then
+    Result := RunningJobMembers(ATree.FJob, PtrUInt(AProcess.ProcessID));
+  {$ENDIF}
+  {$IFDEF LINUX}
+  if ATree.FOwnProcessGroup then
+    Result := RunningGroupMembers(AProcess.ProcessID);
+  {$ENDIF}
 end;
-{$ENDIF}
-{$ENDIF}
+
+function OwnedChildSurvivors(AProcess: TProcess; var AStdout,
+  AStderr: string; const ASettleMilliseconds: QWord): string;
+var
+  Tree: TChildProcessTree;
+  StartedAt: QWord;
+begin
+  Result := '';
+  Tree := ChildTreeOf(AProcess);
+  if Tree = nil then Exit;
+  StartedAt := GetTickCount64;
+  repeat
+    DrainChildPipes(AProcess, AStdout, AStderr);
+    Result := OwnedTreeRunningMembers(AProcess, Tree);
+    if (Result = '')
+       or (GetTickCount64 - StartedAt >= ASettleMilliseconds) then
+      Exit;
+    Sleep(ProcessPollMilliseconds);
+  until False;
+end;
+
+function OwnedChildSurvivors(AProcess: TProcess;
+  const ASettleMilliseconds: QWord): string;
+var
+  Discarded: string;
+begin
+  Discarded := '';
+  Result := OwnedChildSurvivors(AProcess, Discarded, Discarded,
+    ASettleMilliseconds);
+end;
 
 function ProcessIsLive(const APID: Integer): Boolean;
 {$IFDEF LINUX}

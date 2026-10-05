@@ -3,12 +3,15 @@
 
   Each case re-runs this program in a child mode: one that writes past pipe
   capacity to both streams, one that sleeps, one that leaves a descendant
-  running after it returns, and one that holds a sleeping descendant. The
-  survivor cases are the falsification of process-tree ownership: an owned
-  child that returns while a descendant still runs must fail its wait,
-  never pass on the helper's own kill-on-close or group cleanup. They need
-  a Job Object (Windows) or Linux procfs; Darwin skips them. Under Wine the
-  Job Object cases do not exercise native Windows job semantics. }
+  running after it returns, one that leaves a descendant that ends shortly
+  after it, and one that holds a sleeping descendant. The survivor cases
+  are the falsification of process-tree ownership: an owned child that
+  returns while a descendant still runs must fail its wait, never pass on
+  the helper's own kill-on-close or group cleanup. Their descendant sleeps
+  far past the survivor settle period, while the brief descendant ends well
+  inside it and must not be reported. They need a Job Object (Windows) or
+  Linux procfs; Darwin skips them. Under Wine the Job Object cases do not
+  exercise native Windows job semantics. }
 program ProcessSupport.Test;
 
 {$mode delphi}{$H+}
@@ -31,11 +34,16 @@ const
   FloodSwitch = '--process-support-flood';
   SleepSwitch = '--process-support-sleep';
   SurvivorSwitch = '--process-support-spawn-survivor';
+  BriefSwitch = '--process-support-spawn-brief';
   HolderSwitch = '--process-support-hold-descendant';
   { Past every platform's anonymous-pipe capacity (64 KiB on Linux and
     macOS, a few KiB to 64 KiB on Windows). }
   FloodBytes = 1024 * 1024;
+  { A survivor must outlive the settle period by far, so a slow runner
+    cannot let it end inside the period and pass unreported. }
   DescendantSleepMilliseconds = 60000;
+  { A trailing member that ends well inside the settle period. }
+  BriefDescendantMilliseconds = 500;
   CaseTimeoutMilliseconds = 60000;
   ShortDeadlineMilliseconds = 300;
   DescendantGoneMilliseconds = 5000;
@@ -58,6 +66,7 @@ type
     procedure TestZeroAllowanceDoesNotBlock;
     procedure TestOwnedTreeIsTerminatedWithItsDescendants;
     procedure TestFinishChildReportsASurvivingDescendant;
+    procedure TestFinishChildToleratesADescendantEndingWithinTheSettle;
     procedure TestReapChildEndsAnOwnedTreesSurvivor;
     procedure TestRunLwptReportsASurvivingDescendant;
   end;
@@ -82,14 +91,22 @@ begin
   end;
 end;
 
-{ Starts a sleeping copy of this program and returns it; the caller
-  decides whether to wait for it. }
-function StartSleepingDescendant: TProcess;
+{$IF DescendantSleepMilliseconds < 6 * OWNED_TREE_SETTLE_MILLISECONDS}
+{$ERROR the survivor descendant must sleep far past the settle period}
+{$ENDIF}
+{$IF 4 * BriefDescendantMilliseconds > OWNED_TREE_SETTLE_MILLISECONDS}
+{$ERROR the brief descendant must end well inside the settle period}
+{$ENDIF}
+
+{ Starts a copy of this program sleeping AMilliseconds and returns it; the
+  caller decides whether to wait for it. }
+function StartSleepingDescendant(
+  const AMilliseconds: Integer = DescendantSleepMilliseconds): TProcess;
 begin
   Result := TProcess.Create(nil);
   Result.Executable := ExpandFileName(ParamStr(0));
   Result.Parameters.Add(SleepSwitch);
-  Result.Parameters.Add(IntToStr(DescendantSleepMilliseconds));
+  Result.Parameters.Add(IntToStr(AMilliseconds));
   { The descendant must not keep the parent's pipe writers open. }
   Result.InheritHandles := False;
   Result.Execute;
@@ -116,6 +133,15 @@ begin
     { Returns at once, leaving its descendant running: the defect an
       owned child's wait must report. }
     Descendant := StartSleepingDescendant;
+    PublishReadablePayload(ParamStr(2), IntToStr(Descendant.ProcessID));
+    Descendant.Free;
+    Halt(0);
+  end;
+  if (ParamCount = 2) and (ParamStr(1) = BriefSwitch) then
+  begin
+    { Returns at once; its descendant ends shortly after, like a console
+      host or a member still being torn down. }
+    Descendant := StartSleepingDescendant(BriefDescendantMilliseconds);
     PublishReadablePayload(ParamStr(2), IntToStr(Descendant.ProcessID));
     Descendant.Free;
     Halt(0);
@@ -311,7 +337,7 @@ begin
       on E: EChildProcessSurvivors do Failure := E.Message;
     end;
     DescendantPID := WaitForDescendantPID(PIDPath);
-    Expect<Boolean>(Pos('pid ' + IntToStr(DescendantPID), Failure) > 0)
+    Expect<Boolean>(Pos('pid ' + IntToStr(DescendantPID) + ' (', Failure) > 0)
       .ToBe(True);
     { Reported first, then ended by the owned tree. }
     Expect<Boolean>(TerminateChildProcess(Child)).ToBe(True);
@@ -319,6 +345,38 @@ begin
   finally
     { The whole owned tree, unconditionally: a failed assertion above must
       not leave the surviving sleeper running in its own group. }
+    TerminateChildProcess(Child);
+    Child.Free;
+  end;
+end;
+
+procedure TProcessSupportTests.
+  TestFinishChildToleratesADescendantEndingWithinTheSettle;
+var
+  Child: TProcess;
+  DescendantPID, ExitCode: Integer;
+  Failure, PIDPath: string;
+begin
+  { The settle period's other half: a member that ends shortly after the
+    child returned is not a survivor, so it neither fails the wait nor
+    needs the helper's cleanup. }
+  PIDPath := FScratch + '/brief-descendant-pid';
+  Child := SelfChild([BriefSwitch, PIDPath], []);
+  try
+    ExecuteOwnedChild(Child, True);
+    Failure := '';
+    ExitCode := -1;
+    try
+      ExitCode := FinishChild(Child, CaseTimeoutMilliseconds,
+        'brief spawner');
+    except
+      on E: EChildProcessSurvivors do Failure := E.Message;
+    end;
+    Expect<string>(Failure).ToBe('');
+    Expect<Integer>(ExitCode).ToBe(0);
+    DescendantPID := WaitForDescendantPID(PIDPath);
+    Expect<Boolean>(DescendantGone(DescendantPID)).ToBe(True);
+  finally
     TerminateChildProcess(Child);
     Child.Free;
   end;
@@ -370,7 +428,7 @@ begin
     SetLwptBinaryPath(SavedBinary);
   end;
   DescendantPID := WaitForDescendantPID(PIDPath);
-  Expect<Boolean>(Pos('pid ' + IntToStr(DescendantPID), Failure) > 0)
+  Expect<Boolean>(Pos('pid ' + IntToStr(DescendantPID) + ' (', Failure) > 0)
     .ToBe(True);
   { Freeing the child closed its kill-on-close job. }
   Expect<Boolean>(DescendantGone(DescendantPID)).ToBe(True);
@@ -390,9 +448,14 @@ begin
   {$IF DEFINED(MSWINDOWS) OR DEFINED(LINUX)}
   Test('FinishChild reports a descendant that outlives an owned child',
     TestFinishChildReportsASurvivingDescendant);
+  Test('FinishChild tolerates a descendant that ends within the settle '
+    + 'period', TestFinishChildToleratesADescendantEndingWithinTheSettle);
   {$ELSE}
   Skip('FinishChild reports a descendant that outlives an owned child',
     TestFinishChildReportsASurvivingDescendant,
+    'survivors are listed from a Job Object or Linux procfs');
+  Skip('FinishChild tolerates a descendant that ends within the settle '
+    + 'period', TestFinishChildToleratesADescendantEndingWithinTheSettle,
     'survivors are listed from a Job Object or Linux procfs');
   {$ENDIF}
   Test('ReapChild ends the surviving descendant of an exited owned child',
