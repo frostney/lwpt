@@ -218,7 +218,7 @@ Source kinds:
 - an `https://` URL to a tarball;
 - a local path (or `local:` prefix);
 - `workspace:` (`workspace:*` or `workspace:^X.Y.Z`), naming a member discovered through `[workspaces]`;
-- `registry:[<alias>/]<package>`, selected from the signed snapshot of an origin declared in the root `[registries]` table.
+- `registry:[<alias>/]<package>`, selected from the registry snapshot named by the signed checkpoint of an origin declared in the root `[registries]` table.
 
 See the [README manifest section](../README.md#manifest) for an annotated example, [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) for the source syntax, and [ADR-0051](./adr/0051-registry-dependency-sources.md) for registry sources.
 

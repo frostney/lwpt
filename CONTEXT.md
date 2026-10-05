@@ -26,7 +26,7 @@ An extracted dependency tree under `.lwpt/modules/<dep>/`. The thing FPC's `-Fu`
 
 **Module snapshot**:
 The exact validated, include/exclude-filtered tree that the install transaction publishes as a module from the stable resolver plan, whatever the source kind. Its framed digest is the lock's `computedHash`. Never a live link to its source.
-*Avoid*: "snapshot" alone (a *Registry snapshot* is signed origin state), "copy", "link".
+*Avoid*: "snapshot" alone (a *Registry snapshot* is origin state named by a signed checkpoint), "copy", "link".
 
 **Archive**:
 The committed `.tar.gz` at `.lwpt/archives/<dep>-<safe-ref>.tar.gz` that produced a module. Source of truth for hash verification on `lwpt install --frozen`. Per ADR-0002 Z-both, archives live alongside extracted modules so a tampered modules tree is detectable.
