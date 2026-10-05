@@ -25,6 +25,7 @@ uses
   LWPT.Registry.Verification,
   TransportSecurity,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -145,10 +146,12 @@ begin
     ProcessInstance.Parameters.Add('mklink /J "'
       + StringReplace(ALinkDirectory, '/', '\', [rfReplaceAll]) + '" "'
       + StringReplace(ALinkTarget, '/', '\', [rfReplaceAll]) + '"');
-    ProcessInstance.Options := [poWaitOnExit];
     try
       ProcessInstance.Execute;
-      Result := ProcessInstance.ExitStatus = 0;
+      { A cmd.exe past the deadline is ended and raises, so the junction is
+        reported as not created. }
+      Result := FinishChild(ProcessInstance,
+        CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'mklink') = 0;
     except
       Result := False;
     end;

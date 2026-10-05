@@ -248,8 +248,8 @@ begin
     Child.Parameters.Add(CompilerNormalExitProxyOption);
     Child.Parameters.Add(DescendantPIDPath);
     ProcessTree.Execute;
-    Child.WaitOnExit;
-    Expect<Integer>(Child.ExitStatus).ToBe(0);
+    Expect<Integer>(FinishChild(Child, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+      'normal-exit compiler proxy')).ToBe(0);
     Expect<Boolean>(PayloadIsReadable(DescendantPIDPath)).ToBe(True);
     DescendantPID := StrToInt(Trim(ReadPayloadText(DescendantPIDPath)));
     FreeAndNil(ProcessTree);
@@ -528,7 +528,7 @@ begin
       Sleep(ProcessPollMilliseconds);
     if not PayloadIsReadable(ParamStr(2)) then
     begin
-      if Descendant.Running then Descendant.Terminate(1);
+      TerminateChildProcess(Descendant);
       Exit;
     end;
     Result := 0;

@@ -30,6 +30,7 @@ uses
   LWPT.GitProtocol,
   TestingPascalLibrary,
   Tests.HTTPMockServer,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -236,8 +237,8 @@ function TRecordingTransport.RunUploadPack(const ARepoURL: string;
   const AArguments: array of string; const AInput: TBytes): TBytes;
 var
   Proc: TProcess;
-  Buffer: array[0..65535] of Byte;
-  Count, i, n: Integer;
+  i: Integer;
+  Stdout, Stderr: string;
 begin
   Proc := TProcess.Create(nil);
   try
@@ -260,28 +261,14 @@ begin
     if Length(AInput) > 0 then
       Proc.Input.WriteBuffer(AInput[0], Length(AInput));
     Proc.CloseInput;
-    SetLength(Result, 0);
-    repeat
-      Count := Proc.Output.NumBytesAvailable;
-      if Count = 0 then
-      begin
-        if not Proc.Running then Break;
-        Sleep(5);
-        Continue;
-      end;
-      if Count > SizeOf(Buffer) then Count := SizeOf(Buffer);
-      Count := Proc.Output.Read(Buffer[0], Count);
-      n := Length(Result);
-      SetLength(Result, n + Count);
-      Move(Buffer[0], Result[n], Count);
-    until False;
-    repeat
-      Count := Proc.Output.Read(Buffer[0], SizeOf(Buffer));
-      if Count <= 0 then Break;
-      n := Length(Result);
-      SetLength(Result, n + Count);
-      Move(Buffer[0], Result[n], Count);
-    until False;
+    { Both pipes are drained in available-byte snapshots until git exits,
+      never read to EOF, and the wait is bounded. }
+    Stdout := '';
+    Stderr := '';
+    FinishChild(Proc, Stdout, Stderr, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+      'git upload-pack');
+    SetLength(Result, Length(Stdout));
+    if Length(Stdout) > 0 then Move(Stdout[1], Result[0], Length(Stdout));
   finally
     Proc.Free;
   end;

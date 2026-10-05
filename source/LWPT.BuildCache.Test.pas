@@ -20,6 +20,7 @@ uses
   LWPT.Core,
   LWPT.ObjectStore,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -390,8 +391,8 @@ begin
   Child := StartStoreChild(FArtifact,
     IntToStr(Length(ReadBytes(FArtifact))));
   try
-    Child.WaitOnExit;
-    Expect<Integer>(Child.ExitStatus).ToBe(3);
+    Expect<Integer>(FinishChild(Child, CHILD_TIMEOUT_MS, 'store child'))
+      .ToBe(3);
     Expect<Boolean>(FileExists(ObjectPath(ArtifactDigest))).ToBe(False);
     Expect<Boolean>(FileExists(FCacheRoot + '/build-results/refs/sha256/'
       + Copy(TEST_FINGERPRINT, 8, 2) + '/'
@@ -597,11 +598,13 @@ begin
   First := StartStoreChild(FirstArtifact);
   Second := StartStoreChild(SecondArtifact);
   try
-    First.WaitOnExit;
-    Second.WaitOnExit;
-    Expect<Integer>(First.ExitStatus).ToBe(0);
-    Expect<Integer>(Second.ExitStatus).ToBe(0);
+    Expect<Integer>(FinishChild(First, CHILD_TIMEOUT_MS, 'first store child'))
+      .ToBe(0);
+    Expect<Integer>(FinishChild(Second, CHILD_TIMEOUT_MS,
+      'second store child')).ToBe(0);
   finally
+    ReapChild(First, CHILD_TIMEOUT_MS);
+    ReapChild(Second, CHILD_TIMEOUT_MS);
     First.Free;
     Second.Free;
   end;
@@ -679,11 +682,7 @@ begin
     if Assigned(Child) and Child.Running then
     begin
       WriteSignal(ReleasePath);
-      if not Child.WaitOnExit(CHILD_TIMEOUT_MS) then
-      begin
-        Child.Terminate(1);
-        Child.WaitOnExit(2000);
-      end;
+      ReapChild(Child, CHILD_TIMEOUT_MS);
     end;
     Child.Free;
     Cache.Free;
@@ -741,11 +740,7 @@ begin
     if Assigned(Child) and Child.Running then
     begin
       WriteSignal(ReleasePath);
-      if not Child.WaitOnExit(CHILD_TIMEOUT_MS) then
-      begin
-        Child.Terminate(1);
-        Child.WaitOnExit(2000);
-      end;
+      ReapChild(Child, CHILD_TIMEOUT_MS);
     end;
     Child.Free;
     Cache.Free;
@@ -799,20 +794,10 @@ begin
     if Assigned(Materializer) and Materializer.Running then
     begin
       WriteSignal(ReleasePath);
-      if not Materializer.WaitOnExit(CHILD_TIMEOUT_MS) then
-      begin
-        Materializer.Terminate(1);
-        Materializer.WaitOnExit(2000);
-      end;
+      ReapChild(Materializer, CHILD_TIMEOUT_MS);
     end;
     if Assigned(StoreChild) and StoreChild.Running then
-    begin
-      if not StoreChild.WaitOnExit(CHILD_TIMEOUT_MS) then
-      begin
-        StoreChild.Terminate(1);
-        StoreChild.WaitOnExit(2000);
-      end;
-    end;
+      ReapChild(StoreChild, CHILD_TIMEOUT_MS);
     StoreChild.Free;
     Materializer.Free;
     Cache.Free;

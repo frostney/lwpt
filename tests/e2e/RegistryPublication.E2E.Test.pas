@@ -22,6 +22,7 @@ uses
 
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.RegistryHTTP,
   Tests.RegistryOrigin,
   Tests.RegistryProcess,

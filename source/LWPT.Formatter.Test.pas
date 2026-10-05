@@ -18,6 +18,7 @@ uses
   LWPT.Core,
   LWPT.Formatter,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 type
@@ -282,14 +283,14 @@ begin
   OutputDirectory := ScratchRoot + '/compile/' + IntToStr(CompileCount);
   ForceDirectories(OutputDirectory);
   if ADefine = '' then
-    Result := RunCommandInDir(GetCurrentDir, TestCompilerExecutable,
+    ExitStatus := RunChildCommand(GetCurrentDir, TestCompilerExecutable,
       ['-Cn', '-FU' + OutputDirectory, '-FE' + OutputDirectory, APath],
-      Output, ExitStatus) = 0
+      Output)
   else
-    Result := RunCommandInDir(GetCurrentDir, TestCompilerExecutable,
+    ExitStatus := RunChildCommand(GetCurrentDir, TestCompilerExecutable,
       ['-Cn', '-d' + ADefine, '-FU' + OutputDirectory, '-FE' + OutputDirectory, APath],
-      Output, ExitStatus) = 0;
-  Result := Result and (ExitStatus = 0);
+      Output);
+  Result := ExitStatus = 0;
   if not Result then
     WriteLn(Output);
 end;

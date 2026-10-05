@@ -26,6 +26,15 @@ uses
   TestingPascalLibrary,
   Tests.HTTPMockServer;
 
+const
+  { Bounds the redirect case's request and its origin mock's completion.
+    Both return as soon as the origin has answered. 30 s is a mitigation,
+    not a root-cause fix: native Windows CI once exceeded the earlier 2 s
+    on the allowed first hop, for a reason not established, and the same
+    run showed a slow mock teardown, whose unbounded Stop and WaitFor are
+    tracked in #380. }
+  RedirectRequestDeadlineMilliseconds = 30000;
+
 type
   TFetchPolicySuite = class(TTestSuite)
   public
@@ -243,13 +252,17 @@ begin
       O := Options(Dep(skGitHost, hkCustom, 'forge', 'owner/repo'),
         MockSources(Origin.Port));
       { The mock servers are plaintext loopback endpoints; only the host
-        rule is under test here. }
+        rule is under test here. The deadline only bounds a hang: the
+        allowed first hop to the origin must complete within it before the
+        redirect can be refused, so it is generous (see
+        RedirectRequestDeadlineMilliseconds). }
       O.Destination.RequireHTTPS := False;
       O.Destination.PrivateAddressPolicy := papAllow;
-      O.RequestTimeoutMilliseconds := 2000;
+      O.RequestTimeoutMilliseconds := RedirectRequestDeadlineMilliseconds;
       Expect<string>(GetError(Base + '/owner/repo/v1.tar.gz', O))
         .ToBe('fetch host not allowed: localhost');
-      Expect<Boolean>(Origin.WaitDone(2000)).ToBe(True);
+      Expect<Boolean>(Origin.WaitDone(RedirectRequestDeadlineMilliseconds))
+        .ToBe(True);
       Expect<Boolean>(Target.WaitDone(200)).ToBe(False);
     finally
       Origin.Free;
