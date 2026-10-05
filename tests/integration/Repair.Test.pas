@@ -805,8 +805,7 @@ begin
   DumpRunFailure(ALabel, ARun, 1);
   Expect<Integer>(ARun.ExitCode).ToBe(1);
   Expect<Boolean>(Pos(ANeedle, ARun.Stderr) > 0).ToBe(True);
-  Expect<Boolean>(Pos('delete ' + ALockPath + ' by hand', ARun.Stderr) > 0)
-    .ToBe(True);
+  Expect<Boolean>(Pos('install.lock by hand', ARun.Stderr) > 0).ToBe(True);
   Expect<string>(ReadBinaryFile(ALockPath)).ToBe(ALockBefore);
   Expect<Boolean>(FileExists(AOrphan)).ToBe(True);
 end;
@@ -916,9 +915,10 @@ var
   FirstResumed, SecondReleased: Boolean;
 begin
   { An install pauses between creating the lock file and taking its record
-    lock. Meanwhile its file is deleted by hand and, where the platform
-    frees the name at once, a second install takes the lock. The first must
-    not then lock its unlinked file and run beside the second. }
+    lock. Meanwhile its file is moved off the path by hand and a second
+    install takes the lock. The first must not then lock its displaced file
+    and run beside the second. (Moved rather than deleted: Windows and Wine
+    can keep a deleted but open file under its name.) }
   Project := WriteLockProject('displaced');
   LockPath := Project + '/.lwpt/install.lock';
   FirstSignals := Project + '-first';
@@ -932,14 +932,12 @@ begin
   try
     Expect<Boolean>(AwaitPayload(FirstSignals + '/created', First))
       .ToBe(True);
-    Expect<Boolean>(DeleteFile(LockPath)).ToBe(True);
-    {$IFDEF UNIX}
+    Expect<Boolean>(RenameFile(LockPath, LockPath + '.moved')).ToBe(True);
     Second := StartLwptTesting(['install'], Project,
       ['LWPT_CACHE_DIR=' + FCacheRoot,
        PROJECT_NAME + '_TEST_HOLD_INSTALL_LOCK=' + SecondSignals]);
     Expect<Boolean>(AwaitPayload(SecondSignals + '/held', Second)).ToBe(True);
     SecondPID := ReadPayloadText(SecondSignals + '/held');
-    {$ENDIF}
 
     PublishPayloadCompletion(FirstSignals + '/resume');
     FirstResumed := True;
@@ -950,20 +948,16 @@ begin
     Expect<Boolean>(Pos('was taken over, removed, or replaced',
       First.Run.Stderr) > 0).ToBe(True);
 
-    if Second <> nil then
-    begin
-      Expect<string>(FirstLine(ReadBinaryFile(LockPath))).ToBe(SecondPID);
-      Expect<Boolean>(Second.Finished).ToBe(False);
-      PublishPayloadCompletion(SecondSignals + '/release');
-      SecondReleased := True;
-      Expect<Boolean>(AwaitFinished(Second)).ToBe(True);
-      Expect<string>(Second.Error).ToBe('');
-      DumpRunFailure('second install', Second.Run, 0);
-      Expect<Integer>(Second.Run.ExitCode).ToBe(0);
-    end
-    else
-      Expect<Boolean>(FileExists(
-        Project + '/.lwpt/modules/branch-a/source/branch-a.pas')).ToBe(False);
+    { The displaced file was left where it was moved, unwritten. }
+    Expect<string>(ReadBinaryFile(LockPath + '.moved')).ToBe('');
+    Expect<string>(FirstLine(ReadBinaryFile(LockPath))).ToBe(SecondPID);
+    Expect<Boolean>(Second.Finished).ToBe(False);
+    PublishPayloadCompletion(SecondSignals + '/release');
+    SecondReleased := True;
+    Expect<Boolean>(AwaitFinished(Second)).ToBe(True);
+    Expect<string>(Second.Error).ToBe('');
+    DumpRunFailure('second install', Second.Run, 0);
+    Expect<Integer>(Second.Run.ExitCode).ToBe(0);
   finally
     if not FirstResumed then PublishPayloadCompletion(FirstSignals + '/resume');
     if (Second <> nil) and not SecondReleased then
