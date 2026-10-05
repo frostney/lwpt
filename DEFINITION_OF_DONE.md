@@ -33,11 +33,14 @@ requirement may be marked not applicable only with a recorded reason.
   compiler rather than memory.
 - No test is silently skipped, disabled, focused, or weakened to obtain a
   passing result.
-- A change that edits any workspace package under `packages/` refreshes the
-  lockfile in the same PR: run `./build/lwpt install` so the package's
-  workspace `computedHash` in `lwpt.lock` matches the edited tree, and commit
-  the updated `lwpt.lock`. A stale hash fails the `install --frozen` gate in
-  CI, not locally, so this must not be left to the pipeline to discover.
+- A change that edits any workspace package under `packages/` refreshes its
+  committed snapshot in the same PR: run `./build/lwpt install` and commit the
+  updated `.lwpt/modules/<name>/` and `lwpt.lock`. `install --frozen`
+  re-derives each workspace module from its `packages/<name>/` source and
+  fails, naming the package, when the source no longer matches the locked
+  `computedHash`. That runs locally as the first gate command below and in
+  CI, where `pr.yml` also fails if the plain `lwpt install` that follows
+  changes any committed toolkit state.
 - The universal project gate passes from the repository root:
 
   ```sh
