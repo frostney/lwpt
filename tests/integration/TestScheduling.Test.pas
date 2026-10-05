@@ -191,6 +191,9 @@ type
     procedure SetupTests; override;
     procedure TestDefaultJobsOverlap;
     procedure TestCacheUnavailableDiagnosticIsBoundedSingleLine;
+    procedure TestDiagnosticLinesNeutralizeEightBitControls;
+    procedure TestDiagnosticLinesTruncateWholeCharactersWithinLimit;
+    procedure TestOutputTailKeepsLastTenNonBlankLines;
     procedure TestPreparedCacheFailureReportsSourceDecisions;
     procedure TestJobsOneRunsInSourceOrder;
     procedure TestBailZeroOverridesManifestAndRunsAll;
@@ -744,7 +747,7 @@ begin
   Diagnostic := CacheUnavailableDiagnostic(StringOfChar('C', 80),
     StringOfChar('m', 300));
   Expect<string>(Diagnostic).ToBe('cache bypass: unavailable ('
-    + StringOfChar('C', 64) + '...: ' + StringOfChar('m', 256) + '...)');
+    + StringOfChar('C', 61) + '...: ' + StringOfChar('m', 253) + '...)');
 
   LogDirectory := FScratch + '/.lwpt/sessions/s-diagnostic/logs';
   ForceDirectories(LogDirectory);
@@ -767,6 +770,58 @@ begin
   Expect<Boolean>(Raised).ToBe(True);
   Expect<Boolean>(Pos('diagnostics: fixture.log: cache bypass: unavailable '
     + '(EProbe: rendered detail)', ErrorMessage) > 0).ToBe(True);
+end;
+
+procedure TTestScheduling.TestDiagnosticLinesNeutralizeEightBitControls;
+begin
+  { A raw C1 byte is invalid UTF-8; an encoded C1 code point is valid UTF-8
+    but still a terminal control. Both become '?', while ordinary multi-byte
+    characters survive intact. }
+  Expect<string>(BoundedSingleLine('a'#$9B'2J'#$C2#$9B'H'#$C3#$A9'z', 50))
+    .ToBe('a?2J?H'#$C3#$A9'z');
+  Expect<string>(BoundedSingleLine('x'#$C0#$AF'y'#$FF, 50)).ToBe('x??y?');
+  Expect<string>(BoundedSingleLine('q'#$E2#$82, 50)).ToBe('q??');
+  Expect<string>(BoundedSingleLine('tab'#9'nul'#0'del'#127, 50))
+    .ToBe('tab nul del ');
+end;
+
+procedure TTestScheduling.TestDiagnosticLinesTruncateWholeCharactersWithinLimit;
+var
+  Line: string;
+begin
+  { 199 ASCII characters plus one two-byte character is exactly 200
+    characters, so it is not truncated even though it is 201 bytes. }
+  Line := StringOfChar('a', 199) + #$C3#$A9;
+  Expect<string>(BoundedSingleLine(Line, 200)).ToBe(Line);
+  Expect<string>(BoundedSingleLine(Line + 'b', 200))
+    .ToBe(StringOfChar('a', 197) + '...');
+  Expect<string>(BoundedSingleLine(StringOfChar('a', 196) + #$C3#$A9
+    + StringOfChar('b', 10), 200))
+    .ToBe(StringOfChar('a', 196) + #$C3#$A9 + '...');
+  Expect<Integer>(Length(BoundedSingleLine(StringOfChar('x', 300), 200)))
+    .ToBe(200);
+end;
+
+procedure TTestScheduling.TestOutputTailKeepsLastTenNonBlankLines;
+var
+  i: Integer;
+  Output, Expected: string;
+begin
+  Output := 'root cause' + LineEnding;
+  for i := 1 to 10 do Output := Output + '   ' + LineEnding;
+  Output := Output + 'final message' + LineEnding + LineEnding;
+  Expect<string>(TestOutputTail(Output)).ToBe(LineEnding + '    root cause'
+    + LineEnding + '    final message');
+
+  Output := '';
+  Expected := '';
+  for i := 1 to 12 do
+  begin
+    Output := Output + 'line ' + IntToStr(i) + LineEnding + LineEnding;
+    if i > 2 then
+      Expected := Expected + LineEnding + '    line ' + IntToStr(i);
+  end;
+  Expect<string>(TestOutputTail(Output)).ToBe(Expected);
 end;
 
 procedure TTestScheduling.TestPreparedCacheFailureReportsSourceDecisions;
@@ -2938,6 +2993,12 @@ begin
   Test('default jobs overlap', TestDefaultJobsOverlap);
   Test('cache unavailable diagnostic is bounded and single-line',
     TestCacheUnavailableDiagnosticIsBoundedSingleLine);
+  Test('diagnostic lines neutralize eight-bit controls and invalid UTF-8',
+    TestDiagnosticLinesNeutralizeEightBitControls);
+  Test('diagnostic lines truncate whole characters within the limit',
+    TestDiagnosticLinesTruncateWholeCharactersWithinLimit);
+  Test('inventory output tail keeps the last ten non-blank lines',
+    TestOutputTailKeepsLastTenNonBlankLines);
   Test('prepared cache failures report source decisions and fingerprints',
     TestPreparedCacheFailureReportsSourceDecisions);
   Test('--jobs=1 runs in source order', TestJobsOneRunsInSourceOrder);

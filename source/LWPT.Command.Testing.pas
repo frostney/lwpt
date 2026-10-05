@@ -17,6 +17,9 @@ function TestTargetRunsOnHost(const ATarget: TLWPTTarget;
   const AHostOS, AHostArchitecture: string): Boolean;
 function CacheUnavailableDiagnostic(const AExceptionClass,
   AExceptionMessage: string): string;
+function BoundedSingleLine(const AValue: string;
+  const AMaximumLength: Integer): string;
+function TestOutputTail(const AOutput: string): string;
 function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings; const AUseCache: Boolean = True): Integer;
@@ -782,17 +785,111 @@ begin
     Result := 'cache miss: ' + AReason;
 end;
 
+{ The length in bytes of the well-formed UTF-8 character starting at
+  AIndex, or 0 when the bytes there are not one (RFC 3629: no overlong
+  forms, surrogates, or code points above U+10FFFF). }
+function UTF8CharacterLength(const AValue: string;
+  const AIndex: Integer): Integer;
+var
+  Lead, SecondMinimum, SecondMaximum, i: Integer;
+begin
+  Result := 0;
+  Lead := Ord(AValue[AIndex]);
+  SecondMinimum := $80;
+  SecondMaximum := $BF;
+  case Lead of
+    $C2..$DF: Result := 2;
+    $E0:
+      begin
+        Result := 3;
+        SecondMinimum := $A0;
+      end;
+    $E1..$EC, $EE, $EF: Result := 3;
+    $ED:
+      begin
+        Result := 3;
+        SecondMaximum := $9F;
+      end;
+    $F0:
+      begin
+        Result := 4;
+        SecondMinimum := $90;
+      end;
+    $F1..$F3: Result := 4;
+    $F4:
+      begin
+        Result := 4;
+        SecondMaximum := $8F;
+      end;
+  else
+    Exit;
+  end;
+  if AIndex + Result - 1 > Length(AValue) then Exit(0);
+  if (Ord(AValue[AIndex + 1]) < SecondMinimum)
+     or (Ord(AValue[AIndex + 1]) > SecondMaximum) then
+    Exit(0);
+  for i := AIndex + 2 to AIndex + Result - 1 do
+    if (Ord(AValue[i]) < $80) or (Ord(AValue[i]) > $BF) then Exit(0);
+end;
+
+{ One terminal-safe line of at most AMaximumLength characters. The value is
+  read as UTF-8: C0 controls and DEL become spaces, while C1 control code
+  points (U+0080..U+009F, which some terminals treat like ESC sequences) and
+  bytes that are not well-formed UTF-8 become '?'. Truncation keeps whole
+  characters and fits the trailing '...' inside the limit. }
 function BoundedSingleLine(const AValue: string;
   const AMaximumLength: Integer): string;
+const
+  Ellipsis = '...';
 var
-  Index: Integer;
+  CharacterCount, CharacterLength, Index, KeepCharacters, KeepBytes: Integer;
+  Character: string;
 begin
-  Result := AValue;
-  for Index := 1 to Length(Result) do
-    if (Ord(Result[Index]) < 32) or (Ord(Result[Index]) = 127) then
-      Result[Index] := ' ';
-  if Length(Result) > AMaximumLength then
-    Result := Copy(Result, 1, AMaximumLength) + '...';
+  Result := '';
+  if AMaximumLength <= Length(Ellipsis) then
+    KeepCharacters := AMaximumLength
+  else
+    KeepCharacters := AMaximumLength - Length(Ellipsis);
+  KeepBytes := 0;
+  CharacterCount := 0;
+  Index := 1;
+  while Index <= Length(AValue) do
+  begin
+    if Ord(AValue[Index]) < $80 then
+    begin
+      CharacterLength := 1;
+      if (Ord(AValue[Index]) < 32) or (Ord(AValue[Index]) = 127) then
+        Character := ' '
+      else
+        Character := AValue[Index];
+    end
+    else
+    begin
+      CharacterLength := UTF8CharacterLength(AValue, Index);
+      if CharacterLength = 0 then
+      begin
+        CharacterLength := 1;
+        Character := '?';
+      end
+      else if (CharacterLength = 2) and (Ord(AValue[Index]) = $C2)
+        and (Ord(AValue[Index + 1]) <= $9F) then
+        Character := '?'
+      else
+        Character := Copy(AValue, Index, CharacterLength);
+    end;
+    Result := Result + Character;
+    Inc(CharacterCount);
+    if CharacterCount = KeepCharacters then KeepBytes := Length(Result);
+    { One character past the limit decides truncation; stop there so a
+      megabyte-long line costs no more than a short one. }
+    if CharacterCount > AMaximumLength then Break;
+    Inc(Index, CharacterLength);
+  end;
+  if CharacterCount > AMaximumLength then
+  begin
+    Result := Copy(Result, 1, KeepBytes);
+    if AMaximumLength > Length(Ellipsis) then Result := Result + Ellipsis;
+  end;
 end;
 
 function CacheUnavailableDiagnostic(const AExceptionClass,
@@ -1444,28 +1541,30 @@ begin
   end;
 end;
 
-{ The last non-blank lines of a job's captured output, one indented line each,
-  with control characters neutralized so a child's terminal escapes cannot
+{ The last ten non-blank lines of a job's captured output, in order, one
+  indented terminal-safe line each, so a child's control sequences cannot
   rewrite the diagnostic. }
-function OutputTail(const AOutput: string): string;
+function TestOutputTail(const AOutput: string): string;
 const
   MaximumLines = 10;
   MaximumLineLength = 200;
 var
-  First, i: Integer;
+  Kept, i: Integer;
   Lines: TStringList;
 begin
   Result := '';
+  Kept := 0;
   Lines := TStringList.Create;
   try
     Lines.Text := AOutput;
-    while (Lines.Count > 0) and (Trim(Lines[Lines.Count - 1]) = '') do
-      Lines.Delete(Lines.Count - 1);
-    First := Lines.Count - MaximumLines;
-    if First < 0 then First := 0;
-    for i := First to Lines.Count - 1 do
-      Result := Result + LineEnding + '    '
-        + BoundedSingleLine(Lines[i], MaximumLineLength);
+    for i := Lines.Count - 1 downto 0 do
+    begin
+      if Kept = MaximumLines then Break;
+      if Trim(Lines[i]) = '' then Continue;
+      Result := LineEnding + '    '
+        + BoundedSingleLine(Lines[i], MaximumLineLength) + Result;
+      Inc(Kept);
+    end;
   finally
     Lines.Free;
   end;
@@ -1500,7 +1599,7 @@ begin
     Result := 'did not complete';
   end;
   if Result = '' then Result := 'unknown failure';
-  Tail := OutputTail(Output);
+  Tail := TestOutputTail(Output);
   if Tail <> '' then Result := Result + '; last output lines:' + Tail;
 end;
 
