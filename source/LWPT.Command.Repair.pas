@@ -19,6 +19,7 @@ uses
   LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.Install,
+  LWPT.InstallLock,
   LWPT.Manifest,
   LWPT.ObjectStore,
   LWPT.Registry.Consumer,
@@ -160,6 +161,7 @@ procedure CmdRepair(const AManifestPath: string);
 var
   Ctx : TManifestContext;
   TmpRoot, LockPath : string;
+  InstallLock: TLWPTInstallLock;
   Upgraded: Boolean;
   SessionsRemoved, SessionsRetained: Integer;
   TmpRootCleaned: Boolean;
@@ -173,21 +175,31 @@ begin
   TmpRoot := ResolveRepairPath(Ctx.ProjectRoot, ResolveTmpDir(Ctx.Manifest));
   LockPath := ResolveRepairPath(Ctx.ProjectRoot, INSTALL_LOCK);
 
-  if LongPathFileExists(LockPath) then
-  begin
-    if not LongPathDeleteFile(LockPath) then
-      raise EConcurrencyError.CreateFmt(
-        'repair: failed to remove stale install lock at %s', [LockPath]);
-    WriteLn('repair: removed stale ', LockPath);
-  end
-  else
-    WriteLn('repair: no install lock to remove');
+  { Install recovery and the tmp sweep write install-owned state, so they
+    run under the install lock. A lock whose owner may still run fails
+    here, before anything changes; a dead owner's lock is taken over. }
+  InstallLock := TLWPTInstallLock.CreateReclaiming(LockPath,
+    INSTALL_LOCK_HOLDER_REPAIR);
+  try
+    if not InstallLock.Reclaimed then
+      WriteLn('repair: no install lock to reclaim')
+    else if InstallLock.ReclaimedPID <> '' then
+      WriteLn('repair: reclaimed ', LockPath, '; its owner (PID ',
+        InstallLock.ReclaimedPID, ') has exited')
+    else
+      WriteLn('repair: reclaimed ', LockPath, '; its owner exited before ',
+        'recording itself');
 
-  { A crashed writer may have a validated pre-transaction snapshot below
-    tmp. Restore it before the ordinary residue sweep can delete it. }
-  RecoverInterruptedInstall(Ctx);
-  RepairBuildSessions(Ctx.ProjectRoot, TmpRoot, SessionsRemoved,
-    SessionsRetained, TmpRootCleaned);
+    { A crashed writer may have a validated pre-transaction snapshot below
+      tmp. Restore it before the ordinary residue sweep can delete it. }
+    RecoverInterruptedInstall(Ctx);
+    RepairBuildSessions(Ctx.ProjectRoot, TmpRoot, SessionsRemoved,
+      SessionsRetained, TmpRootCleaned);
+  finally
+    { Released before the schema upgrade below, whose install transaction
+      takes the lock itself. }
+    InstallLock.Free;
+  end;
   if TmpRootCleaned then
   begin
     WriteLn('repair: recovered interrupted publication and cleaned ',
