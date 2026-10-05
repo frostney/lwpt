@@ -57,7 +57,7 @@ The `lwpt install --frozen` mode that refuses to update the lockfile, refuses ne
 *Avoid*: "locked", "strict", "ci mode", "offline" (a different mode). Frozen is the specific term.
 
 **Offline install**:
-The `lwpt install --offline` mode that restores the locked graph without network: it materialises modules and the cfg from committed archives or the per-user archive CAS, restores missing registry proof documents from the per-user document store, and leaves the lockfile byte-identical. Requires an existing lockfile; anything it cannot restore and verify fails before publication. Mutually exclusive with `--frozen`.
+The `lwpt install --offline` mode that restores the locked graph without network: it materialises git-host, URL, and registry modules and the cfg from committed archives or the per-user archive CAS, restores missing registry proof documents from the per-user document store, and leaves the lockfile byte-identical. Local and workspace modules are still copied from their source directories, so those must be present: a missing local or workspace source fails. Requires an existing lockfile; anything it cannot restore and verify fails before publication. Mutually exclusive with `--frozen`.
 *Avoid*: "offline mode" alone, "cached install", "frozen" (frozen verifies; offline restores).
 
 **Install transaction**:

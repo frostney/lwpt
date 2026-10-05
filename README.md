@@ -162,8 +162,13 @@ default = "corp"
 
 [registries.corp]
 identity   = "https://packages.example.com"        # optional; advertised by the contacts, then locked
-key-id     = "ed25519:<64 hex digits>"             # the trust pin: the origin's root key
-public-key = "hex:<64 hex digits>"
+# The trust pin: the origin's root key. EXAMPLE VALUES ONLY: a valid,
+# throwaway pair whose private key was discarded. Replace both with your
+# origin's root pin, its `keys/ed25519-*.toml` record's key_id and public_key
+# (see docs/registry-deployment.md); key-id is "ed25519:" + the SHA-256 of
+# the raw 32-byte public key.
+key-id     = "ed25519:77790c39520108490b51dd825c9c84dc009f92ac5d1b94d68f19c9d11cca3675"
+public-key = "hex:fd49e4bc086e9b5203d162066dc459ca66478324dc3b39d4e202460c0bc3e724"
 origin     = "https://packages.example.com"        # origin contact; defaults to identity
 mirrors    = ["https://mirror.example.net/lwpt"]   # optional; tried first, in this order
 
