@@ -768,7 +768,10 @@ Synchronization is pull-based and requires only the read protocol:
    snapshot chain back to sequence 1 or a locally accepted hash, verifying each
    link before accepting the new head.
 6. Fetch every missing record and archive object by hash, with bounded
-   concurrency and resumable temporary files.
+   concurrency and resumable temporary files. (Non-normative for LWPT: LWPT
+   fetches each archive whole into memory, verifies it, and stores it as an
+   immutable object, so an interrupted synchronization resumes at
+   verified-object boundaries rather than mid-transfer.)
 7. Validate record identity, uniqueness, archive size, archive hash, snapshot predecessor,
    and any key rotation.
 8. Atomically expose the new checkpoint only after all referenced resources
@@ -790,7 +793,8 @@ diagnostics are defined in [ADR-0045](adr/0045-verified-registry-mirror.md).
 For online acquisition, clients MUST try configured mirrors in declaration
 order, followed by the configured origin endpoint, stopping at the first
 successfully verified discovery and proof transaction. Contacts supplied by
-user configuration precede the mirrors a manifest declares; duplicates are
+user configuration precede the mirrors a manifest declares (LWPT: once
+[#313](https://github.com/frostney/lwpt/issues/313) ships); duplicates are
 tried once. Each attempt MUST use
 one contact with the same expected origin identity, configured trust root,
 and previously accepted per-origin history. Changing contact MUST NOT replace

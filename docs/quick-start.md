@@ -168,7 +168,7 @@ scaffold:
 Adoption parses the manifest without rewriting it, creates missing
 project-local directories declared by `[package].units`, and appends missing
 `.gitignore` entries for `.lwpt/tmp/`, `.lwpt/install.lock`,
-`.lwpt/sessions/`, `.lwpt/session-roots`, `.lwpt/workers/`, and the project-local output directories
+`.lwpt/sessions/`, `.lwpt/session-roots`, `.lwpt/workers/`, `.lwpt/registry/`, and the project-local output directories
 declared by `[build]` (`build/` when none is usable). It reports directories
 as created or found and ignore entries as added or found. It does not create
 a sample program, lockfile, cfg, dependency state, or build output.
@@ -210,9 +210,17 @@ horse = "HashLoad/horse@^4.0.0"   # see ADR-0009 for the full source-spec syntax
 
 — then run `./build/lwpt install`. The inverse is `./build/lwpt remove horse`, which deletes the manifest entry, regenerates `lwpt.lock` + `lwpt.cfg`, and prunes `.lwpt/modules/horse/` + its cached archive (see [ADR-0019](./adr/0019-add-remove-subcommands.md)).
 
-`.lwpt/modules/horse/` and `.lwpt/archives/horse-v3.0.0.tar.gz` are committed because of zero-install (ADR-0002). The next contributor's `git clone` doesn't need to run `lwpt install` — `./build/lwpt build` reads the already-committed `lwpt.cfg` and compiles directly.
+`.lwpt/modules/horse/` and `.lwpt/archives/horse-<resolved-tag>.tar.gz` (named after the tag the `^4.0.0` range resolved to) are committed because of zero-install (ADR-0002). The next contributor's `git clone` doesn't need to run `lwpt install` — `./build/lwpt build` reads the already-committed `lwpt.cfg` and compiles directly.
 
-Source kinds for v1: `github`, `gitlab`, `bitbucket`, `release`, `local`. See [`code-style.md`](./code-style.md) for the manifest grammar.
+Source kinds:
+
+- a git host: GitHub by default (`owner/repo`), `gitlab:` or `bitbucket:` prefixes, or a custom host declared in `[sources]`;
+- an `https://` URL to a tarball;
+- a local path (or `local:` prefix);
+- `workspace:` (`workspace:*` or `workspace:^X.Y.Z`), naming a member discovered through `[workspaces]`;
+- `registry:[<alias>/]<package>`, selected from the signed snapshot of an origin declared in the root `[registries]` table.
+
+See the [README manifest section](../README.md#manifest) for an annotated example, [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) for the source syntax, and [ADR-0051](./adr/0051-registry-dependency-sources.md) for registry sources.
 
 ## Writing a test
 
@@ -334,16 +342,20 @@ from the new pin.
 ./build/lwpt repair
 ```
 
-Cleans `.lwpt/tmp/`, any stale install lock, and abandoned or failed sessions
+Cleans `.lwpt/tmp/` (after restoring an interrupted install's validated
+rollback snapshot from it), any stale install lock, and abandoned or failed sessions
 from the default and identity-verified historical build-session roots, then
 reclaims abandoned per-user worker requests and reports the remaining budget
 state. Live build/test sessions are retained. It also reports the per-user
 registry document store's size, live and evictable documents, and budget, and
 removes nothing there.
 Repair never touches the last successfully published build output. It
-changes `.lwpt/modules/`, `.lwpt/archives/`, and `lwpt.lock` only when the
-lockfile is schema v3: it then upgrades the lockfile to v4 without network
-access and without changing dependency versions, re-deriving each module from
-its committed archive or source
+changes `.lwpt/modules/`, `.lwpt/archives/`, `lwpt.cfg`, and `lwpt.lock` in
+two cases only. When an install was interrupted mid-publication, on any
+lockfile schema, it restores the install's validated rollback snapshot, so the
+committed state returns to what it was before that install. When the lockfile
+is schema v3, it upgrades the lockfile to v4 without network access and
+without changing dependency versions, re-deriving each module from its
+committed archive or source
 ([ADR-0052](./adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the
 resulting `lwpt.lock`.

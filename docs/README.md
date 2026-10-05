@@ -52,7 +52,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0021](./adr/0021-machine-wide-worker-budget.md) | Per-user machine worker capacity coordinated through fair, reclaimable filesystem leases |
 | [0022](./adr/0022-compiler-neutral-build-request.md) | Compiler-neutral versioned build requests, target tuples, capabilities, and normalized results; FPC is the only current adapter |
 | [0023](./adr/0023-parallel-build-target-scheduler.md) | Dependency-aware, bounded parallel target scheduling with deterministic reporting and publication |
-| [0024](./adr/0024-openssl-server-tls-accept.md) | Server-side TLS accept via nonblocking memory-BIO OpenSSL 3 with PKCS#12 identities on Unix-not-Darwin (originally also Windows, superseded there by [0033](./adr/0033-schannel-server-tls-accept-on-windows.md)); macOS servers use Network.framework |
+| [0024](./adr/0024-openssl-server-tls-accept.md) | Server-side TLS accept via nonblocking memory-BIO OpenSSL 3 with PKCS#12 identities on Unix-not-Darwin (originally also Windows, superseded there by [0033](./adr/0033-schannel-server-tls-accept-on-windows.md)); on macOS the HTTPClient server context uses Secure Transport, and only the registry's HTTPS listener uses Network.framework, on Darwin kernel 25 and newer ([0043](./adr/0043-self-hosted-registry-origin.md)) |
 | [0025](./adr/0025-cascading-process-tree-cancellation.md) | Cascading process-tree cancellation via Unix signal-forwarding and Windows nested Job Objects |
 | [0026](./adr/0026-release-version-stamp-from-tag.md) | Release binaries stamp the version from the git tag; dev builds stamp from the manifest |
 | [0027](./adr/0027-agents-subcommand.md) | `lwpt agents` writes/verifies the marker-fenced AGENTS.md command reference; subcommand surface 9 → 10 |
@@ -88,7 +88,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 
 | Spike | Topic |
 | --- | --- |
-| [`http-registry-spike.md`](./spikes/http-registry-spike.md) | The removed spike consumer, preserved as prior art for [issue #29](https://github.com/frostney/lwpt/issues/29) |
+| [`http-registry-spike.md`](./spikes/http-registry-spike.md) | The removed spike consumer, preserved as prior art for the self-hosted registry that shipped under [issue #29](https://github.com/frostney/lwpt/issues/29) ([ADR-0043](./adr/0043-self-hosted-registry-origin.md), [ADR-0051](./adr/0051-registry-dependency-sources.md)) |
 
 ## Conventions
 
