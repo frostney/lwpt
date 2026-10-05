@@ -334,7 +334,10 @@ from the new pin.
 ./build/lwpt repair
 ```
 
-Cleans `.lwpt/tmp/`, any stale install lock, and abandoned or failed sessions
+Takes over the install lock once its owner has exited, and fails without
+changing anything while an install or another repair holds it. Holding the
+lock, it restores an interrupted install and cleans `.lwpt/tmp/`. It then
+cleans abandoned or failed sessions
 from the default and identity-verified historical build-session roots, then
 reclaims abandoned per-user worker requests and reports the remaining budget
 state. Live build/test sessions are retained. It also reports the per-user
