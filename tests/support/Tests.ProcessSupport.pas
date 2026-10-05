@@ -205,6 +205,22 @@ function ReapChild(AProcess: TProcess;
 procedure ExecuteOwnedChild(AProcess: TProcess;
   const AOwnProcessGroup: Boolean = False);
 
+{ Ends this process at once with AExitCode, as a crash would: no exit
+  procedure, unit finalization, or finally block runs, and the operating
+  system releases every lock and handle. _exit on Unix, TerminateProcess on
+  Windows. Flush any output first.
+
+  A child that simulates a crash, or that ends early while it still holds
+  an object with a live thread (a producer lease and its heartbeat), must
+  end through this, never Halt. Halt skips the finally blocks that would
+  stop those threads, then finalizes every unit and the heap beneath them.
+  When a thread is still starting, that finalization can fail, and FPC
+  raises the failure as an exception that unwinds into the skipped finally
+  blocks after Classes is finalized. The child then exits with another
+  code: it hung joining the heartbeat on Linux, died by signal 4 on macOS,
+  and by access violation on i386-win32. }
+procedure EndProcessAbruptly(const AExitCode: Integer);
+
 {$IFDEF MSWINDOWS}
 { Whether the process behind AHandle, which must carry SYNCHRONIZE, has
   exited, decided by the signalled process object. An exit code cannot
@@ -1066,5 +1082,15 @@ begin
   Result := ProcessIsRunning(APID);
 end;
 {$ENDIF}
+
+procedure EndProcessAbruptly(const AExitCode: Integer);
+begin
+  {$IFDEF UNIX}
+  FpExit(AExitCode);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows.TerminateProcess(Windows.GetCurrentProcess, UINT(AExitCode));
+  {$ENDIF}
+end;
 
 end.

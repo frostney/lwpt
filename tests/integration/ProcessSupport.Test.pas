@@ -5,7 +5,8 @@
   capacity to both streams, one that sleeps, one that exits with a given
   code (259, Windows' STILL_ACTIVE), one that leaves a descendant
   running after it returns, one that leaves a descendant that ends shortly
-  after it, and one that holds a sleeping descendant. The survivor cases
+  after it, one that holds a sleeping descendant, and one that ends through
+  EndProcessAbruptly beside a thread it has just started. The survivor cases
   are the falsification of process-tree ownership: an owned child that
   returns while a descendant still runs must fail its wait, never pass on
   the helper's own kill-on-close or group cleanup. Their descendant sleeps
@@ -43,6 +44,8 @@ const
   { Windows' STILL_ACTIVE: an exit code that reads as still running. }
   StillActiveExitCode = 259;
   HolderSwitch = '--process-support-hold-descendant';
+  AbruptSwitch = '--process-support-end-abruptly';
+  AbruptExitCode = 77;
   { Past every platform's anonymous-pipe capacity (64 KiB on Linux and
     macOS, a few KiB to 64 KiB on Windows). }
   FloodBytes = 1024 * 1024;
@@ -77,7 +80,47 @@ type
     procedure TestReapChildEndsAnOwnedTreesSurvivor;
     procedure TestProcessExitingWithStillActiveHasExited;
     procedure TestRunLwptReportsASurvivingDescendant;
+    procedure TestAbruptEndSkipsExitProceduresAndFinallyBlocks;
   end;
+
+  { Polls until terminated, like a producer-lease heartbeat. }
+  TPollingThread = class(TThread)
+  protected
+    procedure Execute; override;
+  end;
+
+procedure TPollingThread.Execute;
+begin
+  while not Terminated do Sleep(10);
+end;
+
+procedure ReportExitProcedure;
+begin
+  WriteLn('exit procedure ran');
+  Flush(Output);
+end;
+
+{ Starts a thread and ends at once beside it, inside a finally block that
+  would stop it, with an exit procedure installed: the shape of a
+  producer-lease crash child. }
+procedure EndAbruptlyBesideAThread;
+var
+  Poller: TPollingThread;
+begin
+  ExitProc := @ReportExitProcedure;
+  Poller := TPollingThread.Create(False);
+  try
+    WriteLn('ending abruptly');
+    Flush(Output);
+    EndProcessAbruptly(AbruptExitCode);
+  finally
+    WriteLn('finally block ran');
+    Flush(Output);
+    Poller.Terminate;
+    Poller.WaitFor;
+    Poller.Free;
+  end;
+end;
 
 procedure WriteFlood(const AHandle: THandle);
 var
@@ -154,6 +197,11 @@ begin
     Descendant := StartSleepingDescendant(BriefDescendantMilliseconds);
     PublishReadablePayload(ParamStr(2), IntToStr(Descendant.ProcessID));
     Descendant.Free;
+    Halt(0);
+  end;
+  if (ParamCount = 1) and (ParamStr(1) = AbruptSwitch) then
+  begin
+    EndAbruptlyBesideAThread;
     Halt(0);
   end;
   if (ParamCount = 2) and (ParamStr(1) = HolderSwitch) then
@@ -481,6 +529,29 @@ begin
   Expect<Boolean>(DescendantGone(DescendantPID)).ToBe(True);
 end;
 
+procedure TProcessSupportTests.TestAbruptEndSkipsExitProceduresAndFinallyBlocks;
+var
+  Child: TProcess;
+  Stdout, Stderr: string;
+begin
+  { A crash child ends with its own code however far its thread has
+    started, and runs nothing on the way out. }
+  Child := SelfChild([AbruptSwitch], [poUsePipes]);
+  try
+    Child.Execute;
+    Stdout := '';
+    Stderr := '';
+    Expect<Integer>(FinishChild(Child, Stdout, Stderr,
+      CaseTimeoutMilliseconds, 'abrupt end')).ToBe(AbruptExitCode);
+    Expect<Boolean>(Pos('ending abruptly', Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('finally block ran', Stdout) > 0).ToBe(False);
+    Expect<Boolean>(Pos('exit procedure ran', Stdout) > 0).ToBe(False);
+  finally
+    ReapChild(Child, CHILD_KILL_MILLISECONDS);
+    Child.Free;
+  end;
+end;
+
 procedure TProcessSupportTests.SetupTests;
 begin
   Test('a draining wait takes both overfull pipes',
@@ -523,6 +594,8 @@ begin
     TestRunLwptReportsASurvivingDescendant,
     'RunLwpt owns its child through a Job Object only on Windows');
   {$ENDIF}
+  Test('an abruptly ended child skips exit procedures and finally blocks',
+    TestAbruptEndSkipsExitProceduresAndFinallyBlocks);
 end;
 
 begin
