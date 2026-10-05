@@ -235,12 +235,13 @@ Mirrors GocciaScript's `pr.yml` shape, and is the only **automatic** pre-merge s
 1. Install FPC via `apt`
 2. `./bootstrap.sh` — cold build of `build/lwpt` from a freshly-cloned repo
 3. `./build/lwpt --help` (does the binary even load?)
-4. `./build/lwpt install --frozen` (committed lockfile matches committed trees — runs *before* plain install so lock drift cannot be masked by regeneration)
-5. `./build/lwpt install` (workspace auto-discovery + symlinks)
-6. `./build/lwpt format --check`
-7. `./build/lwpt build` (manifest build-entry compile)
-8. `./build/lwpt agents --check` (generated command-reference drift)
-9. `./build/lwpt test <ordinary paths> --bail=0`
+4. `./build/lwpt install --frozen` (committed lockfile matches committed trees, and every local and workspace module still matches the snapshot re-derived from its source — runs *before* plain install so lock drift cannot be masked by regeneration)
+5. `./build/lwpt install` (workspace auto-discovery)
+6. `git status --porcelain` over `lwpt.lock`, `lwpt.cfg`, `.lwpt/modules/`, and `.lwpt/archives/` (the plain install changed no committed toolkit state; defense in depth for [#370](https://github.com/frostney/lwpt/issues/370))
+7. `./build/lwpt format --check`
+8. `./build/lwpt build` (manifest build-entry compile)
+9. `./build/lwpt agents --check` (generated command-reference drift)
+10. `./build/lwpt test <ordinary paths> --bail=0`
 
 In the automatic gate, the live-network E2E paths run on the Linux leg only. Their dedicated selector invocation sets the repository-owned `LWPT_ENABLE_NETWORK=1` opt-in, added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close class proved invisible to the ordinary route. The ordinary pass still carries the concurrency suites which cover the #101 timing class; E2E does not rerun them as accidental stress. Every platform runs the E2E paths in the required manual `ci.yml` run on the PR's exact head, and again on the push to `main`. The native `build-and-test`, `darwin-test`, and `windows-test` jobs each have a 20-minute ceiling. The Windows job uses the same pinned installer as `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the ordinary paths — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) run in that required manual run rather than on every push. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
 

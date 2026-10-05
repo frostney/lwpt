@@ -92,3 +92,38 @@ canonical source plus every requirer and constraint for the package.
   manifest makes that identity ambiguous.
 - Multiple installed versions, nested unit namespaces, and dependency-graph
   backtracking remain explicit non-goals.
+
+## Amendment: frozen re-derives local and workspace snapshots
+
+Publishing local and workspace sources as snapshots, rather than links, cost
+`--frozen` a property the earlier link policy had by accident: hashing a
+linked module read the live source. Hashing a snapshot reads only the
+committed copy, so an edited `packages/<name>/` source with an unrefreshed
+copy and lock passed every gate, and consumers who cloned the repository
+built the old package source
+([issue #370](https://github.com/frostney/lwpt/issues/370)).
+
+The decision:
+
+- **`--frozen` re-derives each local and workspace snapshot from its source.**
+  After the installed tree matches `computedHash`, the source is copied into
+  private scratch below `.lwpt/tmp/` with install's own copy rule and the
+  dependency's include/exclude policy, hashed with the same tree digest, and
+  compared with `computedHash`. The publication preflight uses the same
+  staging routine, so both compare against what install would publish. A
+  mismatch fails, naming the package, the first added, removed, or changed
+  file, and the remedy: run `lwpt install` and commit the result.
+- **A missing source fails closed.** Without the source, the snapshot can't be
+  proven current. Workspace members always exist, since discovery found them.
+- **Frozen stays read-only and network-free.** It writes only its own scratch
+  directory and removes it on every path, as it already does for registry
+  re-derivation.
+- **`--offline` is unchanged in effect.** It already copies local sources
+  again and compares them with `computedHash`, so it refuses an edited source.
+  Its diagnostic now names the cause and the same remedy.
+
+Stale means the same thing on every platform: the snapshot re-derived from the
+source has a different `sha256-tree2` digest than the lock. Installed modules
+are never links, and `--frozen` refuses any link it finds in one, so no
+platform has a separate link or junction case. The digest's CRLF
+normalization keeps a CRLF checkout of an unchanged source current.

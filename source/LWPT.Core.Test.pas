@@ -31,6 +31,7 @@ uses
   LWPT.Manifest,
   LWPT.Registry.Consumer,
   TestingPascalLibrary,
+  Tests.Scratch,
   TOML;
 
 type
@@ -325,6 +326,9 @@ type
     procedure TestAtomicWritesAndMovesPastLimit;
     procedure TestCopyHashAndWipeTree;
     procedure TestRetainAndRestoreThroughDeepRollbackRoot;
+    procedure TestModificationStampKeepsSubSecondOrder;
+    procedure TestModificationStampOnCoarseFilesystem;
+    procedure TestModificationStampSpansWideDates;
     {$IFDEF MSWINDOWS}
     procedure TestExtendedPathSpelling;
     procedure TestExtendedPathKeepsWin32Meaning;
@@ -3871,7 +3875,137 @@ begin
 end;
 {$ENDIF}
 
+const
+  { An even second, so the 2-second DOS tick FileAge reports on Windows
+    covers every sub-second stamp in it. }
+  StampBaseSeconds = 1700000000;
+  EarlierStampNanoseconds = 100000000;
+  LaterStampNanoseconds = 101000000;
+
+{ #367: two writes inside one FileAge tick keep their order, an equal time
+  stays equal, and a directory or missing path has no stamp. The times are
+  set explicitly, so no sleep is needed to cross a tick. Registered only
+  where the filesystem keeps sub-second times; see
+  TestModificationStampOnCoarseFilesystem. }
+procedure TLongPathHelpers.TestModificationStampKeepsSubSecondOrder;
+var
+  Dir, Earlier, Later, Twin: string;
+  EarlierStamp, LaterStamp, TwinStamp, Missing: TLWPTModificationStamp;
+begin
+  Dir := DeepPath('stamp');
+  Expect<Boolean>(LongPathForceDirectories(Dir)).ToBe(True);
+  Earlier := Dir + '/earlier.txt';
+  Later := Dir + '/later.txt';
+  Twin := Dir + '/twin.txt';
+  WriteLong(Earlier, 'a');
+  WriteLong(Later, 'b');
+  WriteLong(Twin, 'c');
+  SetFileModificationTime(Earlier, StampBaseSeconds, EarlierStampNanoseconds);
+  SetFileModificationTime(Later, StampBaseSeconds, LaterStampNanoseconds);
+  SetFileModificationTime(Twin, StampBaseSeconds, EarlierStampNanoseconds);
+
+  Expect<Boolean>(LongPathModificationStamp(Earlier, EarlierStamp))
+    .ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(Later, LaterStamp)).ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(Twin, TwinStamp)).ToBe(True);
+  Expect<Int64>(EarlierStamp.Seconds).ToBe(StampBaseSeconds);
+  Expect<Int64>(EarlierStamp.Nanoseconds).ToBe(EarlierStampNanoseconds);
+  { FileAge cannot tell the two writes apart; the stamp can. }
+  Expect<Integer>(LongPathFileAge(Later)).ToBe(LongPathFileAge(Earlier));
+  Expect<Integer>(CompareModificationStamps(LaterStamp, EarlierStamp))
+    .ToBe(1);
+  Expect<Integer>(CompareModificationStamps(EarlierStamp, LaterStamp))
+    .ToBe(-1);
+  Expect<Integer>(CompareModificationStamps(TwinStamp, EarlierStamp))
+    .ToBe(0);
+
+  Expect<Boolean>(LongPathModificationStamp(Dir, Missing)).ToBe(False);
+  Expect<Boolean>(LongPathModificationStamp(Dir + '/absent.txt', Missing))
+    .ToBe(False);
+  Expect<Int64>(Missing.Seconds).ToBe(0);
+  Expect<Int64>(Missing.Nanoseconds).ToBe(0);
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'stamp');
+end;
+
+{ The counterpart on a filesystem that drops sub-second times: two writes in
+  one tick read as equal, never reversed. }
+procedure TLongPathHelpers.TestModificationStampOnCoarseFilesystem;
+var
+  Dir, Earlier, Later: string;
+  EarlierStamp, LaterStamp: TLWPTModificationStamp;
+begin
+  Dir := DeepPath('stamp-coarse');
+  Expect<Boolean>(LongPathForceDirectories(Dir)).ToBe(True);
+  Earlier := Dir + '/earlier.txt';
+  Later := Dir + '/later.txt';
+  WriteLong(Earlier, 'a');
+  WriteLong(Later, 'b');
+  SetFileModificationTime(Earlier, StampBaseSeconds, EarlierStampNanoseconds);
+  SetFileModificationTime(Later, StampBaseSeconds, LaterStampNanoseconds);
+  Expect<Boolean>(LongPathModificationStamp(Earlier, EarlierStamp))
+    .ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(Later, LaterStamp)).ToBe(True);
+  Expect<Integer>(CompareModificationStamps(LaterStamp, EarlierStamp))
+    .ToBe(0);
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'stamp-coarse');
+end;
+
+{ Times a 64-bit nanosecond count since 1970 cannot hold (2300) and times
+  before 1970 compare by their seconds and nanoseconds, with the
+  nanoseconds of a pre-1970 time counted forward within its second. }
+procedure TLongPathHelpers.TestModificationStampSpansWideDates;
+const
+  QuarterSecondNanoseconds = 250000000;
+var
+  Dir, Present, Future, PreEpoch, JustBefore, Epoch: string;
+  PresentStamp, FutureStamp, PreEpochStamp, JustBeforeStamp,
+    EpochStamp: TLWPTModificationStamp;
+begin
+  Dir := DeepPath('stamp-wide');
+  Expect<Boolean>(LongPathForceDirectories(Dir)).ToBe(True);
+  Present := Dir + '/present.txt';
+  Future := Dir + '/future.txt';
+  PreEpoch := Dir + '/pre-epoch.txt';
+  JustBefore := Dir + '/just-before.txt';
+  Epoch := Dir + '/epoch.txt';
+  WriteLong(Present, 'a');
+  WriteLong(Future, 'b');
+  WriteLong(PreEpoch, 'c');
+  WriteLong(JustBefore, 'd');
+  WriteLong(Epoch, 'e');
+  SetFileModificationTime(Present, StampBaseSeconds, EarlierStampNanoseconds);
+  SetFileModificationTime(Future, FarFutureUnixSeconds, 0);
+  SetFileModificationTime(PreEpoch, PreEpochUnixSeconds, 0);
+  SetFileModificationTime(JustBefore, -1, QuarterSecondNanoseconds);
+  SetFileModificationTime(Epoch, 0, 0);
+  Expect<Boolean>(LongPathModificationStamp(Present, PresentStamp))
+    .ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(Future, FutureStamp)).ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(PreEpoch, PreEpochStamp))
+    .ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(JustBefore, JustBeforeStamp))
+    .ToBe(True);
+  Expect<Boolean>(LongPathModificationStamp(Epoch, EpochStamp)).ToBe(True);
+
+  Expect<Int64>(FutureStamp.Seconds).ToBe(FarFutureUnixSeconds);
+  Expect<Int64>(FutureStamp.Nanoseconds).ToBe(0);
+  Expect<Integer>(CompareModificationStamps(FutureStamp, PresentStamp))
+    .ToBe(1);
+  Expect<Int64>(PreEpochStamp.Seconds).ToBe(PreEpochUnixSeconds);
+  Expect<Integer>(CompareModificationStamps(PreEpochStamp, PresentStamp))
+    .ToBe(-1);
+  Expect<Int64>(JustBeforeStamp.Seconds).ToBe(-1);
+  Expect<Int64>(JustBeforeStamp.Nanoseconds).ToBe(QuarterSecondNanoseconds);
+  Expect<Integer>(CompareModificationStamps(JustBeforeStamp, EpochStamp))
+    .ToBe(-1);
+  Expect<Integer>(CompareModificationStamps(PreEpochStamp, JustBeforeStamp))
+    .ToBe(-1);
+  WipeDir(IncludeTrailingPathDelimiter(FScratch) + 'stamp-wide');
+end;
+
 procedure TLongPathHelpers.SetupTests;
+var
+  Support: TTimestampSupport;
 begin
   Test('creates, lists, renames and deletes past MAX_PATH',
     TestCreateListRenameDelete);
@@ -3881,6 +4015,21 @@ begin
     TestCopyHashAndWipeTree);
   Test('retains and restores through a rollback root past MAX_PATH',
     TestRetainAndRestoreThroughDeepRollbackRoot);
+  Support := ProbeTimestampSupport;
+  if Support.SubSecond then
+    Test('orders sub-second modification stamps past MAX_PATH',
+      TestModificationStampKeepsSubSecondOrder)
+  else
+    Test('reads two writes in one coarse timestamp tick as equal past '
+      + 'MAX_PATH (filesystem keeps no sub-second times)',
+      TestModificationStampOnCoarseFilesystem);
+  if Support.WideDates and Support.SubSecond then
+    Test('orders modification stamps from before 1970 and after 2262',
+      TestModificationStampSpansWideDates)
+  else
+    Skip('orders modification stamps from before 1970 and after 2262',
+      TestModificationStampSpansWideDates,
+      'the filesystem does not keep sub-second times or these dates');
   {$IFDEF MSWINDOWS}
   Test('spells absolute, UNC and relative extended-length paths',
     TestExtendedPathSpelling);

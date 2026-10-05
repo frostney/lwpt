@@ -109,8 +109,21 @@ jobs:
       - name: lwpt install --frozen (committed lockfile matches committed trees?)
         run: ./build/lwpt install --frozen
 
-      - name: lwpt install (workspace auto-discovery + symlinks)
+      - name: lwpt install (workspace auto-discovery)
         run: ./build/lwpt install
+
+      # Defense in depth for #370: --frozen re-derives every workspace
+      # snapshot from its source, and this step fails if the plain install
+      # above still changed any committed toolkit state it owns.
+      - name: Committed toolkit state is current (plain install changed nothing?)
+        run: |
+          drift="$(git status --porcelain --untracked-files=all -- \
+            lwpt.lock lwpt.cfg .lwpt/modules .lwpt/archives)"
+          if [ -n "$drift" ]; then
+            printf '%s\n' "$drift"
+            echo "::error::lwpt install changed committed toolkit state; run ./build/lwpt install and commit the result"
+            exit 1
+          fi
 
       - name: lwpt format --check (formatting drift?)
         run: ./build/lwpt format --check
@@ -205,7 +218,7 @@ jobs:
       - name: lwpt install --frozen (committed lockfile matches committed trees?)
         run: ./build/lwpt install --frozen
 
-      - name: lwpt install (workspace auto-discovery + symlinks)
+      - name: lwpt install (workspace auto-discovery)
         run: ./build/lwpt install
 
       - name: lwpt test --bail=0 (ordinary project paths)
@@ -405,7 +418,7 @@ jobs:
       - name: lwpt install --frozen (POSIX-written lockfile verifies on Windows?)
         run: ./build/lwpt.exe install --frozen
 
-      - name: lwpt install (workspace auto-discovery + junctions)
+      - name: lwpt install (workspace auto-discovery)
         run: ./build/lwpt.exe install
 
       - name: lwpt test --bail=0 (ordinary project paths)

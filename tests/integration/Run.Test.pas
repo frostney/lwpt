@@ -51,41 +51,16 @@ type
   end;
 
 const
-  FileAgeOrderingTimeoutMilliseconds = 10000;
-
-procedure WriteUntilFileAgeAfter(const APath, AContent: string;
-  const AOlderPaths: array of string);
-var
-  CandidateAge, OlderAge: LongInt;
-  Deadline: QWord;
-  i: Integer;
-  Ordered: Boolean;
-  BlockingPath: string;
-begin
-  Deadline := GetTickCount64 + FileAgeOrderingTimeoutMilliseconds;
-  repeat
-    WriteTextFile(APath, AContent);
-    CandidateAge := FileAge(APath);
-    Ordered := CandidateAge >= 0;
-    BlockingPath := '';
-    OlderAge := -1;
-    for i := Low(AOlderPaths) to High(AOlderPaths) do
-    begin
-      OlderAge := FileAge(AOlderPaths[i]);
-      if (OlderAge < 0) or (CandidateAge <= OlderAge) then
-      begin
-        Ordered := False;
-        BlockingPath := AOlderPaths[i];
-        Break;
-      end;
-    end;
-    if Ordered then Exit;
-    Sleep(100);
-  until GetTickCount64 >= Deadline;
-  raise Exception.CreateFmt(
-    'timed out establishing file-age order: %s (%d) after %s (%d)',
-    [APath, CandidateAge, BlockingPath, OlderAge]);
-end;
+  { An even base second: both sub-second stamps below share one FileAge
+    tick, a whole second on Unix and a 2-second DOS tick on Windows. }
+  StampBaseSeconds = 1700000000;
+  { Inputs two whole seconds before the marker stay older at any timestamp
+    precision, the 2-second DOS tick included. }
+  InputStampSeconds = StampBaseSeconds - 2;
+  InputStampNanoseconds = 100000000;
+  MarkerStampNanoseconds = 500000000;
+  { One millisecond after the marker, in the same second (#367). }
+  EditStampNanoseconds = 501000000;
 
 procedure TRunE2E.SetupScratchProject;
 begin
@@ -247,16 +222,27 @@ begin
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/fresh-marker.txt')).ToBe(True);
-  WriteUntilFileAgeAfter(FScratch + '/fresh-marker.txt', 'fresh-preserved',
-    [FScratch + '/scripts/fresh.pas', FScratch + '/scripts/hello.pas']);
+  { Explicit times instead of sleeping across a timestamp tick: every
+    input is older than the marker, so the task skips. }
+  WriteTextFile(FScratch + '/fresh-marker.txt', 'fresh-preserved');
+  SetFileModificationTime(FScratch + '/scripts/fresh.pas', InputStampSeconds,
+    InputStampNanoseconds);
+  SetFileModificationTime(FScratch + '/scripts/hello.pas', InputStampSeconds,
+    InputStampNanoseconds);
+  SetFileModificationTime(FScratch + '/fresh-marker.txt', StampBaseSeconds,
+    MarkerStampNanoseconds);
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
     .ToBe('fresh-preserved');
 
-  WriteUntilFileAgeAfter(FScratch + '/scripts/fresh.pas',
-    ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10,
-    [FScratch + '/fresh-marker.txt']);
+  { An input edit a millisecond after the marker, inside the same
+    FileAge tick, makes the task stale: newer where the filesystem keeps
+    sub-second times, and equal, which also runs, where it does not. }
+  WriteTextFile(FScratch + '/scripts/fresh.pas',
+    ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10);
+  SetFileModificationTime(FScratch + '/scripts/fresh.pas', StampBaseSeconds,
+    EditStampNanoseconds);
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
