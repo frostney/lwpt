@@ -73,7 +73,8 @@ uses
   SysUtils,
 
   LWPT.Core,
-  LWPT.ProcessTree;
+  LWPT.ProcessTree,
+  Tests.ProcessSupport;
 
 const
   GUARD_OBSERVATION_TIMEOUT_MILLISECONDS = 10000;
@@ -143,11 +144,7 @@ end;
 procedure StopReporter(var AChild: TProcess);
 begin
   if not Assigned(AChild) then Exit;
-  if AChild.Running then
-  begin
-    AChild.Terminate(0);
-    AChild.WaitOnExit;
-  end;
+  TerminateChildProcess(AChild);
   FreeAndNil(AChild);
 end;
 

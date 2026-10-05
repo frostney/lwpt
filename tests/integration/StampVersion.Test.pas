@@ -76,6 +76,7 @@ uses
   LWPT.WorkerBudget,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const

@@ -17,6 +17,7 @@ uses
 
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.RegistryProcess,
   Tests.Scratch;
 

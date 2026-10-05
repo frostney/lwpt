@@ -153,6 +153,7 @@ end;
 function RunProbeTimeoutProxy(const AGrandchildPIDPath: string): Integer;
 var
   Grandchild: TProcess;
+  StartedAt: QWord;
 begin
   {$IFDEF UNIX}
   FpSignal(SIGTERM, SignalHandler(SIG_IGN));
@@ -163,7 +164,11 @@ begin
     Grandchild.Parameters.Add(ProbeTimeoutGrandchildOption);
     Grandchild.Parameters.Add(AGrandchildPIDPath);
     Grandchild.Execute;
-    while not PayloadIsReadable(AGrandchildPIDPath) and Grandchild.Running do
+    { A safety bound only: the probe timeout under test ends this proxy
+      long before its own sleep, which is as long. }
+    StartedAt := GetTickCount64;
+    while not PayloadIsReadable(AGrandchildPIDPath) and Grandchild.Running
+      and (GetTickCount64 - StartedAt < ProbeTimeoutSleepMilliseconds) do
       Sleep(ProcessPollMilliseconds);
     Sleep(ProbeTimeoutSleepMilliseconds);
   finally
@@ -283,9 +288,9 @@ function TLWPTFPCCompilerDriverTests.RunCompiler(
   out AOutput: string): Integer;
 var
   Arguments: LWPT.Core.TStringArray;
-  Buffer: array[0..PROCESS_OUTPUT_BUFFER_SIZE - 1] of Byte;
-  BytesRead, ArgumentIndex: Integer;
+  ArgumentIndex: Integer;
   CompilerProcess: TProcess;
+  MergedIntoOutput: string;
 begin
   Arguments := ADriver.BuildArguments(ARequest,
     PascalSourceCompilerInvocationOptions(''));
@@ -297,13 +302,10 @@ begin
       CompilerProcess.Parameters.Add(Arguments[ArgumentIndex]);
     CompilerProcess.Options := [poUsePipes, poStderrToOutPut];
     CompilerProcess.Execute;
-    repeat
-      BytesRead := CompilerProcess.Output.Read(Buffer[0], SizeOf(Buffer));
-      if BytesRead > 0 then
-        AppendRawBytes(AOutput, Buffer[0], BytesRead);
-    until BytesRead <= 0;
-    CompilerProcess.WaitOnExit;
-    Result := NormalisedExitCode(CompilerProcess);
+    { Standard error is merged into the output the wait drains. }
+    MergedIntoOutput := '';
+    Result := FinishChild(CompilerProcess, AOutput, MergedIntoOutput,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'compiler');
   finally
     CompilerProcess.Free;
   end;

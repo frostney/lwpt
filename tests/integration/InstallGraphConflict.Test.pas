@@ -16,6 +16,7 @@ uses
   LWPT.Core,
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -655,9 +656,9 @@ begin
     P.Parameters.Add('/C');
     P.Parameters.Add('mklink /J "' + NativePath(ModulePath) + '" "'
       + NativePath(TargetPath) + '"');
-    P.Options := [poWaitOnExit];
     P.Execute;
-    Expect<Integer>(P.ExitStatus).ToBe(0);
+    Expect<Integer>(FinishChild(P, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
+      'mklink')).ToBe(0);
   finally
     P.Free;
   end;

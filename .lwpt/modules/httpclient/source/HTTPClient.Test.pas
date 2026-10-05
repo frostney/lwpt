@@ -581,12 +581,24 @@ begin
   {$ENDIF}
 end;
 
+{ Running has reported the child's exit, and on Unix reaped it. Windows
+  signals the process handle only after the exited child's rundown, so that
+  wait is bounded rather than FPC's parameterless WaitOnExit, which never
+  returns for a child that does not exit. }
+procedure AwaitExitedMockLifecycleChild(const AChild: TProcess);
+begin
+  {$IFDEF MSWINDOWS}
+  if not AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS) then
+    raise Exception.Create('mock lifecycle child handle was not released');
+  {$ENDIF}
+end;
+
 procedure StopMockLifecycleChild(const AChild: TProcess);
 begin
   if AChild.ProcessID <= 0 then Exit;
   if not AChild.Running then
   begin
-    AChild.WaitOnExit;
+    AwaitExitedMockLifecycleChild(AChild);
     Exit;
   end;
   { FPC's Unix Terminate waits without a deadline; kill through the native
@@ -595,7 +607,7 @@ begin
   if not AChild.WaitOnExit(MOCK_LIFECYCLE_CLEANUP_TIMEOUT_MILLISECONDS)
      and AChild.Running then
     raise Exception.Create('mock lifecycle child did not stop after force kill');
-  AChild.WaitOnExit;
+  AwaitExitedMockLifecycleChild(AChild);
 end;
 
 procedure RunBoundedMockLifecycleChild(const AScenario: string;
@@ -618,7 +630,7 @@ begin
     TimedOut := Child.Running;
     if TimedOut then StopMockLifecycleChild(Child)
     else
-      Child.WaitOnExit;
+      AwaitExitedMockLifecycleChild(Child);
     Expect<Boolean>(TimedOut).ToBe(False);
     if not TimedOut then Expect<Integer>(Child.ExitStatus).ToBe(0);
   finally

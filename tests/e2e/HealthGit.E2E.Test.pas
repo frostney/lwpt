@@ -9,6 +9,7 @@ uses
 
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 type
@@ -31,7 +32,7 @@ type
 
 procedure THealthGitE2E.RunGit(const AArguments: array of string);
 var
-  ArgumentIndex: Integer;
+  ArgumentIndex, GitExitCode: Integer;
   ProcessInstance: TProcess;
 begin
   ProcessInstance := TProcess.Create(nil);
@@ -41,11 +42,12 @@ begin
     ProcessInstance.Parameters.Add(FGitRoot);
     for ArgumentIndex := Low(AArguments) to High(AArguments) do
       ProcessInstance.Parameters.Add(AArguments[ArgumentIndex]);
-    ProcessInstance.Options := [poWaitOnExit];
     ProcessInstance.Execute;
-    if ProcessInstance.ExitCode <> 0 then
+    GitExitCode := FinishChild(ProcessInstance,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'git');
+    if GitExitCode <> 0 then
       raise Exception.CreateFmt('git command failed with exit %d',
-        [ProcessInstance.ExitCode]);
+        [GitExitCode]);
   finally
     ProcessInstance.Free;
   end;

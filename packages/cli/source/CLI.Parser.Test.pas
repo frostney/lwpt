@@ -10,6 +10,9 @@ program CLI.Parser.Test;
 {$I Shared.inc}
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   Classes,
   Process,
   SysUtils,
@@ -20,6 +23,8 @@ uses
 
 const
   CHILD_MODE = '--child';
+  { Each child parses its argv and exits at once. }
+  CHILD_TIMEOUT_MILLISECONDS = 60000;
 
 type
   TCLIParserSuite = class(TTestSuite)
@@ -160,6 +165,46 @@ begin
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+{ Declared here rather than through the Windows unit, which would shadow
+  SysUtils routines. }
+function TerminateChildHandle(AProcess: THandle;
+  AExitCode: LongWord): LongBool; stdcall;
+  external 'kernel32.dll' name 'TerminateProcess';
+{$ENDIF}
+
+{ A bounded replacement for poWaitOnExit, which waits forever for a child
+  that never exits. Running is a nonblocking status query that also reaps
+  the child on Unix, so ExitCode then decodes its status. A child past the
+  deadline is killed and reported as an error. }
+function FinishChildWithin(AProcess: TProcess;
+  const ATimeoutMilliseconds: QWord): Integer;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while AProcess.Running
+    and (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
+    Sleep(10);
+  if AProcess.Running then
+  begin
+    {$IFDEF UNIX}
+    FpKill(AProcess.ProcessID, SIGKILL);
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    TerminateChildHandle(AProcess.ProcessHandle, 1);
+    {$ENDIF}
+    StartedAt := GetTickCount64;
+    while AProcess.Running and (GetTickCount64 - StartedAt < 2000) do
+      Sleep(10);
+    raise Exception.CreateFmt('child %s did not exit within %d ms',
+      [AProcess.Executable, ATimeoutMilliseconds]);
+  end;
+  Result := AProcess.ExitCode;
+  if (Result = 0) and (AProcess.ExitStatus <> 0) then
+    Result := AProcess.ExitStatus;
+end;
+
 function TCLIParserSuite.RunChild(const AScenario: string;
   const AArguments: array of string): Integer;
 var
@@ -173,9 +218,8 @@ begin
     ProcessInstance.Parameters.Add(AScenario);
     for I := 0 to High(AArguments) do
       ProcessInstance.Parameters.Add(AArguments[I]);
-    ProcessInstance.Options := [poWaitOnExit];
     ProcessInstance.Execute;
-    Result := ProcessInstance.ExitCode;
+    Result := FinishChildWithin(ProcessInstance, CHILD_TIMEOUT_MILLISECONDS);
   finally
     ProcessInstance.Free;
   end;

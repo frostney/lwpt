@@ -43,6 +43,7 @@ uses
 
   TestingPascalLibrary,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.RegistryHTTP,
   Tests.RegistryOrigin,
   Tests.RegistryProcess,
@@ -269,14 +270,7 @@ end;
 procedure KillProcess(var AProcess: TProcess);
 begin
   if AProcess = nil then Exit;
-  if AProcess.Running then
-  begin
-    {$IFDEF UNIX}
-    FpKill(AProcess.ProcessID, SIGKILL);
-    {$ELSE}
-    AProcess.Terminate(1);
-    {$ENDIF}
-  end;
+  KillChildProcess(AProcess);
   StopRegistryProcess(AProcess);
 end;
 
