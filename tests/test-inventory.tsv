@@ -127,8 +127,8 @@ program	*	tests/integration/ListenerPortGuard.Test.pas	1	5
 program	*	tests/integration/LockSchemaUpgrade.Test.pas	1	18
 program	*	tests/integration/PayloadHandoffGuard.Test.pas	1	10
 program	*	tests/integration/ProcessSupport.Test.pas	1	10
-program	*	tests/integration/Repair.Test.pas	1	17
-program	windows/*	tests/integration/Repair.Test.pas	1	16
+program	*	tests/integration/Repair.Test.pas	1	20
+program	windows/*	tests/integration/Repair.Test.pas	1	19
 program	*	tests/integration/Run.Test.pas	1	9
 program	*	tests/integration/Scratch.Test.pas	1	6
 program	windows/*	tests/integration/Scratch.Test.pas	1	7

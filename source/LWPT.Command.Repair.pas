@@ -176,19 +176,17 @@ begin
   LockPath := ResolveRepairPath(Ctx.ProjectRoot, INSTALL_LOCK);
 
   { Install recovery and the tmp sweep write install-owned state, so they
-    run under the install lock. A lock whose owner may still run fails
-    here, before anything changes; a dead owner's lock is taken over. }
+    run under the install lock. A lock whose owner is not provably dead
+    fails here, before anything changes; a dead owner's lock is taken
+    over. }
   InstallLock := TLWPTInstallLock.CreateReclaiming(LockPath,
     INSTALL_LOCK_HOLDER_REPAIR);
   try
-    if not InstallLock.Reclaimed then
-      WriteLn('repair: no install lock to reclaim')
-    else if InstallLock.ReclaimedPID <> '' then
+    if InstallLock.Reclaimed then
       WriteLn('repair: reclaimed ', LockPath, '; its owner (PID ',
         InstallLock.ReclaimedPID, ') has exited')
     else
-      WriteLn('repair: reclaimed ', LockPath, '; its owner exited before ',
-        'recording itself');
+      WriteLn('repair: no install lock to reclaim');
 
     { A crashed writer may have a validated pre-transaction snapshot below
       tmp. Restore it before the ordinary residue sweep can delete it. }

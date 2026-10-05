@@ -33,10 +33,13 @@
        recovered.
    14. While repair holds the lock, an install and a second repair fail
        fast naming it, and the second repair sweeps nothing.
-   15. An older binary's PID-only lock is kept while that PID runs; a
-       record-lock owner record is reclaimed even when its PID was reused.
-   16. A lock file without an owner record is kept while young and
-       reclaimed once old. }
+   15. Repair never reclaims what it cannot prove dead: a PID-only record
+       (older binary), a lock file without an owner record, or any lock on
+       a filesystem without record locks. It does reclaim a record-lock
+       owner record whose PID was reused, including its own PID.
+   16. An install whose freshly created lock file was replaced before it
+       took the record lock fails instead of running beside the new owner.
+       }
 
 program Repair.Test;
 
@@ -66,6 +69,8 @@ const
   { A PID no process can have: above every Unix pid_max and outside the
     range Windows assigns. }
   UNUSED_PID = '2147483644';
+  { The owner record of a dead owner that held the record lock. }
+  DEAD_OWNER_RECORD = UNUSED_PID + #10'holder=install'#10'lock=record';
 
 type
   TRepairE2E = class(TTestSuite)
@@ -96,9 +101,12 @@ type
     procedure TestRepairRefusesLiveInstallLock;
     procedure TestRepairReclaimsDeadOwnerAndRecovers;
     procedure TestRunningRepairExcludesInstallAndRepair;
-    procedure TestRepairKeepsLegacyLockOfRunningPID;
+    procedure TestRepairRefusesLegacyLock;
     procedure TestRepairReclaimsRecordLockWithReusedPID;
-    procedure TestRepairWaitsOutIncompleteLock;
+    procedure TestRepairReclaimsRecordOfItsOwnPID;
+    procedure TestRepairRefusesLockWithoutOwnerRecord;
+    procedure TestRepairRefusesWithoutRecordLocks;
+    procedure TestDisplacedCreatorFails;
     {$IFDEF UNIX}
     procedure TestRepairSkipsRedirectedOutputDirectory;
     {$ENDIF}
@@ -392,10 +400,10 @@ var
 begin
   LockPath := FScratch + '/.lwpt/install.lock';
 
-  { Simulate an older binary's crashed install: a PID-only lock file whose
-    PID names no process. }
+  { A crashed install's owner record: it held the record lock, which its
+    death released. }
   ForceDirectories(FScratch + '/.lwpt');
-  WriteTextFile(LockPath, UNUSED_PID);
+  WriteTextFile(LockPath, DEAD_OWNER_RECORD);
   Expect<Boolean>(FileExists(LockPath)).ToBe(True);
 
   R := RunRepair;
@@ -789,26 +797,34 @@ begin
   end;
 end;
 
-procedure TRepairE2E.TestRepairKeepsLegacyLockOfRunningPID;
-var Project, LockPath, Orphan, Running: string; R: TLwptResult;
+{ Asserts a refused repair: exit 1 naming ANeedle, the lock and a tmp
+  orphan unchanged. }
+procedure ExpectRefusedRepair(const ALabel, ANeedle, ALockPath,
+  ALockBefore, AOrphan: string; const ARun: TLwptResult);
 begin
-  { An older binary recorded only its PID and held no record lock, so a
-    PID that still runs may be its owner. This test program runs. }
-  Project := WriteLockProject('legacy-live');
+  DumpRunFailure(ALabel, ARun, 1);
+  Expect<Integer>(ARun.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos(ANeedle, ARun.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('delete ' + ALockPath + ' by hand', ARun.Stderr) > 0)
+    .ToBe(True);
+  Expect<string>(ReadBinaryFile(ALockPath)).ToBe(ALockBefore);
+  Expect<Boolean>(FileExists(AOrphan)).ToBe(True);
+end;
+
+procedure TRepairE2E.TestRepairRefusesLegacyLock;
+var Project, LockPath, Orphan: string;
+begin
+  { An older binary recorded only its PID and held no record lock. A PID
+    that names no local process proves nothing: that owner may run in
+    another PID namespace or on another host sharing the project. }
+  Project := WriteLockProject('legacy-record');
   LockPath := Project + '/.lwpt/install.lock';
   Orphan := Project + '/.lwpt/tmp/orphan';
-  Running := IntToStr(GetProcessID);
-  WriteTextFile(LockPath, Running);
+  WriteTextFile(LockPath, UNUSED_PID);
   WriteTextFile(Orphan, 'residue');
-
-  R := RunRepair(Project);
-
-  DumpRunFailure('repair against a legacy lock', R, 1);
-  Expect<Integer>(R.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('names PID ' + Running + ', which is still running',
-    R.Stderr) > 0).ToBe(True);
-  Expect<string>(FirstLine(ReadBinaryFile(LockPath))).ToBe(Running);
-  Expect<Boolean>(FileExists(Orphan)).ToBe(True);
+  ExpectRefusedRepair('repair against a PID-only lock',
+    'was written by an older ' + PROGRAM_NAME, LockPath,
+    ReadBinaryFile(LockPath), Orphan, RunRepair(Project));
 end;
 
 procedure TRepairE2E.TestRepairReclaimsRecordLockWithReusedPID;
@@ -830,30 +846,131 @@ begin
   Expect<Boolean>(FileExists(LockPath)).ToBe(False);
 end;
 
-procedure TRepairE2E.TestRepairWaitsOutIncompleteLock;
-var Project, LockPath: string; R: TLwptResult;
+procedure TRepairE2E.TestRepairReclaimsRecordOfItsOwnPID;
+var
+  Project, LockPath, Signals, OwnPID: string;
+  Environment: TStringArray;
+  R: TLwptResult;
 begin
-  { An owner writes its record right after it creates the file, so a young
-    file without one is being created and an old one is residue. }
-  Project := WriteLockProject('incomplete');
+  { A crashed install and the repair after it can both run as PID 1 of
+    separate containers. The seam rewrites the record to repair's own PID
+    before repair examines it. }
+  Project := WriteLockProject('own-pid');
   LockPath := Project + '/.lwpt/install.lock';
-  WriteTextFile(LockPath, '');
+  Signals := Project + '-signals';
+  WriteTextFile(LockPath, DEAD_OWNER_RECORD);
+  Environment := RepairEnvironment;
+  Insert(PROJECT_NAME + '_TEST_RECORD_OWN_PID=' + Signals, Environment,
+    Length(Environment));
 
-  R := RunRepair(Project);
-  DumpRunFailure('repair against a young incomplete lock', R, 1);
-  Expect<Integer>(R.ExitCode).ToBe(1);
-  Expect<Boolean>(Pos('is being created by another process', R.Stderr) > 0)
-    .ToBe(True);
-  Expect<Boolean>(FileExists(LockPath)).ToBe(True);
+  R := RunLwptTesting(['repair'], Project, Environment);
 
-  SetFileModificationTime(LockPath,
-    DateTimeToUnix(Now, False) - 3600, 0);
-  R := RunRepair(Project);
-  DumpRunFailure('repair against an old incomplete lock', R, 0);
+  DumpRunFailure('repair against its own PID', R, 0);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<Boolean>(Pos('its owner exited before recording itself',
+  OwnPID := ReadPayloadText(Signals + '/pid');
+  Expect<Boolean>(Pos('its owner (PID ' + OwnPID + ') has exited',
     R.Stdout) > 0).ToBe(True);
   Expect<Boolean>(FileExists(LockPath)).ToBe(False);
+end;
+
+procedure TRepairE2E.TestRepairRefusesLockWithoutOwnerRecord;
+var Project, LockPath, Orphan: string;
+begin
+  { Its creator may still be starting, or may have died before writing a
+    record; no age proves which. }
+  Project := WriteLockProject('incomplete');
+  LockPath := Project + '/.lwpt/install.lock';
+  Orphan := Project + '/.lwpt/tmp/orphan';
+  WriteTextFile(LockPath, '');
+  WriteTextFile(Orphan, 'residue');
+  SetFileModificationTime(LockPath, DateTimeToUnix(Now, False) - 3600, 0);
+  ExpectRefusedRepair('repair against a lock without an owner record',
+    'has no owner record', LockPath, ReadBinaryFile(LockPath), Orphan,
+    RunRepair(Project));
+end;
+
+procedure TRepairE2E.TestRepairRefusesWithoutRecordLocks;
+var
+  Project, LockPath, Orphan: string;
+  Environment: TStringArray;
+begin
+  { Without a record lock nothing proves the owner dead or keeps a second
+    repair out, so even a dead owner's record stays. }
+  Project := WriteLockProject('no-record-locks');
+  LockPath := Project + '/.lwpt/install.lock';
+  Orphan := Project + '/.lwpt/tmp/orphan';
+  WriteTextFile(LockPath, DEAD_OWNER_RECORD);
+  WriteTextFile(Orphan, 'residue');
+  Environment := RepairEnvironment;
+  Insert(PROJECT_NAME + '_TEST_RECORD_LOCK_UNSUPPORTED=1', Environment,
+    Length(Environment));
+  ExpectRefusedRepair('repair without record locks', 'keeps no record locks',
+    LockPath, ReadBinaryFile(LockPath), Orphan,
+    RunLwptTesting(['repair'], Project, Environment));
+end;
+
+procedure TRepairE2E.TestDisplacedCreatorFails;
+var
+  Project, LockPath, FirstSignals, SecondSignals, SecondPID: string;
+  First, Second: TLwptThread;
+  FirstResumed, SecondReleased: Boolean;
+begin
+  { An install pauses between creating the lock file and taking its record
+    lock. Meanwhile its file is deleted by hand and, where the platform
+    frees the name at once, a second install takes the lock. The first must
+    not then lock its unlinked file and run beside the second. }
+  Project := WriteLockProject('displaced');
+  LockPath := Project + '/.lwpt/install.lock';
+  FirstSignals := Project + '-first';
+  SecondSignals := Project + '-second';
+  Second := nil;
+  FirstResumed := False;
+  SecondReleased := False;
+  First := StartLwptTesting(['install'], Project,
+    ['LWPT_CACHE_DIR=' + FCacheRoot,
+     PROJECT_NAME + '_TEST_PAUSE_BEFORE_RECORD_LOCK=' + FirstSignals]);
+  try
+    Expect<Boolean>(AwaitPayload(FirstSignals + '/created', First))
+      .ToBe(True);
+    Expect<Boolean>(DeleteFile(LockPath)).ToBe(True);
+    {$IFDEF UNIX}
+    Second := StartLwptTesting(['install'], Project,
+      ['LWPT_CACHE_DIR=' + FCacheRoot,
+       PROJECT_NAME + '_TEST_HOLD_INSTALL_LOCK=' + SecondSignals]);
+    Expect<Boolean>(AwaitPayload(SecondSignals + '/held', Second)).ToBe(True);
+    SecondPID := ReadPayloadText(SecondSignals + '/held');
+    {$ENDIF}
+
+    PublishPayloadCompletion(FirstSignals + '/resume');
+    FirstResumed := True;
+    Expect<Boolean>(AwaitFinished(First)).ToBe(True);
+    Expect<string>(First.Error).ToBe('');
+    DumpRunFailure('displaced install', First.Run, 1);
+    Expect<Integer>(First.Run.ExitCode).ToBe(1);
+    Expect<Boolean>(Pos('was taken over, removed, or replaced',
+      First.Run.Stderr) > 0).ToBe(True);
+
+    if Second <> nil then
+    begin
+      Expect<string>(FirstLine(ReadBinaryFile(LockPath))).ToBe(SecondPID);
+      Expect<Boolean>(Second.Finished).ToBe(False);
+      PublishPayloadCompletion(SecondSignals + '/release');
+      SecondReleased := True;
+      Expect<Boolean>(AwaitFinished(Second)).ToBe(True);
+      Expect<string>(Second.Error).ToBe('');
+      DumpRunFailure('second install', Second.Run, 0);
+      Expect<Integer>(Second.Run.ExitCode).ToBe(0);
+    end
+    else
+      Expect<Boolean>(FileExists(
+        Project + '/.lwpt/modules/branch-a/source/branch-a.pas')).ToBe(False);
+  finally
+    if not FirstResumed then PublishPayloadCompletion(FirstSignals + '/resume');
+    if (Second <> nil) and not SecondReleased then
+      PublishPayloadCompletion(SecondSignals + '/release');
+    if AwaitFinished(First) then First.Free;
+    if (Second <> nil) and AwaitFinished(Second) then Second.Free;
+  end;
 end;
 
 {$IFDEF UNIX}
@@ -916,12 +1033,18 @@ begin
     TestRepairReclaimsDeadOwnerAndRecovers);
   Test('a running repair excludes an install and a second repair',
     TestRunningRepairExcludesInstallAndRepair);
-  Test('repair keeps a PID-only lock while that PID runs',
-    TestRepairKeepsLegacyLockOfRunningPID);
+  Test('repair refuses a PID-only lock from an older binary',
+    TestRepairRefusesLegacyLock);
   Test('repair reclaims a record-lock owner record whose PID was reused',
     TestRepairReclaimsRecordLockWithReusedPID);
-  Test('repair keeps a young lock without an owner record, not an old one',
-    TestRepairWaitsOutIncompleteLock);
+  Test('repair reclaims a record-lock owner record carrying its own PID',
+    TestRepairReclaimsRecordOfItsOwnPID);
+  Test('repair refuses a lock file without an owner record, however old',
+    TestRepairRefusesLockWithoutOwnerRecord);
+  Test('repair refuses to reclaim without record locks',
+    TestRepairRefusesWithoutRecordLocks);
+  Test('an install whose new lock file was replaced fails',
+    TestDisplacedCreatorFails);
   {$IFDEF UNIX}
   Test('repair never sweeps a link-redirected build output directory',
     TestRepairSkipsRedirectedOutputDirectory);
