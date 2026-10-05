@@ -888,13 +888,44 @@ begin
   InterLockedExchange(RaceReaderWaiting, 1);
 end;
 
+const
+  { Bounds every wait in the race test. A reader iteration can itself wait
+    RegistryStateLeaseWaitMilliseconds for the lease, so a finishing reader
+    always fits; only a stuck one exceeds it. }
+  RACE_WAIT_MILLISECONDS = 2 * RegistryStateLeaseWaitMilliseconds;
+
+{ The publisher's per-origin lease, or a failure naming the key once
+  RACE_WAIT_MILLISECONDS pass without it. }
 function AwaitStateLease(ACoordinator: TLWPTProducerLeaseCoordinator;
   const AKey: string): TLWPTProducerLease;
+var StartedAt: QWord;
 begin
+  StartedAt := GetTickCount64;
   repeat
     Result := ACoordinator.TryAcquire(AKey, 'test state publisher');
-    if Result = nil then Sleep(1);
-  until Result <> nil;
+    if Result <> nil then Exit;
+    if GetTickCount64 - StartedAt >= RACE_WAIT_MILLISECONDS then
+      raise Exception.CreateFmt(
+        'the test publisher could not take lease %s within %d ms',
+        [AKey, RACE_WAIT_MILLISECONDS]);
+    Sleep(1);
+  until False;
+end;
+
+{ True once AThread has finished, False when AMilliseconds pass first. A
+  finished thread's WaitFor and Free return at once; neither is called on
+  one that has not finished, because both join without a limit. }
+function AwaitThreadFinished(AThread: TThread;
+  const AMilliseconds: QWord): Boolean;
+var StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while not AThread.Finished do
+  begin
+    if GetTickCount64 - StartedAt >= AMilliseconds then Exit(False);
+    Sleep(10);
+  end;
+  Result := True;
 end;
 
 { Another project's install publishes per-user state and documents while
@@ -921,6 +952,7 @@ var
   Lease: TLWPTProducerLease;
   Loaded: TLWPTRegistryConsumerState;
   Batch, Round, Index, Failures: Integer;
+  Started, Stuck: Boolean;
 begin
   Root := FScratch + '/state-read-race';
   MergeRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
@@ -929,6 +961,8 @@ begin
   StateBytes := BytesOf(ReadBinaryFile(StatePath));
   Coordinator := TLWPTProducerLeaseCoordinator.Create(Root + '/locks');
   Reader := TStateReadThread.Create(True);
+  Started := False;
+  Stuck := False;
   try
     Reader.Root := Root;
     Reader.Identity := RACE_IDENTITY;
@@ -941,6 +975,7 @@ begin
     RaceReaderWaiting := 0;
     RegistryStateLeaseContendedTestHook := NoteRaceReaderWaiting;
     Reader.Start;
+    Started := True;
     Failures := 0;
     Failure := '';
     Index := 0;
@@ -975,7 +1010,8 @@ begin
         Sleep(3 * PRODUCER_LEASE_POLL_MILLISECONDS);
     end;
     InterLockedExchange(Reader.Done, 1);
-    Reader.WaitFor;
+    Stuck := not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS);
+    Expect<Boolean>(Stuck).ToBe(False);
     RegistryStateLeaseContendedTestHook := nil;
     Expect<string>(Failure).ToBe('');
     Expect<Integer>(Failures).ToBe(0);
@@ -986,10 +1022,21 @@ begin
     Expect<Integer>(Reader.MissedDocuments).ToBe(0);
     Expect<Boolean>(Reader.Reads > 0).ToBe(True);
   finally
-    RegistryStateLeaseContendedTestHook := nil;
-    { Stops a reader an exception left running; Free waits for it. }
+    { Stops a reader an exception left running. A reader never started is
+      started so that it sees Done and returns: freeing a suspended
+      thread would also join without a limit. }
     InterLockedExchange(Reader.Done, 1);
-    Reader.Free;
+    if not Started then Reader.Start;
+    if not Stuck then
+      Stuck := not AwaitThreadFinished(Reader, RACE_WAIT_MILLISECONDS);
+    { A reader still running past the bound has already failed the test:
+      it is leaked, and the hook it may still call stays assigned, rather
+      than joined without a limit. }
+    if not Stuck then
+    begin
+      RegistryStateLeaseContendedTestHook := nil;
+      Reader.Free;
+    end;
     Coordinator.Free;
   end;
   Expect<Boolean>(LoadRegistryConsumerStateAt(Root, RACE_IDENTITY, FKeyID,
@@ -1021,7 +1068,9 @@ end;
   hook completes the replacement on the reading thread, and the read then
   returns the stored sequence 9, which keeps a sequence 8 checkpoint stale
   against a lock that records only 3. A state that is really absent, with
-  no publisher, reads as absent without waiting. }
+  no publisher, reads as absent without waiting. The read runs on the test
+  thread, and if the hook ever stopped releasing the lease it would fail
+  with registry_state_locked after RegistryStateLeaseWaitMilliseconds. }
 procedure TRegistryConsumerTests.TestAbsentStateIsReadUnderThePublisherLease;
 var
   Root: string;
