@@ -7,10 +7,17 @@
 #   git-cliff --latest --strip header        # just the latest tag's entries
 #   git-cliff -o CHANGELOG.md                # regenerate the whole file
 #
-# Upgrade notes for a release come from its annotated tag message; while
-# preparing the release PR, pass the same text with --with-tag-message:
+# Upgrade notes for a release come from its annotated tag message: the
+# bullet lines only, without a heading (the template adds "### Upgrade
+# notes"). While preparing the release PR, pass the same text with
+# --with-tag-message and prepend only the new section, so published
+# sections stay byte-identical:
 #
-#   git-cliff --tag <version> --with-tag-message "$(cat notes.md)" -o CHANGELOG.md
+#   git-cliff --unreleased --tag <version> --with-tag-message "$(cat notes.md)" --prepend CHANGELOG.md
+#
+# Tag the merged release commit with the same notes:
+#
+#   git tag -a <version> <sha> -F notes.md
 #
 # The commit parsers are permissive (no Conventional Commits required) —
 # they bin messages by leading verb. release.yml publishes the matching
@@ -31,10 +38,14 @@ body = """
   ## [Unreleased]
 {% endif -%}
 {#- A release's upgrade notes are its annotated tag message (or
-   --with-tag-message while preparing the release PR). Only messages that
-   start with a Markdown heading are rendered, so tags whose message is just
-   the version add nothing. -#}
-{%- if message and message is starting_with("### ") %}
+   --with-tag-message while preparing the release PR): the bullet lines,
+   without a heading, because git strips '#' lines from tag messages by
+   default. Only messages that span several lines are rendered, so tags
+   whose message is just the version add nothing. -#}
+{%- if message and message is containing("
+") %}
+### Upgrade notes
+
 {{ message | trim }}
 {% endif -%}
 

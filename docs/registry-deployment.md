@@ -58,9 +58,11 @@ identity. See [Mirrors](#mirrors).
 | [`healthcheck.sh`](./examples/registry/healthcheck.sh) | Reads `registry.toml` and fetches `<base-url>/.well-known/lwpt-registry` from the local listener. TLS is verified against the real host name. |
 | [`nginx.conf`](./examples/registry/nginx.conf) | A TLS-terminating proxy that re-encrypts to the registry. |
 
-Build it from a release that includes the `registry` command family. Releases
-up to 0.7.0 do not have it. Take the digests from the release's
-`lwpt-<version>-checksums.txt`:
+Build it from a release that includes the `registry` command family; 0.8.0
+is the first. The Dockerfile's defaults pin 0.8.0 and its published digests,
+so `docker build -t lwpt-registry:0.8.0 docs/examples/registry` needs no
+arguments. For another release, override all three, taking the digests from
+that release's `lwpt-<version>-checksums.txt`:
 
 ```sh
 docker build \
