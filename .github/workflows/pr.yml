@@ -8,8 +8,9 @@ name: PR
 #   pr.yml      — every PR, whatever its base branch:
 #                 Ubuntu native bootstrap + install + format --check + build +
 #                 ordinary tests, then the live-network E2E paths on the
-#                 same Linux leg (#102); a native aarch64-darwin
-#                 ordinary-test leg; and a
+#                 same Linux leg (#102), then an inventory-only listing
+#                 checked against tests/test-inventory.tsv (#381); a native
+#                 aarch64-darwin ordinary-test leg; and a
 #                 win64 leg: cross-compile on macOS, then the
 #                 offline ordinary tests natively on
 #                 windows-latest. Typical wall-clock
@@ -167,6 +168,19 @@ jobs:
           'tests/e2e/*.Test.pas'
           'packages/*/tests/e2e/*.Test.pas'
           --bail=0
+
+      # #381: the passes above verify registrations in report mode, which
+      # runs test bodies. Inventory-only mode exits before them, so a program
+      # whose startup misbehaves there escaped every gate. This pass lists
+      # every discovered program from the executables the passes above
+      # cached, compares each record with tests/test-inventory.tsv, and
+      # checks that the published JSON parses.
+      - name: lwpt test --inventory (inventory-only mode matches tests/test-inventory.tsv?)
+        if: ${{ !cancelled() && steps.agents-check.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          ./build/lwpt test --inventory > "$RUNNER_TEMP/test-inventory.json"
+          python3 -m json.tool "$RUNNER_TEMP/test-inventory.json" > /dev/null
 
   docs:
     runs-on: ubuntu-latest
