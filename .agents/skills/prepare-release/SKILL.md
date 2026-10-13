@@ -86,8 +86,8 @@ Stop and report `BLOCKED` when any of these is true:
 ### 1. Establish the baseline
 
 - Read `AGENTS.md`, `VISION.md`, `CONTEXT.md`,
-  `DEFINITION_OF_READY.md`, `DEFINITION_OF_DONE.md`, `docs/architecture.md`,
-  `docs/build-system.md`, `docs/deployment.md`, and `docs/ci.md`.
+  `DEFINITION_OF_READY.md`, `DEFINITION_OF_DONE.md`, `docs/contributor/architecture.md`,
+  `docs/user/build-system.md`, `docs/contributor/deployment.md`, and `docs/contributor/ci.md`.
 - Resolve the default branch through GitHub rather than assuming its name.
 - Fetch the default branch and tags without switching away from the current
   preparation branch.
@@ -133,7 +133,7 @@ integrated-main successor provide the final complete proof.
     an explicit approval gate.
 - Confirm the target list, native-test policy, TLS backends, artifact names,
   and release version stamping agree between `ci.yml`, `release.yml`,
-  `toolchain.yml`, `docs/ci.md`, and `docs/deployment.md`.
+  `toolchain.yml`, `docs/contributor/ci.md`, and `docs/contributor/deployment.md`.
 - Do not trigger or publish a release workflow during preparation.
 
 ### 4. Audit architecture drift
@@ -154,16 +154,16 @@ Cover every surface:
   against manifest examples, lockfile schema claims, and zero-install rules.
 - **Packages and dependencies:** `[workspaces]`, package manifests, committed
   modules, lockfile entries, and package source ownership against
-  `docs/packages.md` and architecture documentation.
+  `docs/contributor/packages.md` and architecture documentation.
 - **Filesystem and concurrency:** actual writes, locks, temporary paths,
   cleanup, build outputs, and repair behavior against atomicity and safety
   claims. Planned behavior in GitHub issues must not be described as shipped.
 - **Testing:** discovery, repository groups, skips, network policy, subprocess
-  boundaries, and test counts against `docs/testing.md` and CI workflows.
+  boundaries, and test counts against `docs/contributor/testing.md` and CI workflows.
 - **Platforms and transport:** source conditionals, TLS implementations,
   compiler targets, and artifact packaging against deployment claims.
 - **Environment and configuration:** every environment-variable and manifest
-  key read by source against `docs/tooling.md` and user documentation, in both
+  key read by source against `docs/contributor/tooling.md` and user documentation, in both
   directions.
 - **ADRs:** verify implemented decisions still match source. Treat ADRs as
   historical records: never rewrite an old ADR to conceal drift. Fix the code
