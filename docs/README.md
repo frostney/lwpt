@@ -1,27 +1,27 @@
 # LWPT documentation
 
-**Using LWPT:** start with the [consumer guide](consumer-guide.md) for installation,
+**Using LWPT:** start with the [consumer guide](user/consumer-guide.md) for installation,
 a working project, and capability selection. **Contributing to LWPT:** follow the
-[contributor quick start](quick-start.md). [llms.txt](../llms.txt) provides a compact
+[contributor quick start](contributor/quick-start.md). [llms.txt](../llms.txt) provides a compact
 index linking to the same canonical Markdown sources.
 
 Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`AGENTS.md`](../AGENTS.md), [`CONTRIBUTING.md`](../CONTRIBUTING.md), and [`CONTEXT.md`](../CONTEXT.md) are the entry points; everything below is the deep dive.
 
 | File | Covers |
 | --- | --- |
-| [`consumer-guide.md`](./consumer-guide.md) | Released-tool installation, CLI and testing dependencies, runnable consumer example, tasks, and capability references |
-| [`architecture.md`](./architecture.md) | Tech stack, the package-manager-is-the-foundation through-line, manifest model, resolver shape, fetch/extract/build/test pipeline, `.lwpt/` layout, error/idempotency model, deferred-contracts note |
-| [`quick-start.md`](./quick-start.md) | Contributor setup: install FPC + InstantFPC + Lefthook, bootstrap LWPT itself, build, test, and common errors |
-| [`tooling.md`](./tooling.md) | Pinned tool versions, environment variables, lint/format/test commands, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), EXDEV fallback, where each deferred contract lives |
-| [`code-style.md`](./code-style.md) | Naming, file layout, formatter rules, manifest scope with protected toolkit state, line-endings, design tokens |
-| [`build-system.md`](./build-system.md) | Bootstrap pattern, `lwpt build` contract, `[build]` section + lifecycle hooks (`[prebuild]` / `[postbuild]` / `[pretest]` / etc.), `build/` output rules, cross-compile |
-| [`deployment.md`](./deployment.md) | Platform tier matrix, release process, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), macOS quarantine, codesigning policy |
-| [`ci.md`](./ci.md) | CI workflow shape (`ci.yml` / `pr.yml` / `release.yml` / `toolchain.yml`), trigger split, cross-build toolchain cache, install scripts |
-| [`testing.md`](./testing.md) | Repository-owned test groups, selector policy, fixture strategy, mock HTTP server, the binary-fetch regression, test inventory |
-| [`health.md`](./health.md) | `lwpt health` scope, Pascal complexity scoring, thresholds, Git hotspot formula, and JSON schema |
-| [`packages.md`](./packages.md) | The package set, divergence vs GocciaScript-older-copies, bootstrap chicken-and-egg, graduation roadmap (per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)) |
-| [`registry-spec.md`](./registry-spec.md) | Open origin-and-mirror HTTP registry protocol: stable identity, immutable records/objects, signed snapshots, publication, synchronization, and conformance fixtures |
-| [`registry-deployment.md`](./registry-deployment.md) | Running a registry origin or mirror: the example container image in [`examples/registry/`](./examples/registry/), TLS and reverse-proxy shapes, secrets and tokens, graceful shutdown, backup and restore, upgrades, operational limits, portability assumptions, and the CI evidence |
+| [`consumer-guide.md`](./user/consumer-guide.md) | Released-tool installation, CLI and testing dependencies, runnable consumer example, tasks, and capability references |
+| [`architecture.md`](./contributor/architecture.md) | Tech stack, the package-manager-is-the-foundation through-line, manifest model, resolver shape, fetch/extract/build/test pipeline, `.lwpt/` layout, error/idempotency model, deferred-contracts note |
+| [`quick-start.md`](./contributor/quick-start.md) | Contributor setup: install FPC + InstantFPC + Lefthook, bootstrap LWPT itself, build, test, and common errors |
+| [`tooling.md`](./contributor/tooling.md) | Pinned tool versions, environment variables, lint/format/test commands, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), EXDEV fallback, where each deferred contract lives |
+| [`code-style.md`](./contributor/code-style.md) | Naming, file layout, formatter rules, manifest scope with protected toolkit state, line-endings, design tokens |
+| [`build-system.md`](./user/build-system.md) | Bootstrap pattern, `lwpt build` contract, `[build]` section + lifecycle hooks (`[prebuild]` / `[postbuild]` / `[pretest]` / etc.), `build/` output rules, cross-compile |
+| [`deployment.md`](./contributor/deployment.md) | Platform tier matrix, release process, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), macOS quarantine, codesigning policy |
+| [`ci.md`](./contributor/ci.md) | CI workflow shape (`ci.yml` / `pr.yml` / `release.yml` / `toolchain.yml`), trigger split, cross-build toolchain cache, install scripts |
+| [`testing.md`](./contributor/testing.md) | Repository-owned test groups, selector policy, fixture strategy, mock HTTP server, the binary-fetch regression, test inventory |
+| [`health.md`](./user/health.md) | `lwpt health` scope, Pascal complexity scoring, thresholds, Git hotspot formula, and JSON schema |
+| [`packages.md`](./contributor/packages.md) | The package set, divergence vs GocciaScript-older-copies, bootstrap chicken-and-egg, graduation roadmap (per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)) |
+| [`registry-spec.md`](./user/registry-spec.md) | Open origin-and-mirror HTTP registry protocol: stable identity, immutable records/objects, signed snapshots, publication, synchronization, and conformance fixtures |
+| [`registry-deployment.md`](./user/registry-deployment.md) | Running a registry origin or mirror: the example container image in [`examples/registry/`](./examples/registry/), TLS and reverse-proxy shapes, secrets and tokens, graceful shutdown, backup and restore, upgrades, operational limits, portability assumptions, and the CI evidence |
 
 ## Decision records
 
@@ -63,7 +63,7 @@ Index of the [`docs/`](.) folder. The root-level [`README.md`](../README.md), [`
 | [0032](./adr/0032-managed-delivery-state-and-proof.md) | (Superseded by [0046](./adr/0046-skill-owned-delivery.md).) Managed delivery through an explicit transition endpoint, phase labels, and exact native-topology full-CI proofs — kept as historical record |
 | [0033](./adr/0033-schannel-server-tls-accept-on-windows.md) | Windows server TLS accept moves to native SChannel + crypt32, removing OpenSSL from Windows entirely and giving `i386-win32` server accept; supersedes the Windows half of [0024](./adr/0024-openssl-server-tls-accept.md) |
 | [0034](./adr/0034-freeze-test-selection-before-pretest.md) | Test discovery and file/directory/glob selection freeze before `pretest`; hooks may prepare inputs but cannot add programs to the invocation |
-| [0035](./adr/0035-runtime-test-registration-inventory.md) | Runtime test-registration inventory: `lwpt test --inventory` reports registered suites and cases as deterministic JSON without running test bodies, and the committed `tests/test-inventory.tsv` verifies counts per platform and renders the `docs/testing.md` tables |
+| [0035](./adr/0035-runtime-test-registration-inventory.md) | Runtime test-registration inventory: `lwpt test --inventory` reports registered suites and cases as deterministic JSON without running test bodies, and the committed `tests/test-inventory.tsv` verifies counts per platform and renders the `docs/contributor/testing.md` tables |
 | [0036](./adr/0036-per-user-dependency-archive-cas.md) | Verified dependency archives reuse one per-user immutable SHA-256 object while project-owned archives and frozen verification remain authoritative |
 | [0037](./adr/0037-verified-build-result-cache.md) | Verified compiler-neutral build-result reuse through per-user immutable manifests and artifacts, with explicit bypass |
 | [0038](./adr/0038-local-producer-leases.md) | Local producer leases: one producer per cache object key, held by a non-inherited operating-system file lock, coalesces concurrent cache misses; waiters recheck before work, and a crashed producer's released guard is reclaimable |

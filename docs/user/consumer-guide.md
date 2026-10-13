@@ -7,7 +7,7 @@ installed commands, then `lwpt <command> --help` for their options. Subcommand
 help links back to the complete command list.
 
 This guide is for projects that **use** LWPT. To change LWPT itself, follow the
-[contributor quick start](quick-start.md). Consumer projects use the installed
+[contributor quick start](../contributor/quick-start.md). Consumer projects use the installed
 `lwpt` executable; LWPT's `bootstrap.sh` builds the toolkit from its source.
 
 ## Install the released toolkit
@@ -24,7 +24,7 @@ lwpt --help
 The [Homebrew formula](https://github.com/frostney/homebrew-tap/blob/main/Formula/lwpt.rb)
 installs the released binary. On other platforms, install FreePascal and use
 the matching archive from [LWPT releases](https://github.com/frostney/lwpt/releases),
-placing its executable on `PATH`. See the [platform support](deployment.md)
+placing its executable on `PATH`. See the [platform support](../contributor/deployment.md)
 reference for supported targets.
 
 The example below uses released **0.8.0** packages. Documentation on `main` can
@@ -224,7 +224,7 @@ The smoke task prints `Hello, LWPT!`; both native tests pass. `build/hello greet
 exits nonzero with `name must not be empty`.
 
 Commit the manifest, generated lockfile/configuration, and dependency snapshots
-according to the [dependency state contract](architecture.md#lwpt-layout).
+according to the [dependency state contract](../contributor/architecture.md#lwpt-layout).
 Generated state belongs to `lwpt install`; do not hand-edit its contents.
 
 ## Choose the existing capability
@@ -232,19 +232,19 @@ Generated state belongs to `lwpt install`; do not hand-edit its contents.
 | Need | LWPT capability | Reference |
 | --- | --- | --- |
 | Initialize or adopt a project | `lwpt init`, `lwpt init --adopt` | `lwpt init --help` |
-| Resolve, add, or remove dependencies | `lwpt install`, `lwpt add`, `lwpt remove` | [Manifest and packages](../README.md#manifest) |
-| Find and apply newer git-host dependency versions | `lwpt outdated`, `lwpt update` | [Outdated and update](adr/0039-outdated-update-subcommands.md) |
-| Consume packages from a self-hosted registry | `registry:` dependencies and a root `[registries]` table | [Registry dependencies](adr/0051-registry-dependency-sources.md) |
+| Resolve, add, or remove dependencies | `lwpt install`, `lwpt add`, `lwpt remove` | [Manifest and packages](../../README.md#manifest) |
+| Find and apply newer git-host dependency versions | `lwpt outdated`, `lwpt update` | [Outdated and update](../adr/0039-outdated-update-subcommands.md) |
+| Consume packages from a self-hosted registry | `registry:` dependencies and a root `[registries]` table | [Registry dependencies](../adr/0051-registry-dependency-sources.md) |
 | Run a registry origin or mirror, or publish to one | `lwpt registry` | [Registry deployment](registry-deployment.md) |
 | Recover from an interrupted install or upgrade a v3 lockfile | `lwpt repair` | `lwpt repair --help` |
-| Parse application arguments and provide help | `cli` package | [CLI public types](../packages/cli/source/CLI.Options.pas), [subcommands](../packages/cli/source/CLI.Subcommands.pas) |
+| Parse application arguments and provide help | `cli` package | [CLI public types](../../packages/cli/source/CLI.Options.pas), [subcommands](../../packages/cli/source/CLI.Subcommands.pas) |
 | Build selected binaries | `lwpt build` | [Build system](build-system.md) |
-| Run native tests | `testing` package and `lwpt test` | [Testing](testing.md) |
-| Run a project-specific tool or oracle adapter | A manifest task and `lwpt run <task>` | [Run tasks](adr/0013-run-subcommand-and-build-rename.md) |
-| Generate inputs or perform lifecycle actions | Manifest lifecycle hooks | [Hooks](adr/0011-build-lifecycle-hooks.md) |
-| Format Pascal source | `lwpt format`, `lwpt format --check` | [Formatting scope and rules](code-style.md) |
-| Check complexity and duplication | `lwpt health`, `lwpt duplication` | [Health thresholds](health.md), [duplication](tooling.md#duplication-analysis) |
-| Keep agent commands current | `lwpt agents`, `lwpt agents --check` | [Generated reference](adr/0027-agents-subcommand.md) |
+| Run native tests | `testing` package and `lwpt test` | [Testing](../contributor/testing.md) |
+| Run a project-specific tool or oracle adapter | A manifest task and `lwpt run <task>` | [Run tasks](../adr/0013-run-subcommand-and-build-rename.md) |
+| Generate inputs or perform lifecycle actions | Manifest lifecycle hooks | [Hooks](../adr/0011-build-lifecycle-hooks.md) |
+| Format Pascal source | `lwpt format`, `lwpt format --check` | [Formatting scope and rules](../contributor/code-style.md) |
+| Check complexity and duplication | `lwpt health`, `lwpt duplication` | [Health thresholds](health.md), [duplication](../contributor/tooling.md#duplication-analysis) |
+| Keep agent commands current | `lwpt agents`, `lwpt agents --check` | [Generated reference](../adr/0027-agents-subcommand.md) |
 
 The formatter handles uses clauses and identifiers; it does not reflow arbitrary
 procedure bodies. Write readable Pascal and configure health/duplication limits
@@ -255,4 +255,4 @@ entry points when the toolkit does not supply that behavior.
 
 For larger consumer configurations, see [Wasmlight's manifest](https://github.com/frostney/wasmlight/blob/main/lwpt.toml)
 and [Duetto's manifest](https://github.com/frostney/duetto/blob/main/lwpt.toml).
-For a compact Markdown documentation index, see [llms.txt](../llms.txt).
+For a compact Markdown documentation index, see [llms.txt](../../llms.txt).

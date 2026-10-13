@@ -304,7 +304,7 @@ begin
     WriteLn('A concurrent test''s outbound connection can be auto-bound to ',
       'a port from ', LowestEphemeralPort, ' to ', HighestPort, '. Bind port ',
       '0 and read the assignment back, or use a fixed port below ',
-      LowestEphemeralPort, '. See docs/testing.md.');
+      LowestEphemeralPort, '. See docs/contributor/testing.md.');
   Expect<Integer>(Violations).ToBe(0);
 end;
 

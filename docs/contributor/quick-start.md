@@ -2,14 +2,14 @@
 
 This walkthrough builds and tests **LWPT itself** from a source checkout.
 To install the released toolkit and scaffold another project, follow the
-[consumer guide](consumer-guide.md). The [documentation index](README.md) and
-[llms.txt](../llms.txt) cover the full capability set.
+[consumer guide](../user/consumer-guide.md). The [documentation index](../README.md) and
+[llms.txt](../../llms.txt) cover the full capability set.
 
 ## Executive Summary
 
 - **Bootstrap is one command, run once.** `./bootstrap.sh` (or `bootstrap.bat` on Windows) produces `build/lwpt` from `source/lwpt.pas`. After that, `./build/lwpt build` is the canonical build entry point.
-- **No `lwpt install` needed after clone.** Per [ADR-0002](./adr/0002-lwpt-namespace-zero-install.md) every LWPT project commits `.lwpt/modules/` and `.lwpt/archives/`; `fpc @lwpt.cfg` works without LWPT being involved.
-- **Two prerequisites:** FPC 3.2.2 (with InstantFPC bundled) and Lefthook for pre-commit hooks. TLS is platform-native in both directions on Windows and macOS (SChannel per [ADR-0016](./adr/0016-tls-backend-per-platform.md) and [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), SecureTransport on macOS, system OpenSSL on Linux); no DLLs to bundle.
+- **No `lwpt install` needed after clone.** Per [ADR-0002](../adr/0002-lwpt-namespace-zero-install.md) every LWPT project commits `.lwpt/modules/` and `.lwpt/archives/`; `fpc @lwpt.cfg` works without LWPT being involved.
+- **Two prerequisites:** FPC 3.2.2 (with InstantFPC bundled) and Lefthook for pre-commit hooks. TLS is platform-native in both directions on Windows and macOS (SChannel per [ADR-0016](../adr/0016-tls-backend-per-platform.md) and [ADR-0033](../adr/0033-schannel-server-tls-accept-on-windows.md), SecureTransport on macOS, system OpenSSL on Linux); no DLLs to bundle.
 - **A new test is one `.Test.pas` file.** Add `testing` to `[dependencies]` (or rely on workspace auto-discovery in a monorepo), run `lwpt install` once, then write `program <Name>.Test;` files using `TestingPascalLibrary`. `lwpt test` discovers and runs them.
 - **Pre-commit auto-formats.** `lwpt format` and `lwpt agents` run on every commit via Lefthook and re-stage any rewrites (`stage_fixed: true`). The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`, `lwpt agents --check`) run on the PR workflow in CI. Install the local hook once with `lefthook install`.
 
@@ -89,7 +89,7 @@ After bootstrap:
                                 # publish (token from LWPT_REGISTRY_TOKEN), then verify it from the pin
 ```
 
-[`build-system.md`](./build-system.md) covers each in depth.
+[`build-system.md`](../user/build-system.md) covers each in depth.
 
 `install --offline` requires an existing compatible `lwpt.lock`. It resolves
 network-backed dependencies to the lockfile's exact identities without remote
@@ -123,7 +123,7 @@ re-derives each registry module from its archive and fails when an installed
 unit was edited, even together with its recorded hash. `--offline` restores a
 missing proof document from the per-user registry state directory. A changed
 pin fails both modes; run `lwpt install` online to verify from the new pin
-([ADR-0051](./adr/0051-registry-dependency-sources.md)).
+([ADR-0051](../adr/0051-registry-dependency-sources.md)).
 
 A tag names a reviewed commit, and `lwpt.lock` records both the commit and
 whether the ref was a tag or a branch. An online install fails before fetching
@@ -186,7 +186,7 @@ Lefthook runs `lwpt format` and `lwpt agents` on every `git commit` with `stage_
 lefthook install
 ```
 
-If you genuinely need to bypass (rare), see [`tooling.md`](./tooling.md) — but `--no-verify` violates [`CONTRIBUTING.md`](../CONTRIBUTING.md) unless explicitly requested by a maintainer.
+If you genuinely need to bypass (rare), see [`tooling.md`](./tooling.md) — but `--no-verify` violates [`CONTRIBUTING.md`](../../CONTRIBUTING.md) unless explicitly requested by a maintainer.
 
 ## Adding a dependency
 
@@ -208,7 +208,7 @@ The dependency name defaults to the repo / path basename (`horse` here); pass `-
 horse = "HashLoad/horse@^4.0.0"   # see ADR-0009 for the full source-spec syntax
 ```
 
-— then run `./build/lwpt install`. The inverse is `./build/lwpt remove horse`, which deletes the manifest entry, regenerates `lwpt.lock` + `lwpt.cfg`, and prunes `.lwpt/modules/horse/` + its cached archive (see [ADR-0019](./adr/0019-add-remove-subcommands.md)).
+— then run `./build/lwpt install`. The inverse is `./build/lwpt remove horse`, which deletes the manifest entry, regenerates `lwpt.lock` + `lwpt.cfg`, and prunes `.lwpt/modules/horse/` + its cached archive (see [ADR-0019](../adr/0019-add-remove-subcommands.md)).
 
 `.lwpt/modules/horse/` and `.lwpt/archives/horse-<resolved-tag>.tar.gz` (named after the tag the `^4.0.0` range resolved to) are committed because of zero-install (ADR-0002). The next contributor's `git clone` doesn't need to run `lwpt install` — `./build/lwpt build` reads the already-committed `lwpt.cfg` and compiles directly.
 
@@ -220,7 +220,7 @@ Source kinds:
 - `workspace:` (`workspace:*` or `workspace:^X.Y.Z`), naming a member discovered through `[workspaces]`;
 - `registry:[<alias>/]<package>`, selected from the registry snapshot named by the signed checkpoint of an origin declared in the root `[registries]` table.
 
-See the [README manifest section](../README.md#manifest) for an annotated example, [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) for the source syntax, and [ADR-0051](./adr/0051-registry-dependency-sources.md) for registry sources.
+See the [README manifest section](../../README.md#manifest) for an annotated example, [ADR-0009](../adr/0009-source-syntax-and-tag-resolution.md) for the source syntax, and [ADR-0051](../adr/0051-registry-dependency-sources.md) for registry sources.
 
 ## Writing a test
 
@@ -293,7 +293,7 @@ mock HTTP server; and the binary-fetch regression) is in
 
 **`bootstrap.sh: instantfpc not found; falling back to direct fpc`** — informational. Both code paths produce the same `build/lwpt`; the fallback just skips the InstantFPC wrapper.
 
-**`lwpt install: dependency "<name>": the legacy manifest shape ... is no longer supported`** — per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md): no more `source = "github|gitlab|..."` selector, no separate `repo` / `ref` / `tag` / `path` keys. Rewrite as a bare-string shorthand or a slim inline table:
+**`lwpt install: dependency "<name>": the legacy manifest shape ... is no longer supported`** — per [ADR-0009](../adr/0009-source-syntax-and-tag-resolution.md): no more `source = "github|gitlab|..."` selector, no separate `repo` / `ref` / `tag` / `path` keys. Rewrite as a bare-string shorthand or a slim inline table:
 
 ```toml
 [dependencies]
@@ -305,7 +305,7 @@ bar = { source = "owner/bar", version = "^1.0", include = ["src/**"] } # inline-
 
 **`lwpt install: CONFLICT on package "X"`** — two requirers want incompatible versions of the same package; FPC's single global unit namespace forbids both. The output names both requirers — edit the manifest tree to align them.
 
-**`HTTPS requires OpenSSL but it could not be loaded` (Linux only)** — install your distro's libssl package (`apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs`). LWPT loads it via `dlopen` at runtime. Windows + macOS do not hit this path (SChannel / SecureTransport are built into the OS — see [ADR-0016](./adr/0016-tls-backend-per-platform.md)).
+**`HTTPS requires OpenSSL but it could not be loaded` (Linux only)** — install your distro's libssl package (`apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs`). LWPT loads it via `dlopen` at runtime. Windows + macOS do not hit this path (SChannel / SecureTransport are built into the OS — see [ADR-0016](../adr/0016-tls-backend-per-platform.md)).
 
 **`[frozen] missing extracted module for "<name>"`** — `lwpt install --frozen` requires `.lwpt/modules/<name>/` to be present. Run `lwpt install` (without `--frozen`) to fetch.
 
@@ -344,7 +344,7 @@ from the new pin.
 
 Takes over the install lock only once it can prove its owner has exited, and
 otherwise fails without changing anything, naming the holder or the file to
-delete by hand ([ADR-0053](./adr/0053-install-lock-ownership-and-reclamation.md)).
+delete by hand ([ADR-0053](../adr/0053-install-lock-ownership-and-reclamation.md)).
 Holding the lock, it cleans `.lwpt/tmp/` after restoring an interrupted
 install's validated rollback snapshot from it. It then cleans abandoned or
 failed sessions
@@ -361,5 +361,5 @@ committed state returns to what it was before that install. When the lockfile
 is schema v3, it upgrades the lockfile to v4 without network access and
 without changing dependency versions, re-deriving each module from its
 committed archive or source
-([ADR-0052](./adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the
+([ADR-0052](../adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the
 resulting `lwpt.lock`.

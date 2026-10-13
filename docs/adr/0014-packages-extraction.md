@@ -99,7 +99,7 @@ The graduation arc from [ADR-0003](./0003-vendored-permanent-fork-graduation.md)
 
 - **`CONTEXT.md` gains a `Package (graduated)` glossary entry** disambiguating from the `Vendored` term (which now describes the broader notion) and from `Module` / `.lwpt/modules/` (the installed-dep-tree term). `Vendored` is updated to acknowledge that vendored units mostly live in `packages/<name>/` post-ADR-0014, with `source/` holding the remainder.
 
-- **`docs/vendored.md` reorganises** its table — paths change from `source/<unit>.pas` to `packages/<name>/source/<unit>.pas` for the four graduates. The named-exception treatment (CLI prefix-strip, Semver rename, Platform rename) is preserved, just at the new paths. Patch markers in code move with the files. *(update: `docs/vendored.md` is now `docs/packages.md` per ADR-0017; the "named exception" + "patch marker" framing was retired in the same wave.)*
+- **`docs/vendored.md` reorganises** its table — paths change from `source/<unit>.pas` to `packages/<name>/source/<unit>.pas` for the four graduates. The named-exception treatment (CLI prefix-strip, Semver rename, Platform rename) is preserved, just at the new paths. Patch markers in code move with the files. *(update: `docs/vendored.md` is now `docs/contributor/packages.md` per ADR-0017; the "named exception" + "patch marker" framing was retired in the same wave.)*
 
 - **Subcommand surface, hook surface, placeholder namespace are unchanged.** None of the prior ADR work touches package boundaries directly; the extraction is structural and additive.
 
@@ -142,7 +142,7 @@ The npm-ecosystem precedent informed the implementation choice — npm + pnpm bo
 Documented by pnpm's [issue #10707](https://github.com/pnpm/pnpm/issues/10707): PowerShell's `Remove-Item -Recurse -Force` and Git Bash's `rm -rf` **follow NTFS junctions into the target directory and delete files outside the intended path**. This is a Windows-platform behaviour, not an LWPT bug, but it's the kind of footgun that LWPT must address explicitly:
 
 - **Internal**: LWPT's own `WipeInstalledDep` uses `IsDirSymlinkOrJunction` to detect a link and `RemoveDirLink` (which on Windows calls `RemoveDirectoryW`, documented to remove the reparse point itself rather than recurse) to remove it safely. We never walk through a junction.
-- **External**: a user running `Remove-Item .lwpt -Recurse -Force` on a Windows machine where `.lwpt/modules/httpclient` is a junction to `packages/httpclient/` would lose `packages/httpclient/source/*.pas`. This is documented prominently in `docs/architecture.md` with the safe alternative (`cmd.exe /c "rmdir /S /Q .lwpt"`).
+- **External**: a user running `Remove-Item .lwpt -Recurse -Force` on a Windows machine where `.lwpt/modules/httpclient` is a junction to `packages/httpclient/` would lose `packages/httpclient/source/*.pas`. This is documented prominently in `docs/contributor/architecture.md` with the safe alternative (`cmd.exe /c "rmdir /S /Q .lwpt"`).
 
 ### Consequences
 

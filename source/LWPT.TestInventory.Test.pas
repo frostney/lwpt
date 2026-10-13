@@ -83,7 +83,7 @@ var
 begin
   Inventory := TLWPTTestInventory.Create(TEST_INVENTORY_PATH);
   try
-    Inventory.ValidateDocumentation('docs/testing.md');
+    Inventory.ValidateDocumentation('docs/contributor/testing.md');
     Expect<Boolean>(True).ToBe(True);
   finally
     Inventory.Free;

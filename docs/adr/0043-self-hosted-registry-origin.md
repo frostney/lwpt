@@ -12,7 +12,7 @@
 > kernel release below 25, not only kernel 24.
 
 Issue [#53](https://github.com/frostney/lwpt/issues/53) turns the registry
-protocol from [a wire contract](../registry-spec.md) into an origin that the
+protocol from [a wire contract](../user/registry-spec.md) into an origin that the
 LWPT executable can initialize and run. The command surface is
 `lwpt registry init|serve`: one ADR-backed command family with lifecycle
 operations below it, rather than two unrelated top-level subcommands. This is

@@ -4,8 +4,8 @@ Six GitHub Actions workflows provide the build-once/test-natively matrix, the
 release pipeline, and the reusable LWPT dependency updater. Workflows that
 execute pull-request code have read-only permissions. Delivery itself (waiting
 for CI, converging review, merging, and verifying integration) belongs to the
-known-good-route skills under [`ORCHESTRATION.md`](../ORCHESTRATION.md), per
-[ADR-0046](./adr/0046-skill-owned-delivery.md).
+known-good-route skills under [`ORCHESTRATION.md`](../../ORCHESTRATION.md), per
+[ADR-0046](../adr/0046-skill-owned-delivery.md).
 
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
@@ -117,7 +117,7 @@ gh workflow run ci.yml --ref <branch> -f mode=diagnostic \
 ```
 
 `mode=manual` runs the full six-target build and native test matrix. Delivery
-policy in [`ORCHESTRATION.md`](../ORCHESTRATION.md) requires one green manual
+policy in [`ORCHESTRATION.md`](../../ORCHESTRATION.md) requires one green manual
 run whose head is the PR's exact head before merge; the ruleset does not
 enforce it (its only required check is `delivery-admission`), and the
 push-to-`main` `ci.yml` run covers the full native matrix again after merge. The run name shows the mode and ref (`CI / manual / <branch>`).
@@ -199,10 +199,10 @@ The official FPC 3.2.2 Windows distribution's native compiler is i386, so both W
 
 Both installers are SHA-256-pinned. The setup script fails unless the selected compiler reports the leg's `-iTO -iTP` target, then compiles and runs a probe, so the setup log shows the compiler banner and the probe's pointer width. On the `x86_64-win64` leg the `bootstrap.bat` smoke uses the same `LWPT_FPC` and therefore builds a 64-bit `lwpt.exe`. The `fpc` and `instantfpc` on `PATH` remain the i386 host tools on both legs; they run host-side scripts, not test programs.
 
-Per [Q22=b](./adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
+Per [Q22=b](../adr/0014-packages-extraction.md), the runner side compiles tests at runtime via `lwpt test` rather than pre-compiling them on the cross-build stage. This exercises the full LWPT pipeline natively — including the resolver, the per-target cfg emitter, FPC's per-platform `{$IFDEF}` paths, and the install loop's symlink-vs-copy decision (junctions on Windows, symlinks on Unix).
 
 When a test step fails, the job uploads `registry-matrix-<target>`: the
-scratch directory that [`RegistryMatrix.E2E.Test.pas`](../tests/e2e/RegistryMatrix.E2E.Test.pas)
+scratch directory that [`RegistryMatrix.E2E.Test.pas`](../../tests/e2e/RegistryMatrix.E2E.Test.pas)
 keeps for a failing case, holding its data directories, consumer projects,
 and command log. The registries in it are loopback-only test registries with
 throwaway keys.
@@ -210,10 +210,10 @@ throwaway keys.
 **Registry container stage** (`registry-container`, `ubuntu-latest`, 20-minute
 ceiling, full matrix only, skipped in diagnostic mode): downloads the
 `lwpt-x86_64-linux` artefact and runs
-[`.github/ci/registry-container/smoke.sh`](../.github/ci/registry-container/smoke.sh)
+[`.github/ci/registry-container/smoke.sh`](../../.github/ci/registry-container/smoke.sh)
 `--binary build/lwpt`. The script packages the binary exactly like a release
 archive, serves it on loopback, and builds the unchanged example image from
-[`docs/examples/registry/`](./examples/registry/). It first proves that a
+[`docs/examples/registry/`](../examples/registry/). It first proves that a
 wrong SHA-256 pin fails the build. It then runs the registry as UID 10001 on
 a read-only root file system with `registry.toml` exported and mounted
 read-only, checks that the service account can modify neither the binary nor
@@ -231,12 +231,12 @@ helper bounded by `timeout --foreground`, and the script itself runs under a
 including health history, and data-volume listings (never signing seeds or
 tokens) even when the smoke was killed, and the job uploads them as
 `registry-container-smoke`. The stage stays off `pr.yml` because it needs Docker and image
-pulls. [`registry-deployment.md`](./registry-deployment.md) is the operator
+pulls. [`registry-deployment.md`](../user/registry-deployment.md) is the operator
 guide.
 
 ### `pr.yml` — pre-merge PR gate
 
-Mirrors GocciaScript's `pr.yml` shape, and is the only **automatic** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs). Its `delivery-admission` job is the ruleset's required check. The manual `ci.yml` run on the PR's exact head, which delivery policy ([`ORCHESTRATION.md`](../ORCHESTRATION.md)) requires but the ruleset does not enforce, supplies the rest of the pre-merge coverage. The main `build-and-test` job is a single Ubuntu runner:
+Mirrors GocciaScript's `pr.yml` shape, and is the only **automatic** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs). Its `delivery-admission` job is the ruleset's required check. The manual `ci.yml` run on the PR's exact head, which delivery policy ([`ORCHESTRATION.md`](../../ORCHESTRATION.md)) requires but the ruleset does not enforce, supplies the rest of the pre-merge coverage. The main `build-and-test` job is a single Ubuntu runner:
 
 1. Install FPC via `apt`
 2. `./bootstrap.sh` — cold build of `build/lwpt` from a freshly-cloned repo
@@ -272,11 +272,11 @@ Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`
 
 #### Why not run the full matrix automatically on every push?
 
-A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold). Running it on every push of the typical commit-amend-push PR cycle costs an order of magnitude more CI minutes than the automatic gate, so `pr.yml` stays cheap for iteration. Delivery policy still requires the full matrix before merge, but only once, as a manual run on the PR's final exact head ([`ORCHESTRATION.md`](../ORCHESTRATION.md)); the ruleset does not enforce it, and the push run on `main` repeats the full native matrix after merge. That rule replaced the earlier GocciaScript-style trade of verifying the other platforms only after merge: in September 2026 the automatic gate repeatedly let Intel-Darwin, i386 and cross-toolchain breaks reach `main`. The win64 leg (cross-compile + native offline test run, ~3 min total on a warm cache), the Linux e2e step and the aarch64-darwin leg remain in the automatic gate because they catch the most common breakage classes early.
+A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold). Running it on every push of the typical commit-amend-push PR cycle costs an order of magnitude more CI minutes than the automatic gate, so `pr.yml` stays cheap for iteration. Delivery policy still requires the full matrix before merge, but only once, as a manual run on the PR's final exact head ([`ORCHESTRATION.md`](../../ORCHESTRATION.md)); the ruleset does not enforce it, and the push run on `main` repeats the full native matrix after merge. That rule replaced the earlier GocciaScript-style trade of verifying the other platforms only after merge: in September 2026 the automatic gate repeatedly let Intel-Darwin, i386 and cross-toolchain breaks reach `main`. The win64 leg (cross-compile + native offline test run, ~3 min total on a warm cache), the Linux e2e step and the aarch64-darwin leg remain in the automatic gate because they catch the most common breakage classes early.
 
 ### `release.yml` — tag-triggered release pipeline
 
-Triggers on tags matching `v?N.N.N` or `v?N.N.N-*` (e.g. `0.1.0`, `0.1.0-rc.1` — the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md), which adopts SemVer 2.0.0; the `v`-prefixed form `v0.1.0` is also accepted as a courtesy but not the recommended shape). Pre-release detection: any version containing a hyphen is published as `prerelease: true`.
+Triggers on tags matching `v?N.N.N` or `v?N.N.N-*` (e.g. `0.1.0`, `0.1.0-rc.1` — the canonical form per [ADR-0009](../adr/0009-source-syntax-and-tag-resolution.md), which adopts SemVer 2.0.0; the `v`-prefixed form `v0.1.0` is also accepted as a courtesy but not the recommended shape). Pre-release detection: any version containing a hyphen is published as `prerelease: true`.
 
 The pipeline runs:
 
@@ -383,7 +383,7 @@ A bump invalidates the cache on the next workflow run; the toolchain rebuild tak
 
 The explicit E2E-path step runs these live-network programs on every platform (per Q23=c) unless noted:
 
-- `InstallGitHub.E2E`, `InstallGitLab.E2E`, and `InstallBitbucket.E2E` install one commit-pinned dependency each through the real binary: `octocat/Hello-World @ 7fd1a60b…` from GitHub, `gitlab-examples/ci-debug-trace @ dd648b2e48ce6518303b0bb580b2ee32fadaf045` from GitLab, and `atlassian/atlaskit @ d7ac1acad54e…` from Bitbucket. Each install lists refs, proves the commit pin's reachability with git smart-HTTP upload-pack requests ([ADR-0047](./adr/0047-commit-pins-must-be-reachable.md)), and downloads the archive.
+- `InstallGitHub.E2E`, `InstallGitLab.E2E`, and `InstallBitbucket.E2E` install one commit-pinned dependency each through the real binary: `octocat/Hello-World @ 7fd1a60b…` from GitHub, `gitlab-examples/ci-debug-trace @ dd648b2e48ce6518303b0bb580b2ee32fadaf045` from GitLab, and `atlassian/atlaskit @ d7ac1acad54e…` from Bitbucket. Each install lists refs, proves the commit pin's reachability with git smart-HTTP upload-pack requests ([ADR-0047](../adr/0047-commit-pins-must-be-reachable.md)), and downloads the archive.
 - `InstallScript.E2E` runs the real `install.sh`, which queries the GitHub API for the latest release and downloads the release archive.
 - `InstallDirectArchivesWindows.E2E` (Windows only) fetches the GitHub and GitLab archives above as direct `https://` URLs, exercising the SChannel archive-body read path.
 - `TransportSecurityClientOptions.E2E` (in `packages/httpclient/`) makes one live request to `https://github.com/` through the platform trust store; its other cases use loopback servers.
@@ -398,11 +398,11 @@ Crucially, this is **not** a blanket "ignore e2e failures". An install that *con
 
 ## What CI does NOT cover
 
-- **`lwpt build` doesn't rebuild `lwpt` on the test runner** — doing so would rebuild `lwpt` with the runner's native FPC, defeating the cross-build verification. The one exception is the root `[pretest]` hook, which runs `build/lwpt build lwpt-testing` to produce the test-seam binary ([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)) that the subprocess tests need. The pipeline tests the cross-built binary's *behavior* (install / format / test); the cross-build *itself* is verified by the build-stage compile.
+- **`lwpt build` doesn't rebuild `lwpt` on the test runner** — doing so would rebuild `lwpt` with the runner's native FPC, defeating the cross-build verification. The one exception is the root `[pretest]` hook, which runs `build/lwpt build lwpt-testing` to produce the test-seam binary ([ADR-0044](../adr/0044-test-seams-only-in-test-builds.md)) that the subprocess tests need. The pipeline tests the cross-built binary's *behavior* (install / format / test); the cross-build *itself* is verified by the build-stage compile.
 - **No artefact retention beyond 7 days** — set in `upload-artifact`. CI artefacts are debugging aids, not release artefacts. The release artefacts published by `release.yml` are permanent (GitHub Releases).
 - **No Pascal lint beyond `lwpt format --check`** — there's no `flake8`-style linter for FPC. Format check is the closest equivalent.
 - **No post-tag changelog PR** — `CHANGELOG.md` is generated on the release branch before the tag exists, so the tag points at a commit that already contains its own changelog. `release.yml` publishes artifacts from that tag after protected-environment approval; it does not commit back to `main`.
-- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](./adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form).
+- **No automatic version bump** — tagging is a manual maintainer step. The version embedded in archive names is the tag with any leading `v` stripped (the canonical form per [ADR-0009](../adr/0009-source-syntax-and-tag-resolution.md) has no `v`; the strip handles the courtesy-accepted prefixed form).
 
 ## Release version stamping
 
@@ -413,7 +413,7 @@ Crucially, this is **not** a blanket "ignore e2e failures". An install that *con
 
 Concurrent self-builds can run the hook at the same moment while another build compiles against `Version.inc`, so the script never rewrites the file in place ([#361](https://github.com/frostney/lwpt/issues/361)). When the file already holds exactly the text it would write, the script leaves it untouched, modification time included. Otherwise it writes a uniquely named, exclusively created temporary file in the project's own `.lwpt/tmp/` (beside `lwpt.toml`, created when missing) and replaces the destination atomically: `rename(2)` on Unix, `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` and `MOVEFILE_WRITE_THROUGH` on Windows, where a destination held open is retried up to 40 times with configured sleeps totalling 3,555 ms; exhausting the attempts fails the run unless the destination already holds the expected text. Staging outside `source/` keeps the transient file out of the tree builds fingerprint. The script does not read an `[lwpt] tmp-dir` override: its naive manifest scan cannot parse TOML faithfully, and a misread path could point outside the project. There is no other staging place. When `.lwpt/tmp/` cannot be created or written, or the rename crosses file systems (`EXDEV`, `ERROR_NOT_SAME_DEVICE`), the run fails with a message naming the path and leaves `Version.inc` as it was. A temporary file removed under the script, as `lwpt install` does when it wipes `.lwpt/tmp/`, is written again, at most three times in all. A failed replacement whose destination already holds the expected text counts as success. Every temporary file that is not published is deleted, and one that cannot be deleted is reported on stderr. The bytes are unchanged: each line ends with the platform line ending. Because an unchanged file keeps its old modification time, a manifest edit that leaves the version alone makes the staleness-gated hook run again on later builds, each time as a no-op. `tests/integration/StampVersion.Test.pas` covers concurrent runs, an end-to-end smoke of concurrent `lwpt build` runs using the hook, and the failure paths.
 
-This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). Release PRs still bump `[package].version` so local builds, `CHANGELOG.md`, and the eventual release tag move together, but the tag remains the source of truth for published binaries. The rationale and rejected alternatives live in [ADR-0026](./adr/0026-release-version-stamp-from-tag.md).
+This split keeps the tag, the archive name, and the binary's self-report consistent for anything a user downloads, while leaving local builds pinned to the manifest version (the dev/unreleased number). Release PRs still bump `[package].version` so local builds, `CHANGELOG.md`, and the eventual release tag move together, but the tag remains the source of truth for published binaries. The rationale and rejected alternatives live in [ADR-0026](../adr/0026-release-version-stamp-from-tag.md).
 
 Three independent layers keep the tag, archive name, and binary self-report in agreement — each catches what the others can't:
 

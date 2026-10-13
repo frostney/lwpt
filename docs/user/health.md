@@ -11,7 +11,7 @@
 
 `lwpt health` is an offline Object Pascal complexity report. It analyzes the
 root project and discovered workspace packages through the shared
-[`[analysis]` scope](./architecture.md#shared-analysis-foundation), reports
+[`[analysis]` scope](../contributor/architecture.md#shared-analysis-foundation), reports
 every scored executable region and file in stable path order, and succeeds by
 default. Limits are opt-in.
 

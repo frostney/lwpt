@@ -5,10 +5,10 @@ Naming, file layout, formatter rules, manifest scope with protected toolkit stat
 ## Executive Summary
 
 - **Identifiers are PascalCase, no underscores, no abbreviations.** Industry-standard acronyms (HTTP, JSON, UUID, **LWPT**) stay as-is. Type prefix `T`, exception `E`, interface `I`, private field `F`, parameter `A` (when ≥ 2 letters).
-- **The project name lives in two constants.** `PROGRAM_NAME = 'lwpt'` (lowercase Unix convention; derives filenames and shell commands) and `PROJECT_NAME = 'LWPT'` (uppercase acronym in prose). See [ADR-0001](./adr/0001-program-name-as-constant.md). Never hardcode either spelling.
+- **The project name lives in two constants.** `PROGRAM_NAME = 'lwpt'` (lowercase Unix convention; derives filenames and shell commands) and `PROJECT_NAME = 'LWPT'` (uppercase acronym in prose). See [ADR-0001](../adr/0001-program-name-as-constant.md). Never hardcode either spelling.
 - **LWPT-internal units use the dotted `LWPT.<Subsys>.pas` form.** Workspace packages under `packages/<name>/source/` follow their own naming and public-surface contracts (see [`packages.md`](./packages.md)). Root formatting applies across workspace packages by default; a package opts out by declaring its own `[format]` section.
 - **`lwpt format` is the canonical formatter.** No-flag invocation rewrites in place and is used by pre-commit; `--check` is the non-mutating CI form. Rules are encoded in the Pascal source of `LWPT.Formatter`, not in a config file.
-- **Formatter scope is manifest-declared with one safety boundary**: `[package].units` + `[format].include`, root `.lwpt/**` excluded unless explicitly included, then `[format].exclude`. Globs are supported; recursion is explicit via `**`. See [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](./adr/0028-default-toolkit-state-format-exclusion.md). Root LWPT's `[format].include` covers `tests/integration/`, `tests/support/`, `tests/e2e/`, and every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo. Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)'s root-owns-unless-overridden model, a workspace package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
+- **Formatter scope is manifest-declared with one safety boundary**: `[package].units` + `[format].include`, root `.lwpt/**` excluded unless explicitly included, then `[format].exclude`. Globs are supported; recursion is explicit via `**`. See [ADR-0007](../adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](../adr/0028-default-toolkit-state-format-exclusion.md). Root LWPT's `[format].include` covers `tests/integration/`, `tests/support/`, `tests/e2e/`, and every workspace package (`packages/**/*.{pas,inc}`) so the canonical style applies across the monorepo. Per [ADR-0017](../adr/0017-packages-lwpt-canonical.md)'s root-owns-unless-overridden model, a workspace package can opt out by declaring its own `[format]` section in `packages/<name>/lwpt.toml`.
 - **Line endings: LF everywhere, trailing whitespace stripped.** The two scope additions from Q8; both are zero-controversy.
 
 ## Naming
@@ -27,12 +27,12 @@ LWPT-specific extension of the rule above:
 - The project's binary, filenames, environment variables, and shell commands are **lowercase `lwpt`** (Unix convention).
 - Both spellings are declared once in `LWPT.Core` as `PROJECT_NAME` and `PROGRAM_NAME` respectively, and every derived literal threads through one of them: `MANIFEST_FILE = PROGRAM_NAME + '.toml'`, error prefixes via `PROGRAM_NAME + ' install: '`, banners via `PROJECT_NAME`. Never write `'lwpt'` or `'LWPT'` as a literal anywhere except in those two declarations.
 
-The reasoning is in [ADR-0001](./adr/0001-program-name-as-constant.md).
+The reasoning is in [ADR-0001](../adr/0001-program-name-as-constant.md).
 
 ## Unit naming
 
 - **Project-owned units** use the dotted form: `LWPT.<Subsys>.pas` (or `LWPT.<Subsys>.<Subsys>.pas` for nested namespaces). The acronym stays uppercase per the rule above. Examples: `LWPT.Core.pas`, `LWPT.Formatter.pas`, `LWPT.GitProtocol.pas`. **CLI-layer units intentionally skip the `LWPT.` prefix** (`CLI.Options`, `CLI.Parser`, `CLI.Help`, `CLI.Subcommands`, `CLI.Prompts`) because they live in the `packages/cli/` workspace package — designed to graduate as a standalone reusable package (see ADR-0006 + ADR-0014).
-- **Workspace packages** under `packages/<name>/source/` follow each package's own naming conventions; the root LWPT manifest does not dictate. Today's names (`HTTPClient`, `TransportSecurity`, `FileUtils`, `StringBuffer`, `TestingPascalLibrary`, `CLI.Options`, `CLI.Parser`, `CLI.Help`, `CLI.Subcommands`, `CLI.Prompts`, `Semver`, `TOML`, `OrderedStringMap`, `BaseMap`) reflect LWPT-canonical choices per [ADR-0017](./adr/0017-packages-lwpt-canonical.md) — the `CLI` namespace stripped `TGoccia` prefixes + dropped dead code, `Semver` renamed from `Goccia.Semver` + inlined the one needed `MAX_SAFE_INTEGER` constant, `Platform` (in `source/`) renamed from `Goccia.Platform`, TOML refactored to its current class-based parser shape. See [`packages.md`](./packages.md) for the full set + divergence-vs-GocciaScript table.
+- **Workspace packages** under `packages/<name>/source/` follow each package's own naming conventions; the root LWPT manifest does not dictate. Today's names (`HTTPClient`, `TransportSecurity`, `FileUtils`, `StringBuffer`, `TestingPascalLibrary`, `CLI.Options`, `CLI.Parser`, `CLI.Help`, `CLI.Subcommands`, `CLI.Prompts`, `Semver`, `TOML`, `OrderedStringMap`, `BaseMap`) reflect LWPT-canonical choices per [ADR-0017](../adr/0017-packages-lwpt-canonical.md) — the `CLI` namespace stripped `TGoccia` prefixes + dropped dead code, `Semver` renamed from `Goccia.Semver` + inlined the one needed `MAX_SAFE_INTEGER` constant, `Platform` (in `source/`) renamed from `Goccia.Platform`, TOML refactored to its current class-based parser shape. See [`packages.md`](./packages.md) for the full set + divergence-vs-GocciaScript table.
 - **Type-name prefix** for project-owned types is `TLWPT`/`ELWPT`/`ILWPT`. Workspace-package types follow each package's own convention (HTTPClient uses `T...HTTPResponse` etc.; CLI uses `T...Option`; Semver uses `T...Semver`; etc.).
 
 ## OOP defaults
@@ -151,7 +151,7 @@ the formatter's fixes.
 
 ### Scope: include + exclude
 
-The format scope is composed from the manifest plus the toolkit-state safety boundary. Full spec in [ADR-0007](./adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](./adr/0028-default-toolkit-state-format-exclusion.md); the short version:
+The format scope is composed from the manifest plus the toolkit-state safety boundary. Full spec in [ADR-0007](../adr/0007-formatter-scope-manifest-declared.md) and [ADR-0028](../adr/0028-default-toolkit-state-format-exclusion.md); the short version:
 
 - **Seed**: `[package].units` (each dir, non-recursive, formattable extensions only).
 - **Add**: `[format].include` — array of globs added on top of the seed.
@@ -212,7 +212,7 @@ When you add a new package under `packages/<name>/`, it's auto-discovered via `[
 ## Comments
 
 - Whether Pascal block comments nest depends on the mode. They nest in FPC's default `fpc` mode and in `objfpc`, and `{$modeswitch nestedcomments+}` turns nesting on elsewhere. They do not nest in the `delphi` mode that `Shared.inc` selects. If a comment body contains literal `{` or `}` (e.g. quoting TOML or FPC include syntax), use `(* ... *)` for the outer so the comment reads the same in every mode.
-- **No patch markers.** Per [ADR-0017](./adr/0017-packages-lwpt-canonical.md), LWPT-canonical code does not carry `{ [LWPT patch] }` / `{ [gpm patch] }` markers — git history is the canonical record of every change. Inline Pascal comments still document *why* non-obvious code looks the way it does (e.g. why HTTPClient uses a byte-safe `AppendRawBytes` instead of `Copy(PAnsiChar)`).
+- **No patch markers.** Per [ADR-0017](../adr/0017-packages-lwpt-canonical.md), LWPT-canonical code does not carry `{ [LWPT patch] }` / `{ [gpm patch] }` markers — git history is the canonical record of every change. Inline Pascal comments still document *why* non-obvious code looks the way it does (e.g. why HTTPClient uses a byte-safe `AppendRawBytes` instead of `Copy(PAnsiChar)`).
 - Documentation comments should explain non-obvious intent, trade-offs, or constraints. **Do not narrate what the code does.** Don't write `{ Increment the counter }`. Do write `{ Skip the trailing CRLF — see RFC 7230 §3.5 }`.
 
 ## FPC and libc interop

@@ -3,7 +3,7 @@
 ## Context
 
 LWPT's test programs register suites and cases at runtime, including under
-conditional compilation. `docs/testing.md` previously duplicated those counts
+conditional compilation. `docs/contributor/testing.md` previously duplicated those counts
 by hand. Source-text counting cannot distinguish active platform branches,
 while reconstructing totals from CI logs made documentation drift expensive to
 detect and easy to misdiagnose.
@@ -32,7 +32,7 @@ failing closed. Ordinary successful test executions are checked against the
 selected rule; full discovery also rejects removed programs still present in
 the inventory. LWPT's own file declares every native CI platform.
 
-The registered-count cells and aggregate table in `docs/testing.md` are rendered
+The registered-count cells and aggregate table in `docs/contributor/testing.md` are rendered
 from that same file by `scripts/update-test-inventory.pas`. The PR gate runs its
 `--check` form, while the existing native test jobs verify runtime records. No
 extra test-body or network pass is introduced.
