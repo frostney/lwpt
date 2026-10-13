@@ -54,7 +54,7 @@ const
   CHILD_KILL_MILLISECONDS = 2000;
   { The deadline of a child wait that names none. It matches the RunLwpt
     default (Tests.LwptSubprocess), whose measured basis is recorded in
-    docs/testing.md, and stays well inside a CI job's bound. }
+    docs/contributor/testing.md, and stays well inside a CI job's bound. }
   CHILD_COMPLETION_TIMEOUT_MILLISECONDS = 300000;
   { How long OwnedChildSurvivors lets an exited owned child's remaining
     members finish before it reports them; see there. }

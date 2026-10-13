@@ -19,7 +19,7 @@
   Skip semantics: LWPT_ENABLE_NETWORK is not 1, OR a clean connect/DNS failure
   to the host at install time (IsNetworkUnavailable — transient
   third-party downtime, not an LWPT defect), → tests pass with a "skipped"
-  log line. A content/hash/parse failure still fails hard. See docs/ci.md. }
+  log line. A content/hash/parse failure still fails hard. See docs/contributor/ci.md. }
 
 program InstallBitbucket.E2E.Test;
 

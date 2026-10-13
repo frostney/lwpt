@@ -561,7 +561,7 @@ end;
   Darwin/Linux; the constant differs between RTL builds). The fallback
   is byte-copy then delete — still safer than direct overwrite because
   the source remains untouched until the copy completes. ADR-0002
-  consequences mentions this; docs/tooling.md is the canonical reference.
+  consequences mentions this; docs/contributor/tooling.md is the canonical reference.
   =========================================================================== }
 { FetchToCache writes the archive atomically into
   ArchivesRoot/<name>-<version>.tar.gz via the tmp dir, and sets

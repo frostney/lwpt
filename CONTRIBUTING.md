@@ -6,11 +6,11 @@ This file is the authoritative contract for human contributors. AI assistants fo
 
 - Read [`AGENTS.md`](./AGENTS.md). The "Hard Constraints" section enumerates the rules a PR may not violate; the rest of the file is the operating manual for the toolkit.
 - Skim the ADRs in [`docs/adr/`](./docs/adr/) — six short notes covering the decisions that shape the current shape of the code. If your change challenges one of these, raise it before writing code.
-- Make sure your environment matches [`docs/tooling.md`](./docs/tooling.md): FPC 3.2.2 (verified live, never assumed), InstantFPC (bundled with FPC), Lefthook for the pre-commit hook.
+- Make sure your environment matches [`docs/contributor/tooling.md`](./docs/contributor/tooling.md): FPC 3.2.2 (verified live, never assumed), InstantFPC (bundled with FPC), Lefthook for the pre-commit hook.
 
 ## Setup
 
-[`docs/quick-start.md`](./docs/quick-start.md) is the canonical setup walkthrough. Short version:
+[`docs/contributor/quick-start.md`](./docs/contributor/quick-start.md) is the canonical setup walkthrough. Short version:
 
 ```sh
 ./bootstrap.sh                  # one-time per fresh clone
@@ -26,8 +26,8 @@ Install Lefthook hooks once: `lefthook install`.
 The pre-commit hook runs `lwpt format` and `lwpt agents` locally (both with `stage_fixed: true`, so any rewrites are auto-staged into the same commit). The heavyweight gates — `lwpt format --check`, `lwpt build`, `lwpt agents --check`, `lwpt test` — run on the PR workflow in CI. A PR is mergeable when:
 
 1. All four CI gate commands exit zero on the proposed branch.
-2. CI is green on every Tier 1 platform from [`docs/deployment.md`](./docs/deployment.md).
-3. The change has tests where tests are the right answer (see [`docs/testing.md`](./docs/testing.md) for LWPT's repository-owned test groups and CI routes).
+2. CI is green on every Tier 1 platform from [`docs/contributor/deployment.md`](./docs/contributor/deployment.md).
+3. The change has tests where tests are the right answer (see [`docs/contributor/testing.md`](./docs/contributor/testing.md) for LWPT's repository-owned test groups and CI routes).
 4. Documentation that mentions the changed surface has been updated. The no-duplication rule from [`docs/`](./docs/) applies: edit the *one* canonical document, not five.
 
 If any check fails on a hook autofix you didn't expect, do not commit with `--no-verify`. Investigate, then fix.
@@ -75,13 +75,13 @@ If you need to change a package:
 2. **Do not add patch markers.** No `{ [gpm patch] }` / `{ [LWPT patch] }` syntax. Git history is the canonical record; inline Pascal comments explain non-obvious *why*.
 3. Bump the package's `[package].version` in its `lwpt.toml` per semver 2.0.0 if the change is consumer-visible.
 4. Update the package's own `*.Test.pas` files in the same change if the public surface shifts.
-5. If the change widens the LWPT-canonical-vs-GocciaScript-older-copy delta, add a row to the divergence table in [`docs/packages.md`](./docs/packages.md).
+5. If the change widens the LWPT-canonical-vs-GocciaScript-older-copy delta, add a row to the divergence table in [`docs/contributor/packages.md`](./docs/contributor/packages.md).
 
 Per the graduation roadmap in ADR-0017, individual packages will graduate to standalone repos when warranted. If your change touches HTTPClient or CLI substantially, mention the graduation context in the PR description.
 
 ## Planned work
 
-[`VISION.md`](./VISION.md) owns product direction; GitHub issues and milestones own planned scope and scheduling. Coordinate registry work through [issue #29](https://github.com/frostney/lwpt/issues/29) rather than a drive-by PR. Duplication changes follow the shipped contract in [`docs/tooling.md`](./docs/tooling.md#duplication-analysis), and codebase-health changes follow [`docs/health.md`](./docs/health.md). [`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md) owns the project-local release and architecture-conformance gate.
+[`VISION.md`](./VISION.md) owns product direction; GitHub issues and milestones own planned scope and scheduling. Coordinate registry work through [issue #29](https://github.com/frostney/lwpt/issues/29) rather than a drive-by PR. Duplication changes follow the shipped contract in [`docs/contributor/tooling.md`](./docs/contributor/tooling.md#duplication-analysis), and codebase-health changes follow [`docs/user/health.md`](./docs/user/health.md). [`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md) owns the project-local release and architecture-conformance gate.
 
 ## Reporting issues
 

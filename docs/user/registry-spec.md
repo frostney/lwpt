@@ -15,7 +15,7 @@
   after every referenced object has verified.
 - This document specifies the interoperable wire contract. The origin
   executable, storage engine, command surface, and lifecycle are recorded in
-  [ADR-0043](./adr/0043-self-hosted-registry-origin.md).
+  [ADR-0043](../adr/0043-self-hosted-registry-origin.md).
 
 ## Status and conformance language
 
@@ -24,7 +24,7 @@ This is version 1 of the LWPT registry protocol. The key words **MUST**,
 interpreted as described by RFC 2119 and RFC 8174.
 
 The conformance corpus is under
-[`tests/fixtures/registry/v1/`](../tests/fixtures/registry/v1/). A server is
+[`tests/fixtures/registry/v1/`](../../tests/fixtures/registry/v1/). A server is
 protocol-conformant when it can serve the valid corpus with the response
 semantics below. A client or mirror is protocol-conformant when it accepts the
 valid cases and rejects every invalid case for the stated reason.
@@ -139,7 +139,7 @@ A version is a canonical SemVer 2.0.0 version without a leading `v`.
 
 LWPT's dependency consumer installs only names without `.`, because a name is
 also a module directory and a dependency key, and `lwpt registry publish`
-refuses the rest ([ADR-0051](./adr/0051-registry-dependency-sources.md)
+refuses the rest ([ADR-0051](../adr/0051-registry-dependency-sources.md)
 decision 6). The protocol grammar itself is unchanged, so other clients and
 LWPT origins still accept such names.
 
@@ -327,7 +327,7 @@ otherwise its origin is explicit and canonical.
 
 LWPT's `registry publish` derives `dependencies` from the archive
 `lwpt.toml`'s `registry:` dependencies, as
-[ADR-0051](./adr/0051-registry-dependency-sources.md) ("Dependency-bearing
+[ADR-0051](../adr/0051-registry-dependency-sources.md) ("Dependency-bearing
 publication") specifies. A manifest dependency this list cannot express, such
 as another source kind or one with extraction filters, is refused before
 anything is uploaded, never dropped.
@@ -488,7 +488,7 @@ else it verifies depends on what the operation retains:
 - A mirror's retained proof also verifies snapshot history back to the first
   sequence, record membership, archive identity, and available archive bytes.
 - A dependency consumer's locked selection proof retains no history
-  ([ADR-0051](./adr/0051-registry-dependency-sources.md)). It verifies the
+  ([ADR-0051](../adr/0051-registry-dependency-sources.md)). It verifies the
   checkpoint hash, the signature through the rotation chain from the pin, the
   snapshot hash, membership of each selected record in that snapshot, the
   record's origin, name, and version, and archive identity. The consumer then
@@ -546,7 +546,7 @@ and take the origin identity its contacts advertise in discovery. The
 advertised identity is accepted only after a checkpoint that verifies through
 the pinned key names that same origin; the consumer then records it and MUST
 treat a later advertisement of a different identity as a failure, never as a
-replacement ([ADR-0051](./adr/0051-registry-dependency-sources.md)). Mirrors keep
+replacement ([ADR-0051](../adr/0051-registry-dependency-sources.md)). Mirrors keep
 the configured-identity requirement: `registry init --role mirror` still
 requires an explicit origin identity with the key.
 
@@ -786,7 +786,7 @@ trigger, but that control surface is not part of the interoperable registry
 protocol.
 
 The executable mirror lifecycle, local storage, transfer limits, and freshness
-diagnostics are defined in [ADR-0045](adr/0045-verified-registry-mirror.md).
+diagnostics are defined in [ADR-0045](../adr/0045-verified-registry-mirror.md).
 
 ## Client contact selection and failover
 
@@ -837,7 +837,7 @@ including their explicit expiry policy.
 
 The dependency consumer that applies this policy, its manifest syntax, and
 its locked state are recorded in
-[ADR-0051](./adr/0051-registry-dependency-sources.md); the manifest syntax is
+[ADR-0051](../adr/0051-registry-dependency-sources.md); the manifest syntax is
 outside this protocol.
 
 ## Errors and HTTP behavior
@@ -938,13 +938,13 @@ The corpus uses four harness-only schemas that are not served by registries:
 
 These schemas use the same canonical TOML profile. Their field order and
 complete examples are the files under
-[`tests/fixtures/registry/v1/`](../tests/fixtures/registry/v1/).
+[`tests/fixtures/registry/v1/`](../../tests/fixtures/registry/v1/).
 
 ## Implementation boundary
 
 This specification does not itself define a manifest source kind; the
 `registry:` dependency source that consumes it is recorded in
-[ADR-0051](./adr/0051-registry-dependency-sources.md). Nor does it add a
+[ADR-0051](../adr/0051-registry-dependency-sources.md). Nor does it add a
 subcommand, storage engine, background daemon, or hosted service to LWPT.
 Those choices belong to the implementation issues under
 [#29](https://github.com/frostney/lwpt/issues/29).

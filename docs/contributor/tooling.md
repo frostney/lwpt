@@ -11,7 +11,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   `LWPT_WORKER_*` settings below. `--jobs=<n>` is the invocation ceiling; the
   machine budget remains authoritative across processes and worktrees.
 - **Worker capacity is coordinated across worktrees.** The internal worker-budget module uses per-user, reclaimable filesystem leases. Its default budget is the host's logical processor count; `LWPT_WORKER_BUDGET` overrides it.
-- **TLS is platform-native on Windows and macOS in both directions.** Clients use SChannel on Windows, SecureTransport on macOS, and system OpenSSL on other Unix. Server accept is native SChannel on Windows, Secure Transport on macOS, and requires runtime-loaded OpenSSL 3 or newer on Unix-not-Darwin. Only the registry's HTTPS listener uses Network.framework, and only on Darwin kernel 25 and newer (macOS 26 and newer); on kernel 24 and older it uses the portable listener with Secure Transport. Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), [ADR-0024](./adr/0024-openssl-server-tls-accept.md), [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), and [ADR-0043](./adr/0043-self-hosted-registry-origin.md); see [`deployment.md`](./deployment.md#tls-backends-per-platform).
+- **TLS is platform-native on Windows and macOS in both directions.** Clients use SChannel on Windows, SecureTransport on macOS, and system OpenSSL on other Unix. Server accept is native SChannel on Windows, Secure Transport on macOS, and requires runtime-loaded OpenSSL 3 or newer on Unix-not-Darwin. Only the registry's HTTPS listener uses Network.framework, and only on Darwin kernel 25 and newer (macOS 26 and newer); on kernel 24 and older it uses the portable listener with Secure Transport. Per [ADR-0016](../adr/0016-tls-backend-per-platform.md), [ADR-0024](../adr/0024-openssl-server-tls-accept.md), [ADR-0033](../adr/0033-schannel-server-tls-accept-on-windows.md), and [ADR-0043](../adr/0043-self-hosted-registry-origin.md); see [`deployment.md`](./deployment.md#tls-backends-per-platform).
 - **EXDEV-rename failures fall back safely.** When `.lwpt/tmp/` and a file destination end up on different filesystems, `AtomicMoveFile` copies into an unaddressed sibling on the destination filesystem and atomically replaces the destination before deleting the source. Directory moves retain their recursive copy-then-delete fallback.
 - **Compiler outputs are session-private.** Build and test invocations write
   below the resolved project-owned build-session root; only a successful,
@@ -24,7 +24,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   `registry publish` and `registry issue-token`, their one outcome line
   instead), and neither mode changes the command's exit code.
 - **Local Win32 iteration is cached.** On the maintainer Mac,
-  [`.github/ci/windows-wine/run.sh`](../.github/ci/windows-wine/run.sh)
+  [`.github/ci/windows-wine/run.sh`](../../.github/ci/windows-wine/run.sh)
   uses OrbStack's Docker engine to cross-compile i386-win32 and run bounded
   Wine-compatible smoke checks. Wine does not replace the final native Windows
   console-control proof.
@@ -33,7 +33,7 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
   workspace sources. The remaining deferred stack contracts stay tracked
   separately. Architecture drift is a project-local release-preparation check
   for LWPT itself; it is not a customer feature.
-- **Codebase health is shipped.** `lwpt health` is an offline Pascal complexity report with opt-in local Git hotspots; [`health.md`](./health.md) owns the scoring and configuration contract.
+- **Codebase health is shipped.** `lwpt health` is an offline Pascal complexity report with opt-in local Git hotspots; [`health.md`](../user/health.md) owns the scoring and configuration contract.
 
 ## Pinned versions
 
@@ -43,8 +43,8 @@ Pinned tool versions, environment variables, lint/format/test commands, OpenSSL 
 | InstantFPC | bundled with FPC | `instantfpc --help` |
 | Lefthook | 2.x | `lefthook version` |
 | git-cliff | Verify the installed release live | `git-cliff --version` |
-| Docker Engine with BuildKit | Not pinned; CI uses the GitHub-hosted `ubuntu-latest` engine and logs `docker version` | `docker version`. Used by the registry container smoke in CI ([`registry-deployment.md`](./registry-deployment.md)) and the local Win32 Wine helper. Building, testing, and using LWPT never require Docker. |
-| OpenSSL (Unix-not-Darwin only) | 3.x | `openssl version` on Unix. Windows and macOS never load it: both directions are SChannel / SecureTransport (per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md) and [ADR-0016](./adr/0016-tls-backend-per-platform.md)). The CI PE-import guard keeps Windows free of any OpenSSL linkage. |
+| Docker Engine with BuildKit | Not pinned; CI uses the GitHub-hosted `ubuntu-latest` engine and logs `docker version` | `docker version`. Used by the registry container smoke in CI ([`registry-deployment.md`](../user/registry-deployment.md)) and the local Win32 Wine helper. Building, testing, and using LWPT never require Docker. |
+| OpenSSL (Unix-not-Darwin only) | 3.x | `openssl version` on Unix. Windows and macOS never load it: both directions are SChannel / SecureTransport (per [ADR-0033](../adr/0033-schannel-server-tls-accept-on-windows.md) and [ADR-0016](../adr/0016-tls-backend-per-platform.md)). The CI PE-import guard keeps Windows free of any OpenSSL linkage. |
 
 When you touch code that depends on the version, **verify it live, not from memory.** The Hard Constraint in `AGENTS.md` is explicit about this. If you bump a version, the new pin lives in this file and in the relevant CI workflow.
 
@@ -74,7 +74,7 @@ child output and writes exactly the final completion line to stdout. The
 exception is a command whose result is a single outcome line: silent
 `registry publish` writes only its `published ...` or `already published ...`
 line, and silent `registry issue-token` only the token, each instead of the
-completion line ([ADR-0049](./adr/0049-registry-remote-publication.md)). Silent
+completion line ([ADR-0049](../adr/0049-registry-remote-publication.md)). Silent
 failure suppresses ordinary progress, replays retained diagnostics and failed
 child output in event order, and ends with exactly one failed completion line
 on stderr. `--silent --verbose` is rejected because the two policies
@@ -142,7 +142,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `LWPT_BUILD_ENTRY` | Per-entry postbuild hook context: selected build-entry name | supplied by LWPT |
 | `LWPT_BUILD_OUTPUT` | Per-entry postbuild hook context: session-private candidate path; transform this file before publication | supplied by LWPT |
 | `LWPT_BUILD_PUBLIC_OUTPUT` | Per-entry postbuild hook context: requested manifest output path | supplied by LWPT |
-| `LWPT_PROCESS_TREE_PARENT`, `LWPT_PROCESS_TREE_STATUS_HANDLE`, `LWPT_PROCESS_TREE_CONTROL_HANDLE`, `LWPT_PROCESS_TREE_CHANNEL_TOKEN` | Internal: set by LWPT on managed child processes for cascading process-tree cancellation ([ADR-0025](./adr/0025-cascading-process-tree-cancellation.md)); do not configure | set by LWPT |
+| `LWPT_PROCESS_TREE_PARENT`, `LWPT_PROCESS_TREE_STATUS_HANDLE`, `LWPT_PROCESS_TREE_CONTROL_HANDLE`, `LWPT_PROCESS_TREE_CHANNEL_TOKEN` | Internal: set by LWPT on managed child processes for cascading process-tree cancellation ([ADR-0025](../adr/0025-cascading-process-tree-cancellation.md)); do not configure | set by LWPT |
 | `TESTING_PASCAL_LIBRARY_INVENTORY`, `TESTING_PASCAL_LIBRARY_INVENTORY_EXECUTABLE`, `TESTING_PASCAL_LIBRARY_ACTIVE_CASE_FILE` | Internal: set by `lwpt test` on test programs for inventory-only listing and active-case diagnostics, read by the `testing` package; do not configure | set by `lwpt test` |
 
 ## Per-user dependency archive cache
@@ -165,7 +165,7 @@ writes remain unaddressed below `tmp/`; same-key concurrent writers can publish
 only complete bytes proving the same digest. Cache read/write failures emit a
 warning and fall back to the source because the disposable cache is never
 required for correctness. See
-[ADR-0036](./adr/0036-per-user-dependency-archive-cas.md).
+[ADR-0036](../adr/0036-per-user-dependency-archive-cas.md).
 
 ## Shared cache lifecycle
 
@@ -204,7 +204,7 @@ later repair can reclaim the released state. Repeating repair on the repaired
 state is safe and reports zero further reclamation. Shared-cache repair never
 deletes the invoking project's committed `.lwpt/archives/` or
 `.lwpt/modules/` state. See
-[ADR-0040](./adr/0040-bounded-shared-cache-lifecycle.md).
+[ADR-0040](../adr/0040-bounded-shared-cache-lifecycle.md).
 
 ## Machine-wide worker budget
 
@@ -269,13 +269,13 @@ and state-root path.
 
 ## TLS backend per platform
 
-Per [ADR-0016](./adr/0016-tls-backend-per-platform.md), the `TransportSecurity` unit (in `packages/httpclient/source/`) selects the TLS implementation by FPC conditional — each platform uses what ships with the OS:
+Per [ADR-0016](../adr/0016-tls-backend-per-platform.md), the `TransportSecurity` unit (in `packages/httpclient/source/`) selects the TLS implementation by FPC conditional — each platform uses what ships with the OS:
 
-- **Windows.** **SChannel** via `secur32.dll` (Windows API; built into every Windows install since Windows 2000) for both the client path and, per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md), server accept — with `crypt32.dll` importing the PKCS#12 identity into a snapshot-owned, persisted user CNG key container that is deleted on ordinary teardown. No DLLs to install, no DLLs in the release archive, no OpenSSL in either direction. CI rejects normal, delay-loaded, renamed, legacy, and static OpenSSL linkage while permitting runtime-loader strings.
+- **Windows.** **SChannel** via `secur32.dll` (Windows API; built into every Windows install since Windows 2000) for both the client path and, per [ADR-0033](../adr/0033-schannel-server-tls-accept-on-windows.md), server accept — with `crypt32.dll` importing the PKCS#12 identity into a snapshot-owned, persisted user CNG key container that is deleted on ordinary teardown. No DLLs to install, no DLLs in the release archive, no OpenSSL in either direction. CI rejects normal, delay-loaded, renamed, legacy, and static OpenSSL linkage while permitting runtime-loader strings.
 - **macOS.** **SecureTransport** via Apple's framework (built into every macOS install). No Homebrew dependency, no `DYLD_LIBRARY_PATH` setup.
 - **Linux** (and other Unix-not-Darwin). **System OpenSSL** loaded at runtime via `DynLibs.LoadLibrary`. Install the distro's libssl package: `apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs` / equivalent. No special configuration beyond that — the library is usually already present (every distro pulls it in transitively via `curl`, `git`, `wget`, etc.).
 
-The per-platform selection above is the **client** (outbound) story. The **server accept** path added per [ADR-0024](./adr/0024-openssl-server-tls-accept.md) is nonblocking memory-BIO OpenSSL on Unix-not-Darwin, per [ADR-0033](./adr/0033-schannel-server-tls-accept-on-windows.md) nonblocking native SChannel on Windows, and native Secure Transport on macOS, each with an identical observable contract. Its primary input is a maximum 16 MiB caller-supplied PKCS#12 byte array; it privately copies and wipes those bytes, while the path overload opens once without following links and delegates. Strict validation of validity, explicit server purpose, leaf/CA constraints, and bundled chain coherence is the default; conformant leaves may omit basic constraints, while bundled issuers must carry them. `tsivPermissive` is an explicit self-signed development option and neither mode consults platform system trust. Atomic reload publishes a fully built immutable snapshot, existing connections retain their original reference, and a failed reload preserves the active snapshot. Listeners stop and join `Begin` and `Reload` callers before closing the holder; established connections can outlive it through retained snapshots. The API converts passphrases to UTF-8 and wipes temporary copies, installs intermediate certificates, and exposes WANT states plus `tssPeerClosed`. `Active` becomes true only after authentication. Retained ciphertext drains before another protocol operation, its returned span stays stable until consumed, and WANT-write plaintext is retained internally for a nil, zero-length resume call. Consumers must enforce a handshake deadline and byte budget. Network.framework is used only by the registry's HTTPS listener on Darwin kernel 25 and newer, which bypasses this server context ([ADR-0043](./adr/0043-self-hosted-registry-origin.md); see [`deployment.md`](./deployment.md#tls-backends-per-platform)).
+The per-platform selection above is the **client** (outbound) story. The **server accept** path added per [ADR-0024](../adr/0024-openssl-server-tls-accept.md) is nonblocking memory-BIO OpenSSL on Unix-not-Darwin, per [ADR-0033](../adr/0033-schannel-server-tls-accept-on-windows.md) nonblocking native SChannel on Windows, and native Secure Transport on macOS, each with an identical observable contract. Its primary input is a maximum 16 MiB caller-supplied PKCS#12 byte array; it privately copies and wipes those bytes, while the path overload opens once without following links and delegates. Strict validation of validity, explicit server purpose, leaf/CA constraints, and bundled chain coherence is the default; conformant leaves may omit basic constraints, while bundled issuers must carry them. `tsivPermissive` is an explicit self-signed development option and neither mode consults platform system trust. Atomic reload publishes a fully built immutable snapshot, existing connections retain their original reference, and a failed reload preserves the active snapshot. Listeners stop and join `Begin` and `Reload` callers before closing the holder; established connections can outlive it through retained snapshots. The API converts passphrases to UTF-8 and wipes temporary copies, installs intermediate certificates, and exposes WANT states plus `tssPeerClosed`. `Active` becomes true only after authentication. Retained ciphertext drains before another protocol operation, its returned span stays stable until consumed, and WANT-write plaintext is retained internally for a nil, zero-length resume call. Consumers must enforce a handshake deadline and byte budget. Network.framework is used only by the registry's HTTPS listener on Darwin kernel 25 and newer, which bypasses this server context ([ADR-0043](../adr/0043-self-hosted-registry-origin.md); see [`deployment.md`](./deployment.md#tls-backends-per-platform)).
 
 If `lwpt install` fails on Linux with `HTTPS requires OpenSSL but it could not be loaded`, install the distro's libssl package. Windows + macOS never hit this path on the client side. Documented in [`quick-start.md`](./quick-start.md).
 
@@ -312,7 +312,7 @@ On Windows, a shared read through `OpenProtectedFileStream` (`fmOpenRead or fmSh
 
 ## Install lock + crash recovery
 
-`lwpt install` acquires a cross-process lock at `.lwpt/install.lock` before doing any work (`LWPT.InstallLock`, [ADR-0053](./adr/0053-install-lock-ownership-and-reclamation.md)). The file's existence is the mutual exclusion: it is created with `O_CREAT|O_EXCL` on Unix and `CREATE_NEW` on Windows, so only one process wins the create. A second concurrent `lwpt install` fails fast with `EConcurrencyError` naming the lock holder's command and PID. The normally-completing owner deletes the file; a crashed one leaves it behind.
+`lwpt install` acquires a cross-process lock at `.lwpt/install.lock` before doing any work (`LWPT.InstallLock`, [ADR-0053](../adr/0053-install-lock-ownership-and-reclamation.md)). The file's existence is the mutual exclusion: it is created with `O_CREAT|O_EXCL` on Unix and `CREATE_NEW` on Windows, so only one process wins the create. A second concurrent `lwpt install` fails fast with `EConcurrencyError` naming the lock holder's command and PID. The normally-completing owner deletes the file; a crashed one leaves it behind.
 
 Liveness is an operating-system record lock on the same file: `fcntl` `F_SETLK` on byte 0 on Unix, an exclusive `LockFileEx` on byte 1024 on Windows. After creating the file, the owner takes the record lock, checks that the path still names the file it created (an owner whose file was taken over, removed, or replaced meanwhile fails without touching it), and only then writes its owner record: the PID on the first line (the only line older binaries wrote), `holder=install` or `holder=repair`, and `lock=record`. It deletes the file before it releases the record lock. The kernel releases the record lock when the owner dies; it is not inherited by child processes and does not depend on PIDs. On a filesystem that keeps no record locks, the owner proceeds but writes no `lock=record` line.
 
@@ -437,7 +437,7 @@ build system and formatter. Duplication analysis and codebase health now ship:
 
 | Contract | Workstream | Notes |
 | --- | --- | --- |
-| **Codebase-health** (`lwpt health`) | Delivered; see [`health.md`](./health.md) | Deterministic routine/file complexity, optional local Git hotspots, stable JSON, and strict opt-in thresholds. |
+| **Codebase-health** (`lwpt health`) | Delivered; see [`health.md`](../user/health.md) | Deterministic routine/file complexity, optional local Git hotspots, stable JSON, and strict opt-in thresholds. |
 | **Duplication** (`lwpt duplication`) | Delivered from [issue #32](https://github.com/frostney/lwpt/issues/32) | Deterministic Type-2 clone reporting across manifest-owned source scope. |
 
 The v1 pre-commit gate excludes these analysis commands; they run on demand or

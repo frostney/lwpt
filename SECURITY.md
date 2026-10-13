@@ -46,7 +46,7 @@ Issues that meaningfully affect a consumer running `lwpt install` / `lwpt build`
 
 Known limitations documented elsewhere:
 
-- The Windows install lock (`LockFileEx`) ships alongside the Windows CI work; until it lands, concurrent installs on Windows can race. See [`docs/tooling.md`](./docs/tooling.md#environment-variables).
+- The Windows install lock (`LockFileEx`) ships alongside the Windows CI work; until it lands, concurrent installs on Windows can race. See [`docs/contributor/tooling.md`](./docs/contributor/tooling.md#environment-variables).
 - LWPT is pre-1.0; the API surface (manifest format, lockfile schema, subcommand set) is not yet stable. Migrations are deliberate, not security issues.
 - Issues affecting test-only paths (`*.Test.pas`, `tests/support/Tests.HTTPMockServer.pas`) — they don't ship in the release binary.
 

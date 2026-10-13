@@ -1,7 +1,7 @@
 # Registry protocol v1 conformance corpus
 
 This directory is the deterministic corpus for
-[`docs/registry-spec.md`](../../../../docs/registry-spec.md).
+[`docs/user/registry-spec.md`](../../../../docs/user/registry-spec.md).
 
 All `.toml` payloads are canonical protocol bytes. Files under `objects/` use a
 `.hex` suffix so the binary gzip archives remain reviewable: remove ASCII

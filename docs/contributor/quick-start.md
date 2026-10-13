@@ -1,0 +1,365 @@
+# Contributor quick start
+
+This walkthrough builds and tests **LWPT itself** from a source checkout.
+To install the released toolkit and scaffold another project, follow the
+[consumer guide](../user/consumer-guide.md). The [documentation index](../README.md) and
+[llms.txt](../../llms.txt) cover the full capability set.
+
+## Executive Summary
+
+- **Bootstrap is one command, run once.** `./bootstrap.sh` (or `bootstrap.bat` on Windows) produces `build/lwpt` from `source/lwpt.pas`. After that, `./build/lwpt build` is the canonical build entry point.
+- **No `lwpt install` needed after clone.** Per [ADR-0002](../adr/0002-lwpt-namespace-zero-install.md) every LWPT project commits `.lwpt/modules/` and `.lwpt/archives/`; `fpc @lwpt.cfg` works without LWPT being involved.
+- **Two prerequisites:** FPC 3.2.2 (with InstantFPC bundled) and Lefthook for pre-commit hooks. TLS is platform-native in both directions on Windows and macOS (SChannel per [ADR-0016](../adr/0016-tls-backend-per-platform.md) and [ADR-0033](../adr/0033-schannel-server-tls-accept-on-windows.md), SecureTransport on macOS, system OpenSSL on Linux); no DLLs to bundle.
+- **A new test is one `.Test.pas` file.** Add `testing` to `[dependencies]` (or rely on workspace auto-discovery in a monorepo), run `lwpt install` once, then write `program <Name>.Test;` files using `TestingPascalLibrary`. `lwpt test` discovers and runs them.
+- **Pre-commit auto-formats.** `lwpt format` and `lwpt agents` run on every commit via Lefthook and re-stage any rewrites (`stage_fixed: true`). The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`, `lwpt agents --check`) run on the PR workflow in CI. Install the local hook once with `lefthook install`.
+
+## Prerequisites
+
+| Tool | Version | Where it comes from |
+| --- | --- | --- |
+| FreePascal | 3.2.2 (verified live with `fpc -iV`) | [freepascal.org/download](https://www.freepascal.org/download.html) or `fpcupdeluxe` |
+| InstantFPC | bundled with FPC | `instantfpc --help` should work; if not, install FPC's `fcl-fpcunit` package |
+| Lefthook | 2.x | `brew install lefthook` / `winget install evilmartians.lefthook` / `go install github.com/evilmartians/lefthook@latest` |
+| TLS library | platform-native | Windows: SChannel (built-in). macOS: SecureTransport (built-in). Linux: distro libssl (`apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs`). See [`deployment.md`](./deployment.md) for the per-platform story. |
+
+Verify the toolchain before continuing:
+
+```sh
+fpc -iV                # → 3.2.2
+instantfpc --help      # → usage banner
+lefthook version       # → 2.x
+```
+
+## First clone
+
+```sh
+git clone <repo-url>
+cd <repo>
+./bootstrap.sh         # Unix
+# Windows: bootstrap.bat
+```
+
+What the bootstrap does:
+
+1. If InstantFPC is on `PATH`, runs `scripts/bootstrap.pas`, which invokes `fpc` once to compile `source/lwpt.pas` → `build/lwpt`. The fpc invocation passes `-Fu` / `-Fi` for `source/` and for every workspace package under `packages/<name>/source/` (currently: `httpclient`, `cli`, `semver`, `toml`, `testing`).
+2. If InstantFPC is not on `PATH`, falls back to a direct `fpc` invocation with the same flag set.
+
+Both code paths are dev-mode only; release builds always go through `./build/lwpt build --mode release`.
+
+After bootstrap:
+
+```sh
+./build/lwpt --help     # top-level help; lists the 15 command families
+```
+
+## Daily commands
+
+```sh
+./build/lwpt init --yes         # scaffold a fresh project
+./build/lwpt init --adopt       # adopt an existing manifest
+
+./build/lwpt build              # dev build, all manifest entries
+./build/lwpt build --mode release
+./build/lwpt build <entry>      # single build entry
+./build/lwpt build --clean      # force a fresh private-session rebuild
+./build/lwpt build --jobs=1     # force sequential entry execution
+./build/lwpt build --no-cache   # compile without reusable build results
+
+./build/lwpt format             # rewrite sources to canonical style
+./build/lwpt format --check     # exit non-zero on any deviation
+
+./build/lwpt duplication        # report manifest-scoped Pascal clones
+./build/lwpt duplication --json # emit the deterministic analysis envelope
+
+./build/lwpt test               # discover/compile/run *.Test.pas
+
+./build/lwpt install            # fetch any new deps; rewrite lwpt.lock + lwpt.cfg
+./build/lwpt install --frozen   # CI: verify, refuse to update
+./build/lwpt install --offline  # restore exact locked state from local bytes
+./build/lwpt install --accept-moved-tags  # re-pin reviewed upstream tag moves
+./build/lwpt add owner/repo@^1.0    # add a dependency + install it (ADR-0019)
+./build/lwpt remove <name>      # remove a dependency + prune its modules
+./build/lwpt outdated           # compare locked git-host deps to advertised tags
+./build/lwpt update             # bump constraints + reinstall newer git-host deps
+./build/lwpt repair             # recover residue; upgrade a v3 lockfile to v4
+./build/lwpt registry init      # initialize a self-hosted registry origin
+./build/lwpt registry serve     # serve the origin in the foreground
+./build/lwpt registry issue-token --packages 'my-*'   # print a scoped, expiring publication token once
+./build/lwpt registry publish pkg.tar.gz --origin <url> --key-id <id> --public-key <key>
+                                # publish (token from LWPT_REGISTRY_TOKEN), then verify it from the pin
+```
+
+[`build-system.md`](../user/build-system.md) covers each in depth.
+
+`install --offline` requires an existing compatible `lwpt.lock`. It resolves
+network-backed dependencies to the lockfile's exact identities without remote
+discovery, verifies a committed `.lwpt/archives/` file or the shared
+content-addressed cache, then atomically restores missing archives, modules,
+and `lwpt.cfg`. Local and workspace dependencies are copied from their declared
+paths. The lockfile remains byte-identical. A missing object, corrupt archive,
+or manifest/lock mismatch fails without fetching around the problem. Offline
+materialization and read-only `--frozen` verification are mutually exclusive.
+
+`install --frozen` makes no network requests at all. It verifies the committed
+archives and extracted modules against `lwpt.lock` and never writes the lockfile.
+Some other package managers use "frozen" only to mean "don't write the lock".
+
+A local or workspace module is a copied snapshot of its source, so its
+committed tree and its `computedHash` can agree while both are stale. For
+each local and workspace dependency, `--frozen` therefore also re-derives the
+snapshot from the declared source path, with the dependency's `include` and
+`exclude` policy, and fails when it no longer matches the lock. An edit the
+policy filters out is not drift. A missing source fails, because the snapshot
+can't be proven current. The re-derived copy lives in private scratch below
+`.lwpt/tmp/` and is removed afterwards; nothing committed changes.
+`--offline` copies local and workspace sources again, so it refuses an edited
+source the same way rather than restoring the old snapshot.
+
+Registry dependencies follow the same two modes without contacting any
+registry. Both verify each locked selection from the signed documents
+committed under `.lwpt/archives/registry-proofs/` and the key pinned in
+`lwpt.toml`, so an edited lock, proof, or archive fails. `--frozen` also
+re-derives each registry module from its archive and fails when an installed
+unit was edited, even together with its recorded hash. `--offline` restores a
+missing proof document from the per-user registry state directory. A changed
+pin fails both modes; run `lwpt install` online to verify from the new pin
+([ADR-0051](../adr/0051-registry-dependency-sources.md)).
+
+A tag names a reviewed commit, and `lwpt.lock` records both the commit and
+whether the ref was a tag or a branch. An online install fails before fetching
+anything when a locked tag changes upstream:
+
+- the tag now points at a different commit;
+- the same version is re-published under another spelling (`v1.0.0` becomes
+  `1.0.0`) at a different commit;
+- the tag is replaced by a same-named branch.
+
+The error names the dependency, the ref, and the old and new commits. The
+`add`, `remove`, and `update` flows share the install transaction and fail the
+same way. A locked commit must also reproduce the archive bytes recorded in
+`lwpt.lock`, even when the ref listing is unreachable and the lock is reused.
+A lock written before LWPT recorded commits is checked the same way, by
+archive. Review the change, then run `lwpt install --accept-moved-tags` to
+re-pin it. The flag cannot be combined with `--frozen` or `--offline`, which
+never list refs. Branch requirements keep following their moving tip.
+
+Every dependency request uses HTTPS on every redirect, may reach only the
+hosts its source names, and is refused if any hop resolves to a private,
+loopback, link-local, or other non-globally-reachable address. Dependencies
+hosted on a private network are currently unsupported; see
+[`deployment.md`](./deployment.md).
+
+## Start or adopt a project
+
+From an empty project directory, `init --yes` writes a default manifest,
+hello-world entry, and `.gitignore` without prompting:
+
+```sh
+./build/lwpt init --yes
+```
+
+When `lwpt.toml` already exists, adoption fills in only the missing standard
+scaffold:
+
+```sh
+./build/lwpt init --adopt
+```
+
+Adoption parses the manifest without rewriting it, creates missing
+project-local directories declared by `[package].units`, and appends missing
+`.gitignore` entries for `.lwpt/tmp/`, `.lwpt/install.lock`,
+`.lwpt/sessions/`, `.lwpt/session-roots`, `.lwpt/workers/`, `.lwpt/registry/`, and the project-local output directories
+declared by `[build]` (`build/` when none is usable). It reports directories
+as created or found and ignore entries as added or found. It does not create
+a sample program, lockfile, cfg, dependency state, or build output.
+
+`--adopt` requires an existing valid manifest and cannot be combined with
+`--force`. A units path that is a file is a conflict. A missing units path
+outside the project is also refused rather than creating directories beyond
+the manifest's project root.
+
+## Install the pre-commit hook
+
+Lefthook runs `lwpt format` and `lwpt agents` on every `git commit` with `stage_fixed: true` — any files they rewrite (formatted sources, the refreshed AGENTS.md agents block) are auto-staged into the same commit, so the local hook never blocks. The heavyweight gates (`lwpt build`, `lwpt test`, `lwpt format --check`, `lwpt agents --check`) run on the PR workflow on every pull request. Install the local hook once per fresh clone:
+
+```sh
+lefthook install
+```
+
+If you genuinely need to bypass (rare), see [`tooling.md`](./tooling.md) — but `--no-verify` violates [`CONTRIBUTING.md`](../../CONTRIBUTING.md) unless explicitly requested by a maintainer.
+
+## Adding a dependency
+
+```sh
+./build/lwpt add HashLoad/horse@^4.0.0   # writes the [dependencies] entry + installs
+git add .lwpt/ lwpt.lock lwpt.cfg lwpt.toml
+git commit -m "feat: add horse v4.0.0"
+```
+
+To check and update git-host dependencies by hand, use `lwpt outdated` followed
+by `lwpt update`. To schedule the same transaction and receive one pull request
+with safely quoted release-note excerpts, call the reusable
+[`lwpt-update.yml` workflow](./ci.md#lwpt-dependency-updater).
+
+The dependency name defaults to the repo / path basename (`horse` here); pass `--name <name>` to override it (required for `https://` tarball sources). The manifest is only written after the install succeeded, so a typo'd repo or dead tag leaves `lwpt.toml` untouched. Equivalent manual path: edit `lwpt.toml` yourself —
+
+```toml
+[dependencies]
+horse = "HashLoad/horse@^4.0.0"   # see ADR-0009 for the full source-spec syntax
+```
+
+— then run `./build/lwpt install`. The inverse is `./build/lwpt remove horse`, which deletes the manifest entry, regenerates `lwpt.lock` + `lwpt.cfg`, and prunes `.lwpt/modules/horse/` + its cached archive (see [ADR-0019](../adr/0019-add-remove-subcommands.md)).
+
+`.lwpt/modules/horse/` and `.lwpt/archives/horse-<resolved-tag>.tar.gz` (named after the tag the `^4.0.0` range resolved to) are committed because of zero-install (ADR-0002). The next contributor's `git clone` doesn't need to run `lwpt install` — `./build/lwpt build` reads the already-committed `lwpt.cfg` and compiles directly.
+
+Source kinds:
+
+- a git host: GitHub by default (`owner/repo`), `gitlab:` or `bitbucket:` prefixes, or a custom host declared in `[sources]`;
+- an `https://` URL to a tarball;
+- a local path (or `local:` prefix);
+- `workspace:` (`workspace:*` or `workspace:^X.Y.Z`), naming a member discovered through `[workspaces]`;
+- `registry:[<alias>/]<package>`, selected from the registry snapshot named by the signed checkpoint of an origin declared in the root `[registries]` table.
+
+See the [README manifest section](../../README.md#manifest) for an annotated example, [ADR-0009](../adr/0009-source-syntax-and-tag-resolution.md) for the source syntax, and [ADR-0051](../adr/0051-registry-dependency-sources.md) for registry sources.
+
+## Writing a test
+
+`TestingPascalLibrary` lives in the `testing` workspace package; add it to your manifest (or rely on the auto-discovery glob in a monorepo) and run install:
+
+```toml
+# lwpt.toml — non-monorepo consumer
+[dependencies]
+testing = { source = "frostney/lwpt", version = "0.8.0", include = ["packages/testing/**"] }
+```
+
+Include filters keep the repo-relative path prefix, so the filtered tree lands at `.lwpt/modules/testing/packages/testing/…`. That's fine: the resolver finds the package's `lwpt.toml` wherever it sits in the module tree (the shallowest one wins; if two manifests tie at the same minimal depth there is no defensible winner, so the resolver falls back to manifest-less module-root behavior — `-Fu`/`-Fi` point at the module root and no transitive deps are walked), reads its `units` array, and emits `-Fu`/`-Fi` paths relative to the module root — no extra configuration in the consumer manifest.
+
+```toml
+# lwpt.toml — monorepo: packages/testing/ already discovered
+[workspaces]
+include = ["packages/*"]
+```
+
+```sh
+./build/lwpt install
+```
+
+`lwpt install` publishes the package's validated snapshot into `.lwpt/modules/testing/`; commit that snapshot alongside the other deps (it's part of zero-install per ADR-0002). Re-run install after changing the workspace source.
+
+Create a co-located test next to the unit it covers, e.g. `source/MyUnit.Test.pas`:
+
+```pascal
+program MyUnit.Test;
+{$mode delphi}{$H+}
+uses
+  TestingPascalLibrary,
+  MyUnit;
+
+type
+  TMyUnitTests = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestAdds;
+  end;
+
+procedure TMyUnitTests.TestAdds;
+begin
+  Expect<Integer>(MyAdd(2, 2)).ToBe(4);
+end;
+
+procedure TMyUnitTests.SetupTests;
+begin
+  Test('addition works', TestAdds);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TMyUnitTests.Create('MyUnit'));
+  TestRunnerProgram.Run;
+  ExitCode := TestResultToExitCode;
+end.
+```
+
+Then:
+
+```sh
+./build/lwpt test           # discovers MyUnit.Test.pas, compiles, runs, reads exit code
+```
+
+The full test policy (unit, integration, E2E, and manual groups; fixture rules;
+mock HTTP server; and the binary-fetch regression) is in
+[`testing.md`](./testing.md).
+
+## Common errors
+
+**`bootstrap.sh: instantfpc not found; falling back to direct fpc`** — informational. Both code paths produce the same `build/lwpt`; the fallback just skips the InstantFPC wrapper.
+
+**`lwpt install: dependency "<name>": the legacy manifest shape ... is no longer supported`** — per [ADR-0009](../adr/0009-source-syntax-and-tag-resolution.md): no more `source = "github|gitlab|..."` selector, no separate `repo` / `ref` / `tag` / `path` keys. Rewrite as a bare-string shorthand or a slim inline table:
+
+```toml
+[dependencies]
+foo = "owner/foo@v1.2.3"                                           # bare-string
+bar = { source = "owner/bar", version = "^1.0", include = ["src/**"] } # inline-table
+```
+
+**`lwpt install: source = "http" is a legacy kind selector`** — same migration. The current syntax puts the locator in the source value: `"https://example.com/foo.tar.gz"` for an arbitrary tarball.
+
+**`lwpt install: CONFLICT on package "X"`** — two requirers want incompatible versions of the same package; FPC's single global unit namespace forbids both. The output names both requirers — edit the manifest tree to align them.
+
+**`HTTPS requires OpenSSL but it could not be loaded` (Linux only)** — install your distro's libssl package (`apt install libssl3` / `dnf install openssl-libs` / `apk add openssl3-libs`). LWPT loads it via `dlopen` at runtime. Windows + macOS do not hit this path (SChannel / SecureTransport are built into the OS — see [ADR-0016](../adr/0016-tls-backend-per-platform.md)).
+
+**`[frozen] missing extracted module for "<name>"`** — `lwpt install --frozen` requires `.lwpt/modules/<name>/` to be present. Run `lwpt install` (without `--frozen`) to fetch.
+
+**`[frozen] workspace package "<name>" at <path> changed after it was
+installed`** — the workspace source (or, for `local dependency "<name>"`, the
+local source) differs from the snapshot committed in `.lwpt/modules/<name>/`
+and `lwpt.lock`. The message names the first added, removed, or changed file.
+Run `lwpt install` and commit the updated `lwpt.lock` and
+`.lwpt/modules/<name>/`. `[offline] tree hash mismatch` with "local or
+workspace source changed after it was installed" is the same drift seen by
+`--offline`.
+
+**`[offline] verified archive for "<name>" is unavailable`** — neither the
+committed project archive nor the shared content-addressed cache contains the
+archive hash recorded in `lwpt.lock`. Restore the committed archive or run
+`lwpt install` online once to seed verified content.
+
+**`[frozen] module tree of "<name>" differs from the tree re-derived from its
+proof-authenticated archive`** — an installed file of a registry dependency
+differs from its signed archive, even though `lwpt.lock` may have been
+updated to match. Restore `.lwpt/modules/<name>/` from version control, or run
+`lwpt install --offline` to re-extract it from the archive.
+
+**`trust pin for <identity> changed`** — the `key-id` or `public-key` of a
+`[registries.<alias>]` declaration no longer matches the key the lock was
+verified from. Review the change, then run `lwpt install` online to verify
+from the new pin.
+
+**Pre-commit hook auto-formatted files unexpectedly** — the hook runs `lwpt format` and `lwpt agents` with `stage_fixed: true`, so any drift (source formatting, the AGENTS.md agents block) gets rewritten + re-staged into the same commit. Review the staged diff before pushing.
+
+**Recovery from a crashed install:**
+
+```sh
+./build/lwpt repair
+```
+
+Takes over the install lock only once it can prove its owner has exited, and
+otherwise fails without changing anything, naming the holder or the file to
+delete by hand ([ADR-0053](../adr/0053-install-lock-ownership-and-reclamation.md)).
+Holding the lock, it cleans `.lwpt/tmp/` after restoring an interrupted
+install's validated rollback snapshot from it. It then cleans abandoned or
+failed sessions
+from the default and identity-verified historical build-session roots, then
+reclaims abandoned per-user worker requests and reports the remaining budget
+state. Live build/test sessions are retained. It also reports the per-user
+registry document store's size, live and evictable documents, and budget, and
+removes nothing there.
+Repair never touches the last successfully published build output. It
+changes `.lwpt/modules/`, `.lwpt/archives/`, `lwpt.cfg`, and `lwpt.lock` in
+two cases only. When an install was interrupted mid-publication, on any
+lockfile schema, it restores the install's validated rollback snapshot, so the
+committed state returns to what it was before that install. When the lockfile
+is schema v3, it upgrades the lockfile to v4 without network access and
+without changing dependency versions, re-deriving each module from its
+committed archive or source
+([ADR-0052](../adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the
+resulting `lwpt.lock`.

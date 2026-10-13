@@ -12,21 +12,21 @@ released packages; main-branch references may describe newer behavior.
 
 ## Start here
 
-- [Consumer guide](https://raw.githubusercontent.com/frostney/lwpt/main/docs/consumer-guide.md): Homebrew installation, a complete CLI and native test, and capability selection.
+- [Consumer guide](https://raw.githubusercontent.com/frostney/lwpt/main/docs/user/consumer-guide.md): Homebrew installation, a complete CLI and native test, and capability selection.
 - [README](https://raw.githubusercontent.com/frostney/lwpt/main/README.md): Command overview and manifest examples.
 - [Documentation index](https://raw.githubusercontent.com/frostney/lwpt/main/docs/README.md): Canonical topic references.
 
 ## Capabilities
 
 - [Registry dependencies](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0051-registry-dependency-sources.md): Consume `registry:` dependencies from a pinned, signed registry origin.
-- [Registry deployment](https://raw.githubusercontent.com/frostney/lwpt/main/docs/registry-deployment.md): Run a registry origin or mirror and publish packages with `lwpt registry`.
+- [Registry deployment](https://raw.githubusercontent.com/frostney/lwpt/main/docs/user/registry-deployment.md): Run a registry origin or mirror and publish packages with `lwpt registry`.
 - [Dependency updates](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0039-outdated-update-subcommands.md): `lwpt outdated` and `lwpt update` for git-host dependencies.
-- [Recovery](https://raw.githubusercontent.com/frostney/lwpt/main/docs/quick-start.md#common-errors): `lwpt repair` recovers interrupted installs and residue and upgrades a v3 lockfile.
-- [Build system](https://raw.githubusercontent.com/frostney/lwpt/main/docs/build-system.md): Build entries and lifecycle integration.
-- [Testing](https://raw.githubusercontent.com/frostney/lwpt/main/docs/testing.md): Native test programs, selectors, and compiled-test reuse.
-- [Code style](https://raw.githubusercontent.com/frostney/lwpt/main/docs/code-style.md): Formatter behavior and source scope.
-- [Health](https://raw.githubusercontent.com/frostney/lwpt/main/docs/health.md): Complexity thresholds and reports.
-- [Tooling](https://raw.githubusercontent.com/frostney/lwpt/main/docs/tooling.md): Duplication checks and tool configuration.
+- [Recovery](https://raw.githubusercontent.com/frostney/lwpt/main/docs/contributor/quick-start.md#common-errors): `lwpt repair` recovers interrupted installs and residue and upgrades a v3 lockfile.
+- [Build system](https://raw.githubusercontent.com/frostney/lwpt/main/docs/user/build-system.md): Build entries and lifecycle integration.
+- [Testing](https://raw.githubusercontent.com/frostney/lwpt/main/docs/contributor/testing.md): Native test programs, selectors, and compiled-test reuse.
+- [Code style](https://raw.githubusercontent.com/frostney/lwpt/main/docs/contributor/code-style.md): Formatter behavior and source scope.
+- [Health](https://raw.githubusercontent.com/frostney/lwpt/main/docs/user/health.md): Complexity thresholds and reports.
+- [Tooling](https://raw.githubusercontent.com/frostney/lwpt/main/docs/contributor/tooling.md): Duplication checks and tool configuration.
 - [Run tasks](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0013-run-subcommand-and-build-rename.md): Manifest commands for project-specific work.
 - [Lifecycle hooks](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0011-build-lifecycle-hooks.md): Hook commands and staleness checks.
 - [Agent reference](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0027-agents-subcommand.md): Generate and check project command documentation.
@@ -35,6 +35,6 @@ released packages; main-branch references may describe newer behavior.
 
 ## Optional
 
-- [Contributor setup](https://raw.githubusercontent.com/frostney/lwpt/main/docs/quick-start.md): Build and test LWPT itself from source.
+- [Contributor setup](https://raw.githubusercontent.com/frostney/lwpt/main/docs/contributor/quick-start.md): Build and test LWPT itself from source.
 - [Contributor instructions](https://raw.githubusercontent.com/frostney/lwpt/main/AGENTS.md): Repository-specific constraints.
-- [Package architecture](https://raw.githubusercontent.com/frostney/lwpt/main/docs/packages.md): Package ownership and migration history.
+- [Package architecture](https://raw.githubusercontent.com/frostney/lwpt/main/docs/contributor/packages.md): Package ownership and migration history.

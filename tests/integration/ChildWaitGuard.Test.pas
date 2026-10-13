@@ -464,7 +464,7 @@ begin
     WriteLn('Wait for children through Tests.ProcessSupport: FinishChild or ',
       'WaitForChildExit with a deadline, ReapChild in cleanup, and ',
       'TerminateChildProcess instead of TProcess.Terminate; generated ',
-      'fixtures poll Running against a deadline. See docs/testing.md.');
+      'fixtures poll Running against a deadline. See docs/contributor/testing.md.');
   Expect<Integer>(Violations).ToBe(0);
 end;
 

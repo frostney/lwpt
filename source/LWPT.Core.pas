@@ -2117,7 +2117,7 @@ end;
   ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 contract; Wine does both renames on
   every call), so a reader can briefly find the path absent. Readers that
   must not mistake that for a missing file coordinate with the writer; see
-  docs/tooling.md. It is intentionally strict: callers must stage the
+  docs/contributor/tooling.md. It is intentionally strict: callers must stage the
   source on the same filesystem as the destination. ARetireInUseBackup is
   set only by AtomicReplaceExecutable. }
 function ReplaceFileInOneOperation(const ASrc, ADst: string;
