@@ -19,7 +19,7 @@ edit other documents. It completes the deferral recorded in
 manifest section), [ADR-0048](0048-git-host-fetch-trust.md) (registry
 destinations), and [ADR-0049](0049-registry-remote-publication.md) (its
 decision 4), and specifies the consumer side of the
-[registry protocol](../user/registry-spec.md). It also covers the registry half of
+[registry protocol](../registry-spec.md). It also covers the registry half of
 [issue #226](https://github.com/frostney/lwpt/issues/226).
 
 ## Executive Summary
@@ -107,7 +107,7 @@ These facts decide whether registry entries can extend schema v3:
 - **No registry source kind or consumer configuration.**
 - **No executable contact selection or failover.** The protocol
   specification defines the policy
-  ([Client contact selection and failover](../user/registry-spec.md#client-contact-selection-and-failover)).
+  ([Client contact selection and failover](../registry-spec.md#client-contact-selection-and-failover)).
   The mirror uses exactly one upstream.
 - **Acquisition exists only inside the mirror.** `Synchronize` is coupled to
   the mirror store and its budgets.
@@ -671,7 +671,7 @@ ADRs and the specification are edited only by the implementation PR, so the
 documents it touches describe shipped behavior. That PR must apply each
 amendment below in the same change as the code it describes.
 
-- **`docs/user/registry-spec.md`:**
+- **`docs/registry-spec.md`:**
   - **Locked-proof paragraph (decision 4).** Amend "Acquisition and locked
     proof verification". A consumer's locked selection proof verifies the
     checkpoint hash, the signature through the rotation chain from the pin,
@@ -715,7 +715,7 @@ amendment below in the same change as the code it describes.
     unreferenced proof documents.
   - **"Network operations are explicit".** `install`, `add`, `remove`, and
     `update` reach registry contacts; `--frozen` and `--offline` never do.
-- **`docs/contributor/architecture.md`.** Add the lockfile table rows, the
+- **`docs/architecture.md`.** Add the lockfile table rows, the
   `registry-proofs` layout row, and the `registry:` source rows.
 - **Manifest schema registry.** Register `[registries]` and the `registry:`
   prefix, then regenerate the `lwpt agents` block.

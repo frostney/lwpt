@@ -17,7 +17,7 @@
 Accepted on 2026-09-29 by the maintainer, who settled the nine decisions at
 the end of this record. Amends [ADR-0043](0043-self-hosted-registry-origin.md), whose
 `registry` command family and origin store this extends, and records the
-publication decisions the [registry protocol](../user/registry-spec.md) leaves to
+publication decisions the [registry protocol](../registry-spec.md) leaves to
 the implementation. Issue [#54](https://github.com/frostney/lwpt/issues/54).
 
 ## Context

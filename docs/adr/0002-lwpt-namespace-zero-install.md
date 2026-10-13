@@ -14,5 +14,5 @@ Per-project dependency state lives under `.lwpt/` at the project root: `.lwpt/mo
 
 - Repo size grows with dependency count. Pascal libraries are small (tens of `.pas` files, not the thousands a typical npm package ships), so this is bounded.
 - Dependency upgrades produce per-file git diffs — louder than committing a zip would be, but reviewable. Treat this as a feature: the next reviewer can see exactly what changed in an upgrade.
-- Cross-filesystem rename failures (EXDEV) need a copy-then-delete fallback (documented in `docs/contributor/tooling.md`).
+- Cross-filesystem rename failures (EXDEV) need a copy-then-delete fallback (documented in `docs/tooling.md`).
 - Adding an opt-in global cache later means new behavior, not a change to the on-disk shape — backwards compatible.

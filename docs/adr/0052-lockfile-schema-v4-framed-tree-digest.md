@@ -485,13 +485,13 @@ The implementation PR applies these in the same change as the code.
 
   > `lwpt repair` writes this state only to upgrade a schema-v3 lockfile to v4 ([ADR-0052](./docs/adr/0052-lockfile-schema-v4-framed-tree-digest.md)): through the install transaction, under the install lock, it re-derives each locked module from its verified archive, proof, or source and republishes the modules, archives, proofs, cfg, and lockfile. It never runs on a v4 lockfile and never resolves or fetches.
 
-- **`docs/contributor/quick-start.md`, "Recovery from a crashed install".** Replace
+- **`docs/quick-start.md`, "Recovery from a crashed install".** Replace
   "Repair never touches `.lwpt/modules/`, `.lwpt/archives/`, or the last
   successfully published build output." with:
 
   > Repair never touches the last successfully published build output. It changes `.lwpt/modules/`, `.lwpt/archives/`, and `lwpt.lock` only when the lockfile is schema v3: it then upgrades the lockfile to v4 without network access and without changing dependency versions, re-deriving each module from its committed archive or source ([ADR-0052](./adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the resulting `lwpt.lock`.
 
-- **`docs/contributor/architecture.md`, "Lockfile schema".** Retitle the section v4.
+- **`docs/architecture.md`, "Lockfile schema".** Retitle the section v4.
   Update:
   - the `computedHash` row;
   - the registry paragraph's "file for file" sentence (section 4);
@@ -500,7 +500,7 @@ The implementation PR applies these in the same change as the code.
   - the `EVerifyError` row, adding links inside installed modules.
 - **`CONTEXT.md`, "Lockfile".** "schema-v3" becomes "schema-v4", and
   "extracted-tree hash" becomes "framed extracted-tree digest".
-- **`docs/contributor/testing.md`.** Update the `LWPT.Core.Test.pas` description of
+- **`docs/testing.md`.** Update the `LWPT.Core.Test.pas` description of
   `HashTree` paths and `LoadLockfile`, and add the new rows below.
 - **ADR-0008 and ADR-0009.** Add amendment notes that point here. ADR-0009's
   "v3 is the last schema break planned for v1" is superseded.
