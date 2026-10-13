@@ -11,6 +11,6 @@ Documentation for building, testing, and releasing LWPT itself. Start with the [
 | [`deployment.md`](./deployment.md) | Platform tier matrix, release process, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), macOS quarantine, codesigning policy |
 | [`ci.md`](./ci.md) | CI workflow shape (`ci.yml` / `pr.yml` / `release.yml` / `toolchain.yml`), trigger split, cross-build toolchain cache, install scripts |
 | [`testing.md`](./testing.md) | Repository-owned test groups, selector policy, fixture strategy, mock HTTP server, the binary-fetch regression, test inventory |
-| [`packages.md`](./packages.md) | The package set, divergence vs GocciaScript-older-copies, bootstrap chicken-and-egg, graduation roadmap (per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)) |
+| [`packages.md`](./packages.md) | The package set, divergence vs GocciaScript-older-copies, bootstrap chicken-and-egg, graduation roadmap (per [ADR-0017](../adr/0017-packages-lwpt-canonical.md)) |
 
 Using LWPT in your own project? See the [user guide](../user/README.md). Decision records live in [`docs/adr/`](../adr/).
