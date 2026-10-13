@@ -5,7 +5,7 @@
 # This file is deployment documentation, not a build system. It installs a
 # released `lwpt` binary, verified against a SHA-256 you pin, and never
 # compiles LWPT; `./build/lwpt build` remains the only way LWPT builds
-# itself. The operating guide is docs/registry-deployment.md.
+# itself. The operating guide is docs/user/registry-deployment.md.
 #
 # The defaults below pin the latest release and its published SHA-256
 # digests, so `docker build -t lwpt-registry docs/examples/registry` works
