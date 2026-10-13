@@ -6,7 +6,7 @@
   describe the JS engine's CLI surface — execution mode, source
   type, coverage formats, bytecode-profiler modes — none of which
   LWPT has. Types were also un-prefixed: the `TGoccia` prefix is
-  gone; types live in the CLI namespace now). See docs/contributor/packages.md.
+  gone; types live in the CLI namespace now). See docs/packages.md.
 
   Surface kept:
     - TParseError                  — raised on user input errors
