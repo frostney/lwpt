@@ -1,6 +1,6 @@
 # Review worker lanes
 
-When the user supplies `subagents`, the coordinating agent still owns the
+When the review delegates lanes, the coordinating agent still owns the
 comparison boundary, claim, finding scope, active and skipped review axes,
 validation, verdict, and report.
 
@@ -20,14 +20,14 @@ validation, verdict, and report.
    severities, or issue a verdict.
 4. Require each worker to return its lane ID, assigned review axis or findings,
    bounded scope, inspected supporting context, exact probes and observed
-   results, every evidence-supported candidate with evidence, impact, smallest
-   remedy, and any uncertainty or limitation, verified claims, limitations, and
+   results, every evidence-supported candidate with evidence, impact, gain, if not
+   done, smallest remedy, and any uncertainty or limitation, verified claims, limitations, and
    `complete` or `incomplete` status. Workers do not apply a severity or
    reporting threshold; the coordinator owns candidate filtering.
 5. Validate every candidate against the current checkout, apply the
-   de-duplication model below, reconcile conflicts across lanes, then assign
-   final IDs, severities, categories, and verdict. Do not repeat a completed
-   lane wholesale.
+   de-duplication checks in `SKILL.md`, reconcile conflicts across lanes, then
+   assign final IDs, severities, categories, and verdict. Do not repeat a
+   completed lane wholesale.
 6. If sub-agents are unsupported, unavailable after any applicable bounded
    retry, or leave a lane incomplete, complete that lane directly. Report the
    affected lane and reason as a single-agent fallback. Temporary capacity

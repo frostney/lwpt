@@ -8,16 +8,22 @@ description: >-
 license: Unlicense OR MIT
 compatibility: >-
   Requires git; pull-request operations also require the GitHub CLI (gh) and
-  network access. Protected native stack publication also requires Python 3.11+
-  and a POSIX shell.
+  network access. Publishing to GitHub also requires Python 3.11+; protected
+  native stack publication also requires a POSIX shell.
 ---
 
 # Git workflow
 
-Apply these defaults unless the user has explicitly overridden them in the
-active workstream. Preserve that authority across turns until changed; a new
-repository or operation needs its own scope. A git request authorizes only the repository and GitHub state required for
-that operation.
+Keep every change on a fresh, focused branch whose history stays reviewable and
+recoverable: merge instead of rewriting, never lose local work, and land each
+pull request as one squash commit with a meaningful subject. A git request
+authorizes only the repository and GitHub state required for that operation.
+
+An explicit user instruction about one of these defaults replaces only that
+default for the active workstream. Preserve it across turns until changed; a
+new repository or operation needs its own scope.
+
+## Start or resume work
 
 - Resolve the base from the remote default; never hardcode `main`.
 - Make remote-default synchronization an automatic preflight for new work; do
@@ -37,9 +43,23 @@ that operation.
   freshly fetched remote-default tip. Do not configure a focused branch to
   track the remote default; set its upstream only when pushing that focused
   branch.
-- When entering an existing focused branch or worktree, merge the freshly
-  fetched remote default before editing.
-- Merge the remote base to update a branch. Never rebase.
+- When entering an existing focused branch or worktree, fetch and merge its
+  remote base before editing.
+- Before new work starts, apply the
+  [default-branch health](#default-branch-health) gate.
+
+## Update, commit, and push
+
+- Merge the remote base to update a branch. Never rebase. The remote base is
+  the branch the open PR targets when that is the remote default or a named
+  base as [create-pr](../create-pr/SKILL.md) step 1 defines it, such as a
+  release branch for a backport. Never merge the remote default into a branch
+  whose PR targets a named base. Without an open PR, the remote base is the
+  remote default.
+- A layer of a native stack is updated through the stack reference. When an
+  open PR targets any other non-default branch, it has no remote base: stop
+  before merging or pushing and report that base instead of choosing one. The
+  user can then name it or have the PR restacked.
 - During an authorized PR update, resolve conflicts whose intended behavior is
   established by the selected change and current base. Preserve both sides'
   required behavior, regenerate generated files with the project tool, and
@@ -48,9 +68,88 @@ that operation.
 - Never amend commits. Add a new commit for every correction.
 - Never force-push. Stop if a plain push is rejected by divergent history.
 - Stage only relevant files and exclude secrets or unrelated local work.
+- Run the [publication guard](#publication-guard) before each commit, push
+  and pull request write to a GitHub repository.
 - Use concise Conventional Commit subjects in imperative mood. Each commit title
   must state its observable impact, not only the mechanism changed.
 - Let hooks run unless the user explicitly asks otherwise.
+
+## Publication guard
+
+Run [scripts/publication_guard.py](scripts/publication_guard.py) from this
+installed skill with Python 3.11 or newer, using its actual installed path, for
+example `python3 /path/to/git-workflow/scripts/publication_guard.py`. It needs
+`gh` signed in to GitHub. When the repository receiving the content is public,
+it rewrites private GitHub references and local machine paths out of it.
+
+- Before each commit, write the message to a file, run `staged --message-file
+  FILE`, and commit with `git commit -F FILE`.
+- Before each push, including `gh stack push`, `gh stack submit` and
+  `gh stack link`, run `outgoing --base BASE`. BASE is `REMOTE/DEFAULT`, or for
+  a stack layer the branch beneath it. Add `--remote NAME` when the push goes
+  to a remote other than the branch's push remote. Commit what it stages
+  through the commit step above, then push.
+- Before each pull request title or body write, write the title and body to
+  files and run `pr --repo OWNER/REPO --title-file FILE --body-file FILE`, where
+  `OWNER/REPO` is the repository the pull request is opened in. Then create or
+  edit the pull request from those files. This covers `gh pr create`,
+  `gh pr edit`, `gh api .../pulls --input FILE` (build its JSON from the
+  checked files), and the titles and bodies that `gh stack submit` and
+  `gh stack link` create, which you reconcile with `gh pr edit` afterwards.
+
+Act on its result:
+
+- Exit 0 with `is not public; nothing checked` or `nothing to rewrite`:
+  continue.
+- Exit 0 with `rewrote ...` lines: the staged files and the files you passed
+  now hold the rewritten text, and unstaged edits to those files get the same
+  rewrite. Continue, and report each `rewrote` and `placeholder` line.
+- `warning: commit ... pushing publishes that commit unchanged`: history is
+  never rewritten. Report the named commits and files to the user with the
+  push.
+- `warning: PATH was not checked`: the guard could not read that file as text.
+  Check it yourself for private repository names and local paths before
+  publishing, and report it.
+- `warning:` about `.github/publication-guard.json` or a keep pattern: report
+  it; the guard used its default keep list for what it could not read.
+- Exit 2: Git or GitHub could not answer a question the guard depends on, or
+  an argument was wrong, and nothing was changed. Fix the cause the error names
+  and rerun. Never publish without a run that exits 0.
+- Any other exit: the guard failed. Stop, do not publish, and report its
+  output.
+
+## Default-branch health
+
+Establish the default branch's health before new work starts, and recheck it
+immediately before each merge. Check the CI the project requires on
+default-branch commits, such as its push CI, not an integration deployment.
+Judge the current tip commit by its newest completed run; a run for an earlier
+commit says nothing about the tip.
+
+- **Green:** that run succeeded, or the project requires no CI on
+  default-branch commits. Work starts and merges.
+- **Pending:** the tip has no succeeded or failed run yet, and one is queued
+  or in progress. Pending is not green: await its result with `delivery-wait` before
+  starting or merging, and never merge anything that would supersede or cancel
+  it.
+- **No result:** the tip's newest run was cancelled or superseded with nothing
+  replacing it, or it has no run. This is not green either. Rerun or trigger
+  its required CI where the project allows; otherwise report it.
+- **Red:** that run failed. Getting it green comes first, and only its repair
+  starts or merges. Identify the failing job and its cause, then look for an
+  owner of the fix: an open PR, an issue or another session. When no one owns
+  it and the active request authorizes merging, deliver the repair as its own
+  work item through `/deliver` and land it first. Otherwise report the failing
+  job, its cause and the repair it needs. Independent local investigation can
+  continue; nothing else starts development or merges.
+
+The rule is strict by default. Only the person or the project can relax it,
+explicitly, for example to let an unrelated docs-only change land.
+
+## Merge
+
+- Before each merge, recheck
+  [default-branch health](#default-branch-health).
 - Squash-merge pull requests and delete the source branch afterward.
 - Because the merge is a squash, the pull request **title** becomes the commit
   subject on the base branch: the branch's own commit subjects do not survive.
@@ -59,6 +158,7 @@ that operation.
   most frequent commit under it. Where a project generates its changelog or
   version bump from commit history, a non-conforming title merges cleanly and is
   then silently absent from it.
+- After a squash merge, sync the local base and remove the merged local branch.
 
 ## Native GitHub stacks
 
@@ -74,5 +174,3 @@ the only exception to the merge-only and never-force-push defaults above:
 rebases and force-with-lease are permitted only when performed by verified
 `gh stack` commands against a clean, confirmed native stack. Raw `git rebase`,
 `git push --force`, and manual `git push --force-with-lease` remain forbidden.
-
-After a squash merge, sync the local base and remove the merged local branch.

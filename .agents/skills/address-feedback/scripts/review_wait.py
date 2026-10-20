@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.dont_write_bytecode = True  # Keep installed skill trees free of __pycache__.
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "delivery-wait" / "scripts"))
 
 from kgr_github import (  # noqa: E402
@@ -121,24 +123,40 @@ def review_snapshot(
                 for comment in comments
             )
         )
+        maintainer_times = [
+            str(comment.get("createdAt") or "")
+            for comment in comments
+            if comment.get("authorAssociation") in {"OWNER", "MEMBER", "COLLABORATOR"}
+            and normalize_login((comment.get("author") or {}).get("login")) not in all_actors
+        ]
+        # An automation's reply to a maintainer reply in a thread that is now
+        # resolved answers that reply; it is not a new finding that needs one.
+        # It stays a finding surface so pushback is still read and judged.
+        follow_ups = [
+            comment for comment in automation_comments
+            if is_resolved
+            and comment.get("replyTo") is not None
+            and any(at < str(comment.get("createdAt") or "") for at in maintainer_times)
+        ]
         unanswered_comments = [
             finding for finding in automation_comments
-            if not any(
-                comment.get("authorAssociation") in {"OWNER", "MEMBER", "COLLABORATOR"}
-                and normalize_login((comment.get("author") or {}).get("login")) not in all_actors
-                and str(comment.get("createdAt") or "") > str(finding.get("createdAt") or "")
-                for comment in comments
-            )
+            if finding not in follow_ups
+            and not any(at > str(finding.get("createdAt") or "") for at in maintainer_times)
         ]
         has_maintainer_reply = bool(automation_comments) and not unanswered_comments
         if unanswered_comments:
             unanswered += 1
+        trailing_follow_ups = [
+            comment for comment in follow_ups
+            if not any(at > str(comment.get("createdAt") or "") for at in maintainer_times)
+        ]
         threads.append({
             "id": thread.get("id"),
             "resolved": is_resolved,
             "automation": bool(automation_comments) if policy_available else None,
             "automationIds": automation_ids,
             "maintainerReply": has_maintainer_reply if policy_available else None,
+            "automationFollowUps": [comment.get("databaseId") for comment in trailing_follow_ups],
             "comments": [
                 ({
                     "id": comment.get("databaseId"),
@@ -179,8 +197,13 @@ def review_snapshot(
                 conclusion = str(check.get("state") or "").lower()
                 status = "PENDING" if conclusion in {"pending", "expected"} else "COMPLETED"
             if check_name in contexts_wanted and (not apps_wanted or app in apps_wanted):
+                description = (
+                    " ".join(str(check.get(key) or "") for key in ("title", "summary")).strip()
+                    if check.get("__typename") == "CheckRun"
+                    else str(check.get("description") or "")
+                )
                 matching_checks.append({"id": check.get("id"), "source": check.get("__typename"), "name": check_name, "app": app,
-                    "status": status, "conclusion": conclusion,
+                    "status": status, "conclusion": conclusion, "description": description,
                     "startedAt": check.get("startedAt") if check.get("__typename") == "CheckRun" else check.get("createdAt"),
                     "completedAt": check.get("completedAt") if check.get("__typename") == "CheckRun" else check.get("createdAt")})
         matching_reviews = [
@@ -233,7 +256,8 @@ def review_snapshot(
     finding_surfaces = []
     for thread in threads:
         if policy_available and thread["resolved"] and (
-            not thread["automation"] or thread["maintainerReply"]
+            not thread["automation"]
+            or (thread["maintainerReply"] and not thread["automationFollowUps"])
         ):
             continue
         finding_surfaces.append({
@@ -243,6 +267,7 @@ def review_snapshot(
             "automationIds": thread["automationIds"],
             "resolved": thread["resolved"],
             "maintainerReply": thread["maintainerReply"],
+            "automationFollowUps": thread["automationFollowUps"],
             "comments": thread["comments"],
         })
     for comment in top_level:
