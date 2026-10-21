@@ -429,10 +429,12 @@ jobs:
             for f in README.md CONTEXT.md CONTRIBUTING.md AGENTS.md; do
               if [ -f "$f" ]; then cp "$f" "$pkg_dir/"; fi
             done
-            mkdir -p "$pkg_dir/docs"
-            cp docs/contributor/quick-start.md "$pkg_dir/docs/" 2>/dev/null || true
-            cp docs/contributor/architecture.md "$pkg_dir/docs/" 2>/dev/null || true
-            cp docs/user/build-system.md "$pkg_dir/docs/" 2>/dev/null || true
+            # Keep the user/ and contributor/ layout so the bundled
+            # README.md, CONTRIBUTING.md and quick start links resolve.
+            mkdir -p "$pkg_dir/docs/contributor" "$pkg_dir/docs/user"
+            cp docs/contributor/quick-start.md "$pkg_dir/docs/contributor/" 2>/dev/null || true
+            cp docs/contributor/architecture.md "$pkg_dir/docs/contributor/" 2>/dev/null || true
+            cp docs/user/build-system.md "$pkg_dir/docs/user/" 2>/dev/null || true
 
             cd dist
             # Format per target: zip for Windows, tar.gz for Unix.
