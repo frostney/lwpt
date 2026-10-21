@@ -1,7 +1,7 @@
 name: LWPT dependency update
 
 # Reusable weekly Dependabot-equivalent for lwpt.toml git-host deps
-# (ADR-0039). See docs/ci.md for the caller workflow.
+# (ADR-0039). See docs/contributor/ci.md for the caller workflow.
 
 on:
   workflow_call:

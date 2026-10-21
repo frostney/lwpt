@@ -27,7 +27,7 @@ pre-commit:
         lwpt format failed. Inspect the output above; the formatter
         only fails when it cannot parse a file. If `build/lwpt` is
         missing entirely (fresh clone), run ./bootstrap.sh first. See
-        docs/quick-start.md.
+        docs/contributor/quick-start.md.
 
     # Refresh the generated AGENTS.md command reference (ADR-0027)
     # whenever a commit touches something that can change it: Pascal

@@ -66,7 +66,7 @@ uses
 const
   { The deadline of a RunLwpt call that names none. The slowest ordinary
     call measured across the full Linux suite is recorded in
-    docs/testing.md; this leaves room for slower Windows and macOS runners
+    docs/contributor/testing.md; this leaves room for slower Windows and macOS runners
     and stays well inside a CI job's bound. Calls that legitimately need
     longer pass their own timeout. }
   LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS = CHILD_COMPLETION_TIMEOUT_MILLISECONDS;

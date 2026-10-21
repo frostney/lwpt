@@ -8,7 +8,7 @@ portability assumptions behind them.
 ## Executive Summary
 
 - **Registry service deployment is Linux-container-first.** The example image in
-  [`docs/examples/registry/`](./examples/registry/) installs a released `lwpt`
+  [`docs/examples/registry/`](../examples/registry/) installs a released `lwpt`
   binary pinned by SHA-256, runs `lwpt registry serve` as UID 10001 with a
   read-only root file system and a read-only configuration mount, keeps all
   other state on one data volume, and checks health through the discovery
@@ -49,14 +49,14 @@ identity. See [Mirrors](#mirrors).
 
 ## The example image
 
-[`docs/examples/registry/`](./examples/registry/) contains:
+[`docs/examples/registry/`](../examples/registry/) contains:
 
 | File | Role |
 | --- | --- |
-| [`Dockerfile`](./examples/registry/Dockerfile) | Downloads `lwpt-<version>-linux-x64.tar.gz` or `-linux-arm64.tar.gz` from the release, verifies the pinned SHA-256, checks `lwpt --version`, and installs the binary root-owned with mode `0555`. |
-| [`entrypoint.sh`](./examples/registry/entrypoint.sh) | Optionally loads the TLS password from a file, then `exec`s `lwpt`, so `lwpt` is PID 1. |
-| [`healthcheck.sh`](./examples/registry/healthcheck.sh) | Reads `registry.toml` and fetches `<base-url>/.well-known/lwpt-registry` from the local listener. TLS is verified against the real host name. |
-| [`nginx.conf`](./examples/registry/nginx.conf) | A TLS-terminating proxy that re-encrypts to the registry. |
+| [`Dockerfile`](../examples/registry/Dockerfile) | Downloads `lwpt-<version>-linux-x64.tar.gz` or `-linux-arm64.tar.gz` from the release, verifies the pinned SHA-256, checks `lwpt --version`, and installs the binary root-owned with mode `0555`. |
+| [`entrypoint.sh`](../examples/registry/entrypoint.sh) | Optionally loads the TLS password from a file, then `exec`s `lwpt`, so `lwpt` is PID 1. |
+| [`healthcheck.sh`](../examples/registry/healthcheck.sh) | Reads `registry.toml` and fetches `<base-url>/.well-known/lwpt-registry` from the local listener. TLS is verified against the real host name. |
+| [`nginx.conf`](../examples/registry/nginx.conf) | A TLS-terminating proxy that re-encrypts to the registry. |
 
 Build it from a release that includes the `registry` command family; 0.8.0
 is the first. The Dockerfile's defaults pin 0.8.0 and its published digests,
@@ -270,7 +270,7 @@ work:
   base URL, listens on a private network, and presents a certificate for the
   public host name, usually from a private CA. The proxy presents the public
   certificate and verifies the registry's certificate against that CA.
-  [`nginx.conf`](./examples/registry/nginx.conf) is a working example. CI
+  [`nginx.conf`](../examples/registry/nginx.conf) is a working example. CI
   runs it with the example image.
 - **TLS passthrough.** A layer-4 proxy forwards the TCP stream by SNI, and
   the registry holds the public certificate as in
@@ -341,8 +341,8 @@ docker exec lwpt-mirror lwpt registry verify --data-dir /var/lib/lwpt-registry
 Consumers list mirrors in `[registries.<alias>].mirrors` and try them in
 order, then the origin. An unreachable or stale contact advances to the
 next. A trust failure stops the install. See
-[ADR-0051](./adr/0051-registry-dependency-sources.md) and the manifest
-reference in [`architecture.md`](./architecture.md).
+[ADR-0051](../adr/0051-registry-dependency-sources.md) and the manifest
+reference in [`architecture.md`](../contributor/architecture.md).
 
 ## Backup and restore
 
@@ -426,15 +426,15 @@ re-initialize it and sync from scratch.
 
 | Area | Limit | Source |
 | --- | --- | --- |
-| Connections | 32 concurrent; one HTTP/1.1 request per connection; one 10-second deadline for handshake, request, and response; 32 KiB of headers | [ADR-0043](./adr/0043-self-hosted-registry-origin.md) |
-| Uploads | Archives up to 256 MiB, record bodies up to 64 KiB, two bodies in flight, a body deadline of 30 s plus 1 s per MiB | [ADR-0049](./adr/0049-registry-remote-publication.md) |
+| Connections | 32 concurrent; one HTTP/1.1 request per connection; one 10-second deadline for handshake, request, and response; 32 KiB of headers | [ADR-0043](../adr/0043-self-hosted-registry-origin.md) |
+| Uploads | Archives up to 256 MiB, record bodies up to 64 KiB, two bodies in flight, a body deadline of 30 s plus 1 s per MiB | [ADR-0049](../adr/0049-registry-remote-publication.md) |
 | Upload staging | Up to 1 GiB and 1,000 uncommitted uploads (507 beyond); completed, unreferenced uploads expire after one hour | ADR-0049 |
 | Rate limits | 60 mutating requests per minute per token; 20 failed authentications per minute per peer address; in memory and reset on restart | ADR-0049 |
 | Commits | Wait up to 5 s for the publication lease, then 503 with `Retry-After`; refused while the server clock is behind the active checkpoint | ADR-0049 |
 | Tokens | Expire after 1 to 365 days (90 by default); at most 1,000 active | ADR-0049 |
 | Checkpoints | Valid for exactly seven days; the origin renews with less than 24 hours left, at start or on the next request | ADR-0043, ADR-0045 |
 | History | Verification walks the whole snapshot chain within 64 MiB of metadata, 10,000 documents, 10,000 snapshots, and 1,000 rotations | [`registry-spec.md`](./registry-spec.md#acquisition-and-locked-proof-verification) |
-| Mirrors | 32 GiB store and 8 GiB per sync by default; two archive transfers at a time; 120 s per request; 60 minutes per sync | [ADR-0045](./adr/0045-verified-registry-mirror.md) |
+| Mirrors | 32 GiB store and 8 GiB per sync by default; two archive transfers at a time; 120 s per request; 60 minutes per sync | [ADR-0045](../adr/0045-verified-registry-mirror.md) |
 | Storage growth | Objects, records, snapshots, checkpoints, and audit records are never pruned on an origin | ADR-0043, ADR-0049 |
 | Addresses | Portable listeners are IPv4 only (IPv6 only on macOS 26 and newer); clients connect over IPv4 only | ADR-0043, ADR-0045 |
 
@@ -489,10 +489,10 @@ retention or checkpointed-history design would need a protocol change.
 
 | Evidence | Where | Platforms |
 | --- | --- | --- |
-| Registry E2E matrix: localhost HTTP development with live publication, reads, install, and restart; mirror sync, outage serving, and failover both ways; a publication crashed before activation and its recovery; key rotation while serving; HTTPS by host name and by IP address; future schemas failing closed; pointer-first backup, restore, and the refused rollback; an origin start that recovers from a taken port with its identity unchanged | [`tests/e2e/RegistryMatrix.E2E.Test.pas`](../tests/e2e/RegistryMatrix.E2E.Test.pas) in every `ci.yml` E2E run; a failing case uploads its scratch directory | All six release targets (Linux, macOS, and Windows runners) |
-| Container smoke: a wrong pin fails the build; the image runs as UID 10001 with a read-only root and configuration that the service account cannot write, replace, or remove; health check; token issuance and key rotation in the serving container; live publication from the runner; graceful stop, the reconfiguration procedure, container replacement, and data survival; the re-encrypting nginx proxy | [`.github/ci/registry-container/smoke.sh`](../.github/ci/registry-container/smoke.sh): `ci.yml` job `registry-container` on the binary under test, and `release.yml` job `registry-container-smoke` on the published assets | Linux x86-64 |
+| Registry E2E matrix: localhost HTTP development with live publication, reads, install, and restart; mirror sync, outage serving, and failover both ways; a publication crashed before activation and its recovery; key rotation while serving; HTTPS by host name and by IP address; future schemas failing closed; pointer-first backup, restore, and the refused rollback; an origin start that recovers from a taken port with its identity unchanged | [`tests/e2e/RegistryMatrix.E2E.Test.pas`](../../tests/e2e/RegistryMatrix.E2E.Test.pas) in every `ci.yml` E2E run; a failing case uploads its scratch directory | All six release targets (Linux, macOS, and Windows runners) |
+| Container smoke: a wrong pin fails the build; the image runs as UID 10001 with a read-only root and configuration that the service account cannot write, replace, or remove; health check; token issuance and key rotation in the serving container; live publication from the runner; graceful stop, the reconfiguration procedure, container replacement, and data survival; the re-encrypting nginx proxy | [`.github/ci/registry-container/smoke.sh`](../../.github/ci/registry-container/smoke.sh): `ci.yml` job `registry-container` on the binary under test, and `release.yml` job `registry-container-smoke` on the published assets | Linux x86-64 |
 
 The E2E matrix trusts the committed test root through the test build only,
 so HTTPS consumers and mirrors are exercised over localhost HTTP. The
 container smoke is off the automatic PR gate because it needs Docker and
-image pulls. See [`ci.md`](./ci.md).
+image pulls. See [`ci.md`](../contributor/ci.md).

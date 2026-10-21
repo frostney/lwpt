@@ -19,7 +19,7 @@
     Additionally, a clean connect/DNS failure to the host at install
     time (IsNetworkUnavailable) flips the suite to skip — transient
     third-party downtime is not an LWPT defect. A content/hash/parse
-    failure still fails hard. See docs/ci.md. }
+    failure still fails hard. See docs/contributor/ci.md. }
 
 program InstallGitHub.E2E.Test;
 

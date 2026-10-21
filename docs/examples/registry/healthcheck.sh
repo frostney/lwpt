@@ -1,5 +1,5 @@
 #!/bin/sh
-# Health check of the example LWPT registry image (docs/registry-deployment.md).
+# Health check of the example LWPT registry image (docs/user/registry-deployment.md).
 #
 # Healthy means this container's listener serves the discovery document of
 # the registry in its data directory. The check reads the persisted

@@ -29,7 +29,7 @@ LWPT is pre-1.0. The package model, install pipeline, formatter, test runner,
 duplication analysis, codebase-health report, and release flow are in place.
 The project-only release architecture check remains separate from the customer
 commands originally deferred by
-[ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See the [consumer guide](./docs/consumer-guide.md) for using LWPT,
+[ADR-0006](./docs/adr/0006-stack-contracts-deferred-from-v1.md). See the [consumer guide](./docs/user/consumer-guide.md) for using LWPT,
 [`AGENTS.md`](./AGENTS.md) for contributing to LWPT, and
 [`docs/adr/`](./docs/adr/) for the architectural decisions that shape
 the v1 design.
@@ -52,12 +52,12 @@ lwpt init --yes
 lwpt build
 ```
 
-Continue with **[Use LWPT in your project](docs/consumer-guide.md)** for a
+Continue with **[Use LWPT in your project](docs/user/consumer-guide.md)** for a
 complete CLI, native test, dependency manifest, run task, and quality commands.
 It also covers release installation on other platforms. Each subcommand's help
 links back to `lwpt --help` so its other capabilities remain discoverable.
 
-**Contributing to LWPT itself?** Follow the [contributor quick start](docs/quick-start.md)
+**Contributing to LWPT itself?** Follow the [contributor quick start](docs/contributor/quick-start.md)
 for the source bootstrap and self-host build. The bootstrap belongs to the
 LWPT repository; a consumer uses the installed executable.
 
@@ -101,7 +101,7 @@ under the same owner) is the first named consumer, committed to Path A
 adoption (full toolchain migration to `lwpt build / install / test /
 format`). Phase 2 graduates individual packages to standalone repos
 when warranted; the per-package roadmap lives in
-[`docs/packages.md`](./docs/packages.md).
+[`docs/contributor/packages.md`](./docs/contributor/packages.md).
 
 ## On-disk layout
 
@@ -165,7 +165,7 @@ identity   = "https://packages.example.com"        # optional; advertised by the
 # The trust pin: the origin's root key. EXAMPLE VALUES ONLY: a valid,
 # throwaway pair whose private key was discarded. Replace both with your
 # origin's root pin, its `keys/ed25519-*.toml` record's key_id and public_key
-# (see docs/registry-deployment.md); key-id is "ed25519:" + the SHA-256 of
+# (see docs/user/registry-deployment.md); key-id is "ed25519:" + the SHA-256 of
 # the raw 32-byte public key.
 key-id     = "ed25519:77790c39520108490b51dd825c9c84dc009f92ac5d1b94d68f19c9d11cca3675"
 public-key = "hex:fd49e4bc086e9b5203d162066dc459ca66478324dc3b39d4e202460c0bc3e724"
@@ -239,7 +239,7 @@ prefix = "APP"   # generates APP_VERSION, APP_BUILD_DATE
 # include = additive glob list on top of [package].units;
 # exclude = glob list subtracted from the resolved set.
 # Plain dir names are top-level shorthand; recursion via ** is explicit.
-# See ADR-0007 + docs/code-style.md for the full algorithm.
+# See ADR-0007 + docs/contributor/code-style.md for the full algorithm.
 include = ["tests/**/*.pas"]
 exclude = ["src/legacy/Vendored.pas"]
 ```
@@ -249,7 +249,7 @@ Source kinds: `skGitHost` (default `github`, with `gitlab:` / `bitbucket:` / any
 ## Writing tests
 
 For a consumer dependency manifest and a runnable example, start with the
-[consumer guide](docs/consumer-guide.md#scaffold-a-cli-with-a-native-test).
+[consumer guide](docs/user/consumer-guide.md#scaffold-a-cli-with-a-native-test).
 The workspace auto-discovery below describes LWPT’s own monorepo.
 
 `TestingPascalLibrary` lives in the `testing` workspace package and is
@@ -331,13 +331,13 @@ differs from GocciaScript's older copy:
   parser refactored to a class-based AST shape.
 - **`source/Platform.pas`** — renamed from `Goccia.Platform`.
 
-See [`docs/packages.md`](./docs/packages.md) for the complete
+See [`docs/contributor/packages.md`](./docs/contributor/packages.md) for the complete
 package set + per-file divergence table + bootstrap chicken-and-egg
 story.
 
 ## Documentation
 
-- [Consumer guide](docs/consumer-guide.md) — install LWPT and use its capabilities in your project.
+- [Consumer guide](docs/user/consumer-guide.md) — install LWPT and use its capabilities in your project.
 - [Documentation index](docs/README.md) — topic-by-topic navigation.
 - [llms.txt](llms.txt) — compact index with direct Markdown links for agents.
 - [`AGENTS.md`](./AGENTS.md) — contributor instructions for AI assistants changing LWPT itself.

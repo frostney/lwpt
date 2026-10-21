@@ -72,7 +72,7 @@ release concern.
   understood well enough to implement.
 - [`DEFINITION_OF_DONE.md`](./DEFINITION_OF_DONE.md) defines when a change is
   complete and releasable.
-- [`docs/architecture.md`](./docs/architecture.md) describes the implemented
+- [`docs/contributor/architecture.md`](./docs/contributor/architecture.md) describes the implemented
   architecture.
 - [`docs/adr/`](./docs/adr/) records decisions when they are made during
   implementation.
