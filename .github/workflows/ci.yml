@@ -1,9 +1,6 @@
 name: CI
 run-name: >-
-  ${{ inputs.diagnostic_target && inputs.diagnostic_target != 'none' &&
-      format('CI / diagnostic / {0} / {1}/{2}', github.ref_name,
-      inputs.diagnostic_target, inputs.diagnostic_selector) ||
-      format('CI / {0} / {1}', github.event_name,
+  ${{ format('CI / {0} / {1}', github.event_name,
       github.head_ref || github.ref_name) }}
 
 # The one CI workflow for code changes; release.yml owns tag pushes.
@@ -15,12 +12,15 @@ run-name: >-
 #                       every job succeeded.
 #   push to main      — the same matrix on the squash commit: a delivery's
 #                       integration evidence.
-#   workflow_dispatch — on any ref (dispatch requires write access). With
-#                       no diagnostic target, the same full matrix: this is
-#                       how a coverage sampler fills in main commits whose
-#                       push runs were superseded. With a target and
-#                       selector, one allow-listed diagnostic slice for
-#                       remediation, never proof that a change is ready.
+#   workflow_dispatch — the same full matrix on any ref (dispatch requires
+#                       write access), never cancelled: this is how a
+#                       coverage sampler fills in main commits whose push
+#                       runs were superseded.
+#   workflow_call     — only from diagnostic.yml: one allow-listed
+#                       target/selector slice for remediation. Its runs
+#                       belong to the Diagnostic workflow and its checks are
+#                       named "diagnose / <job>", so a slice can never stand
+#                       in for delivery-admission or for a ci.yml run on main.
 #
 #   build:  Cross-compile the lwpt binary on macos-latest for each of
 #           six targets using the cross-FPC toolchain produced by
@@ -29,19 +29,23 @@ run-name: >-
 #           compile at run time on the native runner (Q22=b).
 #
 #   test:   Per-platform native runners — install FPC via the
-#           platform's package manager, run a Windows bootstrap smoke
-#           once, download the cross-built lwpt binary, then run the
+#           platform's package manager, download the cross-built lwpt
+#           binary, then run the
 #           full pipeline:
 #             ./build/lwpt install --frozen
 #             ./build/lwpt install
 #             ./build/lwpt test <ordinary paths> --bail=0
 #             ./build/lwpt test <E2E paths> --bail=0  (live network, Q23=c)
+#           plus cold bootstrap.bat (x86_64-win64) and bootstrap.sh
+#           (aarch64-darwin) smokes.
 #           This exercises lwpt itself + the underlying native FPC on
 #           each platform end-to-end, including live GitHub/GitLab/
 #           Bitbucket fetches.
 #
 #   native: Ubuntu with the distro FPC: bootstrap.sh, committed-state,
-#           formatting, build-entry and AGENTS.md checks.
+#           formatting, build-entry and AGENTS.md checks, then the
+#           ordinary, E2E and inventory-only test passes against the
+#           checked dev-mode binary.
 #
 #   docs:   Markdown lint and the CI tooling's unit tests.
 
@@ -55,48 +59,33 @@ on:
     branches:
       - main
   workflow_dispatch:
+  workflow_call:
     inputs:
       diagnostic_target:
-        description: Native target for a diagnostic slice (none runs the full matrix)
-        required: false
-        type: choice
-        default: none
-        options:
-          - none
-          - aarch64-darwin
-          - x86_64-darwin
-          - x86_64-linux
-          - x86_64-win64
-          - i386-win32
+        description: Native target for the diagnostic slice
+        required: true
+        type: string
       diagnostic_selector:
-        description: Allow-listed test scope for a diagnostic slice
-        required: false
-        type: choice
-        default: default
-        options:
-          - default
-          - e2e
-          - scheduling
-          - tls
+        description: Allow-listed test scope for the diagnostic slice
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-# A new push to a PR cancels its superseded run, and so does a new diagnostic
-# on the same ref. Rapid merges still create distinct main commits; only the
-# latest integrated-main verification keeps running. A dispatched full matrix
-# is never cancelled, so it can cover the commit it was started on.
+# A new push to a PR cancels its superseded run. Rapid merges still create
+# distinct main commits; only the latest integrated-main verification keeps
+# running. A dispatched full matrix is never cancelled, so it covers the
+# commit it was started on. diagnostic.yml owns a slice's concurrency; the
+# called run's own group must differ from the caller's.
 concurrency:
   group: >-
     ${{ github.event_name == 'push' && 'integrated-main' ||
         github.event_name == 'pull_request' &&
         format('pr-{0}', github.event.pull_request.number) ||
-        inputs.diagnostic_target != 'none' &&
-        format('diagnostic-{0}', github.ref_name) ||
-        format('dispatch-{0}', github.run_id) }}
+        format('ci-dispatch-{0}', github.run_id) }}
   cancel-in-progress: >-
-    ${{ github.event_name != 'workflow_dispatch' ||
-        inputs.diagnostic_target != 'none' }}
+    ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 jobs:
   validate-inputs:
@@ -106,14 +95,13 @@ jobs:
       build-matrix: ${{ steps.route.outputs.build-matrix }}
       test-matrix: ${{ steps.route.outputs.test-matrix }}
     steps:
-      - name: Validate dispatch inputs
+      - name: Validate diagnostic inputs
         env:
-          EVENT: ${{ github.event_name }}
           DIAGNOSTIC_TARGET: ${{ inputs.diagnostic_target }}
           DIAGNOSTIC_SELECTOR: ${{ inputs.diagnostic_selector }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "$DIAGNOSTIC_TARGET" != "none" ]; then
+          if [ -n "$DIAGNOSTIC_TARGET" ]; then
             case "$DIAGNOSTIC_TARGET" in
               aarch64-darwin|x86_64-darwin|x86_64-linux|x86_64-win64|i386-win32) ;;
               *) echo "::error::unsupported diagnostic target: $DIAGNOSTIC_TARGET"; exit 1 ;;
@@ -130,7 +118,7 @@ jobs:
               i386-win32/default|i386-win32/e2e|i386-win32/tls) ;;
               *) echo "::error::unsupported diagnostic slice: $DIAGNOSTIC_TARGET/$DIAGNOSTIC_SELECTOR"; exit 1 ;;
             esac
-          elif [ "$DIAGNOSTIC_SELECTOR" != "default" ] && [ -n "$DIAGNOSTIC_SELECTOR" ]; then
+          elif [ -n "$DIAGNOSTIC_SELECTOR" ]; then
             echo "::error::diagnostic selector $DIAGNOSTIC_SELECTOR needs a diagnostic target"
             exit 1
           fi
@@ -138,11 +126,10 @@ jobs:
       - name: Select exact matrix
         id: route
         env:
-          EVENT: ${{ github.event_name }}
           DIAGNOSTIC_TARGET: ${{ inputs.diagnostic_target }}
         run: |
           set -euo pipefail
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "$DIAGNOSTIC_TARGET" != "none" ]; then
+          if [ -n "$DIAGNOSTIC_TARGET" ]; then
             DIAGNOSTIC=true
             case "$DIAGNOSTIC_TARGET" in
               aarch64-darwin)
@@ -169,7 +156,7 @@ jobs:
           else
             DIAGNOSTIC=false
             BUILD='{"include":[{"target":"aarch64-darwin","cpu":"aarch64","os":"darwin","native":true},{"target":"x86_64-darwin","cpu":"x86_64","os":"darwin"},{"target":"x86_64-linux","cpu":"x86_64","os":"linux"},{"target":"aarch64-linux","cpu":"aarch64","os":"linux"},{"target":"x86_64-win64","cpu":"x86_64","os":"win64"},{"target":"i386-win32","cpu":"i386","os":"win32"}]}'
-            TEST='{"include":[{"target":"aarch64-darwin","runner":"macos-latest","fpc-install":"brew"},{"target":"x86_64-darwin","runner":"macos-15-intel","fpc-install":"brew"},{"target":"x86_64-linux","runner":"ubuntu-latest","fpc-install":"apt","inventory-check":true},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","fpc-install":"apt"},{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"official","bootstrap-check":true},{"target":"i386-win32","runner":"windows-latest","fpc-install":"official"}]}'
+            TEST='{"include":[{"target":"aarch64-darwin","runner":"macos-latest","fpc-install":"brew","bootstrap-check":true},{"target":"x86_64-darwin","runner":"macos-15-intel","fpc-install":"brew"},{"target":"x86_64-linux","runner":"ubuntu-latest","fpc-install":"apt"},{"target":"aarch64-linux","runner":"ubuntu-24.04-arm","fpc-install":"apt"},{"target":"x86_64-win64","runner":"windows-latest","fpc-install":"official","bootstrap-check":true},{"target":"i386-win32","runner":"windows-latest","fpc-install":"official"}]}'
           fi
           {
             echo "diagnostic=$DIAGNOSTIC"
@@ -438,8 +425,22 @@ jobs:
           LWPT_WINDOWS_TEST_TARGET: ${{ matrix.target }}
         run: .github/ci/install-windows-fpc.sh "$LWPT_WINDOWS_TEST_TARGET"
 
+      # The README's macOS path: a cold bootstrap.sh build with brew FPC.
+      # build/ is removed again so the rest of the job validates the
+      # downloaded cross-built artefact.
+      - name: bootstrap.sh (macOS cold build)
+        if: >-
+          matrix.bootstrap-check == true && runner.os == 'macOS' &&
+          needs.validate-inputs.outputs.diagnostic != 'true'
+        run: |
+          ./bootstrap.sh
+          ./build/lwpt --help
+          rm -rf build
+
       - name: bootstrap.bat (Windows cold build)
-        if: matrix.bootstrap-check == true && needs.validate-inputs.outputs.diagnostic != 'true'
+        if: >-
+          matrix.bootstrap-check == true && runner.os == 'Windows' &&
+          needs.validate-inputs.outputs.diagnostic != 'true'
         shell: cmd
         run: |
           rem Exercise bootstrap.bat's direct-fpc fallback path. This cmd
@@ -568,21 +569,6 @@ jobs:
               'packages/*/tests/e2e/*.Test.pas' \
               --bail=0
           fi
-
-      # #381: the passes above verify registrations in report mode, which
-      # runs test bodies. Inventory-only mode exits before them, so a program
-      # whose startup misbehaves there escaped every gate. This pass lists
-      # every discovered program from the executables the passes above
-      # cached, compares each record with tests/test-inventory.tsv, and
-      # checks that the published JSON parses. One leg is enough.
-      - name: lwpt test --inventory (inventory-only mode matches tests/test-inventory.tsv?)
-        if: >-
-          !cancelled() && matrix.inventory-check == true &&
-          steps.workspace-install.outcome == 'success'
-        timeout-minutes: 5
-        run: |
-          ./build/lwpt test --inventory > "$RUNNER_TEMP/test-inventory.json"
-          python3 -m json.tool "$RUNNER_TEMP/test-inventory.json" > /dev/null
 
       # The registry matrix keeps a failing case's scratch directory (data
       # directories, consumer projects, and command logs of loopback-only
@@ -737,7 +723,45 @@ jobs:
       # own command surface, is what the committed AGENTS.md block is checked
       # against (ADR-0027).
       - name: lwpt agents --check (AGENTS.md command reference fresh?)
+        id: agents-check
         run: ./build/lwpt agents --check
+
+      # The test legs run the cross-built release binary. These passes run
+      # the bootstrapped dev-mode binary instead, built with range, stack and
+      # assertion checks (-Ct -Cr -Sa), which the subprocess tests spawn.
+      - name: lwpt test --bail=0 (ordinary project paths, checked binary)
+        run: >-
+          ./build/lwpt test
+          'source/*.Test.pas'
+          'packages/*/source/*.Test.pas'
+          'tests/integration/*.Test.pas'
+          --bail=0
+
+      - name: lwpt test --bail=0 (E2E project paths, live network, checked binary)
+        # Run even when the ordinary queue failed, so one run reports both;
+        # a failed setup step (bootstrap through agents --check) still skips it.
+        if: ${{ !cancelled() && steps.agents-check.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          LWPT_ENABLE_NETWORK: "1"
+        run: >-
+          ./build/lwpt test
+          'tests/e2e/*.Test.pas'
+          'packages/*/tests/e2e/*.Test.pas'
+          --bail=0
+
+      # #381: the passes above verify registrations in report mode, which
+      # runs test bodies. Inventory-only mode exits before them, so a program
+      # whose startup misbehaves there escaped every gate. This pass lists
+      # every discovered program from the executables the passes above
+      # cached, compares each record with tests/test-inventory.tsv, and
+      # checks that the published JSON parses.
+      - name: lwpt test --inventory (inventory-only mode matches tests/test-inventory.tsv?)
+        if: ${{ !cancelled() && steps.agents-check.outcome == 'success' }}
+        timeout-minutes: 5
+        run: |
+          ./build/lwpt test --inventory > "$RUNNER_TEMP/test-inventory.json"
+          python3 -m json.tool "$RUNNER_TEMP/test-inventory.json" > /dev/null
 
   docs:
     needs: validate-inputs

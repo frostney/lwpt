@@ -10,7 +10,8 @@ known-good-route skills under [`ORCHESTRATION.md`](../../ORCHESTRATION.md), per
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
-| `ci.yml` | `pull_request`, `push` to `main`, `workflow_dispatch` | Full native matrix on every PR and every `main` commit; dispatch runs it on any ref, or runs one allow-listed diagnostic slice |
+| `ci.yml` | `pull_request`, `push` to `main`, `workflow_dispatch`, `workflow_call` | Full native matrix on every PR and every `main` commit, or on any dispatched ref; `diagnostic.yml` calls it for one slice |
+| `diagnostic.yml` | `workflow_dispatch` | One allow-listed `ci.yml` target/selector slice for remediation; never evidence |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 | `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
 | `lwpt-update.yml` | `workflow_call`, manual | Update git-host dependencies and open or refresh one bot-owned pull request |
@@ -23,8 +24,8 @@ Trigger split:
   older run.
 - **A push to `main` runs it again** on the squash commit, as the delivery's
   integration evidence. Rapid main pushes cancel older integrated-main runs.
-- **Dispatch** runs the same full matrix on any ref and is never cancelled, or
-  runs one allow-listed native target and test scope.
+- **Dispatch** runs the same full matrix on any ref and is never cancelled.
+  `diagnostic.yml` runs one allow-listed native target and test scope.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 Repository rules make these contracts enforceable. The desired main ruleset is
@@ -105,25 +106,29 @@ Optional inputs change `working-directory`, the bot `branch-name`, `pr-title`,
 or the bootstrapped `lwpt-ref`. Concurrent runs targeting the same repository
 and branch serialize rather than racing the fixed update branch.
 
-### Dispatch
+### Dispatch and diagnostics
 
-`ci.yml` accepts `workflow_dispatch` on any ref; dispatch already requires
+Both workflows accept `workflow_dispatch` on any ref; dispatch already requires
 write access. Every job checks out the run's own head SHA, so a run is
 evidence for exactly that commit.
 
 ```sh
 gh workflow run ci.yml --ref <ref>
-gh workflow run ci.yml --ref <ref> \
+gh workflow run diagnostic.yml --ref <ref> \
   -f diagnostic_target=<target> -f diagnostic_selector=<selector>
 ```
 
-Without a diagnostic target, a dispatch runs the full six-target build and
-native test matrix, exactly as on a PR or a push to `main`, and concurrent
-pushes never cancel it. This is how
+A `ci.yml` dispatch runs the full six-target build and native test matrix,
+exactly as on a PR or a push to `main`, and concurrent pushes never cancel it.
+This is how
 [`git-workflow`'s coverage sampler](../../.agents/skills/git-workflow/SKILL.md#coverage-sampler)
 fills in `main` commits whose push runs were superseded. The run name shows
 the event and ref (`CI / workflow_dispatch / <ref>`).
 
+`diagnostic.yml` calls `ci.yml` for one slice. Its runs belong to the
+Diagnostic workflow and its checks are named `diagnose / <job>`, so a slice can
+never satisfy the required `delivery-admission` check or count as a `ci.yml`
+run on `main`.
 A diagnostic runs one allow-listed native remediation slice and is never
 merge evidence. The surface covers Windows x86_64/i386 ordinary, E2E, and TLS
 slices, plus ARM- and Intel-Darwin scheduling slices that run only
@@ -140,7 +145,7 @@ captures `/proc` process and thread status, wait channels, syscalls, stacks, and
 file descriptors. Target and selector combinations are allow-listed as pairs:
 Windows-only selectors cannot silently run on Darwin or Linux, and the
 scheduling probe cannot run on Windows. A diagnostic accepts no shell command,
-its run name is `CI / diagnostic / <ref> / <target>/<selector>`, and a later
+its run name is `Diagnostic / <ref> / <target>/<selector>`, and a later
 diagnostic on the same ref cancels the prior run. The scheduling probe lives at
 `.github/ci/scheduling-diagnostic.sh`.
 
@@ -184,14 +189,13 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 | `x86_64-win64` | `windows-latest` |
 | `i386-win32` | `windows-latest` |
 
-Each runner installs FPC natively (`brew`, `apt`, or the pinned official Windows distribution through `.github/ci/install-windows-fpc.sh <target>`), then the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke through both the direct-`fpc` fallback and the InstantFPC path, rebuilds LWPT twice with the InstantFPC-bootstrapped `build\lwpt.exe` (each rebuild replaces the running image), and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. Every native test-matrix job has a 20-minute ceiling, containing a stalled test process without treating the bound as a root-cause fix. The Windows installer verifies the download's SHA-256 and retries only the download. Tests themselves are never retried. After setup, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
+Each runner installs FPC natively (`brew`, `apt`, or the pinned official Windows distribution through `.github/ci/install-windows-fpc.sh <target>`), then the `aarch64-darwin` leg runs a cold `bootstrap.sh` build with brew FPC and the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke through both the direct-`fpc` fallback and the InstantFPC path, rebuilds LWPT twice with the InstantFPC-bootstrapped `build\lwpt.exe` (each rebuild replaces the running image), and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. Every native test-matrix job has a 20-minute ceiling, containing a stalled test process without treating the bound as a root-cause fix. The Windows installer verifies the download's SHA-256 and retries only the download. Tests themselves are never retried. After setup, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
 
 1. **Sanity** — `lwpt --help` (does the binary even load?)
 2. **`lwpt install --frozen`** — the committed lockfile matches the committed trees, and every local and workspace module still matches the snapshot re-derived from its source. It runs *before* the plain install, so regeneration cannot mask lock drift. On Windows this verifies a POSIX-written lockfile on a CRLF-defaulting, word-sorting host.
 3. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
 4. **`lwpt test <ordinary paths> --bail=0`** — the repository's co-located and integration programs; compiles them via the runner's FPC (on Windows, the leg's compiler from the table below), runs them concurrently, and runs the full queue so one run reports every failing program (a first-failure bail hid independent intermittent failures behind separate reruns, #299)
 5. **`lwpt test <E2E paths> --bail=0`** — with `LWPT_ENABLE_NETWORK=1` set in the job environment, the repository's E2E programs run on every platform (Q23 decision: surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
-6. **`lwpt test --inventory`** — `x86_64-linux` only. Both test passes verify registrations in report mode, which runs test bodies. Inventory-only mode exits before them, so per [issue #381](https://github.com/frostney/lwpt/issues/381) this pass lists every discovered program from the executables the earlier passes cached, compares each record with `tests/test-inventory.tsv`, and checks that the published JSON parses. It never touches the network.
 
 The official FPC 3.2.2 Windows distribution's native compiler is i386, so both Windows legs install its `i386-win32` base and differ in the compiler that `LWPT_FPC` publishes for test programs:
 
@@ -237,7 +241,9 @@ tokens) even when the smoke was killed, and the job uploads them as
 guide.
 
 **Native stage** (`native`, `ubuntu-latest`, 20-minute ceiling, skipped in
-diagnostic mode) runs the repository-level checks that need only one platform.
+diagnostic mode) runs the repository-level checks that need only one platform,
+then tests the bootstrapped dev-mode binary, which is built with range, stack
+and assertion checks (`-Ct -Cr -Sa`) that the test legs' release binary lacks.
 It deliberately uses the distro FPC (the same as the install instructions in
 `README.md`), so a regression that only shows up with the system FPC's slightly
 older RTL gets caught, and `bootstrap.sh` gets a cold build:
@@ -250,6 +256,8 @@ older RTL gets caught, and `bootstrap.sh` gets a cold build:
 6. `./build/lwpt format --check`
 7. `./build/lwpt build` (manifest build-entry compile)
 8. `./build/lwpt agents --check` (generated command-reference drift)
+9. `./build/lwpt test <ordinary paths> --bail=0`, then `./build/lwpt test <E2E paths> --bail=0` with `LWPT_ENABLE_NETWORK=1`, both spawning the checked binary
+10. `./build/lwpt test --inventory` — both test passes verify registrations in report mode, which runs test bodies. Inventory-only mode exits before them, so per [issue #381](https://github.com/frostney/lwpt/issues/381) this pass lists every discovered program from the executables the earlier passes cached, compares each record with `tests/test-inventory.tsv`, and checks that the published JSON parses. It never touches the network.
 
 **Docs stage** (`docs`, skipped in diagnostic mode) runs `markdownlint-cli2`
 against the Markdown corpus, then the unit tests of the CI tooling under
@@ -257,8 +265,9 @@ against the Markdown corpus, then the unit tests of the CI tooling under
 
 **Admission** (`delivery-admission`) runs even when a dependency fails or is
 skipped, and passes only when every other job succeeded. It is the ruleset's
-single required check, so the ruleset names one stable context. A diagnostic
-is never admission evidence, so it does not run there.
+single required check, so the ruleset names one stable context. In a
+diagnostic slice it is skipped, and its check is named
+`diagnose / delivery-admission`, which the ruleset does not accept.
 
 Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); a weekly `schedule` cron on `toolchain.yml` re-warms the default-branch copy so that window is bounded even when `main` is quiet.
 

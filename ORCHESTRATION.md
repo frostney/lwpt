@@ -103,14 +103,15 @@ implementation or a local gate; never learn this limit from failing tests.
 - **Required check:** `delivery-admission` from `ci.yml` on the exact head,
   with every review thread resolved. `ci.yml` runs the full native matrix on
   every PR, so there is no separate full-CI rule. Branches need not be up to
-  date with `main`. A single PR merges with `gh pr merge --squash`; a native
-  stack merges through `git-workflow`.
+  date with `main`. Merge a single PR with
+  `gh pr merge --squash --match-head-commit <sha>`, so a later push cannot slip
+  past the review evidence; a native stack merges through `git-workflow`.
 - **Main stays green:** a failed push run of `ci.yml` on `main` stops merges
   until `main` is fixed, as `git-workflow`'s default-branch health gate
   describes.
 - **Review policy:** `.github/delivery/review-automations.json` lists no
   hosted automations, so `/address-feedback` waits only on review threads.
   The review evidence above is still required.
-- **Diagnostics** (`gh workflow run ci.yml --ref <branch> -f
+- **Diagnostics** (`gh workflow run diagnostic.yml --ref <branch> -f
   diagnostic_target=<target> -f diagnostic_selector=<selector>`) are
   remediation, never proof.
