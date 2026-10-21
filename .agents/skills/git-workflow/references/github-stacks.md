@@ -4,6 +4,40 @@ Use GitHub's official `gh stack` extension and native pull-request stack
 topology. Branch names, labels, PR base branches, and delivery automation are
 routing evidence, not proof of stack membership.
 
+## When to start a stack
+
+Publish a change as a native stack when it builds on an open, unmerged PR, as
+[create-pr](../../create-pr/SKILL.md) step 1 defines and detects. A PR whose base
+is set by hand to another PR's branch keeps that PR's commits after the lower PR
+is squash-merged and conflicts with the base; `gh stack sync` handles that
+transition for a native stack.
+
+- When several open PRs match, the lower PR is the one sharing the most commits
+  with this branch and, among equals, the one with the fewest commits above the
+  remote default. Stop and report the topology when that leaves a tie.
+- If the lower PR is the top layer of a native stack, publish the change as its
+  new top layer under "Submit, validate, and merge" below. If it is a lower
+  layer, stop and report the topology: the change would depend on the layers
+  above it.
+- Otherwise the lower PR must be based on the remote default with auto-merge
+  disabled; stop and report any other base or auto-merge state. For an
+  unstacked PR, `gh stack submit` retargets it onto the trunk and disables its
+  auto-merge, and `gh stack link` retargets it onto the default branch and
+  refuses it with auto-merge enabled. Require the local lower branch to match
+  that PR's remote head and this branch to contain it; if the lower PR has
+  moved on, merge its branch into this branch first. Then take one route:
+  - Adopt both branches bottom to top with `gh stack init LOWER-BRANCH BRANCH`.
+  - When the lower PR must stay frozen, for example because it is approved,
+    run `gh stack link LOWER-PR BRANCH --remote REMOTE`, giving the lower PR's
+    number, through the protected publication helper instead. In
+    [gh-stack 0.2.1](https://github.com/github/gh-stack/blob/v0.2.1/cmd/link.go),
+    that pushes only `BRANCH`, opens its draft PR on the lower PR's branch and
+    creates the stack.
+
+Joining a stack does not authorize changing the lower PR's commits, base or
+metadata. Fast-forward the local default branch before `init`, and never sync
+or rebase an adopted lower branch while its PR is open.
+
 ## Establish the stack
 
 1. Require a clean worktree. Resolve and fetch the remote default branch, then
@@ -45,10 +79,13 @@ when the extension offers restoration; never resolve ambiguity by invoking raw
 rebase or force-push commands.
 
 Ordinary branches never inherit this exception. Update them by merging the
-freshly fetched remote default and pushing normally.
+freshly fetched remote base and pushing normally.
 
 ## Submit, validate, and merge
 
+- Run the [publication guard](../SKILL.md#publication-guard) before every stack
+  push and every PR title or body write, including PR creation through
+  `gh api` and the reconciliation after `gh stack submit` or `gh stack link`.
 - Bind GitHub API and CLI calls to the verified host and repository, including
   child helpers. `gh api --hostname HOST` selects the API host; inherited
   `GH_HOST` and `GH_REPO` can otherwise alter command defaults. A Git remote or
@@ -57,7 +94,7 @@ freshly fetched remote default and pushing normally.
   See [GitHub CLI environment settings](https://cli.github.com/manual/gh_help_environment).
 - Preserve approved heads at the actual push boundary. A prior remote read or
   the presence of `--force-with-lease` alone is insufficient: `gh stack submit`
-  in [gh-stack 0.1.0](https://github.com/github/gh-stack/blob/v0.1.0/cmd/submit.go)
+  in [gh-stack 0.2.1](https://github.com/github/gh-stack/blob/v0.2.1/cmd/submit.go)
   refreshes tracking refs before constructing its leases. For frozen layers,
   require both the queued source and advertised remote head to match the
   approved commit; require remote absence for a new branch. An enforced
@@ -106,9 +143,11 @@ freshly fetched remote default and pushing normally.
 ## Protected publication helper
 
 Use [scripts/stack_push_guard.py](../scripts/stack_push_guard.py) from this
-installed skill. It requires Python 3.11+, Git, a POSIX shell, and the tested
-official gh-stack 0.1.0 command. It has no third-party Python or eval-harness
-dependency. Existing authorization and native-topology checks still apply.
+installed skill. It requires Python 3.11+, Git, a POSIX shell, and the official
+gh-stack extension. It checks that `gh stack --version` identifies gh-stack, not
+which version; this page describes the latest release, checked at 0.2.1. It has
+no third-party Python or eval-harness dependency. Existing authorization and
+native-topology checks still apply.
 
 After validating the local commits and reading the exact remote heads, write
 an admission JSON file outside the worktree's tracked/untracked files. It has
@@ -135,6 +174,18 @@ separate creation and append procedure below for recovery. The wrapper retains
 support for native link commands, but its Git hook does not prevent their PR-base
 changes. This helper guards Git updates; it
 does not deduplicate GitHub requests or authorize retrying an uncertain command.
+
+It accepts `gh stack link NUMBER BRANCH-OR-PR... --remote REMOTE`: a stack or PR
+number, then one or more PR numbers or admitted branches, each listed once. A
+branch argument may not start with `-` or read as a number, because link would
+take it for a flag or try it as a PR number first. A first number that names a
+stack and is not also a local branch name appends the rest to the stack's top.
+Otherwise list every PR the stack already holds, bottom to top, or link refuses
+to drop them. Link pushes only the arguments that name local branches and opens
+a draft PR for each branch without one. It then moves each existing PR's base
+onto the PR below it, and the bottom one onto the default branch, or onto the
+stack's top when appending; a refused base change only warns. Check every PR's
+base and the stack again afterwards.
 
 Each invocation freezes the helper, records its Python runtime and admission,
 and keeps hook receipts under the checkout's Git directory in `kgr-push-guards`.
@@ -167,10 +218,10 @@ no visible PR does not establish that creation would be safe.
 
 When recovery has an existing PR at the approved head and base, use GitHub's
 [native stack append endpoint](https://docs.github.com/en/rest/pulls/stacks#add-pull-requests-to-a-pull-request-stack).
-In gh-stack 0.1.0, `gh stack link` can retarget that PR's base before appending;
-a concurrent new top could therefore change the approved dependency. The direct
-endpoint requires the candidate's base ref to match the current native top's
-head ref and does not first change the candidate's base.
+`gh stack link` can retarget that PR's base before appending; a concurrent new
+top could therefore change the approved dependency. The direct endpoint requires
+the candidate's base ref to match the current native top's head ref and does not
+first change the candidate's base.
 
 First verify the repository, native stack identity and order, exact branch heads,
 candidate PR number/head/base branch/base commit, and intended draft/open/unmerged
