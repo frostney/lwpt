@@ -25,7 +25,7 @@ on:
 
 env:
   # Single source of truth for the toolchain's FPC version. Consumers
-  # (ci.yml, pr.yml, release.yml) read the fpc-version output instead
+  # (ci.yml, release.yml) read the fpc-version output instead
   # of carrying their own copy, so a bump here propagates everywhere.
   FPC_VERSION: "3.2.2"
   BINUTILS_VERSION: "2.44"

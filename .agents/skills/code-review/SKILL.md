@@ -60,8 +60,7 @@ Remediation is independent of the operation:
   local. When the review delegates lanes, read
   [references/subagent-lanes.md](references/subagent-lanes.md) before
   publishing the lane map. While lanes run, the coordinator continues its own
-  lane-independent work, such as resolving the boundary and running the project
-  gate.
+  lane-independent work, such as running the project gate.
 
 Safe probes include declared checks, local builds and servers, disposable
 repros, isolated test data, browser interaction, temporary artifacts, and

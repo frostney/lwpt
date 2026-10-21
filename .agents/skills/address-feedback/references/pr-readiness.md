@@ -16,6 +16,11 @@ Record the repository, PR number or URL, and final head object ID. A PR is
   review or the project gate;
 - the repository's declared gate passed for that same final content;
 - every required check is terminal and successful;
+- when the repository's declared full-CI rule requires a full or extended CI
+  run for this change, that run succeeded for this head;
+- GitHub reports the PR mergeable without conflict, and its `mergeStateStatus`
+  is not `BEHIND`, which it reports only when the repository requires
+  up-to-date branches;
 - every intentionally active review automation has a terminal completed verdict
   explicitly tied to that head, with no newer incomplete or follow-up review;
 - no actionable current-head finding remains;

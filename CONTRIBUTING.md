@@ -34,19 +34,20 @@ If any check fails on a hook autofix you didn't expect, do not commit with `--no
 
 ### Merging
 
-Every PR runs `pr.yml` automatically, whatever its base branch. `main` accepts
-a squash merge once the `delivery-admission` check passes on the exact head
-and every review thread is resolved. Review evidence is an independent
+Every PR runs `ci.yml` automatically, whatever its base branch: the full
+six-target build and native test matrix. `main` accepts a squash merge once
+its `delivery-admission` check passes on the exact head and every review
+thread is resolved; the branch need not be up to date with `main`. Review evidence is an independent
 review of the exact head, with its report recorded on the PR, as
 [`ORCHESTRATION.md`](./ORCHESTRATION.md) describes. CodeRabbit reviews
 non-draft PRs automatically as an advisory reviewer.
 
-Every PR also needs a green six-target run on its exact head before merge,
-and merges only while the current `main` commit has a green push run:
-`gh workflow run ci.yml --ref <branch> -f mode=manual`. Merge with
-`gh pr merge --squash --match-head-commit <sha>` so a later push cannot slip
-past that evidence. A diagnostic slice (`-f mode=diagnostic`) helps with
-remediation but never counts as that evidence. Agent-led delivery follows
+Merge with `gh pr merge --squash --match-head-commit <sha>` so a later push
+cannot slip past the review evidence. A failed push run of `ci.yml` on `main`
+stops merges until `main` is fixed. A diagnostic slice (`gh workflow run
+diagnostic.yml --ref <branch> -f diagnostic_target=<target> -f
+diagnostic_selector=<selector>`) helps with remediation but never counts as
+merge evidence. Agent-led delivery follows
 [`ORCHESTRATION.md`](./ORCHESTRATION.md).
 
 ## Commit messages

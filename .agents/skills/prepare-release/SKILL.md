@@ -74,7 +74,7 @@ Stop and report `BLOCKED` when any of these is true:
   complete local suite.
 - The default-branch ruleset does not require the current
   `delivery-admission` check, that admission job does not depend on and validate
-  every current native `pr.yml` job, the release-tag ruleset is absent, or the
+  every other current `ci.yml` job, the release-tag ruleset is absent, or the
   protected `release` environment is absent.
 - An architecture-drift finding remains neither fixed nor explicitly waived
   with a rationale.
@@ -126,7 +126,7 @@ integrated-main successor provide the final complete proof.
 - Require the six-target cross-build and native test matrix to be green.
 - Inspect the active repository rulesets and environments. Require:
   - the default branch to require the current `delivery-admission` check, and
-    that admission job to depend on and validate every current native `pr.yml`
+    that admission job to depend on and validate every other current `ci.yml`
     job;
   - SemVer release tags to reject deletion, updates, and unauthorized creation;
   - the `release.yml` publish job to use a protected `release` environment with

@@ -20,14 +20,13 @@ requirement may be marked not applicable only with a recorded reason.
 
 - Focused tests covering the changed behavior pass, including negative and
   recovery paths where applicable.
-- Required CI, review, and applicable full-CI evidence belongs to the exact
-  final head. A new head invalidates earlier evidence.
+- Required CI and review evidence belongs to the exact final head. A new head invalidates earlier evidence.
 - Review completion includes the independent review that
   [`ORCHESTRATION.md`](./ORCHESTRATION.md) requires for the exact final head,
   with its report recorded on the PR, and zero unresolved threads. Every
   review thread, including resolved ones, has a reply with an evidence-backed
   disposition.
-- Each delivery, full-CI, or review requirement marked not applicable has an
+- Each delivery or review requirement marked not applicable has an
   explicit evidence-backed reason.
 - FreePascal behavior relied upon by the change is checked against the live
   compiler rather than memory.
@@ -39,7 +38,7 @@ requirement may be marked not applicable only with a recorded reason.
   re-derives each workspace module from its `packages/<name>/` source and
   fails, naming the package, when the source no longer matches the locked
   `computedHash`. That runs locally as the first gate command below and in
-  CI, where `pr.yml` also fails if the plain `lwpt install` that follows
+  CI, where `ci.yml` also fails if the plain `lwpt install` that follows
   changes any committed toolkit state.
 - The universal project gate passes from the repository root:
 
@@ -58,17 +57,11 @@ requirement may be marked not applicable only with a recorded reason.
   locally merely to restate the same proof. Approved source fixes run their
   affected focused suites before the preparation PR; that PR's required CI and
   the resulting integrated-main CI become the final full-suite evidence.
-- Every change merges only after a green `ci.yml` `mode=manual` run on its
-  exact head, and only while the current `main` commit has a green push run,
-  as
+- Every change merges only after `ci.yml`'s `delivery-admission` check, which
+  covers the full six-target matrix, passes on its exact head, and not while a
+  failed push run of `ci.yml` on `main` is unfixed, as
   [`ORCHESTRATION.md`](./ORCHESTRATION.md) describes. During remediation, use an
-  allow-listed diagnostic slice; a diagnostic is never that evidence. Dispatch
-  the full matrix only once the branch contains the current base and focused
-  checks, required PR CI, and active review evidence have converged; a later
-  head invalidates it (the automatic gate covers Linux ordinary+E2E,
-  aarch64-darwin ordinary, and win64 offline; `x86_64-darwin`,
-  `aarch64-linux`, `i386-win32`, and non-Linux E2E run only in that
-  manual run and on `main`).
+  allow-listed diagnostic slice; a diagnostic is never merge evidence.
 - An intermittent-failure fix names the pinned mechanism and its evidence;
   timeout bumps, retries, and quarantines are mitigations and link a
   tracking issue instead.

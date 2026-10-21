@@ -76,11 +76,21 @@ requires its own identity flags:
   - `--all-workflows` does not cover commit statuses or check runs from other
     apps, such as CodeRabbit or Vercel. Add a `--check` for each one the caller
     needs; the wait then also requires those contexts to succeed.
+  - A named check passes when it ends in success, skipped or neutral. The wait
+    reports `changed` as soon as one named check ends any other way, even
+    while the rest still run. Check runs that share a name count once per
+    source: their app and, for GitHub Actions, their workflow and triggering
+    event. A workflow that runs on both `push` and `pull_request` therefore
+    needs both runs to pass. From one source only the newest check suite
+    counts, so a re-run, a run cancelled by a newer one or a re-check after an
+    edit replaces the older run, whichever started first. A commit status
+    counts by its latest state.
   - `--check` alone judges only the named contexts, whatever else is still
     running for the head. Use it only when the complete expected set is known,
     such as the repository's required status checks. Checks visible at wait
     time are not that set: workflows add jobs in stages.
-- `pr-merged`: `--pr <number>` and `--head <sha>`.
+- `pr-merged`: `--pr <number>` and `--head <sha>`. It reports `changed` when
+  the pull request is closed without merging.
 - `workflow-terminal`: `--run-id <id>` and `--head <sha>`. Use it for a
   dispatched or other run whose checks do not appear on the pull request.
 - `tag-target`: `--tag <name>` and `--head <sha>`.
@@ -91,6 +101,13 @@ requires its own identity flags:
 
 There is no `--checkpoint` flag. The state path is `--state`, and the command
 derives a default path from the kind and identity when it is omitted.
+
+Both `inspect` and `wait` accept `--rest-page-size <1..100>` (default: 100).
+Use a smaller value when GitHub fails to serve large REST pages. It applies
+to workflow runs, jobs, and the REST fallback for checks and statuses. All
+pages are still read and the complete workflow census is still required.
+The option does not change GraphQL queries or the saved wait identity, so
+an existing wait can resume with a different REST page size.
 
 ## Results
 

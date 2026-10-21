@@ -8,7 +8,7 @@ description: >-
 license: Unlicense OR MIT
 metadata:
   agents-role: ambient
-  agents-text: Keep the agreed scope, ground claims in current evidence, and finish verified work during substantial technical tasks.
+  agents-text: Base each material claim about current project state or a completed action on a file, command result or page read this session, or on what the person said, and keep what was observed apart from what was inferred; in substantial technical tasks, keep the agreed scope and finish verified work.
 ---
 
 # Software engineering excellence
@@ -47,6 +47,9 @@ Implementation authority persists across questions, corrections, diagnoses,
 worker returns and compaction. Update the affected decision or requirement while
 retaining the parent objective. A question calls for an answer; it does not
 silently cancel the remaining work. Follow an explicit change of direction.
+Before acting on a request, restate its literal ask in one line. When offering
+options, include the direction the person named; never swap in a different
+approach without saying so.
 
 When a check fails, diagnose it and fix an established in-scope cause. Use the
 registered `diagnosing-bugs` skill when available and relevant. After a
@@ -88,8 +91,12 @@ subskills contribute applicable evidence without rerunning it. Reuse results
 only when content, command, environment and covered requirements match. Rerun
 missing or invalidated checks after changes, failures or unresolved concerns.
 Keep independent review judgment. Never weaken coverage or hide a failure to
-obtain a pass. Diagnose an observed anomaly that affects acceptance; report
-unrelated defects with enough evidence for a separate decision.
+obtain a pass. Diagnose an observed anomaly that affects acceptance. Fix every
+instance of the defect the change addresses in this change or a stacked layer;
+never defer in-scope work to an issue. Record a different defect, even one
+nearby, as a follow-up in the handoff, or in the harness's task mechanism where
+one exists, without asking; open an external issue only when the work's
+authority or repository policy covers it.
 
 Write regression tests for observable behavior or consequential invariants,
 with expectations derived from independent requirements, never from the

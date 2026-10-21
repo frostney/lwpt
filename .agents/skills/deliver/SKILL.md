@@ -62,12 +62,16 @@ service as an incidental fix.
 - At `ready-to-merge`, require the complete readiness contract defined by
   `address-feedback`'s readiness references for the selected PR's exact head: all verified
   requirement gaps resolved, current behavior and project evidence, successful
-  required CI and reviews, and completed required thread handling. For a native
-  stack, require its complete-stack readiness, including every needed fix
-  layer. Ready for review alone does not satisfy this endpoint.
+  required CI and reviews, and completed required thread handling. When the
+  repository's declared full-CI rule requires a full or extended CI run for
+  the change, start it as that rule says once required checks and reviews have
+  converged on the final head, and await it; it is part of readiness. For a
+  native stack, require its complete-stack readiness, including every needed
+  fix layer. Ready for review alone does not satisfy this endpoint.
 - For `merged` or `deployed`, recheck readiness and use `git-workflow` to merge
-  the authorized ordinary PR or complete native stack. Verify the resulting
-  integrated revision. A partial prefix below a required fix layer is not done.
+  the authorized ordinary PR or complete native stack as soon as it is ready.
+  Verify the resulting integrated revision. A partial prefix below a required
+  fix layer is not done.
 - For `deployed`, run or await the existing integration path, then verify its
   destination, delivered revision or artifact provenance, and the required
   behavior in that environment. When later commits are included, verify that
@@ -91,8 +95,10 @@ invalidated checks. Preserve independent review judgment.
 
 Apply `git-workflow`'s
 [default-branch health](../git-workflow/SKILL.md#default-branch-health) gate
-before development starts and again before each merge. A default-branch repair
-it calls for is a separate work item that comes before this one.
+before development starts and again before each merge, including its
+coverage sampler and any staleness bound repository-root `ORCHESTRATION.md`
+declares. A default-branch repair it calls for is a separate work item that
+comes before this one.
 
 Integration delivery and release publication are separate outcomes. Never
 invoke `/create-release` from this single-item loop or use a milestone release
@@ -134,3 +140,11 @@ cleanup or message delivery. Verify required outcomes; omit optional unconfirmed
 claims or label them unconfirmed, without implying failure. Apply this to the
 whole report, including tables and parenthetical remarks; see
 [agent-writing](../agent-writing/SKILL.md) for shared writing guidance.
+
+Call remote CI green, or a PR ready, only after `delivery-wait` reports it
+satisfied for the current head commit, and then say so in plain words. Call a
+local check passing from its actual result on the tested content. Treat a
+failure as flaky or transient only after its failing log shows it is
+intermittent. Blaming something other than the change, or leaving the failure
+out of the required repair, needs its own evidence; a flaky failure the change
+introduced is in scope.

@@ -1,0 +1,52 @@
+name: Diagnostic
+run-name: >-
+  ${{ format('Diagnostic / {0} / {1}/{2}', github.ref_name,
+      inputs.diagnostic_target, inputs.diagnostic_selector) }}
+
+# One allow-listed ci.yml slice on any ref (dispatch requires write access),
+# for remediation and never proof that a change is ready. It calls ci.yml so
+# the slice runs the same build and test steps, but its runs belong to this
+# workflow and its checks are named "diagnose / <job>": a slice can never
+# stand in for the required delivery-admission check or for a ci.yml run on
+# main. ci.yml's validate-inputs job enforces the allow-list.
+#
+#   gh workflow run diagnostic.yml --ref <ref> \
+#     -f diagnostic_target=<target> -f diagnostic_selector=<selector>
+
+on:
+  workflow_dispatch:
+    inputs:
+      diagnostic_target:
+        description: Native target
+        required: true
+        type: choice
+        options:
+          - aarch64-darwin
+          - x86_64-darwin
+          - x86_64-linux
+          - x86_64-win64
+          - i386-win32
+      diagnostic_selector:
+        description: Allow-listed test scope
+        required: true
+        type: choice
+        options:
+          - default
+          - e2e
+          - scheduling
+          - tls
+
+permissions:
+  contents: read
+
+# A new diagnostic on the same ref cancels the superseded one.
+concurrency:
+  group: diagnostic-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    uses: ./.github/workflows/ci.yml
+    with:
+      diagnostic_target: ${{ inputs.diagnostic_target }}
+      diagnostic_selector: ${{ inputs.diagnostic_selector }}

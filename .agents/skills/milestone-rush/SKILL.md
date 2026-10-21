@@ -115,15 +115,17 @@ work-item deliveries and the release at the verified milestone boundary.
    change invalidates it. Do not repeatedly use a complete suite as the
    diagnostic loop.
 6. Treat heavyweight full CI as terminal promotion evidence, never as a remote
-   debugger. Dispatch it only after the current base, required PR checks, and
-   every active review tool have converged on the candidate head. Cancel
-   superseded runs when the CI service supports safe cancellation; record
-   otherwise unavoidable waste. A later head, base, topology, or review change
-   invalidates the proof.
-7. Integrate continuously rather than waiting for a batch. After every squash
-   merge, re-pull milestone scope and default-branch state; merge its updated
-   remote base into every affected remaining branch and rerun its applicable
-   gates. Review and CI evidence is valid only for the current PR head.
+   debugger. Dispatch it only after required PR checks and every active review
+   tool have converged on the candidate head. Cancel superseded runs when the
+   CI service supports safe cancellation; record otherwise unavoidable waste.
+   A later head, PR base, topology, or review change invalidates the proof;
+   the base branch moving on does not.
+7. Integrate continuously rather than waiting for a batch: merge each PR or
+   stack as soon as it is ready under `git-workflow`'s merge rules. After
+   every squash merge, re-pull milestone scope and default-branch
+   state; merge the updated remote base only into remaining branches that
+   `git-workflow` says need it, and rerun their applicable gates. Review and
+   CI evidence is valid only for the current PR head.
 8. Read [references/scope-changes.md](references/scope-changes.md) when
    execution discovers new work, issues are added to the milestone externally,
    or a milestone merge causes an integrated regression.
