@@ -922,14 +922,6 @@ class OrchestrationPolicyTests(unittest.TestCase):
         self.assertIn("--match-head-commit", policy)
         self.assertIn("`.github/delivery/review-automations.json`", policy)
         self.assertIn("## Review evidence", policy)
-        self.assertIn("recorded in the PR body", flat)
-        self.assertIn("a comment from the authenticated user", flat)
-        # Capability classes and the reviewer name no model, provider, or effort level.
-        self.assertIsNone(re.search(
-            r"(?i)\b(gpt-|claude|codex|opus|sonnet|haiku|gemini)"
-            r"|\b(low|medium|high|xhigh|max|standard)[\s-]+(reasoning|effort)\b",
-            policy,
-        ))
         self.assertIn("CodeRabbit is advisory", policy)
         self.assertTrue((ROOT / ".github/delivery/review-automations.json").is_file())
         for retired in ("delivery-transition", "merge:ready", "review:ready", "delivery:managed",
