@@ -2,10 +2,8 @@ name: Release
 
 # Tag-triggered release pipeline. Companion to ci.yml:
 #
-#   ci.yml      — push to main: build + test on every platform
+#   ci.yml      — every PR and push to main: build + test on every platform
 #   release.yml — tag push: cross-build → package → publish GitHub Release
-#   pr.yml      — fast PR feedback (system FPC + win64 cross-compile
-#                 + native offline Windows test run)
 #
 # Triggers on tags matching:
 #   v?[0-9]+.[0-9]+.[0-9]+         e.g.  0.1.0, 1.2.3 (canonical, no v)
@@ -232,8 +230,7 @@ jobs:
           # Release-grade build: -O4 -dPRODUCTION -Xs -CX -XX -B.
           # Same flag set as ci.yml's build stage, so a tagged commit's
           # binary equals what CI produces — single artefact provenance.
-          # pr.yml's windows-cross-compile job mirrors the win64 leg of
-          # the same flag set — keep all three in sync.
+          # Keep both in sync.
           echo "=== Building lwpt for ${TARGET} (release) ==="
           # shellcheck disable=SC2086  # $EXTRA_FLAGS is intentionally word-split
           "$CROSS_FPC" -T"${OS}" -O4 -dPRODUCTION -Xs -CX -XX -B \

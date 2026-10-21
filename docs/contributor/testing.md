@@ -24,7 +24,7 @@ How LWPT tests itself: repository-owned test groups, the mock HTTP server, the b
 | --- | --- | --- | --- | --- |
 | **Unit** | Never by default (opt-in live suite in `LWPT.GitProtocol.Test` with `LWPT_ENABLE_NETWORK=1`) | Co-located in `source/` (`Foo.pas` ↔ `Foo.Test.pas`) | Yes | No |
 | **Integration** | Never (mock server + local fixtures) | `tests/integration/` | Yes | No |
-| **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | Linux leg of the automatic gate (dedicated `pr.yml` step per #102); every platform in the manual `ci.yml` run that delivery policy requires on the PR's exact head, and in the push run on `main` | No |
+| **E2E** | Sometimes (live hosts or loopback only) | `tests/e2e/` and package-owned `tests/e2e/` | Yes, on every platform | No |
 | **Manual / spike** | N/A | Anywhere maintainer wants | No | No |
 
 These names and paths belong to this repository, not to the runner. With no selector, `./build/lwpt test` runs every discovered `*.Test.pas` program. Positional selectors run exactly the matching programs and accept exact files, recursive directories, or LWPT globs (`*`, `?`, and `**`):

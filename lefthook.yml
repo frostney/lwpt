@@ -4,7 +4,7 @@
 #
 # Local pre-commit runs the canonical formatter (`lwpt format`) and
 # re-stages any files it rewrites. The heavyweight gates — `lwpt build`
-# and `lwpt test` — run on the PR workflow (see .github/workflows/pr.yml)
+# and `lwpt test` — run on the PR workflow (see .github/workflows/ci.yml)
 # so local commits stay fast and don't block on multi-second test runs.
 # A pre-merge gate enforces the same checks on every PR; the local hook
 # is the cheap convenience.

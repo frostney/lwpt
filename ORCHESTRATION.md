@@ -100,19 +100,17 @@ implementation or a local gate; never learn this limit from failing tests.
 
 - **Destination:** `main`. A delivery is integrated when the push run of
   `ci.yml` on its squash commit concludes green.
-- **Required check:** `delivery-admission` from `pr.yml` on the exact head,
-  with every review thread resolved. Merge a single PR with
-  `gh pr merge --squash --match-head-commit <sha>`; a native stack merges
-  through `git-workflow`.
-- **Main stays green:** immediately before a merge, the latest push run of
-  `ci.yml` for the current `main` commit must have concluded `success`. A
-  pending, cancelled, missing, or failed run blocks the merge; fix `main`
-  first.
-- **Full CI:** every PR also needs a green
-  `gh workflow run ci.yml --ref <branch> -f mode=manual` run whose head is the
-  PR's exact head. Await it with `delivery-wait wait workflow-terminal`, then
-  merge with `--match-head-commit <sha>`. A new head needs a new run.
+- **Required check:** `delivery-admission` from `ci.yml` on the exact head,
+  with every review thread resolved. `ci.yml` runs the full native matrix on
+  every PR, so there is no separate full-CI rule. Branches need not be up to
+  date with `main`. A single PR merges with `gh pr merge --squash`; a native
+  stack merges through `git-workflow`.
+- **Main stays green:** a failed push run of `ci.yml` on `main` stops merges
+  until `main` is fixed, as `git-workflow`'s default-branch health gate
+  describes.
 - **Review policy:** `.github/delivery/review-automations.json` lists no
   hosted automations, so `/address-feedback` waits only on review threads.
   The review evidence above is still required.
-- **Diagnostics** (`-f mode=diagnostic`) are remediation, never proof.
+- **Diagnostics** (`gh workflow run ci.yml --ref <branch> -f
+  diagnostic_target=<target> -f diagnostic_selector=<selector>`) are
+  remediation, never proof.

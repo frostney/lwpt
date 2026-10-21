@@ -1,6 +1,6 @@
 // markdownlint-cli2 config for LWPT's Markdown corpus.
 //
-// Consumed by .github/workflows/pr.yml's `docs` job
+// Consumed by .github/workflows/ci.yml's `docs` job
 // (DavidAnson/markdownlint-cli2-action@v19). The job is blocking — any
 // failure rejects the PR.
 //

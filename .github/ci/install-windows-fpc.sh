@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Keep native Windows test setup independent of Chocolatey's SourceForge
-# mirror selection. Both PR and full CI call this one pinned acquisition path.
+# mirror selection. Every Windows CI leg calls this one pinned acquisition path.
 #
 # Usage: install-windows-fpc.sh <i386-win32|x86_64-win64>
 #

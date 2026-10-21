@@ -556,7 +556,7 @@ Install once per fresh clone:
 lefthook install
 ```
 
-The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test` — run on the PR workflow in CI (`.github/workflows/pr.yml`) rather than every local commit. This keeps local commits fast and the pre-merge gate strict.
+The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test` — run on the PR workflow in CI (`.github/workflows/ci.yml`) rather than every local commit. This keeps local commits fast and the pre-merge gate strict.
 
 Do **not** bypass with `git commit --no-verify` unless a maintainer explicitly authorises it on the PR.
 

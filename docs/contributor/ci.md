@@ -10,27 +10,28 @@ known-good-route skills under [`ORCHESTRATION.md`](../../ORCHESTRATION.md), per
 | Workflow | Trigger | Purpose |
 |----------|---------|---------|
 | `toolchain.yml` | `workflow_call` (reusable), `workflow_dispatch`, weekly `schedule` | Build + cache the cross-FPC toolchain |
-| `ci.yml` | `push` to `main`, `workflow_dispatch` | Full native matrix on `main` or any dispatched ref, or one allow-listed diagnostic slice |
-| `pr.yml` | `pull_request` | Automatic native gate for every PR, whatever its base branch |
+| `ci.yml` | `pull_request`, `push` to `main`, `workflow_dispatch` | Full native matrix on every PR and every `main` commit; dispatch runs it on any ref, or runs one allow-listed diagnostic slice |
 | `release.yml` | tag push (`v?N.N.N`, `v?N.N.N-*`) | Cross-build → protected approval → package → publish GitHub Release |
 | `delphi-native.yml` | `workflow_dispatch` | Optional Delphi 12+ Win64 smoke on a licensed self-hosted runner; never a required gate |
 | `lwpt-update.yml` | `workflow_call`, manual | Update git-host dependencies and open or refresh one bot-owned pull request |
 
-Trigger split, mirroring GocciaScript's CI shape:
+Trigger split:
 
-- **PR checks are automatic.** `pr.yml` runs its Ubuntu, native Darwin,
-  documentation, and win64 legs on every PR, including native stacked PRs whose
-  base is another branch. A superseded push cancels the older run.
-- **`ci.yml` has three uses.** A push to `main` verifies the integrated tree;
-  rapid main pushes cancel older integrated-main runs. `mode=manual` runs the
-  same full matrix on any dispatched ref and is never coalesced. `mode=diagnostic`
-  runs one allow-listed native target and test scope on any dispatched ref.
+- **Every PR runs the full matrix.** `ci.yml` runs on every PR, including
+  native stacked PRs whose base is another branch, and its
+  `delivery-admission` job is the merge gate. A superseded push cancels the
+  older run.
+- **A push to `main` runs it again** on the squash commit, as the delivery's
+  integration evidence. Rapid main pushes cancel older integrated-main runs.
+- **Dispatch** runs the same full matrix on any ref and is never cancelled, or
+  runs one allow-listed native target and test scope.
 - **`release.yml` owns tag pushes** — `ci.yml` does not trigger on tags, so a tagged commit goes through a single cross-build pipeline (the release one) rather than two.
 
 Repository rules make these contracts enforceable. The desired main ruleset is
 versioned at `.github/rulesets/protect-main.json`: it allows only squash merges,
-requires resolved review threads, and requires the native `delivery-admission`
-job from GitHub Actions integration ID `15368`. The integration binding means a same-named status or check from
+requires resolved review threads, and requires the `delivery-admission` job
+from GitHub Actions integration ID `15368`. It does not require branches to be
+up to date with `main`. The integration binding means a same-named status or check from
 another user or app cannot satisfy the rule:
 
 ```sh
@@ -104,25 +105,26 @@ Optional inputs change `working-directory`, the bot `branch-name`, `pr-title`,
 or the bootstrapped `lwpt-ref`. Concurrent runs targeting the same repository
 and branch serialize rather than racing the fixed update branch.
 
-### Manual and diagnostic dispatch
+### Dispatch
 
 `ci.yml` accepts `workflow_dispatch` on any ref; dispatch already requires
 write access. Every job checks out the run's own head SHA, so a run is
 evidence for exactly that commit.
 
 ```sh
-gh workflow run ci.yml --ref <branch> -f mode=manual
-gh workflow run ci.yml --ref <branch> -f mode=diagnostic \
+gh workflow run ci.yml --ref <ref>
+gh workflow run ci.yml --ref <ref> \
   -f diagnostic_target=<target> -f diagnostic_selector=<selector>
 ```
 
-`mode=manual` runs the full six-target build and native test matrix. Delivery
-policy in [`ORCHESTRATION.md`](../../ORCHESTRATION.md) requires one green manual
-run whose head is the PR's exact head before merge; the ruleset does not
-enforce it (its only required check is `delivery-admission`), and the
-push-to-`main` `ci.yml` run covers the full native matrix again after merge. The run name shows the mode and ref (`CI / manual / <branch>`).
+Without a diagnostic target, a dispatch runs the full six-target build and
+native test matrix, exactly as on a PR or a push to `main`, and concurrent
+pushes never cancel it. This is how
+[`git-workflow`'s coverage sampler](../../.agents/skills/git-workflow/SKILL.md#coverage-sampler)
+fills in `main` commits whose push runs were superseded. The run name shows
+the event and ref (`CI / workflow_dispatch / <ref>`).
 
-`mode=diagnostic` runs one allow-listed native remediation slice and is never
+A diagnostic runs one allow-listed native remediation slice and is never
 merge evidence. The surface covers Windows x86_64/i386 ordinary, E2E, and TLS
 slices, plus ARM- and Intel-Darwin scheduling slices that run only
 `TestScheduling.Test.pas` with a 150-second ceiling. ARM-Darwin captures the
@@ -185,10 +187,11 @@ The whole job is `if: steps.cache-check.outputs.cache-hit != 'true'`-gated. On a
 Each runner installs FPC natively (`brew`, `apt`, or the pinned official Windows distribution through `.github/ci/install-windows-fpc.sh <target>`), then the `x86_64-win64` leg runs a one-off `bootstrap.bat` cold-build smoke through both the direct-`fpc` fallback and the InstantFPC path, rebuilds LWPT twice with the InstantFPC-bootstrapped `build\lwpt.exe` (each rebuild replaces the running image), and deletes `build/` again so the rest of the stage still validates the downloaded cross-built artefact. Every native test-matrix job has a 20-minute ceiling, containing a stalled test process without treating the bound as a root-cause fix. The Windows installer verifies the download's SHA-256 and retries only the download. Tests themselves are never retried. After setup, every runner downloads the cross-built `lwpt` binary and runs the full pipeline:
 
 1. **Sanity** — `lwpt --help` (does the binary even load?)
-2. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
-3. **`lwpt format --check`** — only on `aarch64-darwin` runner (formatting is platform-independent; one check is enough)
+2. **`lwpt install --frozen`** — the committed lockfile matches the committed trees, and every local and workspace module still matches the snapshot re-derived from its source. It runs *before* the plain install, so regeneration cannot mask lock drift. On Windows this verifies a POSIX-written lockfile on a CRLF-defaulting, word-sorting host.
+3. **`lwpt install`** — workspace auto-discovery + symlink/junction creation
 4. **`lwpt test <ordinary paths> --bail=0`** — the repository's co-located and integration programs; compiles them via the runner's FPC (on Windows, the leg's compiler from the table below), runs them concurrently, and runs the full queue so one run reports every failing program (a first-failure bail hid independent intermittent failures behind separate reruns, #299)
 5. **`lwpt test <E2E paths> --bail=0`** — with `LWPT_ENABLE_NETWORK=1` set in the job environment, the repository's E2E programs run on every platform (Q23 decision: surface platform-specific HTTP / TLS / wire-format regressions that offline mocking misses)
+6. **`lwpt test --inventory`** — `x86_64-linux` only. Both test passes verify registrations in report mode, which runs test bodies. Inventory-only mode exits before them, so per [issue #381](https://github.com/frostney/lwpt/issues/381) this pass lists every discovered program from the executables the earlier passes cached, compares each record with `tests/test-inventory.tsv`, and checks that the published JSON parses. It never touches the network.
 
 The official FPC 3.2.2 Windows distribution's native compiler is i386, so both Windows legs install its `i386-win32` base and differ in the compiler that `LWPT_FPC` publishes for test programs:
 
@@ -230,49 +233,46 @@ helper bounded by `timeout --foreground`, and the script itself runs under a
 `smoke.sh --collect`, then writes container logs, `docker inspect` output
 including health history, and data-volume listings (never signing seeds or
 tokens) even when the smoke was killed, and the job uploads them as
-`registry-container-smoke`. The stage stays off `pr.yml` because it needs Docker and image
-pulls. [`registry-deployment.md`](../user/registry-deployment.md) is the operator
+`registry-container-smoke`. [`registry-deployment.md`](../user/registry-deployment.md) is the operator
 guide.
 
-### `pr.yml` — pre-merge PR gate
-
-Mirrors GocciaScript's `pr.yml` shape, and is the only **automatic** pre-merge signal a PR sees (because `ci.yml` doesn't trigger on PRs). Its `delivery-admission` job is the ruleset's required check. The manual `ci.yml` run on the PR's exact head, which delivery policy ([`ORCHESTRATION.md`](../../ORCHESTRATION.md)) requires but the ruleset does not enforce, supplies the rest of the pre-merge coverage. The main `build-and-test` job is a single Ubuntu runner:
+**Native stage** (`native`, `ubuntu-latest`, 20-minute ceiling, skipped in
+diagnostic mode) runs the repository-level checks that need only one platform.
+It deliberately uses the distro FPC (the same as the install instructions in
+`README.md`), so a regression that only shows up with the system FPC's slightly
+older RTL gets caught, and `bootstrap.sh` gets a cold build:
 
 1. Install FPC via `apt`
-2. `./bootstrap.sh` — cold build of `build/lwpt` from a freshly-cloned repo
+2. `./bootstrap.sh` — cold build of `build/lwpt` from a fresh clone
 3. `instantfpc -Fu./source -Fi./source scripts/update-test-inventory.pas --check` (the generated test-inventory documentation is current)
-4. `./build/lwpt --help` (does the binary even load?)
-5. `./build/lwpt install --frozen` (committed lockfile matches committed trees, and every local and workspace module still matches the snapshot re-derived from its source — runs *before* plain install so lock drift cannot be masked by regeneration)
-6. `./build/lwpt install` (workspace auto-discovery)
-7. `git status --porcelain` over `lwpt.lock`, `lwpt.cfg`, `.lwpt/modules/`, and `.lwpt/archives/` (the plain install changed no committed toolkit state; defense in depth for [#370](https://github.com/frostney/lwpt/issues/370))
-8. `./build/lwpt format --check`
-9. `./build/lwpt build` (manifest build-entry compile)
-10. `./build/lwpt agents --check` (generated command-reference drift)
-11. `./build/lwpt test <ordinary paths> --bail=0`
-12. `./build/lwpt test <E2E paths> --bail=0` with `LWPT_ENABLE_NETWORK=1` (live-network E2E, Linux leg only)
-13. `./build/lwpt test --inventory` (inventory-only mode matches `tests/test-inventory.tsv`; see below)
+4. `./build/lwpt install --frozen`, then `./build/lwpt install`
+5. `git status --porcelain` over `lwpt.lock`, `lwpt.cfg`, `.lwpt/modules/`, and `.lwpt/archives/` (the plain install changed no committed toolkit state; defense in depth for [#370](https://github.com/frostney/lwpt/issues/370))
+6. `./build/lwpt format --check`
+7. `./build/lwpt build` (manifest build-entry compile)
+8. `./build/lwpt agents --check` (generated command-reference drift)
 
-In the automatic gate, the live-network E2E paths run on the Linux leg only. Their dedicated selector invocation sets the repository-owned `LWPT_ENABLE_NETWORK=1` opt-in, added per [issue #102](https://github.com/frostney/lwpt/issues/102) after the #84 TLS-close class proved invisible to the ordinary route. The ordinary pass still carries the concurrency suites which cover the #101 timing class; E2E does not rerun them as accidental stress. Every platform runs the E2E paths in the manual `ci.yml` run that delivery policy requires on the PR's exact head, and again on the push to `main`. Both test passes verify registrations in report mode, which runs test bodies. A final Linux step therefore runs `./build/lwpt test --inventory` over every discovered program, per [issue #381](https://github.com/frostney/lwpt/issues/381): inventory-only mode exits before test bodies and never touches the network, reuses the executables the earlier passes cached, compares each record with `tests/test-inventory.tsv`, and checks that the published JSON parses. The native `build-and-test`, `darwin-test`, and `windows-test` jobs each have a 20-minute ceiling. The Windows job uses the same pinned installer as `ci.yml`. A second PR job, `darwin-test`, natively bootstraps on `macos-latest` (brew FPC, independent of the cross-toolchain cache) and runs the ordinary paths — the #105 env-race family and its masks all first surfaced on darwin legs. Bounded cost: ~5–6 min warm, parallel to `build-and-test`. The remaining `ci.yml`-only legs (`x86_64-darwin`, `aarch64-linux`, `i386-win32`) run in that delivery-policy manual run, and in the push run on `main`, rather than on every push. A separate blocking `docs` job runs `markdownlint-cli2` against the Markdown corpus.
+**Docs stage** (`docs`, skipped in diagnostic mode) runs `markdownlint-cli2`
+against the Markdown corpus, then the unit tests of the CI tooling under
+`.github/ci/` and the workflow fixtures under `.github/tests/`.
 
-The PR workflow deliberately uses the distro FPC (same as the install instructions in `README.md`), so any regression that only shows up with the system FPC's slightly older RTL gets caught before merge.
+**Admission** (`delivery-admission`) runs even when a dependency fails or is
+skipped, and passes only when every other job succeeded. It is the ruleset's
+single required check, so the ruleset names one stable context. A diagnostic
+is never admission evidence, so it does not run there.
 
-#### Windows signal (`windows-cross-compile` + `windows-test`)
+Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); a weekly `schedule` cron on `toolchain.yml` re-warms the default-branch copy so that window is bounded even when `main` is quiet.
 
-A second job reuses `toolchain.yml` (`workflow_call`, exactly like `ci.yml`) and cross-compiles `source/lwpt.pas` for **`x86_64-win64` only**, mirroring `ci.yml`'s build-stage flags and unit paths. It exists because `{$IFDEF WINDOWS}` codepaths never compile on the Ubuntu runner: PR #17 merged green while breaking `main` with a `SysUtils.FindClose` vs `Windows.FindClose` unit-shadowing error that PR #21 then had to fix. One target suffices — win32 and win64 share the same `{$IFDEF WINDOWS}` sources. The job also runs the no-OpenSSL guard (ADR-0016 for clients, ADR-0033 for servers — Windows must contain no OpenSSL linkage in either direction) against the produced `lwpt.exe`, surfacing that release-blocker in the automatic gate instead of waiting for the full matrix.
+#### Why the full matrix on every PR?
 
-The produced `lwpt.exe` is then uploaded for **`windows-test`**, which mirrors `ci.yml`'s build-once / test-natively split on a `windows-latest` runner: install FPC through the shared `.github/ci/install-windows-fpc.sh x86_64-win64` (`lwpt test` compiles `*.Test.pas` at run time per Q22=b, here with the x86_64 cross compiler `ppcrossx64.exe`, so the test programs run as 64-bit code like the `lwpt.exe` under test), download the binary, then `lwpt install` + `lwpt test <ordinary paths> --bail=0` (offline). This catches what a compile alone cannot: Windows-only runtime regressions in lwpt itself (junction-vs-symlink installs, path handling, subprocess environment handling), scheduler cancellation/reaping, and compile breaks in test sources.
-
-Deliberately outside the automatic gate, and covered by the manual `ci.yml` run that delivery policy requires before merge (and by the push run on `main` after it):
-
-- **The `i386-win32` leg** (win32 and win64 share `{$IFDEF WINDOWS}` sources, but only this leg compiles its test programs as 32-bit code, whose pointer widths, structure layouts and native-integer arithmetic differ from the automatic win64 leg).
-- **The E2E paths on non-Linux platforms** and the `bootstrap.bat` cold-build smoke (the Linux E2E leg runs pre-merge per #102).
-- **`x86_64-darwin` and `aarch64-linux` runtime.** The aarch64-darwin PR leg covers `{$IFDEF DARWIN}` compile + arm64 runtime pre-merge (added per #102 after the #105 env-race family surfaced on darwin legs first); the intel-mac and arm-linux permutations run only in the manual and push matrices.
-
-Cache economics: the toolchain cache key (`lwpt-fpc-cross-<fpc>-macos-arm64-<n>`) has no branch component, and GitHub Actions lets PR runs restore caches created on the base branch — so PR runs hit the toolchain that `ci.yml` pushes to `main` keep warm, and the `toolchain` job is a seconds-long cache lookup. On eviction, the PR run rebuilds the toolchain (~30 min) into its own cache scope (not shared across PRs); a weekly `schedule` cron on `toolchain.yml` re-warms the default-branch copy so that window is bounded even when `main` is quiet. `pr.yml` also sets `concurrency` with `cancel-in-progress`, so a superseded push doesn't keep burning the macOS runner.
-
-#### Why not run the full matrix automatically on every push?
-
-A 6-target cross-build matrix runs in ~10–15 min on cached toolchain (and ~45 min cold). Running it on every push of the typical commit-amend-push PR cycle costs an order of magnitude more CI minutes than the automatic gate, so `pr.yml` stays cheap for iteration. Delivery policy still requires the full matrix before merge, but only once, as a manual run on the PR's final exact head ([`ORCHESTRATION.md`](../../ORCHESTRATION.md)); the ruleset does not enforce it, and the push run on `main` repeats the full native matrix after merge. That rule replaced the earlier GocciaScript-style trade of verifying the other platforms only after merge: in September 2026 the automatic gate repeatedly let Intel-Darwin, i386 and cross-toolchain breaks reach `main`. The win64 leg (cross-compile + native offline test run, ~3 min total on a warm cache), the Linux e2e step and the aarch64-darwin leg remain in the automatic gate because they catch the most common breakage classes early.
+Until October 2026 a cheaper `pr.yml` gate (Ubuntu, aarch64-darwin, and an
+offline win64 leg) ran on every push, and delivery policy asked for one manual
+full-matrix run on each PR's final head. The cheap gate alone had repeatedly
+let Intel-Darwin, i386 and cross-toolchain breaks reach `main`, and the manual
+run was a second, hand-enforced gate on every PR. Running the full matrix on
+every PR push makes the ruleset enforce it. A run takes about 16–28 minutes
+instead of 9–19, and costs nothing in minutes on a public repository; the
+practical limit is GitHub's concurrent macOS jobs when several PRs push at
+once.
 
 ### `release.yml` — tag-triggered release pipeline
 
@@ -337,16 +337,14 @@ The scripts mirror the shape of [GocciaScript's installers](https://gocciascript
 
 ## Triggers (summary)
 
-- `ci.yml`: `push` to `main`, `workflow_dispatch`
-- `pr.yml`: `pull_request`
+- `ci.yml`: `pull_request`, `push` to `main`, `workflow_dispatch`
 - `release.yml`: `push` of a `v?N.N.N` or `v?N.N.N-*` tag
-- `toolchain.yml`: invoked by `ci.yml`, `pr.yml`, and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
+- `toolchain.yml`: invoked by `ci.yml` and `release.yml` via `workflow_call`; also `workflow_dispatch` for manual cache warming and a weekly `schedule` cron (Mondays 05:00 UTC) that keeps the default-branch cache warm
 
-A normal commit triggers one heavyweight cross-build pipeline through `ci.yml`
-after merge. A release commit later triggers `release.yml` again when tagged:
-that second cross-build stamps the tag version and produces the permanent
-release artifacts, but does not repeat the native test matrix. PRs trigger only
-the cheap `pr.yml` (whose single win64 cross-compile rides the cached toolchain).
+Each PR push and each merge triggers one heavyweight cross-build pipeline
+through `ci.yml`. A release commit later triggers `release.yml` again when
+tagged: that second cross-build stamps the tag version and produces the
+permanent release artifacts, but does not repeat the native test matrix.
 
 ### `delphi-native.yml` — licensed backend smoke
 
@@ -365,7 +363,7 @@ runner is available.
 
 Bump `toolchain.yml`'s `CACHE_VERSION` env var (currently `v5`) when:
 
-- FPC version changes (`FPC_VERSION` lives **only** in `toolchain.yml`; `ci.yml`, `pr.yml`, and `release.yml` consume it via the workflow's `fpc-version` output, so one edit covers all consumers)
+- FPC version changes (`FPC_VERSION` lives **only** in `toolchain.yml`; `ci.yml` and `release.yml` consume it via the workflow's `fpc-version` output, so one edit covers all consumers)
 - A new target is added to the matrix
 - The FPC packages slice is rescoped (e.g. when a future LWPT change requires a package not in the current set)
 - Toolchain scripts themselves change in a way that affects the binary content of the cache

@@ -450,4 +450,4 @@ it is not exposed to consumer projects.
 
 | Item | Status | Comes back in |
 | --- | --- | --- |
-| Markdown linting (`markdownlint-cli2` + `.markdownlint-cli2.jsonc`) | Wired in `pr.yml` docs job | Keep blocking; fix Markdown drift rather than making the job advisory |
+| Markdown linting (`markdownlint-cli2` + `.markdownlint-cli2.jsonc`) | Wired in `ci.yml` docs job | Keep blocking; fix Markdown drift rather than making the job advisory |

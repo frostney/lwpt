@@ -30,7 +30,7 @@ Building, testing, and releasing LWPT itself. Landing page: [`contributor/`](./c
 | [`tooling.md`](./contributor/tooling.md) | Pinned tool versions, environment variables, lint/format/test commands, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), EXDEV fallback, where each deferred contract lives |
 | [`code-style.md`](./contributor/code-style.md) | Naming, file layout, formatter rules, manifest scope with protected toolkit state, line-endings, design tokens |
 | [`deployment.md`](./contributor/deployment.md) | Platform tier matrix, release process, per-platform TLS backend (SChannel / SecureTransport / OpenSSL), macOS quarantine, codesigning policy |
-| [`ci.md`](./contributor/ci.md) | CI workflow shape (`ci.yml` / `pr.yml` / `release.yml` / `toolchain.yml`), trigger split, cross-build toolchain cache, install scripts |
+| [`ci.md`](./contributor/ci.md) | CI workflow shape (`ci.yml` / `release.yml` / `toolchain.yml`), trigger split, cross-build toolchain cache, install scripts |
 | [`testing.md`](./contributor/testing.md) | Repository-owned test groups, selector policy, fixture strategy, mock HTTP server, the binary-fetch regression, test inventory |
 | [`packages.md`](./contributor/packages.md) | The package set, divergence vs GocciaScript-older-copies, bootstrap chicken-and-egg, graduation roadmap (per [ADR-0017](./adr/0017-packages-lwpt-canonical.md)) |
 
