@@ -927,7 +927,7 @@ class OrchestrationPolicyTests(unittest.TestCase):
         # Capability classes and the reviewer name no model, provider, or effort level.
         self.assertIsNone(re.search(
             r"(?i)\b(gpt-|claude|codex|opus|sonnet|haiku|gemini)"
-            r"|\b(low|medium|high|xhigh|max|standard) (reasoning|effort)\b",
+            r"|\b(low|medium|high|xhigh|max|standard)[\s-]+(reasoning|effort)\b",
             policy,
         ))
         self.assertIn("CodeRabbit is advisory", policy)
