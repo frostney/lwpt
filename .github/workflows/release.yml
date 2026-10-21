@@ -104,7 +104,7 @@ jobs:
           # `lwpt build`, so the [prebuild] stamp-version hook never
           # fires here; we regenerate Version.inc explicitly. A manual
           # invocation without a tag keeps the committed (manifest)
-          # version. See docs/ci.md "Release version stamping".
+          # version. See docs/contributor/ci.md "Release version stamping".
           #
           # This is a NATIVE host compile: the cross toolchain in
           # fpc-cross/ cannot link a host binary on this macOS runner
@@ -429,10 +429,12 @@ jobs:
             for f in README.md CONTEXT.md CONTRIBUTING.md AGENTS.md; do
               if [ -f "$f" ]; then cp "$f" "$pkg_dir/"; fi
             done
-            mkdir -p "$pkg_dir/docs"
-            cp docs/quick-start.md "$pkg_dir/docs/" 2>/dev/null || true
-            cp docs/architecture.md "$pkg_dir/docs/" 2>/dev/null || true
-            cp docs/build-system.md "$pkg_dir/docs/" 2>/dev/null || true
+            # Keep the user/ and contributor/ layout so the bundled
+            # README.md, CONTRIBUTING.md and quick start links resolve.
+            mkdir -p "$pkg_dir/docs/contributor" "$pkg_dir/docs/user"
+            cp docs/contributor/quick-start.md "$pkg_dir/docs/contributor/" 2>/dev/null || true
+            cp docs/contributor/architecture.md "$pkg_dir/docs/contributor/" 2>/dev/null || true
+            cp docs/user/build-system.md "$pkg_dir/docs/user/" 2>/dev/null || true
 
             cd dist
             # Format per target: zip for Windows, tar.gz for Unix.

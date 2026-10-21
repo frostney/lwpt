@@ -5,7 +5,7 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 ## Executive Summary
 
 - **The contract:** single entry point from repo root (`./build/lwpt build`), a development build of every binary by default, named build entries as positional args, `--mode dev` (default) / `--mode release`, verified reusable results by default, `--clean` and `--no-cache` controls, and one public `build/` output directory.
-- **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](./adr/0005-self-host-build.md).
+- **Self-host.** LWPT's own `lwpt.toml` declares `lwpt` as a `[build]` entry; `lwpt build` rebuilds the binary that just ran. See [ADR-0005](../adr/0005-self-host-build.md).
 - **Bootstrap once per fresh clone.** `scripts/bootstrap.pas` (via `bootstrap.sh` / `bootstrap.bat`) produces the first `build/lwpt`. The script's `fpc` flags must stay in sync with the dev translation in `TLWPTFPCCompilerDriver.BuildArguments`.
 - **Compiler output is invocation-private.** FPC executables and intermediates
   first land under the resolved project-owned build-session root. A completed
@@ -41,8 +41,8 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
 - **Dependency-aware parallel builds.** Independent ready build entries run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
-  [ADR-0023](./adr/0023-parallel-build-target-scheduler.md).
-- **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](./adr/0011-build-lifecycle-hooks.md). Each entry directly executes its declared `command` and ordered `args`; paired literal/glob `inputs` and `output` apply shared strict staleness evaluation. The earlier `[generated]` shape is no longer parsed.
+  [ADR-0023](../adr/0023-parallel-build-target-scheduler.md).
+- **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](../adr/0011-build-lifecycle-hooks.md). Each entry directly executes its declared `command` and ordered `args`; paired literal/glob `inputs` and `output` apply shared strict staleness evaluation. The earlier `[generated]` shape is no longer parsed.
 
 ## The contract
 
@@ -96,7 +96,7 @@ lwpt-testing = { source = "source/lwpt.pas",
 ```
 
 The `lwpt-testing` entry compiles the test-seam binary
-([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)); the manifest's
+([ADR-0044](../adr/0044-test-seams-only-in-test-builds.md)); the manifest's
 `[prebuild]` hook stamps `source/Version.inc` and its `[pretest]` hook
 rebuilds `lwpt-testing` before every `lwpt test`.
 
@@ -161,16 +161,16 @@ waiters name the fingerprint they are waiting for, recheck the verified result,
 and may abandon independently. A crashed producer releases its OS-held guard
 for safe takeover, while heartbeat age alone cannot displace a live long-running
 compile. The default root is the platform cache location documented in
-[ADR-0036](./adr/0036-per-user-dependency-archive-cas.md), and
+[ADR-0036](../adr/0036-per-user-dependency-archive-cas.md), and
 `LWPT_CACHE_DIR` relocates the shared root for both dependency and build
 namespaces. `LWPT_CACHE_MAX_BYTES` sets one aggregate per-user byte budget for
 all regular files in that shared cache tree (10 GiB by default); projects
 cannot raise or partition it through `lwpt.toml`. Normal admission applies
 deterministic least-recently-used eviction and skips caching when an object
 cannot fit without removing live state. See
-[ADR-0037](./adr/0037-verified-build-result-cache.md),
-[ADR-0038](./adr/0038-local-producer-leases.md), and
-[ADR-0040](./adr/0040-bounded-shared-cache-lifecycle.md).
+[ADR-0037](../adr/0037-verified-build-result-cache.md),
+[ADR-0038](../adr/0038-local-producer-leases.md), and
+[ADR-0040](../adr/0040-bounded-shared-cache-lifecycle.md).
 
 The fingerprint reference, result manifest, and artifact form one logical
 cache result. Eviction invalidates the fingerprint before removing either
@@ -212,7 +212,7 @@ Both wrappers:
 
 Both code paths are dev-mode only; release builds always go through `./build/lwpt build --mode release`.
 
-An earlier bootstrap script also regenerated `source/LWPT.Embedded.TestingLibrary.inc` when `TestingPascalLibrary.pas` or `Shared.inc` were newer than the embedded blob. [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) deleted the embed model — the testing framework now lives in `packages/testing/` and is consumed via workspace auto-discovery like every other dep, so the staleness check is gone and the bootstrap script does one thing.
+An earlier bootstrap script also regenerated `source/LWPT.Embedded.TestingLibrary.inc` when `TestingPascalLibrary.pas` or `Shared.inc` were newer than the embedded blob. [ADR-0015](../adr/0015-drop-export-testing-becomes-workspace-package.md) deleted the embed model — the testing framework now lives in `packages/testing/` and is consumed via workspace auto-discovery like every other dep, so the staleness check is gone and the bootstrap script does one thing.
 
 ### Why a Pascal bootstrap and not pure shell
 
@@ -515,7 +515,7 @@ is selected.
 
 ## Generator hooks (formerly `[generated]`)
 
-An earlier `[generated]` section was replaced by the lifecycle-hook model in [ADR-0011](./adr/0011-build-lifecycle-hooks.md). Each entry is a named direct command in `[prebuild]` / `[postbuild]` / `[pretest]` / etc. with optional ordered `args` and paired `inputs` / `output` staleness fields:
+An earlier `[generated]` section was replaced by the lifecycle-hook model in [ADR-0011](../adr/0011-build-lifecycle-hooks.md). Each entry is a named direct command in `[prebuild]` / `[postbuild]` / `[pretest]` / etc. with optional ordered `args` and paired `inputs` / `output` staleness fields:
 
 ```toml
 [prebuild]
@@ -535,9 +535,9 @@ or glob selection before `[pretest]` runs. The hook may generate fixtures,
 units, or other inputs for those programs, but a test program generated by the
 hook is not part of that invocation. With no selector every discovered program
 runs; with selectors every match runs, without path-derived groups or skips. See
-[ADR-0034](./adr/0034-freeze-test-selection-before-pretest.md).
+[ADR-0034](../adr/0034-freeze-test-selection-before-pretest.md).
 
-LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](./adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`, and a `[pretest]` `lwpt-testing` hook that runs `./build/lwpt build lwpt-testing` so the test-flavoured binary is current before any test program spawns it ([ADR-0044](./adr/0044-test-seams-only-in-test-builds.md)).
+LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](../adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`, and a `[pretest]` `lwpt-testing` hook that runs `./build/lwpt build lwpt-testing` so the test-flavoured binary is current before any test program spawns it ([ADR-0044](../adr/0044-test-seams-only-in-test-builds.md)).
 
 ## Pre-commit hook (Lefthook)
 
@@ -561,7 +561,7 @@ The heavyweight gates — `lwpt format --check` + `lwpt build` + `lwpt agents --
 Do **not** bypass with `git commit --no-verify` unless a maintainer explicitly authorises it on the PR.
 
 The analysis commands remain outside the v1 pre-commit gate per
-[ADR-0006](./adr/0006-stack-contracts-deferred-from-v1.md). Duplication and
+[ADR-0006](../adr/0006-stack-contracts-deferred-from-v1.md). Duplication and
 [`lwpt health`](./health.md) are user-invoked reports and do not widen that
 gate. Architecture drift is checked for LWPT itself during release preparation
 and is not a consumer command. [Issue #28](https://github.com/frostney/lwpt/issues/28)
@@ -588,8 +588,8 @@ from jumping existing waiters, and nested LWPT subprocesses consume a one-shot
 delegation that transfers one grant to their own guarded request instead of
 consuming a second slot. The parent reacquires through the FIFO after the child
 finishes. See
-[`tooling.md`](./tooling.md#machine-wide-worker-budget) for configuration and
-[ADR-0021](./adr/0021-machine-wide-worker-budget.md) for the decision.
+[`tooling.md`](../contributor/tooling.md#machine-wide-worker-budget) for configuration and
+[ADR-0021](../adr/0021-machine-wide-worker-budget.md) for the decision.
 
 The build scheduler uses nonblocking `PollAcquire` calls to retain its FIFO
 ticket while it continues collecting completed jobs. A successful acquisition

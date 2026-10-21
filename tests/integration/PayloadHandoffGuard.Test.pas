@@ -496,7 +496,7 @@ begin
       'the same path; EmitPayloadCompletion in generated fixtures), and ',
       'readers and barriers wait for PayloadIsReadable (the .complete ',
       'marker in generated fixtures) and read with ReadPayloadText. See ',
-      'docs/testing.md.');
+      'docs/contributor/testing.md.');
   Expect<Integer>(Violations).ToBe(0);
 end;
 

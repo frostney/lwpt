@@ -14,7 +14,7 @@ program StampVersion;
   This split is deliberate: dev builds report the manifest version
   (and Version.Test.pas's drift guard checks binary == manifest for
   those); release builds report the tag (release.yml asserts binary ==
-  tag on the native target). See docs/ci.md "Release version stamping".
+  tag on the native target). See docs/contributor/ci.md "Release version stamping".
 
   Deliberately self-contained — does not depend on packages/toml so the
   bootstrap chicken-and-egg (lwpt cannot resolve its own deps before the

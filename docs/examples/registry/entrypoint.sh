@@ -1,5 +1,5 @@
 #!/bin/sh
-# Entry point of the example LWPT registry image (docs/registry-deployment.md).
+# Entry point of the example LWPT registry image (docs/user/registry-deployment.md).
 #
 # `registry serve` reads the PKCS#12 password from the environment variable
 # named by `registry init --tls-password-env`. The example uses

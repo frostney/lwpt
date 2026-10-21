@@ -1,0 +1,119 @@
+# Packages
+
+The table of LWPT's canonical packages, their consumers (including LWPT,
+GocciaScript, and Lakon), the divergence policy for the GocciaScript-adoption
+transition window, and the bootstrap chicken-and-egg story.
+
+> An earlier version of this file lived at `docs/vendored.md` and treated GocciaScript as an upstream that LWPT vendored from. Per [ADR-0017](../adr/0017-packages-lwpt-canonical.md) that framing was wrong: LWPT and GocciaScript are sister projects under the same owner, with LWPT's `packages/<name>/` already canonical for every shared utility. This file is the renamed + rewritten version under the corrected model.
+
+## Executive Summary
+
+- **Five packages** live in LWPT's monorepo today under `packages/<name>/`: `httpclient`, `cli`, `semver`, `toml`, `testing`. Each is a standalone Object Pascal project — own `lwpt.toml`, own `source/`, own tests, own version (semver 2.0.0). LWPT itself consumes them via the root manifest's `[workspaces] include = ["packages/*"]` glob; `lwpt install` publishes each validated workspace snapshot into `.lwpt/modules/<name>/`.
+- **Plus a remainder in `source/`**: `Platform.pas` (still LWPT-internal — extraction candidate for `packages/platform/`) and `Shared.inc` (the FPC mode + switches include — kept as a project-root utility, with each package bundling its own copy under `packages/<name>/source/Shared.inc` for self-containment).
+- **LWPT is the canonical source** for every package's content. Per [ADR-0017](../adr/0017-packages-lwpt-canonical.md) there is no upstream to defer to: LWPT and GocciaScript are sister projects co-owned; LWPT's packages came from GocciaScript historically but have evolved past those original copies (byte-safety fixes in HTTPClient; prefix-strip + dead-code removal in CLI; rename + inlined deps in Semver; rename + parser-class refactor in TOML; etc.).
+- **GocciaScript is the first named consumer**, committed to Path A adoption (full toolchain migration to `lwpt build / install / test / format`). The migration is GocciaScript-side multi-wave work; ADR-0017 commits to the direction, not the timeline.
+- **Lakon consumes the CLI package as a byte-verbatim dual-compile corpus.**
+  Consumer synchronization after CLI changes is tracked in
+  [frostney/lakon#6](https://github.com/frostney/lakon/issues/6); re-syncing and
+  running Lakon's gate happens in that consumer repository, not by editing a
+  second copy in this PR.
+- **Divergence policy during the transition**: GocciaScript's older copies of the LWPT-canonical units are **frozen** pending adoption. All future improvements land in LWPT-canonical only. Backports happen only on demand for P0 bugs, with the LWPT-canonical version always landing first. Observed state: as verified against GocciaScript `main` at `f4eae9a` (2026-09-27), several of GocciaScript's copies have nevertheless changed since the freeze, so some rows below record GocciaScript-ahead divergence. [#303](https://github.com/frostney/lwpt/issues/303) ported GocciaScript's per-hop host allowlist and private-address deny into `packages/httpclient`.
+- **`--frozen` is unrelated to this policy.** `lwpt install --frozen` verifies committed state against `lwpt.lock` without any network access and never writes the lockfile. It does not mean "install, but leave the lockfile alone".
+- **Bootstrap chicken-and-egg**: LWPT cannot fetch its own deps without HTTPClient existing. Today this is satisfied by `packages/httpclient/source/` being on the bootstrap fpc invocation's `-Fu` path; once `build/lwpt` exists, the full package system works.
+- **No patch markers** in source. Per ADR-0017's "No patch markers" Hard Constraint, the codebase has no `{ [gpm patch] }` or `{ [LWPT patch] }` syntax — git history is the canonical record of every change. The historical explanations of *why* the code looks the way it does survive as plain Pascal comments.
+- **No drift-check infrastructure.** With packages canonical-at-LWPT (not vendored from elsewhere), there's nothing external to drift against. The transition-window divergence with GocciaScript is documented here as a known state, not a defect to actively monitor.
+
+## Consumer help navigation
+
+The CLI package appends a program-wide `--help` link to every subcommand help
+page, including commands without options. The link uses the consumer-supplied
+program name. This shared renderer keeps LWPT commands and aliases consistent;
+GocciaScript’s older CLI copy does not include this addition.
+
+## The package set
+
+The Location column lists every file in each package's `source/` directory.
+Package-owned `tests/` and `scripts/` directories (for example `packages/httpclient/tests/e2e/`)
+and each package's `lwpt.toml` are not listed.
+
+| Package | Location | Origin | LWPT-canonical state vs GocciaScript's older copy |
+|---------|----------|--------|---------------------------------------------------|
+| `httpclient` | `packages/httpclient/source/HTTPClient.pas`, `HTTPClient.Test.pas`, `TransportSecurity.pas`, `TransportSecurity.Test.pas`, `FileUtils.pas`, `StringBuffer.pas`, `Tests.HTTPMockServer.pas`, `Tests.RetrievalRecorder.pas`, `Shared.inc` (bundled copy), `fixtures/` | Co-developed with GocciaScript; HTTPClient grew the byte-safety accumulator and body-capable POST core (also serving PUT and DELETE) in LWPT; TransportSecurity owns the server-accept (memory-BIO OpenSSL on Unix-not-Darwin, native SChannel on Windows), bounded-flow, strict-identity, and safe-reload contracts; the per-hop destination policy (host allowlist + private-address deny) was ported from GocciaScript's HTTPClient; FileUtils / StringBuffer were bundled from GocciaScript's copies | `HTTPClient.pas` diverged in both directions (LWPT: byte-safety fixes, POST, PUT, and DELETE support, options-record destination policy; GocciaScript: threaded connect workers, `HTTPTypes` split); `TransportSecurity.pas` diverged (LWPT ahead — server accept, flow control, and identity lifecycle); `Tests.HTTPMockServer.pas` and `HTTPClient.Test.pas` diverged (LWPT ahead — native Windows, complete request-capture, and POST redirect regression coverage); `FileUtils.pas` and `StringBuffer.pas` diverged (GocciaScript ahead — see below) |
+| `cli` | `packages/cli/source/CLI.Help.pas`, `CLI.Options.pas`, `CLI.Parser.pas`, `CLI.Parser.Test.pas`, `CLI.Subcommands.pas` (LWPT-original), `CLI.Subcommands.Test.pas`, `CLI.Events.pas` (LWPT-original), `CLI.Events.Test.pas`, `CLI.Prompts.pas` (LWPT-original), `StringBuffer.pas` (bundled copy), `Shared.inc` (bundled copy) | `CLI.*` family co-developed; LWPT canonicalised the namespace (stripped `TGoccia*` prefix from public types, dropped GocciaScript-engine-specific options as dead code, widened `CLI.Parser` to support separated long values, separated valued short options, and opt-in attached short values). Events, Subcommands, and Prompts are LWPT-original; Events is the output-neutral sequenced delivery boundary. | `CLI.Options.pas` + `CLI.Parser.pas` diverged (LWPT ahead — prefix-strip + dead-code drop + parser widening); `CLI.Help.pas` minor diverge (`{$I Goccia.inc}` → `{$I Shared.inc}`); Events + Subcommands + Prompts absent in GocciaScript |
+| `semver` | `packages/semver/source/Semver.pas`, `Semver.Test.pas`, `Shared.inc` (bundled copy) | Renamed from GocciaScript's `Goccia.Semver.pas`. The single needed constant (`MAX_SAFE_INTEGER`) was inlined from the deleted `Goccia.Constants.NumericLimits` dependency. | Diverged (LWPT ahead — rename + prefix-strip + inlined constant) |
+| `toml` | `packages/toml/source/TOML.pas`, `TOML.Test.pas`, `OrderedStringMap.pas`, `BaseMap.pas`, `Shared.inc` (bundled copy) | TOML refactored in LWPT (parser-class shape; renamed from `Goccia.TOML.pas`; structural depth and node limits for untrusted documents). `OrderedStringMap` + `BaseMap` co-developed. | `TOML.pas` diverged (LWPT ahead — rename + parser refactor); `OrderedStringMap.pas` + `BaseMap.pas` diverged (GocciaScript ahead — see below) |
+| `testing` | `packages/testing/source/TestingPascalLibrary.pas`, `TestingPascalLibrary.Protocol.pas`, `TestingPascalLibrary.Test.pas` (canary), `Shared.inc` (bundled copy) | Co-developed assertion + suite + runner framework. Was previously an embedded blob inside the LWPT binary served via the (now-retired) `lwpt export testing` subcommand; became a regular workspace package per [ADR-0015](../adr/0015-drop-export-testing-becomes-workspace-package.md). LWPT adds Darwin test-thread names and an opt-in, consumed active-case marker for native diagnostics. | Diverged (LWPT ahead: native diagnostic hooks) |
+| `source/Platform.pas` | `source/Platform.pas` (LWPT-internal; extraction candidate) | Renamed from GocciaScript's `Goccia.Platform.pas`. `{$I Goccia.inc}` swapped for `{$I Shared.inc}`. **Value vocabulary** (`darwin` / `linux` / `windows` etc.) is mirrored verbatim with GocciaScript's `Goccia.build.os` global per the [ADR-0012](../adr/0012-manifest-placeholder-interpolation.md) platform-placeholder design; the access path diverges (TOML `{platform.os}` ↔ JS `Goccia.build.os`). | Diverged (LWPT ahead — rename + include swap); GocciaScript still has `source/units/Goccia.Platform.pas` |
+| `source/Shared.inc` | `source/Shared.inc` | Co-developed; each `packages/<name>/source/` also bundles its own copy for self-containment per [ADR-0014](../adr/0014-packages-extraction.md)'s bundled-shared-utils decision. | Diverged (GocciaScript's copy selects `delphiunicode` and normalizes CPU symbols; LWPT's selects `delphi` with build-mode checks) |
+
+## Divergence between the LWPT and GocciaScript copies
+
+Per the freeze policy (ADR-0017): **all the below are LWPT-canonical; GocciaScript will pick them up via Path A adoption**. New improvements only land in LWPT. The status column records the observed state, including GocciaScript copies that changed after the freeze.
+
+| GocciaScript path | LWPT-canonical path | Status | Notes |
+|------|---------------------|--------|-------|
+| `source/shared/HTTPClient.pas` | `packages/httpclient/source/HTTPClient.pas` | **Diverged** (both directions) | LWPT: four byte-safety fixes — header-recv accumulator + chunked-body seed-buffer cast — plus byte-safe POST, PUT, and DELETE, generated entity headers, explicit redirect semantics, and a typed `EHTTPResponseTooLarge` for body-limit failures. Without the byte fixes, every binary download corrupts at the first `#0` byte. GocciaScript: threaded connect workers and wire types split into `HTTPTypes.pas`. Both carry a per-redirect host allowlist and private-range deny. LWPT's port lives in `THTTPRequestOptions.Destination` and adds `RequireHTTPS` and binary classification against the IANA special-purpose registries, and it dials the classified address; GocciaScript classifies address text. LWPT also resolves hostnames natively on Linux and Darwin, and `ConnectAddress` dials a pinned literal IPv4 address for the first hop while keeping the URL authority. |
+| `source/shared/TransportSecurity.pas` | `packages/httpclient/source/TransportSecurity.pas` | **Diverged** (LWPT ahead) | Server accept, independently bounded encrypted-input/output flow, input counters, watermark admission, strict identity validation, and atomic snapshot reload live only in the LWPT-canonical package pending GocciaScript Path A adoption; the Duetto companion update is tracked separately. |
+| `source/shared/FileUtils.pas` | `packages/httpclient/source/FileUtils.pas` | **Diverged** (GocciaScript ahead) | GocciaScript added host-path helpers (`IsAbsoluteHostPath`, `HostPathIsSymlink`, `CanonicalHostPath`), `FindAllFilesExcludingDirectories`, `WriteUTF8FileText`, `ReadFileBytes`, and `ReplaceHostFile`, an atomic replace whose exclusively created temporary refuses a planted symlink. Symlinks are detected with `lstat` (`HostPathIsSymlink`); `source/shared/FileUtils.pas` at `f4eae9a` contains no `O_NOFOLLOW`. LWPT's copy keeps the earlier `FindAllFiles`, UTF-8 path, and `ReadUTF8FileText` helpers. |
+| `source/shared/StringBuffer.pas` | `packages/httpclient/source/StringBuffer.pas` + `packages/cli/source/StringBuffer.pas` | **Diverged** | GocciaScript's buffer stores `UnicodeString`/`WideChar` and guards `inline` with `{$IFDEF FPC}`; LWPT's two bundled copies (identical to each other, per ADR-0014) store `AnsiString`/`AnsiChar`. |
+| `source/shared/CLI.Options.pas` | `packages/cli/source/CLI.Options.pas` | **Diverged** (LWPT ahead) | `TGoccia*` prefix stripped from every public type; GocciaScript-engine-specific option groups (`TGocciaEngineOptions` / `TGocciaCoverageOptions` / `TGocciaProfilerOptions` and their enums) removed as dead code; options can opt in to attached short values |
+| `source/shared/CLI.Parser.pas` | `packages/cli/source/CLI.Parser.pas` | **Diverged** (LWPT ahead) | Space-separated long-option parsing widened from repeatable-only to every valued option; short options support separated values (including values beginning with `-`) plus opt-in attached values and multi-character names; unmatched multi-character single-dash tokens remain positional; `TGoccia` prefix stripped; `AStartArg` parameter added for `lwpt run <subcommand>` aliasing |
+| `source/shared/CLI.Help.pas` | `packages/cli/source/CLI.Help.pas` | Diverged (cosmetic) | `TGoccia` prefix stripped; `{$I Goccia.inc}` swapped for `{$I Shared.inc}` |
+| `source/units/Goccia.Semver.pas` | `packages/semver/source/Semver.pas` | **Diverged** (LWPT ahead) | Unit renamed; type prefix stripped (`TGocciaSemver*` → `TSemver*`, `EGocciaSemver*` → `ESemver*`); `MAX_SAFE_INTEGER` inlined from the deleted `Goccia.Constants.NumericLimits` dependency |
+| `source/units/Goccia.Platform.pas` | `source/Platform.pas` | **Diverged** (LWPT ahead) | Unit renamed; `{$I Goccia.inc}` swapped for `{$I Shared.inc}`. Value vocabulary unchanged (mirrors `Goccia.build.os` etc.) |
+| `source/units/Goccia.TOML.pas` | `packages/toml/source/TOML.pas` | **Diverged** (LWPT ahead) | Unit renamed; parser refactored to the class-based AST shape |
+| `source/shared/OrderedStringMap.pas` | `packages/toml/source/OrderedStringMap.pas` | **Diverged** (GocciaScript ahead) | GocciaScript added storage-growth reporting (`RequireStorageBytes`) and UTF-16 string equality; LWPT's copy uses native string equality. |
+| `source/shared/BaseMap.pas` | `packages/toml/source/BaseMap.pas` | Diverged (cosmetic) | GocciaScript guards `inline` directives with `{$IFDEF FPC}`. |
+| `source/shared/TestingPascalLibrary.pas` | `packages/testing/source/TestingPascalLibrary.pas` | **Diverged** (LWPT ahead) | Darwin test-thread names and the opt-in active-case marker improve native diagnostics; the marker path is consumed before test bodies so nested programs cannot overwrite the outer case. |
+| `source/shared/Shared.inc` | `source/Shared.inc` (+ each `packages/<name>/source/Shared.inc`) | **Diverged** | GocciaScript's include selects `delphiunicode` and defines normalized `GOCCIA_CPU_*` symbols; LWPT's selects `delphi` and toggles runtime checks by `PRODUCTION`. |
+
+**GocciaScript-only utilities not in LWPT** (will need GocciaScript-side packaging when GocciaScript adopts Path A): `BCP47.pas`, `BOM.pas`, `BigInteger.pas`, `EmbeddedResourceReader.pas`, `HashMap.pas`, `ICU.pas`, `IntlICU.pas`, `IntlLocaleResolver.pas`, `IntlTypes.pas`, `JSONParser.pas`, `MemoryDetection.pas`, `OrderedMap.pas`, `TextSemantics.pas`, `TimeZoneInformationFile.pas`, `TimingUtils.pas`, `UnicodeICU.pas`. These extract into GocciaScript's own `packages/<name>/` tree as part of Path A — LWPT is consumer-agnostic and doesn't dictate their layout.
+
+## Bootstrap chicken-and-egg
+
+LWPT cannot fetch its own deps without HTTPClient existing. The resolution: HTTPClient lives in `packages/httpclient/source/` as part of LWPT's own monorepo, and the bootstrap (`bootstrap.sh` / `bootstrap.bat` / `scripts/bootstrap.pas`) compiles `source/lwpt.pas` directly with `-Fu packages/httpclient/source` alongside every other package's source dir. No separate "slim embedded" copy is needed; the full HTTPClient package is the bootstrap's HTTPClient.
+
+```sh
+# Cold bootstrap on a fresh clone (no network needed):
+./bootstrap.sh
+# → fpc -Mdelphi -Sh ... -Fusource -Fipackages/httpclient/source -Fi... source/lwpt.pas
+# → build/lwpt exists; lwpt install + everything else works
+```
+
+Once `packages/httpclient/` graduates to its own standalone repo (Phase 2), the chicken-and-egg returns and LWPT will need to keep a bootstrap copy in its repo — either by continuing to maintain `packages/httpclient/` alongside the standalone (slightly wasteful), or by snapshotting the standalone at a fixed commit under `bootstrap/` (more disciplined). The mechanism is a Phase-2 decision that gets its own follow-on ADR at graduation time; today's `packages/httpclient/` setup is correct for the monorepo era.
+
+## Graduation roadmap
+
+Per [ADR-0017](../adr/0017-packages-lwpt-canonical.md), graduation is a **relocation event**: a package leaves LWPT's monorepo for its own standalone repo. The package's content + identity stays the same before and after; only its filesystem location + the consumer's manifest entry change.
+
+### Phase 1: In-monorepo `packages/<name>/` — DONE
+
+The five current packages (`httpclient`, `cli`, `semver`, `toml`, `testing`) have all reached Phase 1. LWPT's root `lwpt.toml` auto-discovers them via `[workspaces] include = ["packages/*"]`. `Platform.pas` and `Shared.inc` are the remaining `source/`-resident extraction candidates; they'd move into `packages/platform/` + a bundled-only `Shared.inc` policy when warranted.
+
+### Phase 2 onwards: Standalone repo
+
+A package leaves LWPT's monorepo for its own standalone repo when warranted by signals like:
+
+- An external (non-`frostney/*`) contributor base develops.
+- The package's release cadence diverges meaningfully from LWPT's (e.g. weekly bug fixes while LWPT is monthly).
+- The package's CI / docs / tests warrant a dedicated GitHub Actions workflow rather than sharing LWPT's.
+- A third-party consumer beyond `frostney/*` materialises.
+
+Any one signal is enough to *consider* graduation; none alone *forces* it. Each graduation gets its own ADR documenting the trigger + the transition plan. After graduation, the LWPT root manifest flips the `[workspaces]` entry for that package to a `[dependencies]` git-host entry (e.g. `httpclient = "frostney/lwpt-httpclient@^1.0.0"`), and LWPT keeps a bootstrap copy if the package is bootstrap-critical (HTTPClient is the only known case today).
+
+## When you modify a package
+
+1. Edit the file at its LWPT-canonical path under `packages/<name>/source/` (or `source/` for `Platform.pas` / `Shared.inc`).
+2. **Do not add patch markers.** No `{ [gpm patch] }` / `{ [LWPT patch] }` syntax. The commit message + the inline Pascal comment (explaining *why* the code looks the way it does, when non-obvious) is the record.
+3. **Bump the package's version** in `packages/<name>/lwpt.toml`'s `[package].version` per semver 2.0.0 if the change is consumer-visible.
+4. **Update tests in the same commit** if a public-surface change. The package's `*.Test.pas` files are the package's own contract; the root pre-merge gate (`lwpt format --check` + `lwpt build` + `lwpt agents --check` + `lwpt test`) catches regressions.
+5. **Update the divergence table above** if the change widens or narrows the LWPT-canonical-vs-GocciaScript-copy delta, after checking the current GocciaScript source. (When GocciaScript adopts Path A and deletes its local copy, the table row gets removed.)
+
+## When a package graduates (in-monorepo → standalone repo)
+
+1. Create the new repo with `packages/<name>/`'s structure as the root (the package's `lwpt.toml` becomes the new repo's root manifest; the `source/` tree moves up).
+2. Move the canonical source there (verbatim — the package's identity is unchanged).
+3. Update LWPT's root `lwpt.toml`: drop the package from the auto-discovery glob (or add it to the `[workspaces].exclude` list); add a `[dependencies]` entry pointing at the standalone repo (`<package> = "frostney/lwpt-<name>@^X.Y.Z"`).
+4. Remove the `packages/<name>/` directory from LWPT's repo, EXCEPT for bootstrap-critical packages where LWPT keeps a copy per the Phase-2 ADR's decision.
+5. Write the graduation ADR documenting the trigger + the version pin chosen + the bootstrap-copy decision (if applicable).
+6. Mark the row in "the package set" table above as "Graduated to `<repo-url>`".

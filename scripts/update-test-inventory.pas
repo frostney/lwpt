@@ -8,7 +8,7 @@ uses
   LWPT.TestInventory;
 
 const
-  DOCUMENTATION_PATH = 'docs/testing.md';
+  DOCUMENTATION_PATH = 'docs/contributor/testing.md';
 
 var
   CheckOnly: Boolean;

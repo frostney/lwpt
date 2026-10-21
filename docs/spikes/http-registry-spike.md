@@ -192,7 +192,7 @@ branch is gone).
 
 ## What the v2 workstream needs to produce
 
-1. **`docs/registry-spec.md`** — the authoritative spec for what a
+1. **`docs/user/registry-spec.md`** — the authoritative spec for what a
    registry must serve:
    - URL layout (`<registry>/<name>/index.toml`,
      `<registry>/<name>/<version>/<name>.tar.gz`).
