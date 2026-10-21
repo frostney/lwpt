@@ -74,9 +74,14 @@ declared ready and again after every material change. Every review covers the
 standards and specification axes. Changes to trust surfaces (network, TLS,
 registry, install, lockfile, process isolation) add a security axis. Earlier
 findings are revalidated against the new head before they are fixed or
-dismissed, and the review report is recorded on the PR. The current reviewer is
-Codex with model `gpt-6-astra` at high reasoning. CodeRabbit is advisory: its
-valid findings are addressed, but its verdict is not required.
+dismissed, and the review report is recorded in the PR body by updating its
+matching section in place, not in comments. On a PR someone other than the
+authenticated user opened, the report is instead a comment from the
+authenticated user: a new comment when a head brings findings that change what
+the author must do, and an edit to the latest such comment when a re-check only
+confirms fixes. The current reviewer is Codex with model `gpt-6-astra` at high
+reasoning. CodeRabbit is advisory: its valid findings are addressed, but its
+verdict is not required.
 
 ## Lane-admission preflight
 
