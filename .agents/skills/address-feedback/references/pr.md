@@ -61,9 +61,11 @@ errored, missing, or head-ambiguous verdict is pending rather than passed.
    linked issue or confirmed mini-spec, required behavior, PR body, product
    docs, ADRs or durable decisions, and the nearest Definitions of Ready and
    Done. Label any claim inferred from the current change rather than a source.
-2. If an ordinary branch needs a baseline update, merge the remote base by
-   following `/update-pr`'s no-rebase workflow, but defer its commit and push
-   until the pre-push loop in steps 5 through 7 passes. A stack owner must
+2. If an ordinary branch needs a baseline update under `git-workflow`'s
+   [up-to-date rule](../../git-workflow/SKILL.md#update-commit-and-push),
+   merge the remote base by following `/update-pr`'s no-rebase workflow, but
+   defer its commit and push until the pre-push loop in steps 5 through 7
+   passes. A stack owner must
    perform any stack-wide synchronization before asking this skill to
    re-evaluate the affected layer.
 3. Run the review helper's `inspect` operation for the exact PR head. It returns
@@ -141,10 +143,11 @@ errored, missing, or head-ambiguous verdict is pending rather than passed.
     ordinary PR is `ready` under the exact final-head contract and
     `git-workflow`'s
     [default-branch health](../../git-workflow/SKILL.md#default-branch-health)
-    gate passes. Await a pending default-branch run with `delivery-wait`'s
-    `workflow-terminal` wait, then recheck. If the branch is still
-    not green or the host cannot wait, return `ready` and unmerged with the
-    default branch's state as the blocker. After the merge, sync the local
+    gate passes. When the gate holds the merge for a run, a red branch's
+    repair run or the run past a declared staleness bound, await that run
+    with `delivery-wait`'s `workflow-terminal` wait, then recheck. If the
+    gate still holds or the host cannot wait, return `ready` and unmerged
+    with the default branch's state as the blocker. After the merge, sync the local
     default branch, remove only
     clean worktrees owned by this run, and report the merged PR, final head,
     validation, reviews, and cleanup. For a native
