@@ -118,10 +118,15 @@ type
     can still be starting. fstNever never starts them, so shutdown's bounded
     join expires and the process takes its emergency exit. }
   TLWPTForwarderStartForTesting = (fstImmediate, fstAtShutdown, fstNever);
+  TLWPTAcknowledgementWaitHookForTesting = procedure;
 
 var
   ProcessTreeForwarderStartForTesting: TLWPTForwarderStartForTesting =
     fstImmediate;
+  { Runs after the first acknowledgement snapshot, before the deadline is
+    checked. A test can publish a terminal frame while that snapshot is stale. }
+  ProcessTreeBeforeAcknowledgementWaitForTesting:
+    TLWPTAcknowledgementWaitHookForTesting;
 
 { Signal-forwarder threads this process started that have not ended: on
   Windows, retained thread handles that are not yet signalled; on Unix, the
@@ -1423,6 +1428,10 @@ begin
   end;
   if AcknowledgementRegistered then
   begin
+    {$IFDEF PROCESSTREE_TESTING}
+    if Assigned(ProcessTreeBeforeAcknowledgementWaitForTesting) then
+      ProcessTreeBeforeAcknowledgementWaitForTesting;
+    {$ENDIF}
     while (not AcknowledgementFinished)
       and (GetTickCount64 < AcknowledgementDeadline) do
     begin
@@ -1433,6 +1442,22 @@ begin
         AcknowledgementFinished := FAcknowledgementFinished;
         AcknowledgementSucceeded := FAcknowledgementSucceeded;
         AcknowledgementDeadline := FCancellationAcknowledgementDeadline;
+      finally
+        LeaveCriticalSection(FTerminationCriticalSection);
+      end;
+    end;
+    if not AcknowledgementFinished then
+    begin
+      { The deadline bounds waiting, not the age of our last snapshot. The
+        child can publish its terminal frame while this thread is descheduled
+        between a read and the deadline check. Consume already-buffered status
+        before classifying a timeout or killing the child; this never waits
+        for more bytes and never extends the acknowledgement deadline. }
+      EnterCriticalSection(FTerminationCriticalSection);
+      try
+        DrainAcknowledgementFrames;
+        AcknowledgementFinished := FAcknowledgementFinished;
+        AcknowledgementSucceeded := FAcknowledgementSucceeded;
       finally
         LeaveCriticalSection(FTerminationCriticalSection);
       end;
