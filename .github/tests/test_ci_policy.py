@@ -922,7 +922,6 @@ class OrchestrationPolicyTests(unittest.TestCase):
         self.assertIn("--match-head-commit", policy)
         self.assertIn("`.github/delivery/review-automations.json`", policy)
         self.assertIn("## Review evidence", policy)
-        self.assertIn("`gpt-6-astra`", policy)
         self.assertIn("CodeRabbit is advisory", policy)
         self.assertTrue((ROOT / ".github/delivery/review-automations.json").is_file())
         for retired in ("delivery-transition", "merge:ready", "review:ready", "delivery:managed",

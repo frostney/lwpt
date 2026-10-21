@@ -9,23 +9,18 @@ work. This file declares only what those skills need from LWPT
 
 ## Capability classes and routing
 
-Use host-neutral capability classes, never product model names.
-
-- **Efficient** (standard reasoning): monitoring, status collection,
-  deterministic checks, and mechanical evidence extraction.
-- **Frontier** (high reasoning): design, implementation, security work, complex
-  diagnosis, and independent review.
-
-Split mixed work so the material decision stays frontier. If classification is
-ambiguous, use frontier and record why. No intervention may silently downgrade
-work below the class this routing requires.
+Lanes run on the known-good-route
+[capability tiers](./.agents/skills/milestone-rush/references/orchestration.md#capability-tiers)
+(`mechanical`, `bounded`, `open`), which name no model, provider, or effort
+level. LWPT narrows them: security work and independent review always run
+`open`.
 
 ## Context packets
 
 Workers start with no inherited conversation history. A packet carries the
 applicable decision IDs and their settled text, issue or PR identity, branch
 and exact head, owned scope, dependencies, acceptance criteria, required gates,
-capability class, and the structured result expected back. Add the three to
+capability tier, and the structured result expected back. Add the three to
 five most recent turns only when they are immediately relevant. Full-history
 inheritance needs a recorded, scoped exception.
 
@@ -69,14 +64,18 @@ do not spawn lanes under guessed semantics.
 ## Review evidence
 
 Review evidence is an independent review that the delivering agent runs on a
-separate frontier/high lane against the exact head. It runs before the PR is
+separate `open` lane against the exact head. It runs before the PR is
 declared ready and again after every material change. Every review covers the
 standards and specification axes. Changes to trust surfaces (network, TLS,
 registry, install, lockfile, process isolation) add a security axis. Earlier
 findings are revalidated against the new head before they are fixed or
-dismissed, and the review report is recorded on the PR. The current reviewer is
-Codex with model `gpt-6-astra` at high reasoning. CodeRabbit is advisory: its
-valid findings are addressed, but its verdict is not required.
+dismissed, and the review report is recorded in the PR body by updating its
+matching section in place, not in comments. On a PR someone other than the
+authenticated user opened, the report is instead a comment from the
+authenticated user: a new comment when a head brings findings that change what
+the author must do, and an edit to the latest such comment when a re-check only
+confirms fixes. CodeRabbit is advisory: its valid findings are addressed, but
+its verdict is not required.
 
 ## Lane-admission preflight
 
