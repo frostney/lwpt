@@ -1,5 +1,11 @@
 # Delivery is skill-owned; the repository keeps one gate
 
+> **Amended 2026-10-21, review evidence:** `ORCHESTRATION.md` no longer
+> names a reviewer model. Its capability classes name no model, provider, or
+> effort level; each host maps them to models in its own agent configuration.
+> The review report is recorded in the PR body, or as a comment on a PR the
+> authenticated user did not open.
+>
 > **Amended 2026-10-05, workflow write scope:** the consequence "no workflow
 > writes to pull requests" overstates it. `.github/workflows/lwpt-update.yml`,
 > the reusable dependency updater from
