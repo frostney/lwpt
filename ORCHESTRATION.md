@@ -9,12 +9,14 @@ work. This file declares only what those skills need from LWPT
 
 ## Capability classes and routing
 
-Use host-neutral capability classes, never product model names.
+Use host-neutral capability classes. They name no model, provider, or effort
+level; each host maps them to models in its own agent configuration, so a model
+release needs no edit here.
 
-- **Efficient** (standard reasoning): monitoring, status collection,
-  deterministic checks, and mechanical evidence extraction.
-- **Frontier** (high reasoning): design, implementation, security work, complex
-  diagnosis, and independent review.
+- **Efficient**: monitoring, status collection, deterministic checks, and
+  mechanical evidence extraction.
+- **Frontier**: design, implementation, security work, complex diagnosis, and
+  independent review.
 
 Split mixed work so the material decision stays frontier. If classification is
 ambiguous, use frontier and record why. No intervention may silently downgrade
@@ -69,7 +71,7 @@ do not spawn lanes under guessed semantics.
 ## Review evidence
 
 Review evidence is an independent review that the delivering agent runs on a
-separate frontier/high lane against the exact head. It runs before the PR is
+separate frontier lane against the exact head. It runs before the PR is
 declared ready and again after every material change. Every review covers the
 standards and specification axes. Changes to trust surfaces (network, TLS,
 registry, install, lockfile, process isolation) add a security axis. Earlier
@@ -79,9 +81,8 @@ matching section in place, not in comments. On a PR someone other than the
 authenticated user opened, the report is instead a comment from the
 authenticated user: a new comment when a head brings findings that change what
 the author must do, and an edit to the latest such comment when a re-check only
-confirms fixes. The current reviewer is Codex with model `gpt-6-astra` at high
-reasoning. CodeRabbit is advisory: its valid findings are addressed, but its
-verdict is not required.
+confirms fixes. CodeRabbit is advisory: its valid findings are addressed, but
+its verdict is not required.
 
 ## Lane-admission preflight
 
