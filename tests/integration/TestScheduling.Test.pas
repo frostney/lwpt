@@ -42,8 +42,6 @@ uses
 const
   CancellationCompletionCeilingSeconds = 12;
   AcknowledgementSuccessExitDelayMilliseconds = 300;
-  { An already-expired absolute deadline for the snapshot race fixture. }
-  ExpiredAcknowledgementDeadline = 1;
   CompilerExecutableEnvironment = PROJECT_NAME + '_FPC';
   IgnoreTerminateCompilerProxyMode = 'ignore-term';
   LongRunningFixtureMilliseconds = 15000;
@@ -1950,7 +1948,7 @@ var
   ChildTree: TLWPTProcessTree;
   Environment: array of string;
   ErrorMessage, PIDFile: string;
-  Started: QWord;
+  AcknowledgementDeadline, Started: QWord;
 begin
   PIDFile := FScratch + '/control/buffered-acknowledgement';
   SetLength(Environment, 2);
@@ -1983,8 +1981,11 @@ begin
       leaf then writes and exits while the owner is held at the hook, and
       the owner resumes with its acknowledgement deadline already expired.
       No production timeout is changed, and no sleep chooses the ordering. }
-    ChildTree.BeginTermination(ExpiredAcknowledgementDeadline,
-      ExpiredAcknowledgementDeadline);
+    { Expire the ACK wait now, while retaining the ordinary final reap window
+      for kernel bookkeeping such as Windows Job Object active counts. }
+    AcknowledgementDeadline := GetTickCount64;
+    ChildTree.BeginTermination(AcknowledgementDeadline,
+      AcknowledgementDeadline);
     ErrorMessage := '';
     try
       ChildTree.CompleteTermination;
