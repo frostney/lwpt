@@ -31,13 +31,9 @@ reply-only review records from verdicts. See the deterministic mechanism in
 [pr-readiness.md](pr-readiness.md) when interpreting those helper states; the
 complete-stack gate remains in `stack-readiness.md`.
 
-When current policy or activity identifies CodeRabbit as active, use
-`scripts/coderabbit_adapter.py`; do not reconstruct its trigger, completion,
-acknowledgment, coverage, rate-limit, or locking logic from prose. In read-only
-mode, run `status` with every exact `PR=SHA`. In normal mode, run `run` for one
-PR at a time with its exact head and an absolute deadline. Supply every known
-repository with recent CodeRabbit activity through repeated `--scan-repo`
-arguments so the adapter can select the newest edited account-scoped wait.
+When current policy or activity identifies CodeRabbit as active, use its
+adapter as [CodeRabbit](pr-readiness.md#coderabbit) states. In read-only mode,
+run only `status`, with every exact `PR=SHA`.
 
 ## Review rounds
 
@@ -57,10 +53,15 @@ arguments so the adapter can select the newest edited account-scoped wait.
    never a guessed trigger, completion, or wait.
 4. Review every initial member once for its exact head. Serialize triggers when
    the active provider has account-wide, repository-wide, or other shared
-   limits. During waits, use foreground transition commands and passively await
-   them. Do not wake the model merely to report unchanged state.
+   limits. For CodeRabbit, read `status` for every member, then `run` one
+   member at a time, bottom-up. During waits, run transition commands under
+   [`delivery-wait`'s running rules](../../delivery-wait/SKILL.md#running-a-wait).
+   Do not wake the model merely to report unchanged state.
 5. Inspect every inline thread, exact-head review body, and top-level
-   finding surface. Classify each claim against the integrated stack top:
+   finding surface. Record each finding's impact, gain, and if-not-done facts
+   and apply the repository's finding policy as the [PR workflow](pr.md)
+   describes; a finding the policy does not select is `declined`. Classify
+   each claim against the integrated stack top:
    `moot`, `satisfied-later`, `mutated`, `live`, `declined`, or
    `material-decision`. Cite the exact descendant commit and call path for
    `satisfied-later`; do not accept a vague later-layer claim.
@@ -78,9 +79,11 @@ arguments so the adapter can select the newest edited account-scoped wait.
    incremental review surfaces each missed sibling one round later.
 8. Run focused validation while fixing. Before submitting a substantive fix
    layer, repeat `/code-review fix-all` and `/test-against-spec fix` against the
-   complete integrated tree until both pass on the same unchanged content, then
-   establish the project's declared gate using matching current results. Stop for a material product, architecture,
-   security, compatibility, or scope decision.
+   complete integrated tree until both pass on the same unchanged content,
+   leaving a finding declined under the finding policy unfixed, then
+   establish the project's declared gate using matching current results. Stop
+   for a material product, architecture, security, compatibility, or scope
+   decision.
    If required behavior can only be exercised on a PR preview, complete the
    available checks and use step 9 to publish the necessary draft fix layer,
    explicitly retaining the missing preview evidence. Test its exact revision
@@ -89,11 +92,11 @@ arguments so the adapter can select the newest edited account-scoped wait.
 9. Enforce the native-stack reference's push-boundary checks for the frozen
    prefix and new branch. Use its protected `gh stack push` followed by separate
    PR creation and native append procedure; preserve the frozen PR heads and
-   metadata. Reconcile a partial result before continuing. Immediately replace generated
-   metadata with its actual claim, validation, and originating finding links,
-   and satisfy the project's PR evidence contract. Keep it draft until its own
-   local evidence and required checks permit review. Trigger and collect its
-   exact-head review under the active provider contract.
+   metadata. Reconcile a partial result before continuing. Immediately replace
+   generated metadata with its actual claim, validation, and originating
+   finding links, and satisfy the project's PR evidence contract. Keep it draft
+   until its own local evidence and required checks permit review. Trigger and
+   collect its exact-head review under the active provider contract.
 10. Once that fix layer has successful exact-head CI and a terminal review, it
     is frozen. Reply to and resolve the originating threads with the exact fix
     evidence. If review of the fix layer produces live findings, create another
@@ -117,17 +120,9 @@ own stack identity, findings, fixes, readiness, merge authority, or general CI.
 
 Do not invent adapters for ordinary GitHub review state. Do not copy provider
 commands, comment parsing, timers, or paid options into the core workflow. The
-CodeRabbit adapter is the sole owner of its two permitted trigger commands. Its
-`run` operation serializes triggers with one authenticated-account lock, polls
-through stated waits, and treats a finished acknowledgment as `clean-complete`
-only when walkthrough coverage is verified for the exact head and either ack
-latency meets the trusted threshold or that same head has a CodeRabbit check
-SUCCESS. Latency and walkthrough freshness count from when GitHub recorded the
-head's push (its branch activity, else its earliest check suite on that
-branch), or from the commit time if that is later. Without that record, only
-the head-scoped check completes the review. It escalates untrusted incremental acknowledgments to a full review,
-refuses guessed retry times, and never exposes a paid-review command. Keep
-`review-complete` for real exact-head review objects only.
+CodeRabbit adapter is the only definition of CodeRabbit's triggers, waits,
+refusals, and completion; [CodeRabbit](pr-readiness.md#coderabbit) lists its
+states and what this workflow does for each.
 
 ## Result contract
 

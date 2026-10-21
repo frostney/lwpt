@@ -92,12 +92,11 @@ policy, never reinterpret a visible failure as green.
 - Treat an explicitly requested human or automated reviewer as active. Pending
   review requests and `CHANGES_REQUESTED` remain open; apply the repository's
   current-head approval-dismissal policy.
-- For every active review tool, inspect inline threads plus top-level status,
-  summaries, suggestions, and nitpicks. A rate limit, quota response, error,
-  incomplete run, missing verdict, or review against an older head is pending.
-- For every active automation, include its current-head summary or walkthrough
-  status and every unresolved inline or top-level nitpick. Apply the same
-  evidence-based semantics without hardcoding a provider.
+- For every active review tool or automation, show its current-head summary or
+  walkthrough status and every unresolved inline or top-level finding,
+  including nitpicks, without hardcoding a provider. A rate limit, quota
+  response, error, incomplete run, missing verdict, or review against an older
+  head is pending.
 - Do not infer that source changes resolved a finding. Use the current review
   resolution and verdict evidence; expose uncertainty as a blocker.
 
