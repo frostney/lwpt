@@ -97,6 +97,8 @@ const
   InheritedChannelProbeProxyMode = 'inherited-channel-probe';
   SuccessfulAcknowledgementLeafProxyMode = 'successful-acknowledgement-leaf';
   FailedAcknowledgementLeafProxyMode = 'failed-acknowledgement-leaf';
+  BufferedFailedAcknowledgementLeafProxyMode = 'buffered-failed-acknowledgement';
+  BufferedSuccessfulAcknowledgementLeafProxyMode = 'buffered-successful-acknowledgement';
   {$IFDEF MSWINDOWS}
   WindowsConsoleControllerOption = '--' + PROGRAM_NAME
     + '-console-controller';
@@ -190,6 +192,7 @@ type
     function RunTestsWithHeartbeat(const AArgs: array of string;
       const AHeartbeatMilliseconds: Integer;
       const ATimeoutMilliseconds: QWord = 0): TLwptResult;
+    procedure CheckBufferedAcknowledgement(const ASucceeded: Boolean);
   protected
     procedure BeforeAll; override;
     procedure BeforeEach; override;
@@ -212,6 +215,8 @@ type
     procedure TestManagedAndUnmanagedSpawnsShareCriticalSection;
     procedure TestExitedRegisteredProcessTreeIsSuccessfulNoOp;
     procedure TestFailedNestedTerminationAcknowledgementFailsCancellation;
+    procedure TestBufferedFailedAcknowledgementSurvivesDeadline;
+    procedure TestBufferedSuccessfulAcknowledgementSurvivesDeadline;
     procedure TestMissingTerminationAcknowledgementFailsCancellation;
     procedure TestSiblingTerminationAcknowledgementsShareFanout;
     procedure TestProtocolFramingIsBoundedAndIncremental;
@@ -235,6 +240,10 @@ type
     procedure TestFailureReplaysAndPreservesIsolatedLog;
     procedure TestVerboseSuccessLogsNeverInterleave;
   end;
+
+var
+  BufferedAcknowledgementChild: TProcess;
+  BufferedAcknowledgementPIDFile: string;
 
 function PascalString(const AValue: string): string;
 begin
@@ -1903,14 +1912,112 @@ begin
   CommandResult := RunTestsWithCompilerProxy(['--jobs=2'],
     FailedAcknowledgementCompilerProxyMode, PIDFile);
   Expect<Integer>(CommandResult.ExitCode).ToBe(1);
-  Expect<Boolean>(PayloadIsReadable(PIDFile + '-owner')).ToBe(True);
-  Expect<Boolean>(PayloadIsReadable(PIDFile + '-descendant')).ToBe(True);
+  if not PayloadIsReadable(PIDFile + '-owner') then
+    Fail('failed-acknowledgement owner did not publish its PID'
+      + LineEnding + CommandResult.Stdout + LineEnding + CommandResult.Stderr);
+  if not PayloadIsReadable(PIDFile + '-descendant') then
+    Fail('failed-acknowledgement descendant did not publish its PID'
+      + LineEnding + CommandResult.Stdout + LineEnding + CommandResult.Stderr);
   OwnerPID := StrToInt(Trim(ReadPayloadText(PIDFile + '-owner')));
   DescendantPID := StrToInt(Trim(ReadPayloadText(PIDFile + '-descendant')));
   Expect<Boolean>(ProcessIsRunning(OwnerPID)).ToBe(False);
   Expect<Boolean>(ProcessIsRunning(DescendantPID)).ToBe(False);
-  Expect<Boolean>(Pos('nested process reported failed process-tree '
-    + 'termination', CommandResult.Stdout) > 0).ToBe(True);
+  if Pos('nested process reported failed process-tree termination',
+    CommandResult.Stdout) = 0 then
+    Fail('descendant FAILED acknowledgement did not reach the ancestor'
+      + ' (owner PID ' + IntToStr(OwnerPID) + ', descendant PID '
+      + IntToStr(DescendantPID) + ')' + LineEnding
+      + CommandResult.Stdout + LineEnding + CommandResult.Stderr);
+end;
+
+procedure ReleaseBufferedAcknowledgement;
+begin
+  { The owner has already taken its first snapshot. Only now may the leaf
+    send its terminal frame. Reaping it makes the pipe write happen-before
+    the owner resumes, without relying on a scheduling delay. }
+  WriteTextFile(BufferedAcknowledgementPIDFile + '-release', '');
+  if not WaitForChildExit(BufferedAcknowledgementChild,
+    QWord(ProcessExitCeilingSeconds) * 1000) then
+    raise Exception.Create('buffered acknowledgement leaf did not exit');
+end;
+
+procedure TTestScheduling.CheckBufferedAcknowledgement(
+  const ASucceeded: Boolean);
+var
+  Child: TProcess;
+  ChildTree: TLWPTProcessTree;
+  Environment: array of string;
+  ErrorMessage, PIDFile: string;
+  AcknowledgementDeadline, Started: QWord;
+begin
+  PIDFile := FScratch + '/control/buffered-acknowledgement';
+  SetLength(Environment, 2);
+  if ASucceeded then
+    Environment[0] := ProcessTreeProxyModeEnvironment + '='
+      + BufferedSuccessfulAcknowledgementLeafProxyMode
+  else
+    Environment[0] := ProcessTreeProxyModeEnvironment + '='
+      + BufferedFailedAcknowledgementLeafProxyMode;
+  Environment[1] := ProcessTreeProxyPIDFileEnvironment + '=' + PIDFile;
+  Child := TProcess.Create(nil);
+  ChildTree := TLWPTProcessTree.Create(Child);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    ConfigureProcessEnvironment(Child, Environment);
+    ChildTree.Execute;
+    Started := GetTickCount64;
+    while not PayloadIsReadable(PIDFile + '-descendant') and Child.Running
+      and (GetTickCount64 - Started
+        < QWord(ProcessStartupCeilingSeconds) * 1000) do
+      Sleep(ProcessPollMilliseconds);
+    if not PayloadIsReadable(PIDFile + '-descendant') then
+      Fail('buffered acknowledgement leaf did not publish its PID');
+
+    BufferedAcknowledgementChild := Child;
+    BufferedAcknowledgementPIDFile := PIDFile;
+    ProcessTreeBeforeAcknowledgementWaitForTesting :=
+      ReleaseBufferedAcknowledgement;
+    { Pin the losing interleaving: the first snapshot sees only HELLO, the
+      leaf then writes and exits while the owner is held at the hook, and
+      the owner resumes with its acknowledgement deadline already expired.
+      No production timeout is changed, and no sleep chooses the ordering. }
+    { Expire the ACK wait now, while retaining the ordinary final reap window
+      for kernel bookkeeping such as Windows Job Object active counts. }
+    AcknowledgementDeadline := GetTickCount64;
+    ChildTree.BeginTermination(AcknowledgementDeadline,
+      AcknowledgementDeadline);
+    ErrorMessage := '';
+    try
+      ChildTree.CompleteTermination;
+    except
+      on E: Exception do ErrorMessage := E.Message;
+    end;
+    if ASucceeded then
+      Expect<string>(ErrorMessage).ToBe('')
+    else
+      Expect<string>(ErrorMessage).ToBe(
+        'nested process reported failed process-tree termination');
+    Expect<Boolean>(Child.Running).ToBe(False);
+    if ASucceeded then Expect<Integer>(ChildProcessExitCode(Child)).ToBe(0)
+    else Expect<Integer>(ChildProcessExitCode(Child)).ToBe(1);
+  finally
+    ProcessTreeBeforeAcknowledgementWaitForTesting := nil;
+    BufferedAcknowledgementChild := nil;
+    BufferedAcknowledgementPIDFile := '';
+    EndChildProcessTree(ChildTree, Child);
+    ChildTree.Free;
+    Child.Free;
+  end;
+end;
+
+procedure TTestScheduling.TestBufferedFailedAcknowledgementSurvivesDeadline;
+begin
+  CheckBufferedAcknowledgement(False);
+end;
+
+procedure TTestScheduling.TestBufferedSuccessfulAcknowledgementSurvivesDeadline;
+begin
+  CheckBufferedAcknowledgement(True);
 end;
 
 procedure TTestScheduling.TestSiblingTerminationAcknowledgementsShareFanout;
@@ -2633,6 +2740,7 @@ function RunAcknowledgementLeaf(const AMode, APIDFile: string): Integer;
 var
   ChannelToken, ControlHandleText, Frame, StatusHandleText: string;
   ControlHandle, StatusHandle: PtrInt;
+  Started: QWord;
   {$IFDEF MSWINDOWS}
   Buffer: array[0..511] of Byte;
   BytesRead, BytesWritten: DWORD;
@@ -2677,8 +2785,19 @@ begin
   if not Windows.ReadFile(THandle(ControlHandle), Buffer[0], SizeOf(Buffer),
     BytesRead, nil) or (BytesRead = 0) then Exit(3);
   {$ENDIF}
+  if (AMode = BufferedFailedAcknowledgementLeafProxyMode)
+     or (AMode = BufferedSuccessfulAcknowledgementLeafProxyMode) then
+  begin
+    Started := GetTickCount64;
+    while not FileExists(APIDFile + '-release')
+      and (GetTickCount64 - Started
+        < QWord(ProcessExitCeilingSeconds) * 1000) do
+      Sleep(ProcessPollMilliseconds);
+    if not FileExists(APIDFile + '-release') then Exit(5);
+  end;
   if (AMode = SuccessfulAcknowledgementLeafProxyMode)
-     or (AMode = ImmediateAcknowledgementLeafProxyMode) then
+     or (AMode = ImmediateAcknowledgementLeafProxyMode)
+     or (AMode = BufferedSuccessfulAcknowledgementLeafProxyMode) then
     Frame := ProcessTreeAcknowledgementProtocol + ' ' + ChannelToken
       + ' REAPED' + LineEnding
   else
@@ -2700,7 +2819,8 @@ begin
       past the acknowledgement deadline to pin the separate final reap window. }
     Sleep(AcknowledgementSuccessExitDelayMilliseconds);
   end
-  else if AMode <> ImmediateAcknowledgementLeafProxyMode then
+  else if (AMode <> ImmediateAcknowledgementLeafProxyMode)
+      and (AMode <> BufferedSuccessfulAcknowledgementLeafProxyMode) then
     Exit(1);
   Result := 0;
 end;
@@ -2908,6 +3028,8 @@ begin
   if (Mode = SuccessfulAcknowledgementLeafProxyMode)
      or (Mode = ImmediateAcknowledgementLeafProxyMode)
      or (Mode = FailedAcknowledgementLeafProxyMode)
+     or (Mode = BufferedFailedAcknowledgementLeafProxyMode)
+     or (Mode = BufferedSuccessfulAcknowledgementLeafProxyMode)
      or (Mode = CleanAcknowledgementExitProxyMode) then
     Exit(RunAcknowledgementLeaf(Mode, PIDFile));
   if Mode = InheritedChannelProbeProxyMode then
@@ -3049,6 +3171,10 @@ begin
     TestExitedRegisteredProcessTreeIsSuccessfulNoOp);
   Test('failed descendant termination acknowledgement propagates to ancestor',
     TestFailedNestedTerminationAcknowledgementFailsCancellation);
+  Test('buffered FAILED acknowledgement survives the deadline check',
+    TestBufferedFailedAcknowledgementSurvivesDeadline);
+  Test('buffered REAPED acknowledgement survives the deadline check',
+    TestBufferedSuccessfulAcknowledgementSurvivesDeadline);
   Test('missing nested termination acknowledgement fails cancellation',
     TestMissingTerminationAcknowledgementFailsCancellation);
   Test('registered sibling cancellations share one fanout',
