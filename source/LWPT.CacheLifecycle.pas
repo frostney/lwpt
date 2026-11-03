@@ -73,6 +73,9 @@ var
   { Counts authoritative budget enforcements (cache walks), so a test can
     show that admissions stop walking the cache once it is measured. }
   CacheLifecycleEnforcementCount: Integer;
+  { Counts walks of the build references, so a test can show that one
+    eviction batch collects them once however many objects it evicts. }
+  CacheLifecycleReferenceCollectionCount: Integer;
 {$ENDIF}
 
 implementation
@@ -501,6 +504,27 @@ begin
     and (ASequence >= 0);
 end;
 
+{ The ledger's size when it is a regular file, and -1 for a link or any
+  other entry. A walk skips links, so only a regular ledger's bytes are in
+  its total, and only a regular ledger is ever trusted. 0 when absent. }
+function LedgerFileBytes(const ACacheRoot: string): Int64;
+var
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(LedgerPath(ACacheRoot), faAnyFile or faSymLink,
+       Search) <> 0 then Exit;
+  try
+    if ((Search.Attr and (faSymLink or faDirectory)) <> 0)
+       or IsDirSymlinkOrJunction(LedgerPath(ACacheRoot)) then
+      Result := -1
+    else
+      Result := Search.Size;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+
 function LoadLedger(const ACacheRoot: string;
   out ALedger: TLWPTCacheLedger): Boolean;
 var
@@ -510,6 +534,7 @@ var
 begin
   Result := False;
   ALedger := Default(TLWPTCacheLedger);
+  if LedgerFileBytes(ACacheRoot) <> CACHE_LEDGER_BYTES then Exit;
   if not ReadSmallTextFile(LedgerPath(ACacheRoot), Text) then Exit;
   if not ReadIndexIdentity(ACacheRoot, IndexSequence, IndexBytes) then Exit;
   Lines := TStringList.Create;
@@ -526,13 +551,34 @@ begin
   end;
 end;
 
+{ Removes whatever entry holds the ledger's name without following it: a
+  link is unlinked and a directory is wiped, so nothing outside the cache
+  is touched and the next write can publish a regular ledger. }
 procedure DropLedger(const ACacheRoot: string);
+var
+  Attributes: LongInt;
+  Path: string;
+  Search: TSearchRec;
 begin
-  if FileExists(LedgerPath(ACacheRoot))
-     and not SysUtils.DeleteFile(LedgerPath(ACacheRoot)) then
+  Path := LedgerPath(ACacheRoot);
+  if FindFirst(Path, faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    Attributes := Search.Attr;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+  if (((Attributes and faDirectory) <> 0)
+      and ((Attributes and faSymLink) = 0))
+     or IsDirSymlinkOrJunction(Path) then
+    WipeDir(Path)
+  else
+    SysUtils.DeleteFile(Path);
+  if FindFirst(Path, faAnyFile or faSymLink, Search) = 0 then
+  begin
+    SysUtils.FindClose(Search);
     raise ELWPTCacheLifecycleError.CreateFmt(
-      'failed to remove stale cache usage ledger %s',
-      [LedgerPath(ACacheRoot)]);
+      'failed to remove stale cache usage ledger %s', [Path]);
+  end;
 end;
 
 { Records ABytes against the current index. The ledger itself always
@@ -993,6 +1039,9 @@ begin
   FCollected := True;
   FComplete := True;
   Malformed := nil;
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleReferenceCollectionCount);
+  {$ENDIF}
   Root := BuildReferenceSHA256Root(FCacheRoot);
   if IsDirSymlinkOrJunction(Root) then
   begin
@@ -1281,9 +1330,12 @@ end;
 { The bytes a walk finds, with the usage ledger counted at its fixed size
   whether or not it exists yet: enforcement writes it after measuring. }
 function MeasureCacheBytes(const ACacheRoot: string): Int64;
+var
+  LedgerBytes: Int64;
 begin
-  Result := DirectoryBytes(ACacheRoot) - FileByteSize(LedgerPath(ACacheRoot))
-    + CACHE_LEDGER_BYTES;
+  Result := DirectoryBytes(ACacheRoot) + CACHE_LEDGER_BYTES;
+  LedgerBytes := LedgerFileBytes(ACacheRoot);
+  if LedgerBytes > 0 then Dec(Result, LedgerBytes);
 end;
 
 { Authoritative enforcement: measures the whole tree and, when the cache

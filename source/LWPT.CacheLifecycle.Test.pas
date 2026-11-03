@@ -66,6 +66,7 @@ type
     procedure TestRepairFailsClosedWhenReferenceCannotBeDeleted;
     {$IFDEF UNIX}
     procedure TestRepairUnlinksCacheShardsWithoutFollowingThem;
+    procedure TestLinkedLedgerIsNeitherTrustedNorFollowed;
     {$ENDIF}
     procedure TestRepairReclaimsAbandonedAndPreservesLiveLease;
     procedure TestBudgetParsing;
@@ -1278,7 +1279,7 @@ const
     reference each, all indexed in order) with the cache at its budget,
     then stores Inserts new results. }
   procedure Measure(const AResults: Integer; out AMedianMs: Int64;
-    out AEnforcements: Integer);
+    out AEnforcements, ACollections: Integer);
   var
     Artifact, Fingerprint, IndexText, Manifest, Path, Source: string;
     Artifacts, Fingerprints, Manifests: array of string;
@@ -1340,6 +1341,7 @@ const
     Times := TStringList.Create;
     try
       CacheLifecycleEnforcementCount := 0;
+      CacheLifecycleReferenceCollectionCount := 0;
       for Index := 0 to Inserts - 1 do
       begin
         Source := FScratch + '/sources/flat-' + IntToStr(Index);
@@ -1349,12 +1351,14 @@ const
         Expect<Boolean>(Cache.Store('sha256:' + LowerCase(SHA256Hex(
           BytesOf('new-fingerprint-' + IntToStr(Index)))), Source,
           'executable', 493)).ToBe(True);
-        { The first admission measures the cache and evicts a band;
-          the rest are the steady state this test bounds. }
+        { The first admission measures the cache and evicts a band, whose
+          cost the collection count below bounds; the rest are the steady
+          state this timing bounds. }
         if Index > 0 then
           Times.Add(Format('%.12d', [GetTickCount64 - Started]));
       end;
       AEnforcements := CacheLifecycleEnforcementCount;
+      ACollections := CacheLifecycleReferenceCollectionCount;
       Times.Sort;
       AMedianMs := StrToInt64(Times[Times.Count div 2]);
       if CacheBytes(FCacheRoot) > ResolveCacheMaxBytes then
@@ -1378,15 +1382,20 @@ const
 
 var
   SmallMs, LargeMs: Int64;
-  SmallEnforcements, LargeEnforcements: Integer;
+  SmallCollections, LargeCollections, SmallEnforcements,
+    LargeEnforcements: Integer;
 begin
-  Measure(SmallResults, SmallMs, SmallEnforcements);
-  Measure(LargeResults, LargeMs, LargeEnforcements);
+  Measure(SmallResults, SmallMs, SmallEnforcements, SmallCollections);
+  Measure(LargeResults, LargeMs, LargeEnforcements, LargeCollections);
   { One authoritative enforcement for all the admissions, at either size:
     the first evicts down to the low-water mark, and the band it leaves
-    holds the rest. }
+    holds the rest. That batch evicts a tenth of the results, artifacts
+    and manifests alike, yet walks the references once; a walk per
+    evicted object would count in the dozens or hundreds here. }
   Expect<Integer>(SmallEnforcements).ToBe(1);
   Expect<Integer>(LargeEnforcements).ToBe(1);
+  Expect<Integer>(SmallCollections).ToBe(1);
+  Expect<Integer>(LargeCollections).ToBe(1);
   if LargeMs >= ScaleMultiple * SmallMs + ScaleSlackMs then
     Fail(Format('median admission took %d ms at %d results against %d ms '
       + 'at %d; bound %d x + %d ms', [LargeMs, LargeResults, SmallMs,
@@ -1533,6 +1542,42 @@ begin
   end;
 end;
 
+{$IFDEF UNIX}
+procedure TCacheLifecycleContract.
+  TestLinkedLedgerIsNeitherTrustedNorFollowed;
+var
+  Lifecycle: TLWPTCacheLifecycle;
+  LedgerLink, Outside: string;
+  Mutation: TObject;
+  Info: BaseUnix.Stat;
+begin
+  { A walk skips links, so a ledger name that is a link must neither be
+    trusted nor have its target's bytes subtracted from the walk: that
+    would under-count the cache. Enforcement removes the link itself and
+    leaves its target alone. }
+  WriteTextFile(FCacheRoot + '/dependency-archives/tmp/residue',
+    StringOfChar('r', 10000));
+  Outside := FScratch + '/outside-ledger';
+  WriteTextFile(Outside, StringOfChar('o', 20000));
+  LedgerLink := FCacheRoot + '/lifecycle/usage';
+  ForceDirectories(ExtractFileDir(LedgerLink));
+  if FpSymlink(PChar(Outside), PChar(LedgerLink)) <> 0 then
+    raise Exception.Create('failed to link the ledger fixture');
+  SetBudget('5000');
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+  Expect<Boolean>(FpLstat(PChar(LedgerLink), Info) = 0).ToBe(False);
+  Expect<Int64>(FileSizeOf(Outside)).ToBe(20000 + Length(LineEnding));
+end;
+{$ENDIF}
+
 procedure TCacheLifecycleContract.SetupTests;
 begin
   Test('aggregate admission evicts the deterministic least-recently-used '
@@ -1572,6 +1617,8 @@ begin
   Test('repair fails closed when a reference cannot be deleted',
     TestRepairFailsClosedWhenReferenceCannotBeDeleted);
   {$IFDEF UNIX}
+  Test('a linked usage ledger is neither trusted nor followed',
+    TestLinkedLedgerIsNeitherTrustedNorFollowed);
   Test('repair unlinks cache shards without following them',
     TestRepairUnlinksCacheShardsWithoutFollowingThem);
   {$ENDIF}
