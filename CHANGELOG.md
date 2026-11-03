@@ -1,6 +1,33 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.8.1] - 2026-11-03
+
+### Upgrade notes
+
+- **Shared cache at its budget.** The first command that adds to a full shared cache after upgrading measures it once and evicts down to 90% of `LWPT_CACHE_MAX_BYTES` (9 GiB of the default 10 GiB). Later admissions read a small usage ledger (`lifecycle/usage`) instead of walking the cache, so `--no-cache` is no longer needed to avoid the slowdown, and no `lwpt repair` is required (#405, #406).
+- **Mixed versions.** Older lwpt binaries can keep sharing the cache. Their index writes make 0.8.1 distrust its ledger and measure again, and they still enforce the budget themselves, but they keep their own slow admissions until they are upgraded.
+
+### Bug Fixes
+
+- fix(process): retain buffered termination acknowledgements at the deadline (#402)
+- fix(test): end simulated crash children without finalization (#395)
+
+### Documentation
+
+- docs: sync documentation and records with shipped behavior for 0.8.1 (#407)
+- docs(orchestration): record review reports in the PR body and name no reviewer model (#400)
+- docs: split documentation into user and contributor guides (#396)
+- docs: post-release 0.8.0 pins, image defaults, and heading-less tag upgrade notes (#394)
+
+### Internal
+
+- ci: run the full matrix on every PR and retire pr.yml and the manual full-CI rule (#403)
+- chore(skills): sync provisioned skills (#398)
+
+### Performance
+
+- perf(cache): judge admissions from a usage ledger and evict to a low-water mark (#406)
 ## [0.8.0] - 2026-10-05
 
 ### Upgrade notes
