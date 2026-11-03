@@ -27,7 +27,7 @@ program	*	source/LWPT.ArchiveNormalize.Test.pas	7	50
 program	*	source/LWPT.BuildRequest.Test.pas	1	12
 program	*	source/LWPT.BuildCache.Test.pas	1	13
 program	*	source/LWPT.CacheLifecycle.Test.pas	1	24
-program	unix/*	source/LWPT.CacheLifecycle.Test.pas	1	26
+program	unix/*	source/LWPT.CacheLifecycle.Test.pas	1	28
 program	*	source/LWPT.BuildSession.Test.pas	1	32
 program	windows/*	source/LWPT.BuildSession.Test.pas	1	27
 program	*	source/LWPT.Command.Build.Test.pas	2	6

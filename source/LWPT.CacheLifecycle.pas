@@ -435,14 +435,18 @@ begin
   end;
 end;
 
+{ A regular file's size without following a link: a link counts as zero,
+  as DirectoryBytes skips it, so the bytes this reports for a file are the
+  bytes a walk counts for it. }
 function FileByteSize(const APath: string): Int64;
 var
   Search: TSearchRec;
 begin
   Result := 0;
-  if FindFirst(APath, faAnyFile, Search) <> 0 then Exit;
+  if FindFirst(APath, faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
-    if (Search.Attr and faDirectory) = 0 then Result := Search.Size;
+    if (Search.Attr and (faDirectory or faSymLink)) = 0 then
+      Result := Search.Size;
   finally
     SysUtils.FindClose(Search);
   end;
@@ -504,13 +508,15 @@ begin
     and (ASequence >= 0);
 end;
 
-{ The ledger's size when it is a regular file, and -1 for a link or any
-  other entry. A walk skips links, so only a regular ledger's bytes are in
-  its total, and only a regular ledger is ever trusted. 0 when absent. }
+{ The ledger's size when it is a regular file in an unlinked lifecycle
+  root, 0 when absent, and -1 for a link, any other entry, or a linked
+  lifecycle root. A walk skips links, so only a regular ledger's bytes are
+  in its total, and only a regular ledger is ever trusted or written. }
 function LedgerFileBytes(const ACacheRoot: string): Int64;
 var
   Search: TSearchRec;
 begin
+  if IsDirSymlinkOrJunction(LifecycleRoot(ACacheRoot)) then Exit(-1);
   Result := 0;
   if FindFirst(LedgerPath(ACacheRoot), faAnyFile or faSymLink,
        Search) <> 0 then Exit;
@@ -551,25 +557,24 @@ begin
   end;
 end;
 
-{ Removes whatever entry holds the ledger's name without following it: a
-  link is unlinked and a directory is wiped, so nothing outside the cache
-  is touched and the next write can publish a regular ledger. }
+{ Removes a regular ledger, or a link in its place, without following
+  anything. Any other entry, or a linked lifecycle root, is left alone:
+  such a ledger is never trusted or written, so admissions measure. }
 procedure DropLedger(const ACacheRoot: string);
 var
-  Attributes: LongInt;
   Path: string;
   Search: TSearchRec;
 begin
+  if IsDirSymlinkOrJunction(LifecycleRoot(ACacheRoot)) then Exit;
   Path := LedgerPath(ACacheRoot);
   if FindFirst(Path, faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
-    Attributes := Search.Attr;
+    if ((Search.Attr and faDirectory) <> 0)
+       and ((Search.Attr and faSymLink) = 0) then Exit;
   finally
     SysUtils.FindClose(Search);
   end;
-  if (((Attributes and faDirectory) <> 0)
-      and ((Attributes and faSymLink) = 0))
-     or IsDirSymlinkOrJunction(Path) then
+  if IsDirSymlinkOrJunction(Path) then
     WipeDir(Path)
   else
     SysUtils.DeleteFile(Path);
@@ -590,6 +595,11 @@ var
   Lines: TStringList;
   Padding: Integer;
 begin
+  if LedgerFileBytes(ACacheRoot) < 0 then
+  begin
+    DropLedger(ACacheRoot);
+    if LedgerFileBytes(ACacheRoot) < 0 then Exit;
+  end;
   if not ReadIndexIdentity(ACacheRoot, IndexSequence, IndexBytes) then
   begin
     DropLedger(ACacheRoot);

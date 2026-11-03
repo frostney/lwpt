@@ -67,6 +67,8 @@ type
     {$IFDEF UNIX}
     procedure TestRepairUnlinksCacheShardsWithoutFollowingThem;
     procedure TestLinkedLedgerIsNeitherTrustedNorFollowed;
+    procedure TestLinkedLifecycleRootIsNotFollowed;
+    procedure TestLinkedManifestIsNotDebited;
     {$ENDIF}
     procedure TestRepairReclaimsAbandonedAndPreservesLiveLease;
     procedure TestBudgetParsing;
@@ -1578,6 +1580,69 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF UNIX}
+procedure TCacheLifecycleContract.TestLinkedLifecycleRootIsNotFollowed;
+var
+  Kept, Outside: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { When the lifecycle root links outside the cache, a ledger name below it
+    is outside too: dropping or writing the ledger must not touch it. }
+  Outside := FScratch + '/outside-lifecycle';
+  Kept := Outside + '/usage/keep';
+  WriteTextFile(Kept, 'outside');
+  ForceDirectories(FCacheRoot);
+  if FpSymlink(PChar(Outside), PChar(FCacheRoot + '/lifecycle')) <> 0 then
+    raise Exception.Create('failed to link the lifecycle fixture');
+  SetBudget('0');
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+  Expect<Boolean>(FileExists(Kept)).ToBe(True);
+end;
+
+procedure TCacheLifecycleContract.TestLinkedManifestIsNotDebited;
+var
+  Digest, Manifest, Outside: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { A walk skips a linked control file, so removing one frees none of the
+    bytes the walk counted. Debiting its target's size from the ledger
+    would let a later admission past the budget. }
+  WriteTextFile(FCacheRoot + '/dependency-archives/tmp/residue',
+    StringOfChar('r', 10000));
+  Outside := FScratch + '/outside-manifest';
+  WriteTextFile(Outside, StringOfChar('o', 30000));
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Digest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Manifest := ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Digest);
+    if not SysUtils.DeleteFile(Manifest)
+       or (FpSymlink(PChar(Outside), PChar(Manifest)) <> 0) then
+      raise Exception.Create('failed to link the manifest fixture');
+    Lifecycle.DiscardObjectLocked(Digest, DependencyObjectFile(Digest));
+    SetBudget('5000');
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+  Expect<Int64>(FileSizeOf(Outside)).ToBe(30000 + Length(LineEnding));
+end;
+{$ENDIF}
+
 procedure TCacheLifecycleContract.SetupTests;
 begin
   Test('aggregate admission evicts the deterministic least-recently-used '
@@ -1619,6 +1684,10 @@ begin
   {$IFDEF UNIX}
   Test('a linked usage ledger is neither trusted nor followed',
     TestLinkedLedgerIsNeitherTrustedNorFollowed);
+  Test('a linked lifecycle root is not followed by the ledger',
+    TestLinkedLifecycleRootIsNotFollowed);
+  Test('removing a linked manifest debits none of its target',
+    TestLinkedManifestIsNotDebited);
   Test('repair unlinks cache shards without following them',
     TestRepairUnlinksCacheShardsWithoutFollowingThem);
   {$ENDIF}
