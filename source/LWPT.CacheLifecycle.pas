@@ -1630,11 +1630,15 @@ function TLWPTCacheLifecycle.MakeRoomLocked(
   const AAdditionalBytes: Int64): Boolean;
 var
   Ledger: TLWPTCacheLedger;
+  LedgerTrusted: Boolean;
 begin
   Result := EnsureRoomLocked(FCacheRoot, AAdditionalBytes);
-  if Result and (AAdditionalBytes > 0) then
-    AccountLedger(FCacheRoot, LoadLedger(FCacheRoot, Ledger), Ledger,
-      AAdditionalBytes);
+  if not Result or (AAdditionalBytes <= 0) then Exit;
+  { Load first, in its own statement: Pascal does not fix the order in
+    which arguments are evaluated, so passing Ledger beside the call that
+    fills it could hand AccountLedger the record before it is loaded. }
+  LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
+  AccountLedger(FCacheRoot, LedgerTrusted, Ledger, AAdditionalBytes);
 end;
 
 procedure TLWPTCacheLifecycle.DiscardObjectLocked(const ADigest,
