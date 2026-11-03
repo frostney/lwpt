@@ -260,8 +260,10 @@ installs are not supported.
   mutation invalidates that logical reference before either object is removed.
   `lwpt repair` verifies object manifests, content, and both hops of each build
   reference, reconstructs damaged index state, reclaims abandoned/incomplete
-  residue, preserves live guards, and evicts unleased objects until the
-  configured budget is met. Admissions judge the budget from a guarded usage
+  residue, preserves live guards, and, when the cache is over the configured
+  budget, evicts unleased objects down to its low-water mark. It drops the
+  usage ledger before repairing objects, references, or the index and, when
+  the cache then fits, writes a fresh one from its final measurement. Admissions judge the budget from a guarded usage
   ledger tied to the current index, and walk the tree only when the ledger is
   untrusted, out of room or a band stale; eviction then goes to a low-water
   mark a tenth of the budget below it.

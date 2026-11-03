@@ -317,6 +317,18 @@ failure.
 *Avoid*: "global cache", "store" alone, "archives" (archives are committed
 project state).
 
+**Usage ledger**:
+The shared cache's `lifecycle/usage` control file: the byte total the last
+walk of the cache measured, plus what guarded writers have added since. It is
+trusted only while the LRU index it was recorded against is unchanged, and it
+only grows between walks. Admissions judge the budget from it instead of
+walking the cache. A walk runs when the ledger is missing or untrusted, has no
+room, or has grown by more than one band (a tenth of the budget). When that
+walk finds the cache over budget, eviction goes down to the **low-water mark**
+one band below the budget.
+*Avoid*: "ledger" alone (the session-roots ledger is something else), "size
+cache", "quota file".
+
 **Per-user archive CAS**:
 The shared-cache namespace of dependency archives addressed by the SHA-256 of
 their raw bytes. An install may copy an object into its plan only when a

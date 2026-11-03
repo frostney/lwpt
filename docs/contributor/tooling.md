@@ -212,7 +212,11 @@ recursive removal so a concurrent link substitution cannot redirect cleanup,
 using the directory rename itself as the final producer race check on Windows,
 verifies content-addressed bytes, rebuilds a corrupt LRU index from verified
 object manifests, removes malformed or incomplete transitive build references,
-and enforces the current budget. Its
+and enforces the current budget, evicting down to the low-water mark when the
+cache is over it. Repair drops the usage ledger after reclaiming producer leases and
+lifecycle temporary files but before it repairs objects, references, or the
+index, and, when the cache then fits, writes a fresh one from its final
+measurement, so the next admission trusts a measured total. Its
 report names bytes reclaimed, corrupt objects removed, and live objects and
 leases preserved. Live producer metadata and guarded object bytes may keep a
 repair result above budget; the report makes that preservation explicit and a

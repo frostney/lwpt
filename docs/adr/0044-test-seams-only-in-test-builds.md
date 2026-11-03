@@ -1,5 +1,10 @@
 # Test fetch and fault seams exist only in test builds
 
+> **Amended 2026-10-21 ([#403](https://github.com/frostney/lwpt/pull/403)):**
+> `pr.yml` is retired. The cross-compile commands that never pass the define
+> are those in `ci.yml`, which now also runs on every pull request, and in
+> `release.yml`.
+>
 > **Amended 2026-10-05, test-only behaviours and seam coverage:**
 > `INSTALL_TESTING` also compiles behaviours into the test binary that no
 > variable selects. The first is
