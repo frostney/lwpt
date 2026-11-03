@@ -261,7 +261,10 @@ installs are not supported.
   `lwpt repair` verifies object manifests, content, and both hops of each build
   reference, reconstructs damaged index state, reclaims abandoned/incomplete
   residue, preserves live guards, and evicts unleased objects until the
-  configured budget is met.
+  configured budget is met. Admissions judge the budget from a guarded usage
+  ledger tied to the current index, and walk the tree only when the ledger is
+  untrusted, out of room or a band stale; eviction then goes to a low-water
+  mark a tenth of the budget below it.
 - **Test:** Each `*.Test.pas` is a self-contained program using
   `TestingPascalLibrary`. The runner discovers all programs or resolves strict
   file, directory, and glob selectors; projects own any grouping and network

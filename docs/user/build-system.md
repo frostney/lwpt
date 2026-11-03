@@ -167,7 +167,10 @@ namespaces. `LWPT_CACHE_MAX_BYTES` sets one aggregate per-user byte budget for
 all regular files in that shared cache tree (10 GiB by default); projects
 cannot raise or partition it through `lwpt.toml`. Normal admission applies
 deterministic least-recently-used eviction and skips caching when an object
-cannot fit without removing live state. See
+cannot fit without removing live state. When eviction is needed, it frees a
+tenth of the budget at once, so the cache sits between 90% and 100% of the
+budget and the cost of eviction is paid once per tenth of the budget admitted,
+not on every admission. See
 [ADR-0037](../adr/0037-verified-build-result-cache.md),
 [ADR-0038](../adr/0038-local-producer-leases.md), and
 [ADR-0040](../adr/0040-bounded-shared-cache-lifecycle.md).

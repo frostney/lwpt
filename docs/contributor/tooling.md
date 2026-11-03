@@ -175,10 +175,23 @@ immutable objects, build-result references, lifecycle control files, producer
 metadata, and incomplete or quarantined state pending repair. Every verified
 hit advances a monotonic access sequence, so admission evicts the
 least-recently-used object with the object identity as the deterministic tie
-break. Admission never completes above the effective budget: an oversized
-object, or one that cannot fit without deleting live state, is simply not
-cached. The project-owned archive or freshly built output remains
-authoritative.
+break. Admission never completes above the effective budget as measured or
+accounted: an oversized object, or one that cannot fit without deleting live
+state, is simply not cached. The project-owned archive or freshly built output
+remains authoritative.
+
+Admissions judge the budget from a usage ledger (`lifecycle/usage`) rather than
+a walk of the tree. The ledger holds the total the last walk measured plus
+every change a guarded writer made since. It is trusted only while the index
+it was written against is unchanged, so an older LWPT sharing the cache, or a
+crash between the two writes, makes the next admission measure. A walk also
+runs when the ledger has no room for the admission, or has grown by more than
+one band (a tenth of the budget) since the last walk. When that walk finds the
+cache over budget, eviction continues down to a low-water mark one band below
+the budget. Each eviction batch collects build-reference edges in one walk of
+the references, not one walk per evicted object. Bytes that no guarded writer
+reports, such as crash residue, are counted at the next walk, within one band
+of growth.
 
 Object admission and materialization hold per-object operating-system guards.
 Eviction skips those guards and therefore preserves objects still being
