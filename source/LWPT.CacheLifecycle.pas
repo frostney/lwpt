@@ -45,6 +45,8 @@ type
     destructor Destroy; override;
     function AcquireMutation: TObject;
     function AcquireObject(const ADigest: string): TObject;
+    { Makes room for AAdditionalBytes the caller writes next, under the
+      mutation guard, and counts them in the usage ledger when it does. }
     function MakeRoomLocked(const AAdditionalBytes: Int64): Boolean;
     procedure DiscardObjectLocked(const ADigest, AObjectPath: string);
     procedure RecordObjectLocked(const ADigest, AObjectPath: string);
@@ -53,6 +55,10 @@ type
 
 function ResolveCacheMaxBytes: Int64;
 function ResolveCacheMaxBytesFromValue(const AValue: string): Int64;
+{ The size eviction brings the cache down to once it has to evict: one
+  band (a tenth of the budget) below it, so the walk and reference scan
+  that eviction needs run once per band of admissions, not on each. }
+function CacheLowWaterBytes(const ABudget: Int64): Int64;
 function RepairSharedCache(const ACacheRoot: string):
   TLWPTCacheRepairReport;
 
@@ -64,6 +70,12 @@ var
   { Runs after each eviction attempt, before the next budget check, so a
     test can change unguarded staging bytes at a deterministic point. }
   CacheLifecycleAfterEvictionTestHook: TLWPTCacheEvictionTestHook;
+  { Counts authoritative budget enforcements (cache walks), so a test can
+    show that admissions stop walking the cache once it is measured. }
+  CacheLifecycleEnforcementCount: Integer;
+  { Counts walks of the build references, so a test can show that one
+    eviction batch collects them once however many objects it evicts. }
+  CacheLifecycleReferenceCollectionCount: Integer;
 {$ENDIF}
 
 implementation
@@ -80,6 +92,10 @@ uses
 const
   CACHE_LIFECYCLE_NAMESPACE = 'lifecycle';
   CACHE_INDEX_SCHEMA = 1;
+  CACHE_LEDGER_SCHEMA = 1;
+  { The ledger is padded to exactly this size, so rewriting it never moves
+    the measured total and a walk can count it before it exists. }
+  CACHE_LEDGER_BYTES = 256;
   CACHE_MANIFEST_SCHEMA = 1;
   DEPENDENCY_NAMESPACE = 'dependency-archives';
   BUILD_NAMESPACE = 'build-results';
@@ -105,6 +121,12 @@ function IndexPath(const ACacheRoot: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(LifecycleRoot(ACacheRoot))
     + 'index';
+end;
+
+function LedgerPath(const ACacheRoot: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(LifecycleRoot(ACacheRoot))
+    + 'usage';
 end;
 
 function LifecycleTemporaryRoot(const ACacheRoot: string): string;
@@ -198,6 +220,12 @@ function ResolveCacheMaxBytes: Int64;
 begin
   Result := ResolveCacheMaxBytesFromValue(
     LiveEnvironmentVariable(CACHE_MAX_BYTES_ENV));
+end;
+
+function CacheLowWaterBytes(const ABudget: Int64): Int64;
+begin
+  if ABudget <= 0 then Exit(0);
+  Result := ABudget - ABudget div 10;
 end;
 
 function ReadSmallTextFile(const APath: string;
@@ -336,6 +364,31 @@ begin
   end;
 end;
 
+{ Sets one entry of an index LoadIndex returned, which holds each name
+  once in its name order: a binary search where Values[] would scan every
+  entry. Like Values[], an existing name takes the new spelling. }
+procedure SetIndexEntry(const AEntries: TStringList; const AName,
+  AValue: string);
+var
+  Comparison, High, Low, Middle: Integer;
+begin
+  Low := 0;
+  High := AEntries.Count - 1;
+  while Low <= High do
+  begin
+    Middle := (Low + High) div 2;
+    Comparison := AnsiCompareText(AEntries.Names[Middle], AName);
+    if Comparison = 0 then
+    begin
+      AEntries[Middle] := AName + '=' + AValue;
+      Exit;
+    end;
+    if Comparison < 0 then Low := Middle + 1
+    else High := Middle - 1;
+  end;
+  AEntries.Insert(Low, AName + '=' + AValue);
+end;
+
 procedure WriteIndex(const ACacheRoot: string; const ASequence: Int64;
   const AEntries: TStringList);
 var
@@ -348,12 +401,15 @@ begin
     Lines.Add('schema=' + IntToStr(CACHE_INDEX_SCHEMA));
     Lines.Add('sequence=' + IntToStr(ASequence));
     AEntries.Sort;
+    { Each entry is already its name, the separator and its value. }
     for Index := 0 to AEntries.Count - 1 do
-      Lines.Add('entry.' + AEntries.Names[Index] + '='
-        + AEntries.ValueFromIndex[Index]);
+      Lines.Add('entry.' + AEntries[Index]);
     ForceDirectories(LifecycleTemporaryRoot(ACacheRoot));
-    AtomicWriteText(IndexPath(ACacheRoot),
-      LifecycleTemporaryRoot(ACacheRoot), Lines);
+    { One write of the whole text: TStrings.SaveToStream writes each line
+      and each line break separately, two system calls per index entry on
+      every access. }
+    AtomicWriteBytes(IndexPath(ACacheRoot),
+      LifecycleTemporaryRoot(ACacheRoot), BytesOf(Lines.Text));
   finally
     Lines.Free;
   end;
@@ -372,25 +428,280 @@ begin
     Lines.Add('sequence=' + IntToStr(ASequence));
     AEntries.Sort;
     for Index := 0 to AEntries.Count - 1 do
-      Lines.Add('entry.' + AEntries.Names[Index] + '='
-        + AEntries.ValueFromIndex[Index]);
+      Lines.Add('entry.' + AEntries[Index]);
     Result := Length(RawByteString(Lines.Text));
   finally
     Lines.Free;
   end;
 end;
 
+{ A regular file's size without following a link: a link counts as zero,
+  as DirectoryBytes skips it, so the bytes this reports for a file are the
+  bytes a walk counts for it. }
 function FileByteSize(const APath: string): Int64;
 var
   Search: TSearchRec;
 begin
   Result := 0;
-  if FindFirst(APath, faAnyFile, Search) <> 0 then Exit;
+  if FindFirst(APath, faAnyFile or faSymLink, Search) <> 0 then Exit;
   try
-    if (Search.Attr and faDirectory) = 0 then Result := Search.Size;
+    if (Search.Attr and (faDirectory or faSymLink)) = 0 then
+      Result := Search.Size;
   finally
     SysUtils.FindClose(Search);
   end;
+end;
+
+{ True when a directory between ACacheRoot and APath is a link. A walk
+  does not enter linked directories, so nothing below one is counted. }
+function HasLinkedAncestor(const ACacheRoot, APath: string): Boolean;
+var
+  Directory, Parent, Root: string;
+begin
+  Root := ExcludeTrailingPathDelimiter(ACacheRoot);
+  Directory := ExtractFileDir(APath);
+  while Length(Directory) > Length(Root) do
+  begin
+    if IsDirSymlinkOrJunction(Directory) then Exit(True);
+    Parent := ExtractFileDir(Directory);
+    if Parent = Directory then Break;
+    Directory := Parent;
+  end;
+  Result := False;
+end;
+
+{ The bytes a walk of ACacheRoot counts for the file APath: its size, or
+  zero when it or a directory above it inside the cache is a link. Every
+  ledger credit and debit uses this, so the ledger never subtracts bytes
+  the walk did not count. }
+function CacheFileBytes(const ACacheRoot, APath: string): Int64;
+begin
+  if HasLinkedAncestor(ACacheRoot, APath) then Exit(0);
+  Result := FileByteSize(APath);
+end;
+
+{ The usage ledger: the cache's byte total as last measured by a walk,
+  plus every change guarded writers made since. It is trusted only while
+  the index it was written against is still current (ReadIndexIdentity),
+  so a writer that does not keep it (an older LWPT, or a crash between the
+  index and ledger writes) invalidates it, and the next admission measures
+  the tree. Growth counts the bytes added since that measurement; once it
+  exceeds one band, the next admission measures again, which bounds how
+  long bytes no guarded writer reports (crash residue, producer metadata)
+  can go uncounted. }
+type
+  TLWPTCacheLedger = record
+    Bytes: Int64;
+    Growth: Int64;
+  end;
+
+{ The index's sequence and byte size, without parsing its entries. A
+  missing index has sequence -1; an unreadable header makes it unknown. }
+function ReadIndexHeader(const ACacheRoot: string; out ASequence,
+  ABytes: Int64): Boolean;
+const
+  HEADER_BYTES = 64;
+var
+  Buffer: RawByteString;
+  Count, LineEnd: Integer;
+  Header: string;
+  Stream: TLWPTProtectedFileStream;
+begin
+  Result := False;
+  ASequence := -1;
+  ABytes := 0;
+  if not FileExists(IndexPath(ACacheRoot)) then Exit(True);
+  try
+    Stream := OpenProtectedFileStream(IndexPath(ACacheRoot),
+      fmOpenRead or fmShareDenyNone);
+    try
+      ABytes := Stream.Size;
+      Count := HEADER_BYTES;
+      if ABytes < Count then Count := Integer(ABytes);
+      SetLength(Buffer, Count);
+      if Count > 0 then Stream.ReadBuffer(Buffer[1], Count);
+    finally
+      Stream.Free;
+    end;
+  except
+    on E: EFOpenError do Exit;
+    on E: EInOutError do Exit;
+    on E: EReadError do Exit;
+  end;
+  Header := 'schema=' + IntToStr(CACHE_INDEX_SCHEMA) + #10'sequence=';
+  if Copy(string(Buffer), 1, Length(Header)) <> Header then Exit;
+  Delete(Buffer, 1, Length(Header));
+  LineEnd := Pos(#10, string(Buffer));
+  if LineEnd <= 1 then Exit;
+  Result := TryStrToInt64(Copy(string(Buffer), 1, LineEnd - 1), ASequence)
+    and (ASequence >= 0);
+end;
+
+{ What the ledger is recorded against: the index's sequence, byte size
+  and last-write time at the filesystem's resolution. Every index write
+  publishes a new file, so a writer that does not keep the ledger, even
+  one that deletes the index and recreates the same sequence and size,
+  changes the identity unless it writes within the same timestamp tick.
+  Such a replacement goes unseen like any other untracked bytes: the
+  growth band still forces a walk, and an older writer enforces the
+  budget with its own walk. }
+function ReadIndexIdentity(const ACacheRoot: string;
+  out AIdentity: string): Boolean;
+var
+  Bytes, Sequence: Int64;
+  Stamp: TLWPTModificationStamp;
+begin
+  AIdentity := '';
+  Result := ReadIndexHeader(ACacheRoot, Sequence, Bytes);
+  if not Result then Exit;
+  if Sequence < 0 then
+  begin
+    AIdentity := 'none';
+    Exit;
+  end;
+  if not LongPathModificationStamp(IndexPath(ACacheRoot), Stamp) then
+    Exit(False);
+  AIdentity := IntToStr(Sequence) + ':' + IntToStr(Bytes) + ':'
+    + IntToStr(Stamp.Seconds) + '.' + IntToStr(Stamp.Nanoseconds);
+end;
+
+{ The ledger's size when it is a regular file in an unlinked lifecycle
+  root, 0 when absent, and -1 for a link, any other entry, or a linked
+  lifecycle root. A walk skips links, so only a regular ledger's bytes are
+  in its total, and only a regular ledger is ever trusted or written. }
+function LedgerFileBytes(const ACacheRoot: string): Int64;
+var
+  Search: TSearchRec;
+begin
+  if IsDirSymlinkOrJunction(LifecycleRoot(ACacheRoot)) then Exit(-1);
+  Result := 0;
+  if FindFirst(LedgerPath(ACacheRoot), faAnyFile or faSymLink,
+       Search) <> 0 then Exit;
+  try
+    if ((Search.Attr and (faSymLink or faDirectory)) <> 0)
+       or IsDirSymlinkOrJunction(LedgerPath(ACacheRoot)) then
+      Result := -1
+    else
+      Result := Search.Size;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+end;
+
+function LoadLedger(const ACacheRoot: string;
+  out ALedger: TLWPTCacheLedger): Boolean;
+var
+  Identity: string;
+  Lines: TStringList;
+  Text: string;
+begin
+  Result := False;
+  ALedger := Default(TLWPTCacheLedger);
+  if LedgerFileBytes(ACacheRoot) <> CACHE_LEDGER_BYTES then Exit;
+  if not ReadSmallTextFile(LedgerPath(ACacheRoot), Text) then Exit;
+  if not ReadIndexIdentity(ACacheRoot, Identity) then Exit;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Text;
+    Result := (Lines.Values['schema'] = IntToStr(CACHE_LEDGER_SCHEMA))
+      and (Lines.Values['index'] = Identity)
+      and TryStrToInt64(Lines.Values['bytes'], ALedger.Bytes)
+      and TryStrToInt64(Lines.Values['growth'], ALedger.Growth)
+      and (ALedger.Bytes >= 0) and (ALedger.Growth >= 0);
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ Removes a regular ledger, or a link in its place, without following
+  anything. Any other entry, or a linked lifecycle root, is left alone:
+  such a ledger is never trusted or written, so admissions measure. }
+procedure DropLedger(const ACacheRoot: string);
+var
+  Path: string;
+  Search: TSearchRec;
+begin
+  if IsDirSymlinkOrJunction(LifecycleRoot(ACacheRoot)) then Exit;
+  Path := LedgerPath(ACacheRoot);
+  if FindFirst(Path, faAnyFile or faSymLink, Search) <> 0 then Exit;
+  try
+    if ((Search.Attr and faDirectory) <> 0)
+       and ((Search.Attr and faSymLink) = 0) then Exit;
+  finally
+    SysUtils.FindClose(Search);
+  end;
+  if IsDirSymlinkOrJunction(Path) then
+    WipeDir(Path)
+  else
+    SysUtils.DeleteFile(Path);
+  if FindFirst(Path, faAnyFile or faSymLink, Search) = 0 then
+  begin
+    SysUtils.FindClose(Search);
+    raise ELWPTCacheLifecycleError.CreateFmt(
+      'failed to remove stale cache usage ledger %s', [Path]);
+  end;
+end;
+
+{ Records ABytes against the current index. The ledger itself always
+  counts as CACHE_LEDGER_BYTES, the exact size it is padded to. }
+procedure StoreLedger(const ACacheRoot: string; const ABytes,
+  AGrowth: Int64);
+var
+  Identity: string;
+  Lines: TStringList;
+  Padding: Integer;
+begin
+  if LedgerFileBytes(ACacheRoot) < 0 then
+  begin
+    DropLedger(ACacheRoot);
+    if LedgerFileBytes(ACacheRoot) < 0 then Exit;
+  end;
+  if not ReadIndexIdentity(ACacheRoot, Identity) then
+  begin
+    DropLedger(ACacheRoot);
+    Exit;
+  end;
+  Lines := TStringList.Create;
+  try
+    Lines.LineBreak := #10;
+    Lines.Add('schema=' + IntToStr(CACHE_LEDGER_SCHEMA));
+    Lines.Add('index=' + Identity);
+    if ABytes < 0 then Lines.Add('bytes=0')
+    else Lines.Add('bytes=' + IntToStr(ABytes));
+    if AGrowth < 0 then Lines.Add('growth=0')
+    else Lines.Add('growth=' + IntToStr(AGrowth));
+    Padding := CACHE_LEDGER_BYTES - Length(Lines.Text) - Length('pad=') - 1;
+    if Padding < 0 then
+      raise ELWPTCacheLifecycleError.Create(
+        'cache usage ledger exceeds its fixed size');
+    Lines.Add('pad=' + StringOfChar('0', Padding));
+    ForceDirectories(LifecycleTemporaryRoot(ACacheRoot));
+    AtomicWriteText(LedgerPath(ACacheRoot),
+      LifecycleTemporaryRoot(ACacheRoot), Lines);
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ Adds ADelta bytes to a ledger loaded before the change and records it
+  against the index the change left, or drops a ledger that was already
+  untrusted so it cannot match a later index. Between walks the ledger
+  only grows: a removal's bytes leave it only when a walk measures them,
+  so no removal can subtract bytes a walk did not count (a link's target,
+  say) and the ledger never falls below the tree it stands for. }
+procedure AccountLedger(const ACacheRoot: string; const ATrusted: Boolean;
+  const ALedger: TLWPTCacheLedger; const ADelta: Int64);
+var
+  Added: Int64;
+begin
+  if not ATrusted then
+  begin
+    DropLedger(ACacheRoot);
+    Exit;
+  end;
+  Added := ADelta;
+  if Added < 0 then Added := 0;
+  StoreLedger(ACacheRoot, ALedger.Bytes + Added, ALedger.Growth + Added);
 end;
 
 procedure WriteManifest(const ACacheRoot, ANamespace, ADigest,
@@ -702,113 +1013,210 @@ begin
       'failed to remove invalid build-cache reference %s', [APath]);
 end;
 
-function ReferenceNamesBuildObject(const ACacheRoot, AReferencePath,
-  AReferenceFingerprint, AObjectDigest: string;
-  out AMalformed: Boolean): Boolean;
-var
-  Manifest: TLWPTCachedBuildResult;
-  ManifestDigest, ManifestPath: string;
+{ The reference edges of one eviction batch (or one explicit removal),
+  collected by a single walk of the build references when the batch first
+  removes a build object.
+  Rescanning every reference for each evicted object made eviction cost
+  the number of references times the number of evictions. The collection
+  stays exact for the whole batch because references are only written and
+  removed under the mutation guard the batch holds. Each reference names
+  its result manifest directly and, through a verified manifest that
+  binds its own fingerprint, that manifest's artifact. A reference that
+  cannot be read that far is removed, as the per-object scan removed it;
+  when the walk is incomplete or such a reference cannot be removed, no
+  build object is removed for the rest of the batch. }
+type
+  TLWPTBuildReferenceEdge = record
+    Path: string;
+    Attributes: LongInt;
+    Size: Int64;
+    Removed: Boolean;
+  end;
+
+  TLWPTBuildReferenceEdges = class
+  private
+    FCacheRoot: string;
+    FCollected: Boolean;
+    FComplete: Boolean;
+    FReferences: array of TLWPTBuildReferenceEdge;
+    FTargets: TStringList;
+    procedure AddReference(const APath: string; const AAttributes: LongInt;
+      const ASize: Int64; const ATargets: array of string);
+    procedure Collect(var AFreedBytes: Int64);
+    function RemoveReference(const AIndex: Integer;
+      var AFreedBytes: Int64): Boolean;
+  public
+    constructor Create(const ACacheRoot: string);
+    destructor Destroy; override;
+    function RemoveReferencesFor(const ADigest: string;
+      var AFreedBytes: Int64): Boolean;
+  end;
+
+constructor TLWPTBuildReferenceEdges.Create(const ACacheRoot: string);
 begin
-  Result := False;
-  AMalformed := False;
-  if not ReadCanonicalBuildReference(AReferencePath, ManifestDigest) then
-  begin
-    AMalformed := True;
-    Exit;
-  end;
-  if ManifestDigest = AObjectDigest then Exit(True);
-  ManifestPath := BuildObjectPath(ACacheRoot, ManifestDigest);
-  if not ReadVerifiedBuildResultManifest(ManifestPath, ManifestDigest,
-       Manifest) then
-  begin
-    AMalformed := True;
-    Exit;
-  end;
-  if Manifest.Fingerprint <> AReferenceFingerprint then
-  begin
-    AMalformed := True;
-    Exit;
-  end;
-  Result := Manifest.ArtifactDigest = AObjectDigest;
+  inherited Create;
+  FCacheRoot := ACacheRoot;
+  FTargets := TStringList.Create;
+  FTargets.CaseSensitive := True;
 end;
 
-{ AFreedBytes is increased by the size of every reference file this call
-  removed, including when a later entry makes it report failure. }
-function RemoveBuildReferencesForDigest(const ACacheRoot,
-  ADigest: string; var AFreedBytes: Int64): Boolean;
+destructor TLWPTBuildReferenceEdges.Destroy;
+begin
+  FTargets.Free;
+  inherited Destroy;
+end;
+
+procedure TLWPTBuildReferenceEdges.AddReference(const APath: string;
+  const AAttributes: LongInt; const ASize: Int64;
+  const ATargets: array of string);
 var
-  EntryPath, Fingerprint, PrefixPath, Root: string;
-  EntrySearch, PrefixSearch: TSearchRec;
-  FindResult: Integer;
-  Malformed, RemoveEntry: Boolean;
+  Index, Position: Integer;
+begin
+  Position := Length(FReferences);
+  SetLength(FReferences, Position + 1);
+  FReferences[Position].Path := APath;
+  FReferences[Position].Attributes := AAttributes;
+  FReferences[Position].Size := ASize;
+  FReferences[Position].Removed := False;
+  for Index := 0 to High(ATargets) do
+    FTargets.AddObject(ATargets[Index], TObject(PtrInt(Position)));
+end;
+
+function TLWPTBuildReferenceEdges.RemoveReference(const AIndex: Integer;
+  var AFreedBytes: Int64): Boolean;
 begin
   Result := True;
-  Root := BuildReferenceSHA256Root(ACacheRoot);
-  if IsDirSymlinkOrJunction(Root) then Exit(False);
+  if FReferences[AIndex].Removed then Exit;
+  try
+    RemoveBuildReferenceEntry(FReferences[AIndex].Path,
+      FReferences[AIndex].Attributes);
+    FReferences[AIndex].Removed := True;
+    Inc(AFreedBytes, FReferences[AIndex].Size);
+  except
+    on ELWPTCacheLifecycleError do Result := False;
+  end;
+end;
+
+procedure TLWPTBuildReferenceEdges.Collect(var AFreedBytes: Int64);
+var
+  EntryPath, Fingerprint, ManifestDigest, PrefixPath, Root: string;
+  EntrySearch, PrefixSearch: TSearchRec;
+  FindResult, Index: Integer;
+  Manifest: TLWPTCachedBuildResult;
+  Malformed: array of Integer;
+begin
+  FCollected := True;
+  FComplete := True;
+  Malformed := nil;
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleReferenceCollectionCount);
+  {$ENDIF}
+  Root := BuildReferenceSHA256Root(FCacheRoot);
+  if IsDirSymlinkOrJunction(Root) then
+  begin
+    FComplete := False;
+    Exit;
+  end;
   FindResult := FindFirst(IncludeTrailingPathDelimiter(Root) + '*',
     faAnyFile or faSymLink, PrefixSearch);
   if FindResult <> 0 then
   begin
-    if not FindFirstMeansNoEntry(FindResult) then
-      Result := False;
+    if not FindFirstMeansNoEntry(FindResult) then FComplete := False;
     Exit;
   end;
   try
     repeat
-      if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..')
-         or ((PrefixSearch.Attr and faDirectory) = 0)
+      if (PrefixSearch.Name = '.') or (PrefixSearch.Name = '..') then
+        Continue;
+      if ((PrefixSearch.Attr and faDirectory) = 0)
          or ((PrefixSearch.Attr and faSymLink) <> 0) then
       begin
-        if (PrefixSearch.Name <> '.') and (PrefixSearch.Name <> '..') then
-          Result := False;
+        FComplete := False;
         Continue;
       end;
       PrefixPath := IncludeTrailingPathDelimiter(Root) + PrefixSearch.Name;
       if IsDirSymlinkOrJunction(PrefixPath) then
       begin
-        Result := False;
+        FComplete := False;
         Continue;
       end;
       FindResult := FindFirst(IncludeTrailingPathDelimiter(PrefixPath) + '*',
         faAnyFile or faSymLink, EntrySearch);
       if FindResult <> 0 then
       begin
-        if not FindFirstMeansNoEntry(FindResult) then Result := False;
+        if not FindFirstMeansNoEntry(FindResult) then FComplete := False;
         Continue;
       end;
       try
         repeat
-          if (EntrySearch.Name = '.') or (EntrySearch.Name = '..')
-             or ((EntrySearch.Attr and faDirectory) <> 0)
+          if (EntrySearch.Name = '.') or (EntrySearch.Name = '..') then
+            Continue;
+          if ((EntrySearch.Attr and faDirectory) <> 0)
              or ((EntrySearch.Attr and faSymLink) <> 0) then
           begin
-            if (EntrySearch.Name <> '.') and (EntrySearch.Name <> '..') then
-              Result := False;
+            FComplete := False;
             Continue;
           end;
           EntryPath := IncludeTrailingPathDelimiter(PrefixPath)
             + EntrySearch.Name;
           Fingerprint := BuildReferenceFingerprint(PrefixSearch.Name,
             EntrySearch.Name);
-          RemoveEntry := ReferenceNamesBuildObject(ACacheRoot, EntryPath,
-            Fingerprint, ADigest, Malformed);
-          if RemoveEntry or Malformed then
-            try
-              RemoveBuildReferenceEntry(EntryPath, EntrySearch.Attr);
-              Inc(AFreedBytes, EntrySearch.Size);
-            except
-              on ELWPTCacheLifecycleError do Result := False;
-            end;
+          if not ReadCanonicalBuildReference(EntryPath, ManifestDigest) then
+          begin
+            AddReference(EntryPath, EntrySearch.Attr, EntrySearch.Size, []);
+            SetLength(Malformed, Length(Malformed) + 1);
+            Malformed[High(Malformed)] := High(FReferences);
+            Continue;
+          end;
+          if ReadVerifiedBuildResultManifest(BuildObjectPath(FCacheRoot,
+               ManifestDigest), ManifestDigest, Manifest)
+             and (Manifest.Fingerprint = Fingerprint) then
+            AddReference(EntryPath, EntrySearch.Attr, EntrySearch.Size,
+              [ManifestDigest, Manifest.ArtifactDigest])
+          else
+          begin
+            AddReference(EntryPath, EntrySearch.Attr, EntrySearch.Size,
+              [ManifestDigest]);
+            SetLength(Malformed, Length(Malformed) + 1);
+            Malformed[High(Malformed)] := High(FReferences);
+          end;
         until FindNextFinished(EntrySearch, FindResult);
-        if not FindNextMeansEnd(FindResult) then Result := False;
+        if not FindNextMeansEnd(FindResult) then FComplete := False;
       finally
         SysUtils.FindClose(EntrySearch);
       end;
     until FindNextFinished(PrefixSearch, FindResult);
-    if not FindNextMeansEnd(FindResult) then Result := False;
+    if not FindNextMeansEnd(FindResult) then FComplete := False;
   finally
     SysUtils.FindClose(PrefixSearch);
   end;
+  for Index := 0 to High(Malformed) do
+    if not RemoveReference(Malformed[Index], AFreedBytes) then
+      FComplete := False;
+end;
+
+{ AFreedBytes is increased by the size of every reference this call
+  removed, including when the result reports failure. }
+function TLWPTBuildReferenceEdges.RemoveReferencesFor(
+  const ADigest: string; var AFreedBytes: Int64): Boolean;
+var
+  First, Last, Position: Integer;
+begin
+  if not FCollected then
+  begin
+    Collect(AFreedBytes);
+    FTargets.Sorted := True;
+  end;
+  Result := FComplete;
+  if not FTargets.Find(ADigest, Position) then Exit;
+  First := Position;
+  while (First > 0) and (FTargets[First - 1] = ADigest) do Dec(First);
+  Last := Position;
+  while (Last < FTargets.Count - 1) and (FTargets[Last + 1] = ADigest) do
+    Inc(Last);
+  for Position := First to Last do
+    if not RemoveReference(Integer(PtrInt(FTargets.Objects[Position])),
+         AFreedBytes) then Result := False;
 end;
 
 procedure RepairBuildReferences(const ACacheRoot: string;
@@ -908,31 +1316,44 @@ begin
 end;
 
 { Removes the object, its manifest and (build namespace) its references,
-  leaving the index entry to the caller. AFreedBytes is the size of every
+  through AEdges when an eviction batch collects them, leaving the index
+  entry to the caller. AFreedBytes is the size of every
   file this call actually deleted, measured just before its deletion, so
   it is exact even when the call reports failure part-way: a caller that
   keeps a running byte total instead of re-walking the tree neither stops
   early on bytes that are still present nor evicts more than it must. }
 function RemoveObjectFiles(const ACacheRoot: string;
-  const AObject: TLWPTCacheObject; out AFreedBytes: Int64): Boolean;
+  const AObject: TLWPTCacheObject; out AFreedBytes: Int64;
+  const AEdges: TLWPTBuildReferenceEdges = nil): Boolean;
 var
   Manifest: string;
   ManifestBytes, PayloadBytes: Int64;
+  Edges: TLWPTBuildReferenceEdges;
+  ReferencesRemoved: Boolean;
 begin
   AFreedBytes := 0;
-  if (AObject.Namespace = BUILD_NAMESPACE)
-     and not RemoveBuildReferencesForDigest(ACacheRoot,
-       AObject.Digest, AFreedBytes) then Exit(False);
+  if AObject.Namespace = BUILD_NAMESPACE then
+  begin
+    Edges := AEdges;
+    if Edges = nil then Edges := TLWPTBuildReferenceEdges.Create(ACacheRoot);
+    try
+      ReferencesRemoved := Edges.RemoveReferencesFor(AObject.Digest,
+        AFreedBytes);
+    finally
+      if AEdges = nil then Edges.Free;
+    end;
+    if not ReferencesRemoved then Exit(False);
+  end;
   Result := not FileExists(AObject.Path);
   if not Result then
   begin
-    PayloadBytes := FileByteSize(AObject.Path);
+    PayloadBytes := CacheFileBytes(ACacheRoot, AObject.Path);
     Result := SysUtils.DeleteFile(AObject.Path);
     if not Result then Exit;
     Inc(AFreedBytes, PayloadBytes);
   end;
   Manifest := ManifestPath(ACacheRoot, AObject.Namespace, AObject.Digest);
-  ManifestBytes := FileByteSize(Manifest);
+  ManifestBytes := CacheFileBytes(ACacheRoot, Manifest);
   if SysUtils.DeleteFile(Manifest) then Inc(AFreedBytes, ManifestBytes);
 end;
 
@@ -975,13 +1396,30 @@ begin
   end;
 end;
 
+{ The bytes a walk finds, with the usage ledger counted at its fixed size
+  whether or not it exists yet: enforcement writes it after measuring. }
+function MeasureCacheBytes(const ACacheRoot: string): Int64;
+var
+  LedgerBytes: Int64;
+begin
+  Result := DirectoryBytes(ACacheRoot) + CACHE_LEDGER_BYTES;
+  LedgerBytes := LedgerFileBytes(ACacheRoot);
+  if LedgerBytes > 0 then Dec(Result, LedgerBytes);
+end;
+
+{ Authoritative enforcement: measures the whole tree and, when the cache
+  plus AAdditionalBytes exceeds the budget, evicts in least-recently-used
+  order down to the low-water mark. It then records the measured total in
+  the usage ledger, so later admissions can judge the budget without a
+  walk until the ledger runs out of room or loses its trust. }
 function EnforceBudgetLocked(const ACacheRoot: string;
   const AAdditionalBytes: Int64; out ALivePreserved: Integer;
   out AReclaimed: Int64; const AKnownLive: TStrings): Boolean;
 var
-  Budget, CurrentBytes, Sequence: Int64;
+  Budget, CurrentBytes, Sequence, Target: Int64;
   Entries, Lookup: TStringList;
   Coordinator: TLWPTProducerLeaseCoordinator;
+  Edges: TLWPTBuildReferenceEdges;
   Index, EntryIndex, Next: Integer;
   IndexValid: Boolean;
   Objects: TLWPTCacheObjectArray;
@@ -1012,7 +1450,7 @@ var
       { A partial failure still deleted what it reports, so those bytes
         count whatever the result. }
       Removable := RemoveObjectFiles(ACacheRoot, Objects[ACandidate],
-        FreedBytes);
+        FreedBytes, Edges);
       Dec(CurrentBytes, FreedBytes);
       Inc(AReclaimed, FreedBytes);
       if Removable then
@@ -1031,15 +1469,29 @@ begin
   AReclaimed := 0;
   Budget := ResolveCacheMaxBytes;
   if AAdditionalBytes > Budget then Exit;
-  Objects := DiscoverObjects(ACacheRoot);
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleEnforcementCount);
+  {$ENDIF}
   { The budget owns the complete shared-cache tree, not only immutable object
     payloads. This includes result references, lifecycle control files,
     producer metadata, and incomplete/quarantined bytes until repair reclaims
     them. Directory entries themselves carry no portable logical byte size. }
-  CurrentBytes := DirectoryBytes(ACacheRoot);
+  CurrentBytes := MeasureCacheBytes(ACacheRoot);
+  if CurrentBytes + AAdditionalBytes <= Budget then
+  begin
+    StoreLedger(ACacheRoot, CurrentBytes, 0);
+    Exit(True);
+  end;
+  { Evicting only enough to fit would leave the next admission over budget
+    again, and every eviction batch walks the tree and the references.
+    Going down to the low-water mark leaves a band of room, so that cost
+    is paid once per band of admissions. }
+  Target := CacheLowWaterBytes(Budget);
+  Objects := DiscoverObjects(ACacheRoot);
   Entries := TStringList.Create;
   Coordinator := TLWPTProducerLeaseCoordinator.Create(
     ProducerLeaseRoot(ACacheRoot));
+  Edges := TLWPTBuildReferenceEdges.Create(ACacheRoot);
   try
     Entries.NameValueSeparator := '=';
     LoadIndex(ACacheRoot, Sequence, Entries, IndexValid);
@@ -1069,15 +1521,15 @@ begin
       { Evict in LRU order against a running total, then settle it with one
         authoritative walk. The mutation guard does not cover object
         staging, which other writers fill before taking it, so the tree can
-        grow while this runs. When the walk still finds the cache over
-        budget, resume from the next candidate with the measured total.
-        Without concurrent growth this is one pass and one walk; with it,
-        every extra walk follows at least one further candidate, so the
-        loop ends once the candidates run out. }
+        grow while this runs. When the walk still finds the cache above
+        the low-water mark, resume from the next candidate with the
+        measured total. Without concurrent growth this is one pass and one
+        walk; with it, every extra walk follows at least one further
+        candidate, so the loop ends once the candidates run out. }
       Next := 0;
       repeat
         while (Next <= High(Objects))
-              and (CurrentBytes + AAdditionalBytes > Budget) do
+              and (CurrentBytes + AAdditionalBytes > Target) do
         begin
           EvictCandidate(Next);
           Inc(Next);
@@ -1087,17 +1539,46 @@ begin
           {$ENDIF}
         end;
         WriteIndexWithoutFlagged(ACacheRoot, Sequence, Entries, Removed);
-        CurrentBytes := DirectoryBytes(ACacheRoot);
-      until (CurrentBytes + AAdditionalBytes <= Budget)
+        CurrentBytes := MeasureCacheBytes(ACacheRoot);
+      until (CurrentBytes + AAdditionalBytes <= Target)
             or (Next > High(Objects));
     finally
       Lookup.Free;
     end;
+    { A ledger is only worth its bytes while the cache fits. Above the
+      budget (live objects, or a budget smaller than the ledger itself)
+      every admission measures anyway, so the ledger is dropped. }
+    if CurrentBytes <= Budget then
+      StoreLedger(ACacheRoot, CurrentBytes, 0)
+    else
+      DropLedger(ACacheRoot);
     Result := CurrentBytes + AAdditionalBytes <= Budget;
   finally
+    Edges.Free;
     Coordinator.Free;
     Entries.Free;
   end;
+end;
+
+{ Judges room for AAdditionalBytes from a trusted ledger with no walk, and
+  falls back to authoritative enforcement when the ledger is missing or
+  untrusted, has no room left, or has grown by more than one band since
+  the tree was last measured. }
+function EnsureRoomLocked(const ACacheRoot: string;
+  const AAdditionalBytes: Int64): Boolean;
+var
+  Budget, Reclaimed: Int64;
+  Ledger: TLWPTCacheLedger;
+  LivePreserved: Integer;
+begin
+  Budget := ResolveCacheMaxBytes;
+  if AAdditionalBytes > Budget then Exit(False);
+  if LoadLedger(ACacheRoot, Ledger)
+     and (Ledger.Bytes <= Budget - AAdditionalBytes)
+     and (Ledger.Growth <= Budget - CacheLowWaterBytes(Budget)) then
+    Exit(True);
+  Result := EnforceBudgetLocked(ACacheRoot, AAdditionalBytes,
+    LivePreserved, Reclaimed, nil);
 end;
 
 constructor TLWPTCacheLifecycle.Create(const ACacheRoot,
@@ -1148,21 +1629,30 @@ end;
 function TLWPTCacheLifecycle.MakeRoomLocked(
   const AAdditionalBytes: Int64): Boolean;
 var
-  LivePreserved: Integer;
-  Reclaimed: Int64;
+  Ledger: TLWPTCacheLedger;
+  LedgerTrusted: Boolean;
 begin
-  Result := EnforceBudgetLocked(FCacheRoot, AAdditionalBytes,
-    LivePreserved, Reclaimed, nil);
+  Result := EnsureRoomLocked(FCacheRoot, AAdditionalBytes);
+  if not Result or (AAdditionalBytes <= 0) then Exit;
+  { Load first, in its own statement: Pascal does not fix the order in
+    which arguments are evaluated, so passing Ledger beside the call that
+    fills it could hand AccountLedger the record before it is loaded. }
+  LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
+  AccountLedger(FCacheRoot, LedgerTrusted, Ledger, AAdditionalBytes);
 end;
 
 procedure TLWPTCacheLifecycle.DiscardObjectLocked(const ADigest,
   AObjectPath: string);
 var
   Entries: TStringList;
-  IndexValid: Boolean;
+  IndexValid, LedgerTrusted: Boolean;
   Item: TLWPTCacheObject;
-  Sequence: Int64;
+  FreedBytes, IndexBytes, Sequence: Int64;
+  Index: Integer;
+  Ledger: TLWPTCacheLedger;
 begin
+  LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
+  IndexBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot));
   Entries := TStringList.Create;
   try
     Entries.NameValueSeparator := '=';
@@ -1176,13 +1666,22 @@ begin
     Item.Namespace := FNamespace;
     Item.Digest := ADigest;
     Item.Path := AObjectPath;
-    if not RemoveObject(FCacheRoot, Item, Entries) then
+    { The removed bytes stay in the ledger until the next walk measures
+      them, so only the index's own change is accounted below. }
+    if not RemoveObjectFiles(FCacheRoot, Item, FreedBytes) then
+    begin
+      AccountLedger(FCacheRoot, LedgerTrusted, Ledger, 0);
       raise ELWPTCacheLifecycleError.CreateFmt(
         'failed to discard cache object %s', [ADigest]);
+    end;
+    Index := Entries.IndexOfName(Key(ADigest));
+    if Index >= 0 then Entries.Delete(Index);
     if Entries.Count = 0 then
       SysUtils.DeleteFile(IndexPath(FCacheRoot))
     else
       WriteIndex(FCacheRoot, Sequence, Entries);
+    AccountLedger(FCacheRoot, LedgerTrusted, Ledger,
+      CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot)) - IndexBytes);
   finally
     Entries.Free;
   end;
@@ -1192,9 +1691,10 @@ procedure TLWPTCacheLifecycle.RecordObjectLocked(const ADigest,
   AObjectPath: string);
 var
   Entries: TStringList;
-  IndexValid: Boolean;
-  Sequence, Size: Int64;
+  IndexValid, LedgerTrusted: Boolean;
+  Sequence, Size, ControlBytes: Int64;
   Search: TSearchRec;
+  Ledger: TLWPTCacheLedger;
 begin
   if FindFirst(AObjectPath, faAnyFile, Search) <> 0 then
     raise ELWPTCacheLifecycleError.CreateFmt(
@@ -1204,30 +1704,54 @@ begin
   finally
     SysUtils.FindClose(Search);
   end;
-  WriteManifest(FCacheRoot, FNamespace, ADigest, AObjectPath, Size);
+  { The object arrived by renaming staging bytes that no ledger counted,
+    so its size is new to the ledger, as are the control file changes. }
+  LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
+  ControlBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot))
+    + CacheFileBytes(FCacheRoot,
+      ManifestPath(FCacheRoot, FNamespace, ADigest));
   Entries := TStringList.Create;
   try
-    Entries.NameValueSeparator := '=';
-    LoadIndex(FCacheRoot, Sequence, Entries, IndexValid);
-    if not IndexValid then
-    begin
-      Entries.Clear;
-      Sequence := 0;
+    try
+      WriteManifest(FCacheRoot, FNamespace, ADigest, AObjectPath, Size);
+      Entries.NameValueSeparator := '=';
+      LoadIndex(FCacheRoot, Sequence, Entries, IndexValid);
+      if not IndexValid then
+      begin
+        Entries.Clear;
+        Sequence := 0;
+      end;
+      Inc(Sequence);
+      SetIndexEntry(Entries, Key(ADigest), IntToStr(Sequence));
+      WriteIndex(FCacheRoot, Sequence, Entries);
+    except
+      { The published object is not counted yet, so a rollback discard
+        would subtract bytes the ledger never held. Measure instead, and
+        keep the original failure if the ledger cannot be dropped. }
+      try
+        DropLedger(FCacheRoot);
+      except
+        on ELWPTCacheLifecycleError do;
+      end;
+      raise;
     end;
-    Inc(Sequence);
-    Entries.Values[Key(ADigest)] := IntToStr(Sequence);
-    WriteIndex(FCacheRoot, Sequence, Entries);
   finally
     Entries.Free;
   end;
+  AccountLedger(FCacheRoot, LedgerTrusted, Ledger, Size
+    + CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot))
+    + CacheFileBytes(FCacheRoot,
+      ManifestPath(FCacheRoot, FNamespace, ADigest))
+    - ControlBytes);
 end;
 
 procedure TLWPTCacheLifecycle.TouchObjectLocked(
   const ADigest: string);
 var
   Entries: TStringList;
-  IndexValid: Boolean;
+  IndexValid, LedgerTrusted: Boolean;
   AdditionalBytes, ExistingBytes, Sequence: Int64;
+  Ledger: TLWPTCacheLedger;
 begin
   Entries := TStringList.Create;
   try
@@ -1239,12 +1763,12 @@ begin
       Sequence := 0;
     end;
     Inc(Sequence);
-    Entries.Values[Key(ADigest)] := IntToStr(Sequence);
-    ExistingBytes := FileByteSize(IndexPath(FCacheRoot));
+    SetIndexEntry(Entries, Key(ADigest), IntToStr(Sequence));
+    ExistingBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot));
     AdditionalBytes := IndexByteSize(Sequence, Entries) - ExistingBytes;
     if AdditionalBytes < 0 then AdditionalBytes := 0;
     if (AdditionalBytes > 0)
-       and not MakeRoomLocked(AdditionalBytes) then Exit;
+       and not EnsureRoomLocked(FCacheRoot, AdditionalBytes) then Exit;
     if AdditionalBytes > 0 then
     begin
       LoadIndex(FCacheRoot, Sequence, Entries, IndexValid);
@@ -1254,9 +1778,13 @@ begin
         Sequence := 0;
       end;
       Inc(Sequence);
-      Entries.Values[Key(ADigest)] := IntToStr(Sequence);
+      SetIndexEntry(Entries, Key(ADigest), IntToStr(Sequence));
     end;
+    LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
+    ExistingBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot));
     WriteIndex(FCacheRoot, Sequence, Entries);
+    AccountLedger(FCacheRoot, LedgerTrusted, Ledger,
+      CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot)) - ExistingBytes);
   finally
     Entries.Free;
   end;
@@ -1522,7 +2050,12 @@ begin
     DependencyRootSafe := PrepareInternalRoot(DependencyRoot, Result);
     BuildRootSafe := PrepareInternalRoot(BuildRoot, Result);
     if PrepareInternalRoot(LifecycleRoot(CacheRoot), Result) then
+    begin
       RemoveResidue(LifecycleTemporaryRoot(CacheRoot), Result);
+      { Repair changes bytes without keeping the usage ledger; budget
+        enforcement below measures the tree and writes a fresh one. }
+      DropLedger(CacheRoot);
+    end;
     if DependencyRootSafe then
     begin
       RepairObjectStagingRoot(DependencyRoot, DEPENDENCY_NAMESPACE,

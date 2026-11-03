@@ -14,6 +14,8 @@ uses
   Windows,
   {$ENDIF}
 
+  LWPT.BuildCache,
+  LWPT.BuildResultManifest,
   LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.ObjectStore,
@@ -64,9 +66,19 @@ type
     procedure TestRepairFailsClosedWhenReferenceCannotBeDeleted;
     {$IFDEF UNIX}
     procedure TestRepairUnlinksCacheShardsWithoutFollowingThem;
+    procedure TestLinkedLedgerIsNeitherTrustedNorFollowed;
+    procedure TestLinkedLifecycleRootIsNotFollowed;
+    procedure TestLinkedManifestIsNotDebited;
+    procedure TestLinkedManifestShardIsNotDebited;
     {$ENDIF}
     procedure TestRepairReclaimsAbandonedAndPreservesLiveLease;
     procedure TestBudgetParsing;
+    procedure TestAdmissionCostStaysFlatNearBudget;
+    procedure TestStaleLedgerMakesAdmissionMeasure;
+    procedure TestRecreatedIndexMakesAdmissionMeasure;
+    procedure TestRemovalLeavesTheLedgerUntilAWalk;
+    procedure TestUntrackedBytesAreMeasuredWithinOneBand;
+    procedure TestEvictionStopsAtLowWaterAndRepairKeepsLedger;
   end;
 
 {$IFDEF UNIX}
@@ -489,6 +501,31 @@ begin
   end;
 end;
 
+{ The budget whose low-water mark is exactly ATarget, so a test can make
+  eviction stop at a chosen object: eviction goes down to that mark. }
+function BudgetForLowWater(const ATarget: Int64): Int64;
+begin
+  Result := ATarget + ATarget div 9;
+  while CacheLowWaterBytes(Result) < ATarget do Inc(Result);
+  while CacheLowWaterBytes(Result) > ATarget do Dec(Result);
+  if CacheLowWaterBytes(Result) <> ATarget then
+    raise Exception.CreateFmt('no budget has low-water mark %d', [ATarget]);
+end;
+
+{ Sets the budget so eviction stops once the cache is at most ATarget
+  bytes, and checks that the cache is over that budget, so enforcement
+  actually runs. }
+procedure SetBudgetForLowWater(const ACurrentBytes, ATarget: Int64);
+var
+  Budget: Int64;
+begin
+  Budget := BudgetForLowWater(ATarget);
+  if ACurrentBytes <= Budget then
+    raise Exception.CreateFmt('fixture of %d bytes does not exceed the '
+      + 'budget %d for low-water mark %d', [ACurrentBytes, Budget, ATarget]);
+  SetProcessEnvironment(CACHE_MAX_BYTES_ENV, IntToStr(Budget));
+end;
+
 function TCacheLifecycleContract.BuildObjectFile(
   const ADigest: string): string;
 begin
@@ -766,13 +803,13 @@ const
     IndexLines: TStringList;
     Digests: array of string;
     LastUses: array of Integer;
-    Budget: Int64;
+    LowWater: Int64;
     Index, Evicted, Evictions: Integer;
     Started: QWord;
     EvictedInOrder: Boolean;
   begin
     ResetScratch;
-    Evictions := AObjectCount div 10;
+    Evictions := AObjectCount div 4;
     Store := TLWPTImmutableObjectStore.Create(
       FCacheRoot + '/dependency-archives', FCacheRoot,
       DEPENDENCY_ARCHIVE_NAMESPACE);
@@ -811,16 +848,18 @@ const
       Source := FScratch + '/sources/cold';
       WriteTextFile(Source, 'cold-object');
       NewDigest := 'sha256:' + SHA256File(Source);
-      { WriteTextFile adds the platform line break to each payload. }
-      Budget := CacheBytes(FCacheRoot)
-        - Evictions * FileSizeOf(Store.ObjectPath(Digests[0]));
-      SetBudget(IntToStr(Budget));
+      { WriteTextFile adds the platform line break to each payload. The
+        hit measured the cache and wrote its usage ledger, so the total
+        already counts it. Eviction goes down to the low-water mark. }
+      SetBudgetForLowWater(CacheBytes(FCacheRoot), CacheBytes(FCacheRoot)
+        - Evictions * FileSizeOf(Store.ObjectPath(Digests[0])));
+      LowWater := CacheLowWaterBytes(ResolveCacheMaxBytes);
       Started := GetTickCount64;
       Expect<Boolean>(Store.Admit(Source, NewDigest) <> '').ToBe(True);
       AAdmitMs := Int64(GetTickCount64 - Started);
 
       { The evicted objects are exactly the least recently used ones, and
-        no more of them than the budget needed. }
+        no more of them than the low-water mark needed. }
       Evicted := 0;
       for Index := 0 to AObjectCount - 1 do
         if not FileExists(Store.ObjectPath(Digests[Index])) then Inc(Evicted);
@@ -838,9 +877,9 @@ const
       if not FileExists(Store.ObjectPath(Digest)) then
         Fail(Format('%d objects: the recently used hot object was evicted',
           [AObjectCount]));
-      if CacheBytes(FCacheRoot) > Budget then
-        Fail(Format('%d objects: the cache is still over budget after '
-          + 'admission', [AObjectCount]));
+      if CacheBytes(FCacheRoot) > LowWater then
+        Fail(Format('%d objects: the cache is still above its low-water '
+          + 'mark after admission', [AObjectCount]));
     finally
       IndexLines.Free;
       Store.Free;
@@ -858,8 +897,8 @@ begin
     objects, and every eviction re-walked the tree and rescanned the
     index for its entry. The fixture makes those steps expensive: real
     objects whose recency is unrelated to the order discovery returns them
-    in, an index written in reverse name order, and a budget that forces
-    a tenth of the objects out. }
+    in, an index written in reverse name order, and a budget whose
+    low-water mark forces a quarter of the objects out. }
   Measure(SmallObjects, SmallHitMs, SmallAdmitMs);
   Measure(LargeObjects, LargeHitMs, LargeAdmitMs);
   if LargeHitMs >= ScaleMultiple * SmallHitMs + ScaleSlackMs then
@@ -874,7 +913,7 @@ end;
 
 procedure TCacheLifecycleContract.TestEvictionCountsDeletedReferences;
 var
-  Budget: Int64;
+  Target: Int64;
   Evicted, Kept, Newest, Reference: string;
   Lifecycle: TLWPTCacheLifecycle;
   Mutation: TObject;
@@ -882,8 +921,9 @@ var
   References: array[0..2] of string;
 begin
   { Evicting a build result also deletes the references that name it.
-    Those bytes are freed too: when they are what brings the cache under
-    budget, eviction stops there instead of taking the next object. }
+    Those bytes are freed too: when they are what brings the cache down
+    to its low-water mark, eviction stops there instead of taking the
+    next object. }
   Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot, 'build-results');
   Mutation := Lifecycle.AcquireMutation;
   try
@@ -899,12 +939,15 @@ begin
         + IntToStr(Index + 1) + '1/' + StringOfChar('1', 62);
       WriteTextFile(References[Index], Evicted + #10);
     end;
-    Budget := CacheBytes(FCacheRoot)
+    { Measure once under the default budget, so the usage ledger exists
+      and the totals below count it. }
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Target := CacheBytes(FCacheRoot)
       - FileSizeOf(BuildObjectFile(Evicted))
       - FileSizeOf(ManifestFile('build-results', Evicted));
     for Reference in References do
-      Dec(Budget, FileSizeOf(Reference));
-    SetBudget(IntToStr(Budget));
+      Dec(Target, FileSizeOf(Reference));
+    SetBudgetForLowWater(CacheBytes(FCacheRoot), Target);
     Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
     Expect<Boolean>(FileExists(BuildObjectFile(Evicted))).ToBe(False);
     for Reference in References do
@@ -934,14 +977,16 @@ end;
 procedure TCacheLifecycleContract.
   TestConcurrentStagingGrowthKeepsEvicting;
 var
-  Budget: Int64;
+  Target: Int64;
   Oldest, Second, Third, Newest, Staged: string;
   Lifecycle: TLWPTCacheLifecycle;
   Mutation: TObject;
 begin
-  { The budget fits once the oldest object goes, but another writer's
+  { The low-water mark is reached once the oldest object goes, but another
+    writer's
     staging grows the tree by more than one object in the meantime. The
-    running total then fits while the tree does not; eviction must
+    running total then reaches the mark while the tree does not; eviction
+    must
     continue from the next candidates rather than refuse the admission
     with eligible objects left. }
   Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
@@ -956,10 +1001,11 @@ begin
       FCacheRoot + '/dependency-archives', 'c', 1000);
     Newest := RecordFabricatedObject(Lifecycle,
       FCacheRoot + '/dependency-archives', 'e', 1000);
-    Budget := CacheBytes(FCacheRoot)
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Target := CacheBytes(FCacheRoot)
       - FileSizeOf(DependencyObjectFile(Oldest))
       - FileSizeOf(ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Oldest));
-    SetBudget(IntToStr(Budget));
+    SetBudgetForLowWater(CacheBytes(FCacheRoot), Target);
     Staged := FCacheRoot + '/dependency-archives/tmp/'
       + StringOfChar('d', 64) + '/object';
     ConcurrentStagingPath := Staged;
@@ -977,7 +1023,7 @@ begin
     Expect<Boolean>(FileExists(DependencyObjectFile(Newest))).ToBe(True);
     { Whether Third also goes depends on manifest and index sizes; the
       growth is under two objects, so the newest always survives. }
-    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= Target).ToBe(True);
   finally
     Mutation.Free;
     Lifecycle.Free;
@@ -987,7 +1033,7 @@ end;
 procedure TCacheLifecycleContract.
   TestUndeletedManifestIsNotCountedAsReclaimed;
 var
-  Budget: Int64;
+  Target: Int64;
   Manifest, Oldest, Next, Newest: string;
   Lifecycle: TLWPTCacheLifecycle;
   Mutation: TObject;
@@ -996,9 +1042,9 @@ var
   {$ENDIF}
 begin
   { A payload that is deleted while its manifest is not frees only the
-    payload's bytes. Counting the manifest too would stop eviction early
-    and then reject the admission on the final walk, although the next
-    object could still have been evicted. }
+    payload's bytes. Counting the manifest too would stop eviction early,
+    above the low-water mark, although the next object could still have
+    been evicted. }
   Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
   Mutation := Lifecycle.AcquireMutation;
@@ -1010,9 +1056,10 @@ begin
     Newest := RecordFabricatedObject(Lifecycle,
       FCacheRoot + '/dependency-archives', 'e', 1000);
     Manifest := ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Oldest);
-    Budget := CacheBytes(FCacheRoot)
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Target := CacheBytes(FCacheRoot)
       - FileSizeOf(DependencyObjectFile(Oldest)) - FileSizeOf(Manifest);
-    SetBudget(IntToStr(Budget));
+    SetBudgetForLowWater(CacheBytes(FCacheRoot), Target);
     {$IFDEF UNIX}
     if FpChmod(PChar(ExtractFileDir(Manifest)), &555) <> 0 then
       raise Exception.Create('failed to protect manifest fixture');
@@ -1040,7 +1087,7 @@ begin
     Expect<Boolean>(FileExists(DependencyObjectFile(Oldest))).ToBe(False);
     Expect<Boolean>(FileExists(DependencyObjectFile(Next))).ToBe(False);
     Expect<Boolean>(FileExists(DependencyObjectFile(Newest))).ToBe(True);
-    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= Target).ToBe(True);
   finally
     Mutation.Free;
     Lifecycle.Free;
@@ -1198,6 +1245,573 @@ begin
   Expect<Boolean>(Refused).ToBe(True);
 end;
 
+{ Exact bytes, unlike WriteTextFile, which writes the platform line break:
+  the index is LF-only, and an index fixture whose size changes on the
+  first rewrite would move the measured total under the test. }
+procedure WriteExactFile(const APath: string; const ABytes: RawByteString);
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  with TFileStream.Create(APath, fmCreate) do
+    try
+      if Length(ABytes) > 0 then WriteBuffer(ABytes[1], Length(ABytes));
+    finally
+      Free;
+    end;
+end;
+
+function ReadExactFile(const APath: string): RawByteString;
+begin
+  Result := '';
+  with TFileStream.Create(APath, fmOpenRead or fmShareDenyNone) do
+    try
+      SetLength(Result, Size);
+      if Size > 0 then ReadBuffer(Result[1], Size);
+    finally
+      Free;
+    end;
+end;
+
+function BuildResultManifestText(const AFingerprint,
+  AArtifactDigest: string): string;
+var
+  BuildResult: TLWPTCachedBuildResult;
+  Lines: TStringList;
+begin
+  BuildResult := Default(TLWPTCachedBuildResult);
+  BuildResult.SchemaVersion := BUILD_CACHE_RESULT_SCHEMA_VERSION;
+  BuildResult.Fingerprint := AFingerprint;
+  BuildResult.ArtifactDigest := AArtifactDigest;
+  BuildResult.ArtifactKind := 'executable';
+  BuildResult.UnixMode := 493;
+  Lines := SerializeBuildResultManifest(BuildResult);
+  try
+    Lines.LineBreak := #10;
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestAdmissionCostStaysFlatNearBudget;
+const
+  SmallResults = 200;
+  LargeResults = 2000;
+  Inserts = 12;
+  ArtifactBytes = 1024;
+  { Steady-state admissions no longer walk the cache or its references,
+    so ten times the results costs about the same per admission; only the
+    in-memory index load grows. Before, each admission walked the tree
+    three times and each evicted build object rescanned every reference,
+    which made this ratio about ten. }
+  ScaleMultiple = 3;
+  ScaleSlackMs = 100;
+
+  { Fabricates AResults build results (artifact, result manifest and
+    reference each, all indexed in order) with the cache at its budget,
+    then stores Inserts new results. }
+  procedure Measure(const AResults: Integer; out AMedianMs: Int64;
+    out AEnforcements, ACollections: Integer; out ALedger: string);
+  var
+    Artifact, Fingerprint, IndexText, Manifest, Path, Source: string;
+    Artifacts, Fingerprints, Manifests: array of string;
+    Cache: TLWPTBuildCache;
+    Times: TStringList;
+    Index: Integer;
+    Started: QWord;
+
+    procedure Fabricate(const ADigest, ABytes: string);
+    begin
+      Path := BuildObjectFile(ADigest);
+      ForceDirectories(ExtractFileDir(Path));
+      with TFileStream.Create(Path, fmCreate) do
+        try
+          WriteBuffer(ABytes[1], Length(ABytes));
+        finally
+          Free;
+        end;
+      WriteTextFile(ManifestFile('build-results', ADigest),
+        'schema=1'#10'namespace=build-results'#10'digest=' + ADigest
+        + #10'size=' + IntToStr(Length(ABytes)) + #10'object=' + Path);
+      IndexText := IndexText + 'entry.build-results:' + ADigest + '='
+        + IntToStr(Length(IndexText) + 1) + #10;
+    end;
+
+    function ArtifactText(const ATag: string): string;
+    begin
+      Result := ATag + StringOfChar('x', ArtifactBytes - Length(ATag));
+    end;
+
+  begin
+    ResetScratch;
+    IndexText := '';
+    SetLength(Artifacts, AResults);
+    SetLength(Fingerprints, AResults);
+    SetLength(Manifests, AResults);
+    for Index := 0 to AResults - 1 do
+    begin
+      Fingerprint := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+        'flat-fingerprint-' + IntToStr(Index))));
+      Artifact := ArtifactText('flat-artifact-' + IntToStr(Index) + '-');
+      Artifacts[Index] := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+        Artifact)));
+      Fabricate(Artifacts[Index], Artifact);
+      Manifest := BuildResultManifestText(Fingerprint, Artifacts[Index]);
+      Manifests[Index] := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+        Manifest)));
+      Fabricate(Manifests[Index], Manifest);
+      Fingerprints[Index] := Fingerprint;
+      WriteTextFile(ShardPath(FCacheRoot + '/build-results/refs',
+        Fingerprint), Manifests[Index]);
+    end;
+    { Index values only need to rise in fixture order: each is the index
+      text length so far, which grows with every entry. }
+    WriteExactFile(FCacheRoot + '/lifecycle/index', 'schema=1'#10
+      + 'sequence=' + IntToStr(Length(IndexText) + 1) + #10 + IndexText);
+    SetBudget(IntToStr(CacheBytes(FCacheRoot)));
+    Cache := TLWPTBuildCache.Create(FCacheRoot);
+    Times := TStringList.Create;
+    try
+      CacheLifecycleEnforcementCount := 0;
+      CacheLifecycleReferenceCollectionCount := 0;
+      for Index := 0 to Inserts - 1 do
+      begin
+        Source := FScratch + '/sources/flat-' + IntToStr(Index);
+        WriteTextFile(Source, ArtifactText('new-artifact-'
+          + IntToStr(Index) + '-'));
+        Started := GetTickCount64;
+        Expect<Boolean>(Cache.Store('sha256:' + LowerCase(SHA256Hex(
+          BytesOf('new-fingerprint-' + IntToStr(Index)))), Source,
+          'executable', 493)).ToBe(True);
+        { The first admission measures the cache and evicts a band, whose
+          cost the collection count below bounds; the rest are the steady
+          state this timing bounds. }
+        if Index > 0 then
+          Times.Add(Format('%.12d', [GetTickCount64 - Started]));
+      end;
+      AEnforcements := CacheLifecycleEnforcementCount;
+      ACollections := CacheLifecycleReferenceCollectionCount;
+      ALedger := '';
+      if FileExists(FCacheRoot + '/lifecycle/usage') then
+        with TStringList.Create do
+          try
+            LoadFromFile(FCacheRoot + '/lifecycle/usage');
+            ALedger := Values['bytes'] + ' bytes, ' + Values['growth']
+              + ' growth, budget ' + IntToStr(ResolveCacheMaxBytes);
+          finally
+            Free;
+          end;
+      Times.Sort;
+      AMedianMs := StrToInt64(Times[Times.Count div 2]);
+      if CacheBytes(FCacheRoot) > ResolveCacheMaxBytes then
+        Fail(Format('%d results: the cache is over budget', [AResults]));
+      { Eviction removed whole results, oldest first: a surviving
+        reference still resolves through its manifest to its artifact. }
+      Expect<Boolean>(FileExists(ShardPath(FCacheRoot
+        + '/build-results/refs', Fingerprints[0]))).ToBe(False);
+      for Index := 0 to AResults - 1 do
+        if FileExists(ShardPath(FCacheRoot + '/build-results/refs',
+             Fingerprints[Index]))
+           and not (FileExists(BuildObjectFile(Manifests[Index]))
+             and FileExists(BuildObjectFile(Artifacts[Index]))) then
+          Fail(Format('%d results: reference %d outlived its result',
+            [AResults, Index]));
+    finally
+      Times.Free;
+      Cache.Free;
+    end;
+  end;
+
+var
+  SmallMs, LargeMs: Int64;
+  SmallCollections, LargeCollections, SmallEnforcements,
+    LargeEnforcements: Integer;
+  SmallLedger, LargeLedger: string;
+begin
+  Measure(SmallResults, SmallMs, SmallEnforcements, SmallCollections,
+    SmallLedger);
+  Measure(LargeResults, LargeMs, LargeEnforcements, LargeCollections,
+    LargeLedger);
+  { One authoritative enforcement for all the admissions, at either size:
+    the first evicts down to the low-water mark, and the band it leaves
+    holds the rest. That batch evicts a tenth of the results, artifacts
+    and manifests alike, yet walks the references once; a walk per
+    evicted object would count in the dozens or hundreds here. }
+  if (SmallEnforcements <> 1) or (LargeEnforcements <> 1)
+     or (SmallCollections <> 1) or (LargeCollections <> 1) then
+    Fail(Format('expected one enforcement and one reference walk at each '
+      + 'size; %d results: %d and %d (ledger %s); %d results: %d and %d '
+      + '(ledger %s)', [SmallResults, SmallEnforcements, SmallCollections,
+      SmallLedger, LargeResults, LargeEnforcements, LargeCollections,
+      LargeLedger]));
+  if LargeMs >= ScaleMultiple * SmallMs + ScaleSlackMs then
+    Fail(Format('median admission took %d ms at %d results against %d ms '
+      + 'at %d; bound %d x + %d ms', [LargeMs, LargeResults, SmallMs,
+      SmallResults, ScaleMultiple, ScaleSlackMs]));
+end;
+
+procedure TCacheLifecycleContract.TestStaleLedgerMakesAdmissionMeasure;
+var
+  First, Foreign, ForeignBytes, Newest, Second: string;
+  Lines: TStringList;
+  Sequence: Int64;
+  Store: TLWPTImmutableObjectStore;
+begin
+  { An older LWPT sharing the cache admits objects without keeping the
+    usage ledger. Its index write changes the index the ledger was
+    recorded against, so the next admission distrusts the ledger and
+    measures the tree instead of admitting past the budget. }
+  SetBudget('20000');
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Lines := TStringList.Create;
+  try
+    First := WriteObject('first', StringOfChar('a', 4000), Store);
+    Second := WriteObject('second', StringOfChar('b', 4000), Store);
+    Expect<Boolean>(FileExists(FCacheRoot + '/lifecycle/usage')).ToBe(True);
+    Foreign := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+      StringOfChar('f', 9000))));
+    ForceDirectories(ExtractFileDir(Store.ObjectPath(Foreign)));
+    with TFileStream.Create(Store.ObjectPath(Foreign), fmCreate) do
+      try
+        ForeignBytes := StringOfChar('f', 9000);
+        WriteBuffer(ForeignBytes[1], Length(ForeignBytes));
+      finally
+        Free;
+      end;
+    Lines.LoadFromFile(FCacheRoot + '/lifecycle/index');
+    Sequence := StrToInt64(Copy(Lines[1], Length('sequence=') + 1, MaxInt));
+    Lines[1] := 'sequence=' + IntToStr(Sequence + 1);
+    Lines.Add('entry.' + DEPENDENCY_ARCHIVE_NAMESPACE + ':' + Foreign + '='
+      + IntToStr(Sequence + 1));
+    Lines.LineBreak := #10;
+    Lines.SaveToFile(FCacheRoot + '/lifecycle/index');
+    CacheLifecycleEnforcementCount := 0;
+    Newest := WriteObject('newest', StringOfChar('n', 4000), Store);
+    Expect<Integer>(CacheLifecycleEnforcementCount).ToBe(1);
+    Expect<Boolean>(FileExists(Store.ObjectPath(First))).ToBe(False);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Newest))).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= 20000).ToBe(True);
+  finally
+    Lines.Free;
+    Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.
+  TestUntrackedBytesAreMeasuredWithinOneBand;
+const
+  Budget = 100000;
+  ObjectBytes = 2000;
+var
+  Admissions: Integer;
+  Store: TLWPTImmutableObjectStore;
+begin
+  { Bytes no guarded writer reports, such as crash residue, are invisible
+    to the usage ledger. Admissions trust the ledger until it has grown by
+    one band (a tenth of the budget) since the last measurement; the next
+    admission then measures the tree and enforces the budget on it. }
+  SetBudget(IntToStr(Budget));
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    WriteObject('measured', StringOfChar('m', ObjectBytes), Store);
+    WriteTextFile(FCacheRoot + '/dependency-archives/tmp/residue',
+      StringOfChar('r', 90000));
+    CacheLifecycleEnforcementCount := 0;
+    WriteObject('trusted', StringOfChar('t', ObjectBytes), Store);
+    Expect<Integer>(CacheLifecycleEnforcementCount).ToBe(0);
+    Admissions := 0;
+    while (CacheLifecycleEnforcementCount = 0)
+          and (Admissions <= (Budget - CacheLowWaterBytes(Budget))
+            div ObjectBytes + 1) do
+    begin
+      WriteObject('growth-' + IntToStr(Admissions),
+        StringOfChar('g', ObjectBytes) + IntToStr(Admissions), Store);
+      Inc(Admissions);
+    end;
+    Expect<Integer>(CacheLifecycleEnforcementCount).ToBe(1);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.
+  TestEvictionStopsAtLowWaterAndRepairKeepsLedger;
+const
+  Budget = 20000;
+var
+  Digests: array[0..5] of string;
+  Index: Integer;
+  Store: TLWPTImmutableObjectStore;
+begin
+  { An admission over budget evicts down to the low-water mark, not just
+    enough to fit, and leaves a band for later admissions to use without
+    measuring or evicting. Repair measures the tree and leaves a ledger
+    that later admissions trust. }
+  SetBudget(IntToStr(Budget));
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    for Index := 0 to 4 do
+      Digests[Index] := WriteObject('band-' + IntToStr(Index),
+        StringOfChar(Chr(Ord('a') + Index), 3000), Store);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= CacheLowWaterBytes(Budget))
+      .ToBe(True);
+    CacheLifecycleEnforcementCount := 0;
+    Digests[5] := WriteObject('band-5', StringOfChar('f', 3000), Store);
+    Expect<Integer>(CacheLifecycleEnforcementCount).ToBe(1);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Digests[0]))).ToBe(False);
+    for Index := 1 to 5 do
+      Expect<Boolean>(FileExists(Store.ObjectPath(Digests[Index])))
+        .ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= CacheLowWaterBytes(Budget))
+      .ToBe(True);
+
+    CacheLifecycleEnforcementCount := 0;
+    WriteObject('within-band', 'small', Store);
+    Expect<Integer>(CacheLifecycleEnforcementCount).ToBe(0);
+    for Index := 1 to 5 do
+      Expect<Boolean>(FileExists(Store.ObjectPath(Digests[Index])))
+        .ToBe(True);
+
+    RepairSharedCache(FCacheRoot);
+    Expect<Boolean>(FileExists(FCacheRoot + '/lifecycle/usage')).ToBe(True);
+    CacheLifecycleEnforcementCount := 0;
+    WriteObject('after-repair', 'small-too', Store);
+    Expect<Integer>(CacheLifecycleEnforcementCount).ToBe(0);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= Budget).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+{$IFDEF UNIX}
+procedure TCacheLifecycleContract.
+  TestLinkedLedgerIsNeitherTrustedNorFollowed;
+var
+  Lifecycle: TLWPTCacheLifecycle;
+  LedgerLink, Outside: string;
+  Mutation: TObject;
+  Info: BaseUnix.Stat;
+begin
+  { A walk skips links, so a ledger name that is a link must neither be
+    trusted nor have its target's bytes subtracted from the walk: that
+    would under-count the cache. Enforcement removes the link itself and
+    leaves its target alone. }
+  WriteTextFile(FCacheRoot + '/dependency-archives/tmp/residue',
+    StringOfChar('r', 10000));
+  Outside := FScratch + '/outside-ledger';
+  WriteTextFile(Outside, StringOfChar('o', 20000));
+  LedgerLink := FCacheRoot + '/lifecycle/usage';
+  ForceDirectories(ExtractFileDir(LedgerLink));
+  if FpSymlink(PChar(Outside), PChar(LedgerLink)) <> 0 then
+    raise Exception.Create('failed to link the ledger fixture');
+  SetBudget('5000');
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+  Expect<Boolean>(FpLstat(PChar(LedgerLink), Info) = 0).ToBe(False);
+  Expect<Int64>(FileSizeOf(Outside)).ToBe(20000 + Length(LineEnding));
+end;
+{$ENDIF}
+
+{$IFDEF UNIX}
+procedure TCacheLifecycleContract.TestLinkedLifecycleRootIsNotFollowed;
+var
+  Kept, Outside: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { When the lifecycle root links outside the cache, a ledger name below it
+    is outside too: dropping or writing the ledger must not touch it. }
+  Outside := FScratch + '/outside-lifecycle';
+  Kept := Outside + '/usage/keep';
+  WriteTextFile(Kept, 'outside');
+  ForceDirectories(FCacheRoot);
+  if FpSymlink(PChar(Outside), PChar(FCacheRoot + '/lifecycle')) <> 0 then
+    raise Exception.Create('failed to link the lifecycle fixture');
+  SetBudget('0');
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+  Expect<Boolean>(FileExists(Kept)).ToBe(True);
+end;
+
+procedure TCacheLifecycleContract.TestLinkedManifestIsNotDebited;
+var
+  Digest, Manifest, Outside: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { A walk skips a linked control file, so removing one frees none of the
+    bytes the walk counted. Debiting its target's size from the ledger
+    would let a later admission past the budget. }
+  WriteTextFile(FCacheRoot + '/dependency-archives/tmp/residue',
+    StringOfChar('r', 10000));
+  Outside := FScratch + '/outside-manifest';
+  WriteTextFile(Outside, StringOfChar('o', 30000));
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Digest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Manifest := ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Digest);
+    if not SysUtils.DeleteFile(Manifest)
+       or (FpSymlink(PChar(Outside), PChar(Manifest)) <> 0) then
+      raise Exception.Create('failed to link the manifest fixture');
+    Lifecycle.DiscardObjectLocked(Digest, DependencyObjectFile(Digest));
+    SetBudget('5000');
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+  Expect<Int64>(FileSizeOf(Outside)).ToBe(30000 + Length(LineEnding));
+end;
+procedure TCacheLifecycleContract.TestLinkedManifestShardIsNotDebited;
+var
+  Digest, Manifest, Outside, Shard: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { A walk skips a linked directory, so a regular manifest below a linked
+    shard is not in its total either; removing it debits nothing. }
+  WriteTextFile(FCacheRoot + '/dependency-archives/tmp/residue',
+    StringOfChar('r', 10000));
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Digest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Manifest := ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Digest);
+    Shard := ExtractFileDir(Manifest);
+    Outside := FScratch + '/outside-shard';
+    WriteTextFile(Outside + '/' + ExtractFileName(Manifest),
+      StringOfChar('o', 30000));
+    WipeDir(Shard);
+    if FpSymlink(PChar(Outside), PChar(Shard)) <> 0 then
+      raise Exception.Create('failed to link the manifest shard fixture');
+    Lifecycle.DiscardObjectLocked(Digest, DependencyObjectFile(Digest));
+    SetBudget('5000');
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+end;
+{$ENDIF}
+
+procedure TCacheLifecycleContract.TestRecreatedIndexMakesAdmissionMeasure;
+var
+  First, Newest, Replacement, ReplacementBytes: string;
+  IndexText: RawByteString;
+  Store: TLWPTImmutableObjectStore;
+begin
+  { An older LWPT can delete the index (a zero-budget repair evicting
+    everything) and recreate one with the same sequence and byte size for
+    a different, larger object. The recreated index is a newer file, so
+    the ledger recorded against the old one is not trusted. The fixture
+    sets the newer time explicitly, as a coarse-timestamp filesystem could
+    otherwise record both writes in one tick. }
+  SetBudget('20000');
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    First := WriteObject('first', StringOfChar('a', 1000), Store);
+    Expect<Boolean>(FileExists(FCacheRoot + '/lifecycle/usage')).ToBe(True);
+    IndexText := ReadExactFile(FCacheRoot + '/lifecycle/index');
+    SysUtils.DeleteFile(Store.ObjectPath(First));
+    SysUtils.DeleteFile(ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, First));
+    SysUtils.DeleteFile(FCacheRoot + '/lifecycle/index');
+    ReplacementBytes := StringOfChar('b', 19000);
+    Replacement := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+      ReplacementBytes)));
+    ForceDirectories(ExtractFileDir(Store.ObjectPath(Replacement)));
+    with TFileStream.Create(Store.ObjectPath(Replacement), fmCreate) do
+      try
+        WriteBuffer(ReplacementBytes[1], Length(ReplacementBytes));
+      finally
+        Free;
+      end;
+    { Same bytes but the digest: the sequence, size and header are those
+      the ledger recorded, so only the write time can tell them apart. }
+    WriteExactFile(FCacheRoot + '/lifecycle/index',
+      StringReplace(IndexText, First, Replacement, []));
+    Expect<Int64>(FileSizeOf(FCacheRoot + '/lifecycle/index'))
+      .ToBe(Length(IndexText));
+    if FileSetDate(FCacheRoot + '/lifecycle/index',
+         DateTimeToFileDate(Now + 1)) <> 0 then
+      raise Exception.Create('failed to date the recreated index');
+    Newest := WriteObject('newest', StringOfChar('n', 1000), Store);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Replacement))).ToBe(False);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Newest))).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= 20000).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
+
+function LedgerBytes(const ACacheRoot: string): Int64;
+var
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ACacheRoot + '/lifecycle/usage');
+    Result := StrToInt64(Lines.Values['bytes']);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestRemovalLeavesTheLedgerUntilAWalk;
+var
+  Before: Int64;
+  Digest: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { Between walks the ledger only grows. A removal's bytes leave it when a
+    walk measures them, so no removal can subtract bytes that a walk did
+    not count, through a link or otherwise. }
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Digest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Before := LedgerBytes(FCacheRoot);
+    Lifecycle.DiscardObjectLocked(Digest, DependencyObjectFile(Digest));
+    Expect<Boolean>(FileExists(DependencyObjectFile(Digest))).ToBe(False);
+    Expect<Boolean>(LedgerBytes(FCacheRoot) >= Before).ToBe(True);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+end;
+
 procedure TCacheLifecycleContract.SetupTests;
 begin
   Test('aggregate admission evicts the deterministic least-recently-used '
@@ -1237,11 +1851,31 @@ begin
   Test('repair fails closed when a reference cannot be deleted',
     TestRepairFailsClosedWhenReferenceCannotBeDeleted);
   {$IFDEF UNIX}
+  Test('a linked usage ledger is neither trusted nor followed',
+    TestLinkedLedgerIsNeitherTrustedNorFollowed);
+  Test('a linked lifecycle root is not followed by the ledger',
+    TestLinkedLifecycleRootIsNotFollowed);
+  Test('removing a linked manifest debits none of its target',
+    TestLinkedManifestIsNotDebited);
+  Test('a manifest below a linked shard debits nothing',
+    TestLinkedManifestShardIsNotDebited);
   Test('repair unlinks cache shards without following them',
     TestRepairUnlinksCacheShardsWithoutFollowingThem);
   {$ENDIF}
   Test('repair reclaims abandoned and preserves live producer leases',
     TestRepairReclaimsAbandonedAndPreservesLiveLease);
+  Test('admission cost stays flat near the budget as the cache grows',
+    TestAdmissionCostStaysFlatNearBudget);
+  Test('a ledger another writer left stale makes admission measure',
+    TestStaleLedgerMakesAdmissionMeasure);
+  Test('a recreated index with the same sequence and size makes admission '
+    + 'measure', TestRecreatedIndexMakesAdmissionMeasure);
+  Test('a removal leaves the ledger until a walk measures it',
+    TestRemovalLeavesTheLedgerUntilAWalk);
+  Test('untracked bytes are measured within one band of growth',
+    TestUntrackedBytesAreMeasuredWithinOneBand);
+  Test('eviction stops at the low-water mark and repair keeps a ledger',
+    TestEvictionStopsAtLowWaterAndRepairKeepsLedger);
   Test('cache budget parsing has one byte-valued contract',
     TestBudgetParsing);
 end;
