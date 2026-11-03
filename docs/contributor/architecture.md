@@ -262,8 +262,8 @@ installs are not supported.
   reference, reconstructs damaged index state, reclaims abandoned/incomplete
   residue, preserves live guards, and, when the cache is over the configured
   budget, evicts unleased objects down to its low-water mark. It drops the
-  usage ledger first and, when the cache then fits, writes a fresh one from
-  its final measurement. Admissions judge the budget from a guarded usage
+  usage ledger before repairing objects, references, or the index and, when
+  the cache then fits, writes a fresh one from its final measurement. Admissions judge the budget from a guarded usage
   ledger tied to the current index, and walk the tree only when the ledger is
   untrusted, out of room or a band stale; eviction then goes to a low-water
   mark a tenth of the budget below it.
