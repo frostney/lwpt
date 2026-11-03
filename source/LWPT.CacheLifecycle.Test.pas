@@ -1284,7 +1284,7 @@ const
     reference each, all indexed in order) with the cache at its budget,
     then stores Inserts new results. }
   procedure Measure(const AResults: Integer; out AMedianMs: Int64;
-    out AEnforcements, ACollections: Integer);
+    out AEnforcements, ACollections: Integer; out ALedger: string);
   var
     Artifact, Fingerprint, IndexText, Manifest, Path, Source: string;
     Artifacts, Fingerprints, Manifests: array of string;
@@ -1364,6 +1364,16 @@ const
       end;
       AEnforcements := CacheLifecycleEnforcementCount;
       ACollections := CacheLifecycleReferenceCollectionCount;
+      ALedger := '';
+      if FileExists(FCacheRoot + '/lifecycle/usage') then
+        with TStringList.Create do
+          try
+            LoadFromFile(FCacheRoot + '/lifecycle/usage');
+            ALedger := Values['bytes'] + ' bytes, ' + Values['growth']
+              + ' growth, budget ' + IntToStr(ResolveCacheMaxBytes);
+          finally
+            Free;
+          end;
       Times.Sort;
       AMedianMs := StrToInt64(Times[Times.Count div 2]);
       if CacheBytes(FCacheRoot) > ResolveCacheMaxBytes then
@@ -1389,18 +1399,24 @@ var
   SmallMs, LargeMs: Int64;
   SmallCollections, LargeCollections, SmallEnforcements,
     LargeEnforcements: Integer;
+  SmallLedger, LargeLedger: string;
 begin
-  Measure(SmallResults, SmallMs, SmallEnforcements, SmallCollections);
-  Measure(LargeResults, LargeMs, LargeEnforcements, LargeCollections);
+  Measure(SmallResults, SmallMs, SmallEnforcements, SmallCollections,
+    SmallLedger);
+  Measure(LargeResults, LargeMs, LargeEnforcements, LargeCollections,
+    LargeLedger);
   { One authoritative enforcement for all the admissions, at either size:
     the first evicts down to the low-water mark, and the band it leaves
     holds the rest. That batch evicts a tenth of the results, artifacts
     and manifests alike, yet walks the references once; a walk per
     evicted object would count in the dozens or hundreds here. }
-  Expect<Integer>(SmallEnforcements).ToBe(1);
-  Expect<Integer>(LargeEnforcements).ToBe(1);
-  Expect<Integer>(SmallCollections).ToBe(1);
-  Expect<Integer>(LargeCollections).ToBe(1);
+  if (SmallEnforcements <> 1) or (LargeEnforcements <> 1)
+     or (SmallCollections <> 1) or (LargeCollections <> 1) then
+    Fail(Format('expected one enforcement and one reference walk at each '
+      + 'size; %d results: %d and %d (ledger %s); %d results: %d and %d '
+      + '(ledger %s)', [SmallResults, SmallEnforcements, SmallCollections,
+      SmallLedger, LargeResults, LargeEnforcements, LargeCollections,
+      LargeLedger]));
   if LargeMs >= ScaleMultiple * SmallMs + ScaleSlackMs then
     Fail(Format('median admission took %d ms at %d results against %d ms '
       + 'at %d; bound %d x + %d ms', [LargeMs, LargeResults, SmallMs,
