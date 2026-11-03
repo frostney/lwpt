@@ -347,7 +347,8 @@ story.
   self-hosted registry that shipped under
   [issue #29](https://github.com/frostney/lwpt/issues/29)).
 
-- [`docs/`](./docs/) — full set of canonical docs: `architecture.md`,
-  `quick-start.md`, `tooling.md`, `code-style.md`, `build-system.md`,
-  `deployment.md`, `testing.md`, `packages.md`, `ci.md`. Each opens
-  with an Executive Summary.
+- [User guide](docs/user/README.md) — using LWPT in a project: the
+  consumer guide, build system, health, and registry use and deployment.
+- [Contributor guide](docs/contributor/README.md) — changing LWPT itself:
+  architecture, quick start, tooling, code style, deployment, testing,
+  packages, and CI.

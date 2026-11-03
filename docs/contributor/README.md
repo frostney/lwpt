@@ -2,6 +2,8 @@
 
 Documentation for building, testing, and releasing LWPT itself. Start with the [contributor quick start](./quick-start.md) and [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
+Some of these pages are also the reference for projects that use LWPT: the [environment variables](./tooling.md#environment-variables) and [duplication analysis](./tooling.md#duplication-analysis) in `tooling.md`, test programs and selectors in [`testing.md`](./testing.md), formatter scope in [`code-style.md`](./code-style.md), and `lwpt repair` under [common errors](./quick-start.md#common-errors). The [user guide](../user/README.md) links to them.
+
 | File | Covers |
 | --- | --- |
 | [`architecture.md`](./architecture.md) | Tech stack, the package-manager-is-the-foundation through-line, manifest model, resolver shape, fetch/extract/build/test pipeline, `.lwpt/` layout, error/idempotency model, deferred-contracts note |

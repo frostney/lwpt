@@ -4,7 +4,7 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 
 ## Executive Summary
 
-- **Six release targets** map to the matrix in [`docs/contributor/ci.md`](./ci.md): `aarch64-darwin` + `x86_64-darwin` + `x86_64-linux` + `aarch64-linux` + `x86_64-win64` + `i386-win32`. All six tested natively on every push to `main` (per `ci.yml`); all six published per release tag (per `release.yml`).
+- **Six release targets** map to the matrix in [`docs/contributor/ci.md`](./ci.md): `aarch64-darwin` + `x86_64-darwin` + `x86_64-linux` + `aarch64-linux` + `x86_64-win64` + `i386-win32`. All six tested natively on every pull request and every push to `main` (per `ci.yml`); all six published per release tag (per `release.yml`).
 - **TLS is platform-native in both directions on Windows and macOS.** Clients use SChannel on Windows, Secure Transport on macOS, and OpenSSL on Linux per [ADR-0016](../adr/0016-tls-backend-per-platform.md). Server accept uses native SChannel on Windows per [ADR-0033](../adr/0033-schannel-server-tls-accept-on-windows.md), runtime-loaded OpenSSL on Unix-not-Darwin per [ADR-0024](../adr/0024-openssl-server-tls-accept.md), and two native Apple implementations on macOS: Network.framework by default on macOS 26 and newer, and the HTTPClient Secure Transport backend on macOS 15 and older per [ADR-0043](../adr/0043-self-hosted-registry-origin.md).
 - **Windows has no OpenSSL relationship at all.** Neither direction links, loads, or requires OpenSSL, so Windows server consumers have no DLL prerequisite and `i386-win32` supports server accept like every other target.
 - **The three Windows CI guards fail closed on OpenSSL linkage.** They inspect normal and delay imports, imported symbol families regardless of DLL name, and static-link inputs; canaries prove the parser sees both a prohibited fixture and real system imports.
@@ -15,7 +15,7 @@ Platform support tiers, the per-platform TLS backend story, the release process,
 
 | Tier | Targets | What "supported" means |
 |------|---------|------------------------|
-| **Tier 1** | `x86_64-linux`, `aarch64-linux`, `x86_64-win64`, `aarch64-darwin`, `x86_64-darwin` | Full LWPT self-test on every push to `main` (`ci.yml` runs the repository's ordinary and E2E path selectors natively on each without repeating programs). Pre-built binaries published per release tag. |
+| **Tier 1** | `x86_64-linux`, `aarch64-linux`, `x86_64-win64`, `aarch64-darwin`, `x86_64-darwin` | Full LWPT self-test on every pull request and every push to `main` (`ci.yml` runs the repository's ordinary and E2E path selectors natively on each without repeating programs). Pre-built binaries published per release tag. |
 | **Tier 1 (32-bit Windows)** | `i386-win32` | Cross-built and then tested natively on a `windows-latest` runner alongside `x86_64-win64`: `ci.yml` runs the same ordinary and E2E path selectors as the other Tier 1 targets. The 32-bit binary is published per release. |
 | **Tier 2** | Other Win64 SKUs (server, arm64) | CI is x86_64 only at the Windows runner level; arm64-windows would need separate runners. |
 | **Tier 3** | FreeBSD, OpenBSD, Linux ARM32, NetBSD, others | Documented as "should work, no automation". Issues accepted but not blocking. No published binaries. PRs to elevate to Tier 1 welcome. |

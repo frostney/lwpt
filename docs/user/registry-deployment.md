@@ -494,5 +494,6 @@ retention or checkpointed-history design would need a protocol change.
 
 The E2E matrix trusts the committed test root through the test build only,
 so HTTPS consumers and mirrors are exercised over localhost HTTP. The
-container smoke is off the automatic PR gate because it needs Docker and
-image pulls. See [`ci.md`](../contributor/ci.md).
+container smoke runs in `ci.yml` on every pull request and every push to
+`main`, where `delivery-admission` requires it, and again in `release.yml` on
+the published assets. See [`ci.md`](../contributor/ci.md).

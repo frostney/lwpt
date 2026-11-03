@@ -1,5 +1,10 @@
 # Memory-BIO OpenSSL terminates server TLS on Unix-not-Darwin
 
+> **Amended 2026-10-21 ([#403](https://github.com/frostney/lwpt/pull/403)):**
+> `pr.yml` is retired. The PE import and static-link guards named below run in
+> `ci.yml`, now on every pull request and every push to `main`, and in
+> `release.yml`.
+
 ## Executive Summary
 
 - **Server TLS is socket-independent.** The nonblocking feed/drain state

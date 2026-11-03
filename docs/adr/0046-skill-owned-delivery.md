@@ -1,5 +1,18 @@
 # Delivery is skill-owned; the repository keeps one gate
 
+> **Amended 2026-10-21 ([#403](https://github.com/frostney/lwpt/pull/403),
+> [#400](https://github.com/frostney/lwpt/pull/400)), one CI workflow and no
+> named reviewer model:** `pr.yml` and the full-CI rule are retired.
+> `ci.yml` now runs the full native matrix on every pull request and every
+> push to `main`, and its `delivery-admission` job is still the one check the
+> main ruleset requires. Its `workflow_dispatch` runs the same full matrix on
+> any ref. `diagnostic.yml` dispatches one allow-listed diagnostic slice
+> through `ci.yml`'s `workflow_call`. No separate `mode=manual` run is needed
+> before a head-matched squash merge. [`ORCHESTRATION.md`](../../ORCHESTRATION.md)
+> still requires independent review evidence on the exact head but names no
+> reviewer model. Every decision below that names `pr.yml`, `mode=manual`
+> or the full-CI rule reads as this amendment.
+>
 > **Amended 2026-10-05, workflow write scope:** the consequence "no workflow
 > writes to pull requests" overstates it. `.github/workflows/lwpt-update.yml`,
 > the reusable dependency updater from

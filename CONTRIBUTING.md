@@ -5,7 +5,7 @@ This file is the authoritative contract for human contributors. AI assistants fo
 ## Before you start
 
 - Read [`AGENTS.md`](./AGENTS.md). The "Hard Constraints" section enumerates the rules a PR may not violate; the rest of the file is the operating manual for the toolkit.
-- Skim the ADRs in [`docs/adr/`](./docs/adr/) — six short notes covering the decisions that shape the current shape of the code. If your change challenges one of these, raise it before writing code.
+- Skim the ADRs in [`docs/adr/`](./docs/adr/) — the decision records behind the current shape of the code; the [documentation index](./docs/README.md) summarises each in one line. If your change challenges one of these, raise it before writing code.
 - Make sure your environment matches [`docs/contributor/tooling.md`](./docs/contributor/tooling.md): FPC 3.2.2 (verified live, never assumed), InstantFPC (bundled with FPC), Lefthook for the pre-commit hook.
 
 ## Setup
