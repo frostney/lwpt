@@ -541,7 +541,10 @@ end;
   and last-write time at the filesystem's resolution. Every index write
   publishes a new file, so a writer that does not keep the ledger, even
   one that deletes the index and recreates the same sequence and size,
-  changes the identity unless it writes within the same timestamp tick. }
+  changes the identity unless it writes within the same timestamp tick.
+  Such a replacement goes unseen like any other untracked bytes: the
+  growth band still forces a walk, and an older writer enforces the
+  budget with its own walk. }
 function ReadIndexIdentity(const ACacheRoot: string;
   out AIdentity: string): Boolean;
 var
@@ -680,21 +683,25 @@ begin
   end;
 end;
 
-{ Applies ADelta bytes to a ledger loaded before the change, or drops a
-  ledger that was already untrusted so it cannot match a later index. }
+{ Adds ADelta bytes to a ledger loaded before the change and records it
+  against the index the change left, or drops a ledger that was already
+  untrusted so it cannot match a later index. Between walks the ledger
+  only grows: a removal's bytes leave it only when a walk measures them,
+  so no removal can subtract bytes a walk did not count (a link's target,
+  say) and the ledger never falls below the tree it stands for. }
 procedure AccountLedger(const ACacheRoot: string; const ATrusted: Boolean;
   const ALedger: TLWPTCacheLedger; const ADelta: Int64);
 var
-  Growth: Int64;
+  Added: Int64;
 begin
   if not ATrusted then
   begin
     DropLedger(ACacheRoot);
     Exit;
   end;
-  Growth := ALedger.Growth;
-  if ADelta > 0 then Inc(Growth, ADelta);
-  StoreLedger(ACacheRoot, ALedger.Bytes + ADelta, Growth);
+  Added := ADelta;
+  if Added < 0 then Added := 0;
+  StoreLedger(ACacheRoot, ALedger.Bytes + Added, ALedger.Growth + Added);
 end;
 
 procedure WriteManifest(const ACacheRoot, ANamespace, ADigest,
@@ -1655,9 +1662,11 @@ begin
     Item.Namespace := FNamespace;
     Item.Digest := ADigest;
     Item.Path := AObjectPath;
+    { The removed bytes stay in the ledger until the next walk measures
+      them, so only the index's own change is accounted below. }
     if not RemoveObjectFiles(FCacheRoot, Item, FreedBytes) then
     begin
-      AccountLedger(FCacheRoot, LedgerTrusted, Ledger, -FreedBytes);
+      AccountLedger(FCacheRoot, LedgerTrusted, Ledger, 0);
       raise ELWPTCacheLifecycleError.CreateFmt(
         'failed to discard cache object %s', [ADigest]);
     end;
@@ -1668,8 +1677,7 @@ begin
     else
       WriteIndex(FCacheRoot, Sequence, Entries);
     AccountLedger(FCacheRoot, LedgerTrusted, Ledger,
-      CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot)) - IndexBytes
-      - FreedBytes);
+      CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot)) - IndexBytes);
   finally
     Entries.Free;
   end;

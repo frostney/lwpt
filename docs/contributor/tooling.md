@@ -186,7 +186,8 @@ every change a guarded writer made since. It is trusted only while the index
 it was written against is unchanged (same sequence, size and last-write time),
 so an older LWPT sharing the cache, or a crash between the two writes, makes
 the next admission measure. Ledger accounting counts a file the way the walk
-does: links, and anything below a linked directory, count as zero. A walk also
+does: links, and anything below a linked directory, count as zero. Between
+walks the ledger only grows; removals leave it when the next walk measures. A walk also
 runs when the ledger has no room for the admission, or has grown by more than
 one band (a tenth of the budget) since the last walk. When that walk finds the
 cache over budget, eviction continues down to a low-water mark one band below

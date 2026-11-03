@@ -76,6 +76,7 @@ type
     procedure TestAdmissionCostStaysFlatNearBudget;
     procedure TestStaleLedgerMakesAdmissionMeasure;
     procedure TestRecreatedIndexMakesAdmissionMeasure;
+    procedure TestRemovalLeavesTheLedgerUntilAWalk;
     procedure TestUntrackedBytesAreMeasuredWithinOneBand;
     procedure TestEvictionStopsAtLowWaterAndRepairKeepsLedger;
   end;
@@ -1735,6 +1736,46 @@ begin
   end;
 end;
 
+function LedgerBytes(const ACacheRoot: string): Int64;
+var
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ACacheRoot + '/lifecycle/usage');
+    Result := StrToInt64(Lines.Values['bytes']);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TCacheLifecycleContract.TestRemovalLeavesTheLedgerUntilAWalk;
+var
+  Before: Int64;
+  Digest: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { Between walks the ledger only grows. A removal's bytes leave it when a
+    walk measures them, so no removal can subtract bytes that a walk did
+    not count, through a link or otherwise. }
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Digest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Before := LedgerBytes(FCacheRoot);
+    Lifecycle.DiscardObjectLocked(Digest, DependencyObjectFile(Digest));
+    Expect<Boolean>(FileExists(DependencyObjectFile(Digest))).ToBe(False);
+    Expect<Boolean>(LedgerBytes(FCacheRoot) >= Before).ToBe(True);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+end;
+
 procedure TCacheLifecycleContract.SetupTests;
 begin
   Test('aggregate admission evicts the deterministic least-recently-used '
@@ -1793,6 +1834,8 @@ begin
     TestStaleLedgerMakesAdmissionMeasure);
   Test('a recreated index with the same sequence and size makes admission '
     + 'measure', TestRecreatedIndexMakesAdmissionMeasure);
+  Test('a removal leaves the ledger until a walk measures it',
+    TestRemovalLeavesTheLedgerUntilAWalk);
   Test('untracked bytes are measured within one band of growth',
     TestUntrackedBytesAreMeasuredWithinOneBand);
   Test('eviction stops at the low-water mark and repair keeps a ledger',
