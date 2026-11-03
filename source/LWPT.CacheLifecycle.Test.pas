@@ -69,11 +69,13 @@ type
     procedure TestLinkedLedgerIsNeitherTrustedNorFollowed;
     procedure TestLinkedLifecycleRootIsNotFollowed;
     procedure TestLinkedManifestIsNotDebited;
+    procedure TestLinkedManifestShardIsNotDebited;
     {$ENDIF}
     procedure TestRepairReclaimsAbandonedAndPreservesLiveLease;
     procedure TestBudgetParsing;
     procedure TestAdmissionCostStaysFlatNearBudget;
     procedure TestStaleLedgerMakesAdmissionMeasure;
+    procedure TestRecreatedIndexMakesAdmissionMeasure;
     procedure TestUntrackedBytesAreMeasuredWithinOneBand;
     procedure TestEvictionStopsAtLowWaterAndRepairKeepsLedger;
   end;
@@ -1641,7 +1643,97 @@ begin
   end;
   Expect<Int64>(FileSizeOf(Outside)).ToBe(30000 + Length(LineEnding));
 end;
+procedure TCacheLifecycleContract.TestLinkedManifestShardIsNotDebited;
+var
+  Digest, Manifest, Outside, Shard: string;
+  Lifecycle: TLWPTCacheLifecycle;
+  Mutation: TObject;
+begin
+  { A walk skips a linked directory, so a regular manifest below a linked
+    shard is not in its total either; removing it debits nothing. }
+  WriteTextFile(FCacheRoot + '/dependency-archives/tmp/residue',
+    StringOfChar('r', 10000));
+  Lifecycle := TLWPTCacheLifecycle.Create(FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  Mutation := Lifecycle.AcquireMutation;
+  try
+    Digest := RecordFabricatedObject(Lifecycle,
+      FCacheRoot + '/dependency-archives', 'a', 1000);
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(True);
+    Manifest := ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, Digest);
+    Shard := ExtractFileDir(Manifest);
+    Outside := FScratch + '/outside-shard';
+    WriteTextFile(Outside + '/' + ExtractFileName(Manifest),
+      StringOfChar('o', 30000));
+    WipeDir(Shard);
+    if FpSymlink(PChar(Outside), PChar(Shard)) <> 0 then
+      raise Exception.Create('failed to link the manifest shard fixture');
+    Lifecycle.DiscardObjectLocked(Digest, DependencyObjectFile(Digest));
+    SetBudget('5000');
+    Expect<Boolean>(Lifecycle.MakeRoomLocked(0)).ToBe(False);
+  finally
+    Mutation.Free;
+    Lifecycle.Free;
+  end;
+end;
 {$ENDIF}
+
+procedure TCacheLifecycleContract.TestRecreatedIndexMakesAdmissionMeasure;
+var
+  First, IndexText, Newest, Replacement, ReplacementBytes: string;
+  Store: TLWPTImmutableObjectStore;
+begin
+  { An older LWPT can delete the index (a zero-budget repair evicting
+    everything) and recreate one with the same sequence and byte size for
+    a different, larger object. The recreated index is a newer file, so
+    the ledger recorded against the old one is not trusted. The fixture
+    sets the newer time explicitly, as a coarse-timestamp filesystem could
+    otherwise record both writes in one tick. }
+  SetBudget('20000');
+  Store := TLWPTImmutableObjectStore.Create(
+    FCacheRoot + '/dependency-archives', FCacheRoot,
+    DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    First := WriteObject('first', StringOfChar('a', 1000), Store);
+    Expect<Boolean>(FileExists(FCacheRoot + '/lifecycle/usage')).ToBe(True);
+    with TStringList.Create do
+      try
+        LoadFromFile(FCacheRoot + '/lifecycle/index');
+        IndexText := Text;
+      finally
+        Free;
+      end;
+    SysUtils.DeleteFile(Store.ObjectPath(First));
+    SysUtils.DeleteFile(ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, First));
+    SysUtils.DeleteFile(FCacheRoot + '/lifecycle/index');
+    ReplacementBytes := StringOfChar('b', 19000);
+    Replacement := 'sha256:' + LowerCase(SHA256Hex(BytesOf(
+      ReplacementBytes)));
+    ForceDirectories(ExtractFileDir(Store.ObjectPath(Replacement)));
+    with TFileStream.Create(Store.ObjectPath(Replacement), fmCreate) do
+      try
+        WriteBuffer(ReplacementBytes[1], Length(ReplacementBytes));
+      finally
+        Free;
+      end;
+    with TFileStream.Create(FCacheRoot + '/lifecycle/index', fmCreate) do
+      try
+        IndexText := StringReplace(IndexText, First, Replacement, []);
+        WriteBuffer(IndexText[1], Length(IndexText));
+      finally
+        Free;
+      end;
+    if FileSetDate(FCacheRoot + '/lifecycle/index',
+         DateTimeToFileDate(Now + 1)) <> 0 then
+      raise Exception.Create('failed to date the recreated index');
+    Newest := WriteObject('newest', StringOfChar('n', 1000), Store);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Replacement))).ToBe(False);
+    Expect<Boolean>(FileExists(Store.ObjectPath(Newest))).ToBe(True);
+    Expect<Boolean>(CacheBytes(FCacheRoot) <= 20000).ToBe(True);
+  finally
+    Store.Free;
+  end;
+end;
 
 procedure TCacheLifecycleContract.SetupTests;
 begin
@@ -1688,6 +1780,8 @@ begin
     TestLinkedLifecycleRootIsNotFollowed);
   Test('removing a linked manifest debits none of its target',
     TestLinkedManifestIsNotDebited);
+  Test('a manifest below a linked shard debits nothing',
+    TestLinkedManifestShardIsNotDebited);
   Test('repair unlinks cache shards without following them',
     TestRepairUnlinksCacheShardsWithoutFollowingThem);
   {$ENDIF}
@@ -1697,6 +1791,8 @@ begin
     TestAdmissionCostStaysFlatNearBudget);
   Test('a ledger another writer left stale makes admission measure',
     TestStaleLedgerMakesAdmissionMeasure);
+  Test('a recreated index with the same sequence and size makes admission '
+    + 'measure', TestRecreatedIndexMakesAdmissionMeasure);
   Test('untracked bytes are measured within one band of growth',
     TestUntrackedBytesAreMeasuredWithinOneBand);
   Test('eviction stops at the low-water mark and repair keeps a ledger',

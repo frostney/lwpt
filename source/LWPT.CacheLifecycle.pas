@@ -452,14 +452,43 @@ begin
   end;
 end;
 
+{ True when a directory between ACacheRoot and APath is a link. A walk
+  does not enter linked directories, so nothing below one is counted. }
+function HasLinkedAncestor(const ACacheRoot, APath: string): Boolean;
+var
+  Directory, Parent, Root: string;
+begin
+  Root := ExcludeTrailingPathDelimiter(ACacheRoot);
+  Directory := ExtractFileDir(APath);
+  while Length(Directory) > Length(Root) do
+  begin
+    if IsDirSymlinkOrJunction(Directory) then Exit(True);
+    Parent := ExtractFileDir(Directory);
+    if Parent = Directory then Break;
+    Directory := Parent;
+  end;
+  Result := False;
+end;
+
+{ The bytes a walk of ACacheRoot counts for the file APath: its size, or
+  zero when it or a directory above it inside the cache is a link. Every
+  ledger credit and debit uses this, so the ledger never subtracts bytes
+  the walk did not count. }
+function CacheFileBytes(const ACacheRoot, APath: string): Int64;
+begin
+  if HasLinkedAncestor(ACacheRoot, APath) then Exit(0);
+  Result := FileByteSize(APath);
+end;
+
 { The usage ledger: the cache's byte total as last measured by a walk,
   plus every change guarded writers made since. It is trusted only while
-  the index it was written against is still current, so a writer that does
-  not keep it (an older LWPT, or a crash between the index and ledger
-  writes) invalidates it, and the next admission measures the tree. Growth
-  counts the bytes added since that measurement; once it exceeds one band,
-  the next admission measures again, which bounds how long bytes no guarded
-  writer reports (crash residue, producer metadata) can go uncounted. }
+  the index it was written against is still current (ReadIndexIdentity),
+  so a writer that does not keep it (an older LWPT, or a crash between the
+  index and ledger writes) invalidates it, and the next admission measures
+  the tree. Growth counts the bytes added since that measurement; once it
+  exceeds one band, the next admission measures again, which bounds how
+  long bytes no guarded writer reports (crash residue, producer metadata)
+  can go uncounted. }
 type
   TLWPTCacheLedger = record
     Bytes: Int64;
@@ -468,7 +497,7 @@ type
 
 { The index's sequence and byte size, without parsing its entries. A
   missing index has sequence -1; an unreadable header makes it unknown. }
-function ReadIndexIdentity(const ACacheRoot: string; out ASequence,
+function ReadIndexHeader(const ACacheRoot: string; out ASequence,
   ABytes: Int64): Boolean;
 const
   HEADER_BYTES = 64;
@@ -508,6 +537,31 @@ begin
     and (ASequence >= 0);
 end;
 
+{ What the ledger is recorded against: the index's sequence, byte size
+  and last-write time at the filesystem's resolution. Every index write
+  publishes a new file, so a writer that does not keep the ledger, even
+  one that deletes the index and recreates the same sequence and size,
+  changes the identity unless it writes within the same timestamp tick. }
+function ReadIndexIdentity(const ACacheRoot: string;
+  out AIdentity: string): Boolean;
+var
+  Bytes, Sequence: Int64;
+  Stamp: TLWPTModificationStamp;
+begin
+  AIdentity := '';
+  Result := ReadIndexHeader(ACacheRoot, Sequence, Bytes);
+  if not Result then Exit;
+  if Sequence < 0 then
+  begin
+    AIdentity := 'none';
+    Exit;
+  end;
+  if not LongPathModificationStamp(IndexPath(ACacheRoot), Stamp) then
+    Exit(False);
+  AIdentity := IntToStr(Sequence) + ':' + IntToStr(Bytes) + ':'
+    + IntToStr(Stamp.Seconds) + '.' + IntToStr(Stamp.Nanoseconds);
+end;
+
 { The ledger's size when it is a regular file in an unlinked lifecycle
   root, 0 when absent, and -1 for a link, any other entry, or a linked
   lifecycle root. A walk skips links, so only a regular ledger's bytes are
@@ -534,7 +588,7 @@ end;
 function LoadLedger(const ACacheRoot: string;
   out ALedger: TLWPTCacheLedger): Boolean;
 var
-  IndexBytes, IndexSequence: Int64;
+  Identity: string;
   Lines: TStringList;
   Text: string;
 begin
@@ -542,13 +596,12 @@ begin
   ALedger := Default(TLWPTCacheLedger);
   if LedgerFileBytes(ACacheRoot) <> CACHE_LEDGER_BYTES then Exit;
   if not ReadSmallTextFile(LedgerPath(ACacheRoot), Text) then Exit;
-  if not ReadIndexIdentity(ACacheRoot, IndexSequence, IndexBytes) then Exit;
+  if not ReadIndexIdentity(ACacheRoot, Identity) then Exit;
   Lines := TStringList.Create;
   try
     Lines.Text := Text;
     Result := (Lines.Values['schema'] = IntToStr(CACHE_LEDGER_SCHEMA))
-      and (Lines.Values['index-sequence'] = IntToStr(IndexSequence))
-      and (Lines.Values['index-bytes'] = IntToStr(IndexBytes))
+      and (Lines.Values['index'] = Identity)
       and TryStrToInt64(Lines.Values['bytes'], ALedger.Bytes)
       and TryStrToInt64(Lines.Values['growth'], ALedger.Growth)
       and (ALedger.Bytes >= 0) and (ALedger.Growth >= 0);
@@ -591,7 +644,7 @@ end;
 procedure StoreLedger(const ACacheRoot: string; const ABytes,
   AGrowth: Int64);
 var
-  IndexBytes, IndexSequence: Int64;
+  Identity: string;
   Lines: TStringList;
   Padding: Integer;
 begin
@@ -600,7 +653,7 @@ begin
     DropLedger(ACacheRoot);
     if LedgerFileBytes(ACacheRoot) < 0 then Exit;
   end;
-  if not ReadIndexIdentity(ACacheRoot, IndexSequence, IndexBytes) then
+  if not ReadIndexIdentity(ACacheRoot, Identity) then
   begin
     DropLedger(ACacheRoot);
     Exit;
@@ -609,8 +662,7 @@ begin
   try
     Lines.LineBreak := #10;
     Lines.Add('schema=' + IntToStr(CACHE_LEDGER_SCHEMA));
-    Lines.Add('index-sequence=' + IntToStr(IndexSequence));
-    Lines.Add('index-bytes=' + IntToStr(IndexBytes));
+    Lines.Add('index=' + Identity);
     if ABytes < 0 then Lines.Add('bytes=0')
     else Lines.Add('bytes=' + IntToStr(ABytes));
     if AGrowth < 0 then Lines.Add('growth=0')
@@ -1288,13 +1340,13 @@ begin
   Result := not FileExists(AObject.Path);
   if not Result then
   begin
-    PayloadBytes := FileByteSize(AObject.Path);
+    PayloadBytes := CacheFileBytes(ACacheRoot, AObject.Path);
     Result := SysUtils.DeleteFile(AObject.Path);
     if not Result then Exit;
     Inc(AFreedBytes, PayloadBytes);
   end;
   Manifest := ManifestPath(ACacheRoot, AObject.Namespace, AObject.Digest);
-  ManifestBytes := FileByteSize(Manifest);
+  ManifestBytes := CacheFileBytes(ACacheRoot, Manifest);
   if SysUtils.DeleteFile(Manifest) then Inc(AFreedBytes, ManifestBytes);
 end;
 
@@ -1589,7 +1641,7 @@ var
   Ledger: TLWPTCacheLedger;
 begin
   LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
-  IndexBytes := FileByteSize(IndexPath(FCacheRoot));
+  IndexBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot));
   Entries := TStringList.Create;
   try
     Entries.NameValueSeparator := '=';
@@ -1616,7 +1668,8 @@ begin
     else
       WriteIndex(FCacheRoot, Sequence, Entries);
     AccountLedger(FCacheRoot, LedgerTrusted, Ledger,
-      FileByteSize(IndexPath(FCacheRoot)) - IndexBytes - FreedBytes);
+      CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot)) - IndexBytes
+      - FreedBytes);
   finally
     Entries.Free;
   end;
@@ -1642,8 +1695,9 @@ begin
   { The object arrived by renaming staging bytes that no ledger counted,
     so its size is new to the ledger, as are the control file changes. }
   LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
-  ControlBytes := FileByteSize(IndexPath(FCacheRoot))
-    + FileByteSize(ManifestPath(FCacheRoot, FNamespace, ADigest));
+  ControlBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot))
+    + CacheFileBytes(FCacheRoot,
+      ManifestPath(FCacheRoot, FNamespace, ADigest));
   Entries := TStringList.Create;
   try
     try
@@ -1673,8 +1727,9 @@ begin
     Entries.Free;
   end;
   AccountLedger(FCacheRoot, LedgerTrusted, Ledger, Size
-    + FileByteSize(IndexPath(FCacheRoot))
-    + FileByteSize(ManifestPath(FCacheRoot, FNamespace, ADigest))
+    + CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot))
+    + CacheFileBytes(FCacheRoot,
+      ManifestPath(FCacheRoot, FNamespace, ADigest))
     - ControlBytes);
 end;
 
@@ -1697,7 +1752,7 @@ begin
     end;
     Inc(Sequence);
     SetIndexEntry(Entries, Key(ADigest), IntToStr(Sequence));
-    ExistingBytes := FileByteSize(IndexPath(FCacheRoot));
+    ExistingBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot));
     AdditionalBytes := IndexByteSize(Sequence, Entries) - ExistingBytes;
     if AdditionalBytes < 0 then AdditionalBytes := 0;
     if (AdditionalBytes > 0)
@@ -1714,10 +1769,10 @@ begin
       SetIndexEntry(Entries, Key(ADigest), IntToStr(Sequence));
     end;
     LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
-    ExistingBytes := FileByteSize(IndexPath(FCacheRoot));
+    ExistingBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot));
     WriteIndex(FCacheRoot, Sequence, Entries);
     AccountLedger(FCacheRoot, LedgerTrusted, Ledger,
-      FileByteSize(IndexPath(FCacheRoot)) - ExistingBytes);
+      CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot)) - ExistingBytes);
   finally
     Entries.Free;
   end;
