@@ -1245,6 +1245,32 @@ begin
   Expect<Boolean>(Refused).ToBe(True);
 end;
 
+{ Exact bytes, unlike WriteTextFile, which writes the platform line break:
+  the index is LF-only, and an index fixture whose size changes on the
+  first rewrite would move the measured total under the test. }
+procedure WriteExactFile(const APath: string; const ABytes: RawByteString);
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  with TFileStream.Create(APath, fmCreate) do
+    try
+      if Length(ABytes) > 0 then WriteBuffer(ABytes[1], Length(ABytes));
+    finally
+      Free;
+    end;
+end;
+
+function ReadExactFile(const APath: string): RawByteString;
+begin
+  Result := '';
+  with TFileStream.Create(APath, fmOpenRead or fmShareDenyNone) do
+    try
+      SetLength(Result, Size);
+      if Size > 0 then ReadBuffer(Result[1], Size);
+    finally
+      Free;
+    end;
+end;
+
 function BuildResultManifestText(const AFingerprint,
   AArtifactDigest: string): string;
 var
@@ -1339,7 +1365,7 @@ const
     end;
     { Index values only need to rise in fixture order: each is the index
       text length so far, which grows with every entry. }
-    WriteTextFile(FCacheRoot + '/lifecycle/index', 'schema=1'#10
+    WriteExactFile(FCacheRoot + '/lifecycle/index', 'schema=1'#10
       + 'sequence=' + IntToStr(Length(IndexText) + 1) + #10 + IndexText);
     SetBudget(IntToStr(CacheBytes(FCacheRoot)));
     Cache := TLWPTBuildCache.Create(FCacheRoot);
@@ -1697,7 +1723,8 @@ end;
 
 procedure TCacheLifecycleContract.TestRecreatedIndexMakesAdmissionMeasure;
 var
-  First, IndexText, Newest, Replacement, ReplacementBytes: string;
+  First, Newest, Replacement, ReplacementBytes: string;
+  IndexText: RawByteString;
   Store: TLWPTImmutableObjectStore;
 begin
   { An older LWPT can delete the index (a zero-budget repair evicting
@@ -1713,13 +1740,7 @@ begin
   try
     First := WriteObject('first', StringOfChar('a', 1000), Store);
     Expect<Boolean>(FileExists(FCacheRoot + '/lifecycle/usage')).ToBe(True);
-    with TStringList.Create do
-      try
-        LoadFromFile(FCacheRoot + '/lifecycle/index');
-        IndexText := Text;
-      finally
-        Free;
-      end;
+    IndexText := ReadExactFile(FCacheRoot + '/lifecycle/index');
     SysUtils.DeleteFile(Store.ObjectPath(First));
     SysUtils.DeleteFile(ManifestFile(DEPENDENCY_ARCHIVE_NAMESPACE, First));
     SysUtils.DeleteFile(FCacheRoot + '/lifecycle/index');
@@ -1733,13 +1754,12 @@ begin
       finally
         Free;
       end;
-    with TFileStream.Create(FCacheRoot + '/lifecycle/index', fmCreate) do
-      try
-        IndexText := StringReplace(IndexText, First, Replacement, []);
-        WriteBuffer(IndexText[1], Length(IndexText));
-      finally
-        Free;
-      end;
+    { Same bytes but the digest: the sequence, size and header are those
+      the ledger recorded, so only the write time can tell them apart. }
+    WriteExactFile(FCacheRoot + '/lifecycle/index',
+      StringReplace(IndexText, First, Replacement, []));
+    Expect<Int64>(FileSizeOf(FCacheRoot + '/lifecycle/index'))
+      .ToBe(Length(IndexText));
     if FileSetDate(FCacheRoot + '/lifecycle/index',
          DateTimeToFileDate(Now + 1)) <> 0 then
       raise Exception.Create('failed to date the recreated index');
