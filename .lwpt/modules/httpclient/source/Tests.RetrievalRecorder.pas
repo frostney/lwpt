@@ -17,13 +17,14 @@
     non-default port, logging "skipping SSRF-denied destination"; of the
     local shapes tried, only a host name on port 80 was still fetched. macOS
     lets an unprivileged process bind port 80 on the wildcard address but
-    refuses a loopback address with EACCES (observed on 26.5.2), so this endpoint binds [::]:80
-    dual-stack (localhost may resolve to ::1 or 127.0.0.1) and counts only
-    connections from a loopback peer; any other peer is closed uncounted.
+    refuses a loopback address with EACCES (observed on 26.5.2), so this
+    endpoint binds [::]:80 dual-stack (localhost may resolve to ::1 or
+    127.0.0.1) and counts only connections from a loopback peer; any other
+    peer is closed uncounted.
     Port 80 must therefore be free while the test runs, and a host firewall
     may ask once to let the test program accept connections.
 
-  The port is fixed because it is baked into the certificate, so it sits
+  Port 6741 is fixed because it is baked into the certificate, so it sits
   below every supported platform's default ephemeral range: Linux
   32768-60999, Windows and macOS 49152-65535, and FreeBSD 10000-65535.
   Inside such a range, any outbound loopback connection a concurrent test
@@ -345,7 +346,7 @@ begin
        (GetTickCount64 - StartedAt >= RETRIEVAL_RECORDER_BIND_MILLISECONDS) then
       raise ERetrievalRecorderError.CreateFmt(
         'retrieval recorder could not listen on %s (the port the fixture ' +
-        'certificate''s URLs name): %s failed with error %d (%s) ' +
+        'certificate''s URLs imply): %s failed with error %d (%s) ' +
         'after %d attempt(s) in %d ms',
         [RecorderEndpointText(AEndpoint), Stage, ErrorCode,
          SysErrorMessage(ErrorCode), Attempts,
