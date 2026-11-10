@@ -65,8 +65,17 @@ const
   UNREACHABLE_AIA_PKCS12_PATH =
     FIXTURES + 'localhost-unreachable-aia-identity.p12';
   { The same shape, but the URLs point at the local retrieval recorder so a
-    fetch is observable. }
+    fetch is observable. trustd on macOS 26.7.2 no longer fetches the
+    127.0.0.1:6741 URLs (Tests.RetrievalRecorder), so Darwin uses the leaf
+    naming http://localhost/ and the recorder's default-port endpoint. }
+  {$IFDEF DARWIN}
+  LOOPBACK_AIA_PKCS12_PATH =
+    FIXTURES + 'localhost-default-port-aia-identity.p12';
+  LOOPBACK_AIA_RECORDER = rreLocalhostDefaultPort;
+  {$ELSE}
   LOOPBACK_AIA_PKCS12_PATH = FIXTURES + 'localhost-loopback-aia-identity.p12';
+  LOOPBACK_AIA_RECORDER = rreLoopbackPort;
+  {$ENDIF}
   { Anchor-only evaluation is offline, so it must finish far inside any
     network retrieval timeout (15 s by default on Windows). }
   OFFLINE_VERIFICATION_BUDGET_MILLISECONDS = 8000;
@@ -771,6 +780,28 @@ begin
   Result := Pos(LowerCase(AFragment), LowerCase(AText)) > 0;
 end;
 
+{ What a step of the retrieval case observed, for its failure message: the
+  client's error, how long the exchange took, and every request the
+  recorder had seen by then. }
+function DescribeRetrievalStep(const AStep, AErrorMessage: string;
+  const AElapsedMilliseconds: QWord; const ARequests: Integer;
+  const ARequestLines: string): string;
+begin
+  Result := Format('%s: client error "%s" after %d ms; the recorder saw %d ' +
+    'request(s) [%s]', [AStep, AErrorMessage, AElapsedMilliseconds,
+    ARequests, ARequestLines]);
+end;
+
+{ Whether the recorder's request lines include a fetch of one of the
+  loopback-AIA leaf's own URLs (/issuer.crt, /ocsp, /leaf.crl), so that an
+  unrelated local connection to the recorder cannot pass for one. }
+function RequestsNameLeafURL(const ARequestLines: string): Boolean;
+begin
+  Result := Contains(ARequestLines, ' /issuer.crt ') or
+    Contains(ARequestLines, ' /ocsp') or
+    Contains(ARequestLines, ' /leaf.crl ');
+end;
+
 { ── tests ────────────────────────────────────────────────────────── }
 
 procedure TTransportSecurityClientOptionsE2ETests.TestAnchorsOnlyVerifiesConfiguredCA;
@@ -835,40 +866,55 @@ end;
   intermediate and the leaf's AIA, OCSP, and CRL URLs point at the local
   retrieval recorder. Anchors-only must reject it with zero requests. The
   positive control is system plus anchors, whose second evaluation restores
-  Secure Transport's network fetching: on macOS the recorder then sees the
-  AIA fetch, so the endpoint demonstrably detects retrieval. OpenSSL never
-  fetches certificate URLs, so on Unix-not-Darwin both modes must show zero
-  requests and no positive control is possible. Windows runs this server-
-  less in TransportSecurity.Test (an SChannel server builds its own chain
-  and could fetch the URL itself). }
+  Secure Transport's network fetching: on macOS the recorder then sees a
+  fetch of one of the leaf's URLs, so the endpoint demonstrably detects
+  retrieval. OpenSSL never fetches certificate URLs, so on Unix-not-Darwin
+  both modes must show zero requests and no positive control is possible.
+  Windows runs this server-less in TransportSecurity.Test (an SChannel
+  server builds its own chain and could fetch the URL itself). }
 procedure TTransportSecurityClientOptionsE2ETests.TestAnchorPassMakesNoObservableRetrieval;
 {$IFNDEF MSWINDOWS}
 var
   ErrorMessage: string;
   Peer: TBytes;
+  Met: Boolean;
   Recorder: TRetrievalRecorder;
+  RequestLines: string;
+  Requests: Integer;
   Response: AnsiString;
   Served: TServedConnection;
+  StartedAt: QWord;
 {$ENDIF}
 begin
   {$IFNDEF MSWINDOWS}
-  Recorder := TRetrievalRecorder.Create;
+  Recorder := TRetrievalRecorder.Create(LOOPBACK_AIA_RECORDER);
   try
+    StartedAt := GetTickCount64;
     ErrorMessage := RunExchange(LOOPBACK_AIA_PKCS12_PATH, tsivPermissive,
       'localhost', AnchorsOnly(TEST_ROOT_PATH), False, Response, Peer, Served);
-    Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
-    Expect<string>(Recorder.Describe).ToBe('');
-    Expect<Integer>(Recorder.Requests).ToBe(0);
+    Requests := Recorder.Requests;
+    Met := Contains(ErrorMessage, 'verification') and (Requests = 0);
+    if not Met then
+      Fail(DescribeRetrievalStep('anchors-only exchange', ErrorMessage,
+        GetTickCount64 - StartedAt, Requests, Recorder.Describe));
+    Expect<Boolean>(Met).ToBe(True);
 
+    StartedAt := GetTickCount64;
     ErrorMessage := RunExchange(LOOPBACK_AIA_PKCS12_PATH, tsivPermissive,
       'localhost', SystemAndAnchors(TEST_ROOT_PATH), False, Response, Peer,
       Served);
-    Expect<Boolean>(ErrorMessage <> '').ToBe(True);
+    Requests := Recorder.Requests;
+    RequestLines := Recorder.Describe;
     {$IFDEF DARWIN}
-    Expect<Boolean>(Recorder.Requests >= 1).ToBe(True);
+    { A recorded request line implies a counted connection. }
+    Met := (ErrorMessage <> '') and RequestsNameLeafURL(RequestLines);
     {$ELSE}
-    Expect<Integer>(Recorder.Requests).ToBe(0);
+    Met := (ErrorMessage <> '') and (Requests = 0);
     {$ENDIF}
+    if not Met then
+      Fail(DescribeRetrievalStep('system-plus-anchors exchange', ErrorMessage,
+        GetTickCount64 - StartedAt, Requests, RequestLines));
+    Expect<Boolean>(Met).ToBe(True);
   finally
     Recorder.Free;
   end;

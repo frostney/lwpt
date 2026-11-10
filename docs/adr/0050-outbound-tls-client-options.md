@@ -321,10 +321,16 @@ supported platform's default ephemeral range, so a concurrent test's
 outbound loopback connection cannot take it on a default-configured host;
 an existing listener, an explicit port reservation, or a lowered ephemeral
 range can still refuse it, and the recorder then fails naming the
-operating-system error. An anchors-only evaluation must
-fail with zero requests. The positive control is system plus anchors,
-whose fallback evaluation is allowed to fetch: on Windows and macOS the
-recorder must then see at least one request, which shows that the
+operating-system error. On macOS a second leaf names `http://localhost/`
+instead, and the recorder listens on port 80 for loopback peers: on macOS
+26.7.2 trustd refused to fetch the leaf's CA-issuer URL from a local
+endpoint named by IP literal or on a non-default port ("skipping
+SSRF-denied destination"), and of the local shapes tried only a host name
+on the default port was still fetched. Port 80 must then be free while the
+case runs. An anchors-only evaluation must fail with zero requests. The
+positive control is system plus anchors, whose fallback evaluation is
+allowed to fetch: on Windows and macOS the recorder must then see at least
+one request (on macOS, for one of the leaf's URLs), which shows that the
 endpoint detects retrieval, so restoring retrieval in the anchor pass
 fails the zero-request assertion. OpenSSL never fetches, so on
 Unix-not-Darwin both modes must show zero requests and no positive
