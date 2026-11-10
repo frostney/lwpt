@@ -237,7 +237,7 @@ Generated state belongs to `lwpt install`; do not hand-edit its contents.
 | Consume packages from a self-hosted registry | `registry:` dependencies and a root `[registries]` table | [Registry dependencies](../adr/0051-registry-dependency-sources.md) |
 | Run a registry origin or mirror, or publish to one | `lwpt registry` | [Registry deployment](registry-deployment.md) |
 | Recover from an interrupted install or upgrade a v3 lockfile | `lwpt repair` | `lwpt repair --help` |
-| Parse application arguments and provide help | `cli` package | [CLI public types](../../packages/cli/source/CLI.Options.pas), [subcommands](../../packages/cli/source/CLI.Subcommands.pas) |
+| Parse application arguments and provide help | `cli` package | [Build a command line on the `cli` package](cli-package.md), [CLI public types](../../packages/cli/source/CLI.Options.pas), [subcommands](../../packages/cli/source/CLI.Subcommands.pas) |
 | Build selected binaries | `lwpt build` | [Build system](build-system.md) |
 | Run native tests | `testing` package and `lwpt test` | [Testing](../contributor/testing.md) |
 | Run a project-specific tool or oracle adapter | A manifest task and `lwpt run <task>` | [Run tasks](../adr/0013-run-subcommand-and-build-rename.md) |

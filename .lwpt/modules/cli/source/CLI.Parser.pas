@@ -9,22 +9,53 @@ uses
 
   CLI.Options;
 
-{ Parses command-line arguments against the given option definitions.
-  Returns a TStringList of positional (non-option) arguments; the caller
-  owns the returned list. Raises TParseError for unknown long flags and
-  unmatched single-character short options. An unmatched multi-character
+const
+  { The conventional end-of-options marker. Every argument after it is a
+    positional, whatever it looks like; the marker itself is dropped. }
+  END_OF_OPTIONS_MARKER = '--';
+
+type
+  TCommandLineArguments = array of string;
+
+{ Parses AArguments against the given option definitions. Returns a
+  TStringList of positional (non-option) arguments; the caller owns the
+  returned list. Raises TParseError for unknown long flags and unmatched
+  single-character short options. An unmatched multi-character
   single-dash token remains positional.
 
-  A valued short option consumes the following argv (`-o output`) when
-  its ShortName matches exactly, including a value that begins with `-`.
-  AllowAttachedShortValue additionally enables an attached suffix
+  A valued short option consumes the following argument (`-o output`)
+  when its ShortName matches exactly, including a value that begins with
+  `-`. AllowAttachedShortValue additionally enables an attached suffix
   (`-dDEBUG`, `-Fusource`); the longest registered short-name prefix wins.
 
+  END_OF_OPTIONS_MARKER ends option parsing: the arguments after it are
+  returned as positionals, verbatim.
+
+  AStopAtFirstPositional ends option parsing at the first positional as
+  well: that argument and every argument after it are returned verbatim,
+  including a later END_OF_OPTIONS_MARKER. A program that launches another
+  program uses it to hand the rest of the line through untouched. }
+function ParseArguments(const AArguments: array of string;
+  const AOptions: TOptionArray;
+  AStopAtFirstPositional: Boolean = False): TStringList;
+
+{ Reports whether `--<ALongName>` or `-<AShortName>` is spelled out as an
+  option before option parsing ends at the first positional or at
+  END_OF_OPTIONS_MARKER. Reads AArguments under ParseArguments' rules, so a
+  value consumed by a valued option is never taken for the flag. Applies no
+  option and raises nothing: an argument ParseArguments would reject is
+  skipped. }
+function LeadingFlagGiven(const AArguments: array of string;
+  const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
+
+{ The process's own arguments from position AStartArg onward. }
+function GetCommandLineArguments(
+  AStartArg: Integer = 1): TCommandLineArguments;
+
+{ ParseArguments over the process's own arguments.
+
   AStartArg defaults to 1 (the first real argv after the program name).
-  Callers that need to skip a leading word — e.g. `lwpt run <subcmd>`
-  delegates to the named subcommand by re-parsing argv from position 2
-  onward, treating <subcmd>'s args as if they were the top-level args
-  for that subcommand — pass AStartArg=2 (or higher). }
+  Callers that need to skip leading words pass a higher position. }
 function ParseCommandLine(const AOptions: TOptionArray;
   AStartArg: Integer = 1): TStringList;
 
@@ -38,14 +69,29 @@ const
   SHORT_FLAG_CHAR = '-';
   FLAG_VALUE_SEPARATOR = '=';
 
-procedure SplitFlag(const AArg: string; out AName, AValue: string);
+type
+  TArgumentKind = (akPositional, akEndOfOptions, akOption, akRejected);
+
+  { How one argument reads at its position: the single description of the
+    option syntax that ParseArguments and LeadingFlagGiven share. }
+  TArgumentReading = record
+    Kind: TArgumentKind;
+    Option: TOptionBase;  { akOption }
+    Value: string;        { akOption }
+    Width: Integer;       { arguments read: 2 with a separated value }
+    Rejection: string;    { akRejected: the TParseError message }
+  end;
+
+procedure SplitFlag(const AArg: string; out AName, AValue: string;
+  out AHasEquals: Boolean);
 var
   EqualPos: Integer;
   Body: string;
 begin
   Body := Copy(AArg, Length(LONG_FLAG_PREFIX) + 1, MaxInt);
   EqualPos := Pos(FLAG_VALUE_SEPARATOR, Body);
-  if EqualPos > 0 then
+  AHasEquals := EqualPos > 0;
+  if AHasEquals then
   begin
     AName := Copy(Body, 1, EqualPos - 1);
     AValue := Copy(Body, EqualPos + 1, MaxInt);
@@ -105,91 +151,172 @@ begin
   end;
 end;
 
-function ParseCommandLine(const AOptions: TOptionArray;
-  AStartArg: Integer = 1): TStringList;
+function ReadArgument(const AArguments: array of string; AIndex: Integer;
+  const AOptions: TOptionArray): TArgumentReading;
 var
-  I, Count: Integer;
-  Arg, Name, Value: string;
-  Option: TOptionBase;
-  HasEquals: Boolean;
+  Arg, Name: string;
+  HasEquals, HasNext: Boolean;
+begin
+  Arg := AArguments[AIndex];
+  HasNext := AIndex < High(AArguments);
+  Result.Kind := akOption;
+  Result.Option := nil;
+  Result.Value := '';
+  Result.Width := 1;
+  Result.Rejection := '';
+
+  if Arg = END_OF_OPTIONS_MARKER then
+    Result.Kind := akEndOfOptions
+  else if Copy(Arg, 1, Length(LONG_FLAG_PREFIX)) = LONG_FLAG_PREFIX then
+  begin
+    SplitFlag(Arg, Name, Result.Value, HasEquals);
+    Result.Option := FindOption(AOptions, Name);
+    if Result.Option = nil then
+    begin
+      Result.Kind := akRejected;
+      Result.Rejection := Format('Unknown option: --%s', [Name]);
+    end
+    { Plain string/integer options accept the space-separated form
+      (--mode release) as well as --mode=release; flag options
+      still take no value. }
+    else if (Result.Value = '') and (not HasEquals) and
+            not (Result.Option is TFlagOption) then
+    begin
+      if (not HasNext) or
+         (Copy(AArguments[AIndex + 1], 1, 1) = SHORT_FLAG_CHAR) then
+      begin
+        Result.Kind := akRejected;
+        Result.Rejection := Format('--%s requires a value', [Name]);
+      end
+      else
+      begin
+        Result.Value := AArguments[AIndex + 1];
+        Result.Width := 2;
+      end;
+    end;
+  end
+  else if (Length(Arg) > 1) and
+          (Arg[1] = SHORT_FLAG_CHAR) and
+          (Arg[2] <> SHORT_FLAG_CHAR) then
+  begin
+    Name := Copy(Arg, 2, MaxInt);
+    Result.Option := FindOptionShortExact(AOptions, Name);
+    if Result.Option <> nil then
+    begin
+      if not (Result.Option is TFlagOption) then
+      begin
+        if not HasNext then
+        begin
+          Result.Kind := akRejected;
+          Result.Rejection := Format('-%s requires a value', [Name]);
+        end
+        else
+        begin
+          Result.Value := AArguments[AIndex + 1];
+          Result.Width := 2;
+        end;
+      end;
+    end
+    else
+    begin
+      Result.Option := FindOptionShortAttached(AOptions, Name, Result.Value);
+      if Result.Option = nil then
+      begin
+        { Preserve the pre-valued-short behavior for multi-character
+          single-dash tokens when no option opted into attachment:
+          they remain positional. A one-character short name is the
+          only shape that was previously recognized and rejected as
+          unknown. }
+        if Length(Name) = 1 then
+        begin
+          Result.Kind := akRejected;
+          Result.Rejection := Format('Unknown option: %s', [Arg]);
+        end
+        else
+          Result.Kind := akPositional;
+      end;
+    end;
+  end
+  else
+    Result.Kind := akPositional;
+end;
+
+function ParseArguments(const AArguments: array of string;
+  const AOptions: TOptionArray;
+  AStopAtFirstPositional: Boolean = False): TStringList;
+var
+  I, VerbatimFrom: Integer;
+  Reading: TArgumentReading;
 begin
   Result := TStringList.Create;
   try
-    I := AStartArg;
-    Count := ParamCount;
-    while I <= Count do
+    I := 0;
+    VerbatimFrom := Length(AArguments);
+    while I < VerbatimFrom do
     begin
-      Arg := ParamStr(I);
-
-      if Copy(Arg, 1, Length(LONG_FLAG_PREFIX)) = LONG_FLAG_PREFIX then
-      begin
-        HasEquals := Pos(FLAG_VALUE_SEPARATOR,
-          Copy(Arg, Length(LONG_FLAG_PREFIX) + 1, MaxInt)) > 0;
-        SplitFlag(Arg, Name, Value);
-        Option := FindOption(AOptions, Name);
-        if Option = nil then
-          raise TParseError.CreateFmt('Unknown option: --%s', [Name]);
-
-        { Plain string/integer options accept the space-separated form
-          (--mode release) as well as --mode=release; flag options
-          still take no value. }
-        if (Value = '') and (not HasEquals) and
-           not (Option is TFlagOption) then
-        begin
-          if (I >= Count) or
-             (Copy(ParamStr(I + 1), 1, 1) = SHORT_FLAG_CHAR) then
-            raise TParseError.CreateFmt(
-              '--%s requires a value', [Name]);
-          Inc(I);
-          Value := ParamStr(I);
-        end;
-
-        Option.Apply(Value);
-      end
-      else if (Length(Arg) > 1) and
-              (Arg[1] = SHORT_FLAG_CHAR) and
-              (Arg[2] <> SHORT_FLAG_CHAR) then
-      begin
-        Name := Copy(Arg, 2, MaxInt);
-        Option := FindOptionShortExact(AOptions, Name);
-        if Option <> nil then
-        begin
-          Value := '';
-          if not (Option is TFlagOption) then
+      Reading := ReadArgument(AArguments, I, AOptions);
+      case Reading.Kind of
+        akRejected:
+          raise TParseError.Create(Reading.Rejection);
+        akOption:
+          Reading.Option.Apply(Reading.Value);
+        akEndOfOptions:
+          VerbatimFrom := I + 1;
+        akPositional:
           begin
-            if I >= Count then
-              raise TParseError.CreateFmt(
-                '-%s requires a value', [Name]);
-            Inc(I);
-            Value := ParamStr(I);
+            if AStopAtFirstPositional then
+              VerbatimFrom := I
+            else
+              Result.Add(AArguments[I]);
           end;
-        end
-        else
-          Option := FindOptionShortAttached(AOptions, Name, Value);
-
-        if Option = nil then
-        begin
-          { Preserve the pre-valued-short behavior for multi-character
-            single-dash tokens when no option opted into attachment:
-            they remain positional. A one-character short name is the
-            only shape that was previously recognized and rejected as
-            unknown. }
-          if Length(Name) = 1 then
-            raise TParseError.CreateFmt('Unknown option: %s', [Arg]);
-          Result.Add(Arg);
-        end
-        else
-          Option.Apply(Value);
-      end
-      else
-        Result.Add(Arg);
-
-      Inc(I);
+      end;
+      Inc(I, Reading.Width);
     end;
+    for I := VerbatimFrom to High(AArguments) do
+      Result.Add(AArguments[I]);
   except
     Result.Free;
     raise;
   end;
+end;
+
+function LeadingFlagGiven(const AArguments: array of string;
+  const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
+var
+  I: Integer;
+  Reading: TArgumentReading;
+begin
+  I := 0;
+  while I <= High(AArguments) do
+  begin
+    Reading := ReadArgument(AArguments, I, AOptions);
+    if Reading.Kind in [akPositional, akEndOfOptions] then
+      Exit(False);
+    if (AArguments[I] = LONG_FLAG_PREFIX + ALongName) or
+       (AArguments[I] = SHORT_FLAG_CHAR + AShortName) then
+      Exit(True);
+    Inc(I, Reading.Width);
+  end;
+  Result := False;
+end;
+
+function GetCommandLineArguments(
+  AStartArg: Integer = 1): TCommandLineArguments;
+var
+  I: Integer;
+begin
+  Result := nil;
+  if AStartArg > ParamCount then
+    Exit;
+  SetLength(Result, ParamCount - AStartArg + 1);
+  for I := AStartArg to ParamCount do
+    Result[I - AStartArg] := ParamStr(I);
+end;
+
+function ParseCommandLine(const AOptions: TOptionArray;
+  AStartArg: Integer = 1): TStringList;
+begin
+  Result := ParseArguments(GetCommandLineArguments(AStartArg), AOptions);
 end;
 
 end.

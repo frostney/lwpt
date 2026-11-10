@@ -15,6 +15,11 @@
     - `lwpt unknownsubcommand` → exit != 0, stderr names the unknown
       subcommand. Catches "silent fallthrough" regressions where an
       unknown verb does nothing.
+    - The registry defaults LWPT keeps: a bare `lwpt` prints help and
+      exits 0, an unknown command or option exits 1, and the help after
+      an unknown command goes to stdout.
+    - `--` ends option parsing: what follows is positional, including
+      option and help spellings.
     - `lwpt build --mode release <scratch project>` → the space-separated
       option-value regression. CLI.Parser accepts the space-separated
       form (`--mode release`) for plain string/integer options as well
@@ -54,6 +59,9 @@ type
     procedure TestHelpListsAllSubcommands;
     procedure TestShortHelpAlias;
     procedure TestUnknownSubcommandExitsNonZero;
+    procedure TestBareInvocationPrintsHelpAndSucceeds;
+    procedure TestUsageErrorsExitOneWithHelpOnStdout;
+    procedure TestEndOfOptionsMarkerMakesLaterArgumentsPositional;
     procedure TestBuildModeSpaceSeparatedValueParses;
     procedure TestBuildModeEqualsSeparatedValueParses;
     procedure TestBuildModeInvalidValueExitsNonZero;
@@ -278,6 +286,54 @@ begin
     or (Pos('does-not-exist', R.Stderr) > 0)
     or (Pos('unknown', LowerCase(R.Stdout + R.Stderr)) > 0)
   ).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestBareInvocationPrintsHelpAndSucceeds;
+var R: TLwptResult;
+begin
+  R := RunLwpt([]);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  { LWPT's description leads the help. Its version flag is accepted
+    without being listed, so the help has no options section. }
+  Expect<Boolean>(Pos('lightweight Pascal toolkit', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('lightweight Pascal toolkit', R.Stdout)
+    < Pos('usage: lwpt <command> [options]', R.Stdout)).ToBe(True);
+  Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('options:', R.Stdout) > 0).ToBe(False);
+end;
+
+procedure TCLIOptionsE2E.TestUsageErrorsExitOneWithHelpOnStdout;
+var R: TLwptResult;
+begin
+  R := RunLwpt(['does-not-exist-as-a-subcommand']);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('unknown command: does-not-exist-as-a-subcommand',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('usage: lwpt <command> [options]', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('usage:', R.Stderr) > 0).ToBe(False);
+
+  R := RunLwpt(['build', '--does-not-exist'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('lwpt build: Unknown option: --does-not-exist',
+    R.Stderr) > 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestEndOfOptionsMarkerMakesLaterArgumentsPositional;
+var R: TLwptResult;
+begin
+  { format rejects a positional before it touches any file, so the
+    rejection shows how each argument after the marker was read. }
+  R := RunLwpt(['format', '--', '--check'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('lwpt format: unexpected argument "--check"',
+    R.Stderr) > 0).ToBe(True);
+
+  R := RunLwpt(['format', '--', 'help'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('lwpt format: unexpected argument "help"',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('usage:', R.Stdout) > 0).ToBe(False);
 end;
 
 procedure TCLIOptionsE2E.TestBuildModeSpaceSeparatedValueParses;
@@ -980,6 +1036,12 @@ begin
     TestShortHelpAlias);
   Test('unknown subcommand exits non-zero + names the unknown verb',
     TestUnknownSubcommandExitsNonZero);
+  Test('bare lwpt prints help led by its description and exits 0',
+    TestBareInvocationPrintsHelpAndSucceeds);
+  Test('unknown command and option exit 1; unknown-command help on stdout',
+    TestUsageErrorsExitOneWithHelpOnStdout);
+  Test('-- makes option and help spellings after it positional',
+    TestEndOfOptionsMarkerMakesLaterArgumentsPositional);
   Test('build --mode release (space-separated value) parses correctly',
     TestBuildModeSpaceSeparatedValueParses);
   Test('build --mode=release (equals-separated value) parses correctly',

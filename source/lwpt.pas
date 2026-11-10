@@ -696,9 +696,10 @@ var
   i, N : Integer;
 begin
   { Subcommand-aliasing (`lwpt run install`) is intercepted in
-    CLI.Subcommands.Run BEFORE this handler is called. So when we
-    arrive here, the name (if any) is always a user-declared run task
-    name — never a subcommand. Empty positionals = list mode. }
+    CLI.Subcommands.Run BEFORE this handler is called, because the run
+    command opts in to it at registration. So when we arrive here, the
+    name (if any) is always a user-declared run task name — never a
+    subcommand. Empty positionals = list mode. }
   if APositionals.Count = 0 then
     Name := ''
   else
@@ -843,38 +844,33 @@ begin
 end;
 
 { --- top-level flags ----------------------------------------------------- }
-function HandleTopLevelFlags: Boolean;
-var
-  A : string;
+function HandleVersion: Integer;
 begin
-  Result := False;
-  if ParamCount > 0 then
-  begin
-    A := ParamStr(1);
-    if (A = '--version') or (A = '-v') or (LowerCase(A) = 'version') then
-    begin
-      WriteLn(PROGRAM_NAME, ' ', PROGRAM_VERSION);
-      Result := True;
-    end;
-  end;
+  WriteLn(PROGRAM_NAME, ' ', PROGRAM_VERSION);
+  Result := 0;
 end;
 
 { --- registration -------------------------------------------------------- }
+const
+  PROGRAM_DESCRIPTION = 'lightweight Pascal toolkit';
 var
   InstallOpts, AddOpts, RemoveOpts, OutdatedOpts, UpdateOpts, TestOpts,
     BuildOpts, InitOpts, RunOpts, FormatOpts, HealthOpts, DuplicationOpts,
     RepairOpts, RegistryOpts, AgentsOpts : TOptionArray;
+  VersionFlag : TTopLevelFlag;
+  RunCommand : TSubcommand;
 begin
-  if HandleTopLevelFlags then
-  begin
-    ExitCode := 0;
-    Exit;
-  end;
-
   Registry := TSubcommandRegistry.Create;
   OutputRenderer := TLWPTOutputRenderer.Create;
   SetActiveOutputRenderer(OutputRenderer);
   try
+    Registry.Description := PROGRAM_DESCRIPTION;
+    { `--version`, `-v` and the bare word `version`. Without help text the
+      flag stays out of the top-level help. }
+    VersionFlag := TTopLevelFlag.Create('version', '', @HandleVersion);
+    VersionFlag.ShortName := 'v';
+    VersionFlag.BareWord := True;
+    Registry.AddTopLevelFlag(VersionFlag);
     Registry.AddSharedFlag('silent',
       'Suppress ordinary output and emit only the final command result');
     Registry.OnCommandPrepared := @PrepareCommandOutput;
@@ -1038,10 +1034,12 @@ begin
       @HandleInit, InitOpts));
 
     SetLength(RunOpts, 0);
-    Registry.Add(TSubcommand.Create('run',
+    RunCommand := TSubcommand.Create('run',
       'Invoke a user-declared run task (or a built-in subcommand by name)',
       '<task-name> | <subcommand> [subcommand-args...]',
-      @HandleRun, RunOpts));
+      @HandleRun, RunOpts);
+    RunCommand.AliasesSubcommands := True;
+    Registry.Add(RunCommand);
 
     SetLength(HealthOpts, 2);
     HealthOpts[0] := TFlagOption.Create('json',
