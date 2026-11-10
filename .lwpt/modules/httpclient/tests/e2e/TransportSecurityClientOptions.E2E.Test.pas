@@ -868,11 +868,10 @@ end;
   positive control is system plus anchors, whose second evaluation restores
   Secure Transport's network fetching: on macOS the recorder then sees a
   fetch of one of the leaf's URLs, so the endpoint demonstrably detects
-  retrieval. OpenSSL never
-  fetches certificate URLs, so on Unix-not-Darwin both modes must show zero
-  requests and no positive control is possible. Windows runs this server-
-  less in TransportSecurity.Test (an SChannel server builds its own chain
-  and could fetch the URL itself). }
+  retrieval. OpenSSL never fetches certificate URLs, so on Unix-not-Darwin
+  both modes must show zero requests and no positive control is possible.
+  Windows runs this server-less in TransportSecurity.Test (an SChannel
+  server builds its own chain and could fetch the URL itself). }
 procedure TTransportSecurityClientOptionsE2ETests.TestAnchorPassMakesNoObservableRetrieval;
 {$IFNDEF MSWINDOWS}
 var
@@ -907,8 +906,8 @@ begin
     Requests := Recorder.Requests;
     RequestLines := Recorder.Describe;
     {$IFDEF DARWIN}
-    Met := (ErrorMessage <> '') and (Requests >= 1) and
-      RequestsNameLeafURL(RequestLines);
+    { A recorded request line implies a counted connection. }
+    Met := (ErrorMessage <> '') and RequestsNameLeafURL(RequestLines);
     {$ELSE}
     Met := (ErrorMessage <> '') and (Requests = 0);
     {$ENDIF}

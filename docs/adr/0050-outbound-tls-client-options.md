@@ -327,10 +327,10 @@ instead, and the recorder listens on port 80 for loopback peers: on macOS
 endpoint named by IP literal or on a non-default port ("skipping
 SSRF-denied destination"), and of the local shapes tried only a host name
 on the default port was still fetched. Port 80 must then be free while the
-case runs. An anchors-only evaluation must
-fail with zero requests. The positive control is system plus anchors,
-whose fallback evaluation is allowed to fetch: on Windows and macOS the
-recorder must then see at least one request, which shows that the
+case runs. An anchors-only evaluation must fail with zero requests. The
+positive control is system plus anchors, whose fallback evaluation is
+allowed to fetch: on Windows and macOS the recorder must then see at least
+one request (on macOS, for one of the leaf's URLs), which shows that the
 endpoint detects retrieval, so restoring retrieval in the anchor pass
 fails the zero-request assertion. OpenSSL never fetches, so on
 Unix-not-Darwin both modes must show zero requests and no positive

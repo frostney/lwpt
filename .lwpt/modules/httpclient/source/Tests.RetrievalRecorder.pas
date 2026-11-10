@@ -1,12 +1,13 @@
-{ Tests.RetrievalRecorder — loopback HTTP endpoint that counts certificate
-  URL fetches.
+{ Tests.RetrievalRecorder — HTTP endpoint that counts certificate URL
+  fetches from this host.
 
   The client-options tests use fixture leaves whose AIA issuer, OCSP, and
   CRL URLs all point at the recorder. The recorder answers every request
-  with an uncacheable 404 and counts the connections it accepted, so a test
-  can prove that a chain evaluation made no retrieval (zero requests) and
-  that the same endpoint is observable when retrieval is allowed (at least
-  one request). It listens where one of two leaves points:
+  with an uncacheable 404 and counts the loopback connections it accepted,
+  so a test can prove that a chain evaluation made no retrieval (zero
+  requests) and that the same endpoint is observable when retrieval is
+  allowed (at least one request). It listens where one of two leaves
+  points:
 
   - rreLoopbackPort, http://127.0.0.1:6741/ (localhost-loopback-aia), bound
     on 127.0.0.1 only.
@@ -16,7 +17,7 @@
     non-default port, logging "skipping SSRF-denied destination"; of the
     local shapes tried, only a host name on port 80 was still fetched. macOS
     lets an unprivileged process bind port 80 on the wildcard address but
-    refuses a loopback address with EACCES, so this endpoint binds [::]:80
+    refuses a loopback address with EACCES (observed on 26.5.2), so this endpoint binds [::]:80
     dual-stack (localhost may resolve to ::1 or 127.0.0.1) and counts only
     connections from a loopback peer; any other peer is closed uncounted.
     Port 80 must therefore be free while the test runs, and a host firewall
@@ -343,8 +344,8 @@ begin
     if (Stage <> 'bind()') or not RecorderAddressInUse(ErrorCode) or
        (GetTickCount64 - StartedAt >= RETRIEVAL_RECORDER_BIND_MILLISECONDS) then
       raise ERetrievalRecorderError.CreateFmt(
-        'retrieval recorder could not listen on %s (the port is ' +
-        'baked into the fixture certificate): %s failed with error %d (%s) ' +
+        'retrieval recorder could not listen on %s (the port the fixture ' +
+        'certificate''s URLs name): %s failed with error %d (%s) ' +
         'after %d attempt(s) in %d ms',
         [RecorderEndpointText(AEndpoint), Stage, ErrorCode,
          SysErrorMessage(ErrorCode), Attempts,
@@ -428,7 +429,7 @@ end;
 procedure TRetrievalRecorder.Execute;
 var
   Accepted: TSocket;
-  {$IFDEF UNIX}
+  {$IFDEF DARWIN}
   Peer: TInetSockAddr6;
   PeerLength: TSockLen;
   {$ENDIF}
@@ -437,12 +438,14 @@ begin
   begin
     if not RecorderReadable(FListenSocket, 50) then
       Continue;
-    {$IFDEF MSWINDOWS}
+    {$IF DEFINED(MSWINDOWS)}
     Accepted := WinSock2.accept(FListenSocket, nil, nil);
-    {$ELSE}
+    {$ELSEIF DEFINED(DARWIN)}
     FillChar(Peer, SizeOf(Peer), 0);
     PeerLength := SizeOf(Peer);
     Accepted := FpAccept(FListenSocket, @Peer, @PeerLength);
+    {$ELSE}
+    Accepted := FpAccept(FListenSocket, nil, nil);
     {$ENDIF}
     if not RecorderSocketValid(Accepted) then
       Continue;
