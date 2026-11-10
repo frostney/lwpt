@@ -570,28 +570,6 @@ jobs:
               --bail=0
           fi
 
-      # Temporary evidence for issue 411: trustd's view of the certificate
-      # retrieval case on macOS. Removed before the pull request is ready.
-      - name: trustd log on failure (macOS)
-        if: failure() && runner.os == 'macOS'
-        run: |
-          mkdir -p build/tests/tmp/trustd
-          log show --last 30m --style compact --info --debug \
-            --predicate 'process == "trustd" OR subsystem == "com.apple.securityd"' \
-            > build/tests/tmp/trustd/trustd.log 2>&1 || true
-          wc -l build/tests/tmp/trustd/trustd.log
-          grep -i -E 'fetch|network|caissuer|issuer\.crt|ocsp|crl|6741|127\.0\.0\.1|loopback|http:' \
-            build/tests/tmp/trustd/trustd.log | tail -n 400 || true
-
-      - name: Upload trustd log on failure (macOS)
-        if: failure() && runner.os == 'macOS'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: trustd-${{ matrix.target }}
-          path: build/tests/tmp/trustd
-          if-no-files-found: ignore
-          retention-days: 7
-
       # The registry matrix keeps a failing case's scratch directory (data
       # directories, consumer projects, and command logs of loopback-only
       # test registries with throwaway keys).
@@ -636,25 +614,6 @@ jobs:
   # serving container, live publication from the runner, graceful stop and
   # container replacement on the same volume, and the reverse-proxy example.
   # Full matrix only; release.yml repeats it against the published assets.
-  # Temporary evidence for issue 411: which certificate-URL shapes trustd
-  # fetches on the current macOS image. Removed before the pull request is
-  # ready.
-  trustd-probe:
-    runs-on: macos-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Probe trustd certificate retrieval
-        run: |
-          sw_vers
-          python3 -I .github/ci/trustd-probe.py \
-            packages/httpclient/source/fixtures "$RUNNER_TEMP/trustd-probe"
-          log show --last 5m --style compact --info --debug \
-            --predicate 'process == "trustd" AND eventMessage CONTAINS[c] "SSRF"' || true
-
   registry-container:
     needs:
       - validate-inputs
