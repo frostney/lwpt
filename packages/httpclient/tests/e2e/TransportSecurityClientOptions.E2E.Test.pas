@@ -65,8 +65,18 @@ const
   UNREACHABLE_AIA_PKCS12_PATH =
     FIXTURES + 'localhost-unreachable-aia-identity.p12';
   { The same shape, but the URLs point at the local retrieval recorder so a
-    fetch is observable. }
+    fetch is observable. macOS trustd refuses an IP-literal host or a
+    non-default port as a certificate URL (Tests.RetrievalRecorder), so
+    Darwin uses the leaf naming http://localhost/ and the recorder's
+    default-port endpoint. }
+  {$IFDEF DARWIN}
+  LOOPBACK_AIA_PKCS12_PATH =
+    FIXTURES + 'localhost-default-port-aia-identity.p12';
+  LOOPBACK_AIA_RECORDER = rreLocalhostDefaultPort;
+  {$ELSE}
   LOOPBACK_AIA_PKCS12_PATH = FIXTURES + 'localhost-loopback-aia-identity.p12';
+  LOOPBACK_AIA_RECORDER = rreLoopbackPort;
+  {$ENDIF}
   { Anchor-only evaluation is offline, so it must finish far inside any
     network retrieval timeout (15 s by default on Windows). }
   OFFLINE_VERIFICATION_BUDGET_MILLISECONDS = 8000;
@@ -869,7 +879,7 @@ var
 {$ENDIF}
 begin
   {$IFNDEF MSWINDOWS}
-  Recorder := TRetrievalRecorder.Create;
+  Recorder := TRetrievalRecorder.Create(LOOPBACK_AIA_RECORDER);
   try
     StartedAt := GetTickCount64;
     ErrorMessage := RunExchange(LOOPBACK_AIA_PKCS12_PATH, tsivPermissive,

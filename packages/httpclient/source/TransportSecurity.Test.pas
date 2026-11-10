@@ -118,6 +118,7 @@ type
     procedure TestInconsistentOptionsRejected;
     procedure TestNativeMaterialRejectedBeforeConnecting;
     procedure TestLoopbackAIAFixtureNamesRecorderPort;
+    procedure TestDefaultPortAIAFixtureNamesRecorderEndpoint;
     procedure TestSChannelAnchorVerificationStaysOffline;
     procedure TestSChannelAnchorPassMakesNoRetrieval;
     procedure TestSChannelChainExecutionFailureIsNotARefusal;
@@ -5436,6 +5437,8 @@ const
     'packages/httpclient/source/fixtures/localhost-test-intermediate-cert.pem';
   LOOPBACK_AIA_LEAF_PATH =
     'packages/httpclient/source/fixtures/localhost-loopback-aia-leaf-cert.pem';
+  DEFAULT_PORT_AIA_LEAF_PATH = 'packages/httpclient/source/fixtures/' +
+    'localhost-default-port-aia-leaf-cert.pem';
   { FreeBSD's first ephemeral port; Linux, macOS, and Windows start higher. }
   EPHEMERAL_RANGE_FLOOR = 10000;
 
@@ -5711,6 +5714,34 @@ begin
   Expect<Integer>(RecorderURLs).ToBe(3);
 end;
 
+{ The macOS leaf names its URLs by host name without a port, the shape
+  trustd still fetches from a local endpoint, so they reach the recorder's
+  default-port endpoint only while that endpoint is the HTTP default port.
+  Every http:// URL in the leaf must have that shape. }
+procedure TTransportSecurityClientOptionTests.TestDefaultPortAIAFixtureNamesRecorderEndpoint;
+var
+  Leaf: TBytes;
+  Remaining: AnsiString;
+  HTTPURLs, RecorderURLs: Integer;
+begin
+  Expect<Integer>(RETRIEVAL_RECORDER_DEFAULT_HTTP_PORT).ToBe(80);
+  Leaf := PEMCertificateDER(DEFAULT_PORT_AIA_LEAF_PATH);
+  SetString(Remaining, PAnsiChar(@Leaf[0]), Length(Leaf));
+  HTTPURLs := 0;
+  RecorderURLs := 0;
+  while Pos(AnsiString('http://'), Remaining) > 0 do
+  begin
+    Delete(Remaining, 1, Pos(AnsiString('http://'), Remaining) - 1);
+    Inc(HTTPURLs);
+    if Pos(AnsiString('http://localhost/'), Remaining) = 1 then
+      Inc(RecorderURLs);
+    Delete(Remaining, 1, 1);
+  end;
+  { The AIA issuer, OCSP, and CRL distribution-point URLs. }
+  Expect<Integer>(HTTPURLs).ToBe(3);
+  Expect<Integer>(RecorderURLs).ToBe(3);
+end;
+
 { Observable retrieval: the leaf's AIA, OCSP, and CRL URLs point at a local
   recorder, and its intermediate is withheld. The offline anchor pass must
   reject it with zero requests. The positive control is system plus
@@ -5811,6 +5842,8 @@ begin
     TestNativeMaterialRejectedBeforeConnecting);
   Test('the loopback-AIA fixture names the recorder port below default ephemeral ranges',
     TestLoopbackAIAFixtureNamesRecorderPort);
+  Test('the default-port AIA fixture names the recorder by host name on the HTTP default port',
+    TestDefaultPortAIAFixtureNamesRecorderEndpoint);
   {$IFDEF MSWINDOWS}
   Test('SChannel anchor verification never fetches certificate URLs',
     TestSChannelAnchorVerificationStaysOffline);

@@ -103,6 +103,15 @@ it means changing `RETRIEVAL_RECORDER_PORT` and regenerating this leaf.
 Regenerate it like the unreachable-AIA leaf with that configuration and
 serial.
 
+`localhost-default-port-aia-identity.p12` (passphrase `test-only`) is the
+macOS variant. Its leaf, `localhost-default-port-aia-leaf-cert.pem` (serial
+`0x7104`, `default-port-aia-leaf.cnf`), points the same URLs at
+`http://localhost/`, the recorder's default-port endpoint. trustd on macOS
+26.7.2 refuses to fetch a certificate URL whose host is an IP literal or
+whose port is not the scheme's default, so the `127.0.0.1:6741` leaf is no
+longer observable there. Regenerate it like the unreachable-AIA leaf with
+that configuration and serial.
+
 `localhost-multi-identity.p12` (passphrase `test-only`) carries two
 certificate-and-key identities, the test leaf and the test root, to pin the
 Windows rule that a bundle holds exactly one keyed certificate and that no
