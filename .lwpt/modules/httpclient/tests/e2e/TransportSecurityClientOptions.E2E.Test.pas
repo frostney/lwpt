@@ -771,6 +771,21 @@ begin
   Result := Pos(LowerCase(AFragment), LowerCase(AText)) > 0;
 end;
 
+{ '' when a step of the retrieval case met its expectation; otherwise what
+  the step observed, so a failure names the step and its values: the
+  client's error, how long the exchange took, and every request the
+  recorder had seen by then. }
+function RetrievalStepMismatch(const AMet: Boolean; const AStep: string;
+  const AErrorMessage: string; const AElapsedMilliseconds: QWord;
+  const ARequests: Integer; const ARequestLines: string): string;
+begin
+  Result := '';
+  if not AMet then
+    Result := Format('%s: client error "%s" after %d ms; the recorder ' +
+      'saw %d request(s) [%s]', [AStep, AErrorMessage, AElapsedMilliseconds,
+      ARequests, ARequestLines]);
+end;
+
 { ── tests ────────────────────────────────────────────────────────── }
 
 procedure TTransportSecurityClientOptionsE2ETests.TestAnchorsOnlyVerifiesConfiguredCA;
@@ -847,28 +862,37 @@ var
   ErrorMessage: string;
   Peer: TBytes;
   Recorder: TRetrievalRecorder;
+  Requests: Integer;
   Response: AnsiString;
   Served: TServedConnection;
+  StartedAt: QWord;
 {$ENDIF}
 begin
   {$IFNDEF MSWINDOWS}
   Recorder := TRetrievalRecorder.Create;
   try
+    StartedAt := GetTickCount64;
     ErrorMessage := RunExchange(LOOPBACK_AIA_PKCS12_PATH, tsivPermissive,
       'localhost', AnchorsOnly(TEST_ROOT_PATH), False, Response, Peer, Served);
-    Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
-    Expect<string>(Recorder.Describe).ToBe('');
-    Expect<Integer>(Recorder.Requests).ToBe(0);
+    Requests := Recorder.Requests;
+    Expect<string>(RetrievalStepMismatch(
+      Contains(ErrorMessage, 'verification') and (Requests = 0),
+      'anchors-only exchange', ErrorMessage, GetTickCount64 - StartedAt,
+      Requests, Recorder.Describe)).ToBe('');
 
+    StartedAt := GetTickCount64;
     ErrorMessage := RunExchange(LOOPBACK_AIA_PKCS12_PATH, tsivPermissive,
       'localhost', SystemAndAnchors(TEST_ROOT_PATH), False, Response, Peer,
       Served);
-    Expect<Boolean>(ErrorMessage <> '').ToBe(True);
-    {$IFDEF DARWIN}
-    Expect<Boolean>(Recorder.Requests >= 1).ToBe(True);
-    {$ELSE}
-    Expect<Integer>(Recorder.Requests).ToBe(0);
-    {$ENDIF}
+    Requests := Recorder.Requests;
+    Expect<string>(RetrievalStepMismatch(
+      {$IFDEF DARWIN}
+      (ErrorMessage <> '') and (Requests >= 1),
+      {$ELSE}
+      (ErrorMessage <> '') and (Requests = 0),
+      {$ENDIF}
+      'system-plus-anchors exchange', ErrorMessage,
+      GetTickCount64 - StartedAt, Requests, Recorder.Describe)).ToBe('');
   finally
     Recorder.Free;
   end;
