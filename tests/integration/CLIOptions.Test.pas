@@ -4,7 +4,7 @@
   Lives in the repository's integration group because it covers the built
   binary: how LWPT's own command registration, handlers and exit codes
   answer an argv. The parser's and the registry's own rules are covered
-  in-process by the cli package's tests.
+  by the cli package's tests.
 
   Coverage:
 

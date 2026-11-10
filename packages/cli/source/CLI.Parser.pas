@@ -51,7 +51,8 @@ function LeadingFlagGiven(const AArguments: array of string;
 { The index of END_OF_OPTIONS_MARKER as ParseArguments reads it without
   AStopAtFirstPositional, or Length(AArguments) when the arguments have
   none. A `--` that a valued short option takes as its value is not the
-  marker. Applies no option and raises nothing. }
+  marker. Applies no option and raises nothing: an argument ParseArguments
+  would reject is skipped. }
 function EndOfOptionsIndex(const AArguments: array of string;
   const AOptions: TOptionArray): Integer;
 

@@ -78,8 +78,9 @@ var
   DispatchedPositionals : string = '';
   DispatchedOptions : string = '';
   TopLevelFlagCalls : Integer = 0;
-  { Set in the host children, whose parent tells a dispatch from a help
-    page by the `command:` line on standard output. }
+  { Set in the host children, which then print a `command:` line for a
+    dispatch and the version line for the version flag, so the parent can
+    tell either from a help page on standard output. }
   EchoDispatch : Boolean = False;
 
 const
@@ -349,7 +350,7 @@ end;
   also reaps the child on Unix, so ExitCode then decodes its status. A
   poUsePipes child's output is drained into AOutput and AErrorOutput
   meanwhile. A child past the deadline is killed and reported as an error. }
-function FinishChildWithin(AProcess: TProcess;
+function FinishChildWithin(const AProcess: TProcess;
   const ATimeoutMilliseconds: QWord;
   var AOutput, AErrorOutput: string): Integer;
 var
@@ -1187,7 +1188,7 @@ begin
     TestUnconfiguredUsageErrors);
   Test('a pass-through command reads --help and -h before its first positional',
     TestPassThroughHelp);
-  Test('help spellings ask for help outside pass-through, also after a -- taken as a value',
+  Test('outside pass-through a help spelling asks for help, even after a -- value',
     TestHelpWordOutsidePassThrough);
 end;
 
