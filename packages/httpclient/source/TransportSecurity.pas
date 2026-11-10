@@ -2071,7 +2071,7 @@ begin
       does. }
     if (SecTrustSetAnchorCertificates(Trust, AAnchors) <> ERR_SEC_SUCCESS) or
        (SecTrustSetAnchorCertificatesOnly(Trust, True) <> ERR_SEC_SUCCESS) or
-       (SecTrustSetNetworkFetchAllowed(Trust, True) <> ERR_SEC_SUCCESS) then
+       (SecTrustSetNetworkFetchAllowed(Trust, False) <> ERR_SEC_SUCCESS) then
       raise ETransportSecurityError.Create(
         'Failed to configure the TLS trust anchors');
     if SecTrustEvaluateWithError(Trust, ErrorReference) then
