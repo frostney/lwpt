@@ -84,8 +84,9 @@ type
     Handler  : TSubcommandHandler;
     Options  : TOptionArray;
     { When True, `<program> <Name> <subcommand> [arguments]` dispatches
-      <subcommand> with those arguments, and this command's handler only
-      sees a first argument that names no registered subcommand. }
+      <subcommand> with those arguments instead of this command. Only the
+      argument directly after <Name> is looked up, so an option or `--`
+      in that place keeps the line with this command. }
     AliasesSubcommands : Boolean;
     { When True, option parsing stops at the first positional: that
       argument and everything after it reach the handler untouched,
@@ -100,9 +101,11 @@ type
 
   { A flag the program accepts in place of a command, such as `--version`.
     It is matched against the first argument only, the way the built-in
-    `--help` is; later arguments are ignored. }
+    `--help` is; later arguments are ignored. Set its fields before it is
+    added to a registry, which checks them once, on registration. }
   TTopLevelFlag = class
   public
+    { Both names are given without their leading dashes. }
     LongName  : string;   { matched as --<LongName>, case-sensitively }
     ShortName : string;   { matched as -<ShortName> when not empty }
     { When True, <LongName> without dashes matches too, in any letter
@@ -134,10 +137,15 @@ type
     procedure Add(ASub: TSubcommand);
     { Registers a top-level flag and takes ownership of it. Raises
       EArgumentException, leaving the registry unchanged and the flag with
-      its caller, for an empty name, a missing handler, a spelling the
-      built-in help uses, a name or short name that is already registered,
-      and a bare word that is also a subcommand name. }
-    procedure AddTopLevelFlag(AFlag: TTopLevelFlag);
+      its caller, for an empty name, a name or short name that begins with
+      a dash, a missing handler, a spelling the built-in help uses, a name
+      or short name that is already registered, and a bare word that is
+      also a subcommand name. }
+    procedure AddTopLevelFlag(const AFlag: TTopLevelFlag);
+    { Read iteration over the top-level flags, in registration order: the
+      rest of the command surface that Count and Item iterate. }
+    function TopLevelFlagCount: Integer;
+    function TopLevelFlagItem(const AIndex: Integer): TTopLevelFlag;
     function Find(const AName: string): TSubcommand;
     { Read iteration over the registered subcommands, in registration
       order. The registry is the single source of truth for the
@@ -154,7 +162,9 @@ type
     { Run the process's own arguments. Returns the process exit code. }
     function Run(const AProgramName: string): Integer; overload;
     { Run AArguments, the arguments after the program name. Reads nothing
-      from the process's own command line. }
+      from the process's own command line. A dispatch applies options to
+      the registered option objects, which keep that state: a second Run
+      on the same registry starts from what the first one applied. }
     function Run(const AProgramName: string;
       const AArguments: array of string): Integer; overload;
     { Printed after the program name at the head of top-level help. When
@@ -185,6 +195,7 @@ uses
   CLI.Parser;
 
 const
+  OPTION_DASH = '-';
   HELP_WORD = 'help';
   HELP_SHORT_NAME = 'h';
   HELP_LONG_FLAG = '--' + HELP_WORD;
@@ -211,7 +222,7 @@ end;
 { Gives ASub its own instance of a shared flag and shows it in the usage
   line: after the command's own usage, or ahead of it for a pass-through
   command, which reads options before its first positional only. }
-procedure AttachSharedFlag(ASub: TSubcommand;
+procedure AttachSharedFlag(const ASub: TSubcommand;
   const AFlag: TSubcommandSharedFlag);
 var
   OptionIndex: Integer;
@@ -318,12 +329,18 @@ begin
     AttachSharedFlag(FItems[ItemIndex], FSharedFlags[FlagIndex]);
 end;
 
-procedure TSubcommandRegistry.AddTopLevelFlag(AFlag: TTopLevelFlag);
+procedure TSubcommandRegistry.AddTopLevelFlag(const AFlag: TTopLevelFlag);
 var
   FlagIndex: Integer;
 begin
   if AFlag.LongName = '' then
     raise EArgumentException.Create('top-level flag name cannot be empty');
+  { A name given with its dashes would never match what the user types. }
+  if (AFlag.LongName[1] = OPTION_DASH)
+     or ((AFlag.ShortName <> '') and (AFlag.ShortName[1] = OPTION_DASH)) then
+    raise EArgumentException.CreateFmt(
+      'top-level flag %s is named without its leading dashes',
+      [AFlag.LongName]);
   if not Assigned(AFlag.Handler) then
     raise EArgumentException.CreateFmt(
       'top-level flag --%s has no handler', [AFlag.LongName]);
@@ -345,6 +362,21 @@ begin
 
   SetLength(FTopLevelFlags, Length(FTopLevelFlags) + 1);
   FTopLevelFlags[High(FTopLevelFlags)] := AFlag;
+end;
+
+function TSubcommandRegistry.TopLevelFlagCount: Integer;
+begin
+  Result := Length(FTopLevelFlags);
+end;
+
+function TSubcommandRegistry.TopLevelFlagItem(
+  const AIndex: Integer): TTopLevelFlag;
+begin
+  if (AIndex < 0) or (AIndex > High(FTopLevelFlags)) then
+    raise EArgumentOutOfRangeException.CreateFmt(
+      'top-level flag index %d out of range 0..%d',
+      [AIndex, High(FTopLevelFlags)]);
+  Result := FTopLevelFlags[AIndex];
 end;
 
 function TSubcommandRegistry.FindTopLevelFlag(
@@ -388,23 +420,38 @@ begin
   Result := FItems[AIndex];
 end;
 
+{ Writes an `options:` section: each name padded to the widest one, then
+  its help text. Top-level help and subcommand help share it, so the two
+  sections cannot drift apart. }
+procedure WriteOptionRows(var AOutput: Text;
+  const ANames, AHelpTexts: array of string);
+var
+  i, MaxWidth, W: Integer;
+begin
+  MaxWidth := 0;
+  for i := 0 to High(ANames) do
+    if Length(ANames[i]) > MaxWidth then MaxWidth := Length(ANames[i]);
+
+  WriteLn(AOutput);
+  WriteLn(AOutput, 'options:');
+  for i := 0 to High(ANames) do
+  begin
+    Write(AOutput, '  ', ANames[i]);
+    for W := Length(ANames[i]) to MaxWidth do Write(AOutput, ' ');
+    WriteLn(AOutput, '  ', AHelpTexts[i]);
+  end;
+end;
+
 procedure TSubcommandRegistry.PrintTopLevelHelp(const AProgramName: string);
 begin
   PrintTopLevelHelp(Output, AProgramName);
 end;
 
-function TopLevelFlagForHelp(AFlag: TTopLevelFlag): string;
-begin
-  Result := '--' + AFlag.LongName;
-  if AFlag.ShortName <> '' then
-    Result := '-' + AFlag.ShortName + ', ' + Result;
-end;
-
 procedure TSubcommandRegistry.PrintTopLevelHelp(var AOutput: Text;
   const AProgramName: string);
 var
-  i, MaxFlagWidth, W: Integer;
-  FlagName: string;
+  i, Listed: Integer;
+  Names, HelpTexts: array of string;
 begin
   if FDescription <> '' then
   begin
@@ -417,26 +464,24 @@ begin
   for i := 0 to High(FItems) do
     WriteLn(AOutput, '  ', FItems[i].Name:10, '  ', FItems[i].Summary);
 
-  MaxFlagWidth := 0;
+  { A flag without help text is accepted but not listed. }
+  SetLength(Names, Length(FTopLevelFlags));
+  SetLength(HelpTexts, Length(FTopLevelFlags));
+  Listed := 0;
   for i := 0 to High(FTopLevelFlags) do
     if FTopLevelFlags[i].HelpText <> '' then
     begin
-      W := Length(TopLevelFlagForHelp(FTopLevelFlags[i]));
-      if W > MaxFlagWidth then MaxFlagWidth := W;
+      Names[Listed] := '--' + FTopLevelFlags[i].LongName;
+      if FTopLevelFlags[i].ShortName <> '' then
+        Names[Listed] := '-' + FTopLevelFlags[i].ShortName + ', '
+          + Names[Listed];
+      HelpTexts[Listed] := FTopLevelFlags[i].HelpText;
+      Inc(Listed);
     end;
-  if MaxFlagWidth > 0 then
-  begin
-    WriteLn(AOutput);
-    WriteLn(AOutput, 'options:');
-    for i := 0 to High(FTopLevelFlags) do
-      if FTopLevelFlags[i].HelpText <> '' then
-      begin
-        FlagName := TopLevelFlagForHelp(FTopLevelFlags[i]);
-        Write(AOutput, '  ', FlagName);
-        for W := Length(FlagName) to MaxFlagWidth do Write(AOutput, ' ');
-        WriteLn(AOutput, '  ', FTopLevelFlags[i].HelpText);
-      end;
-  end;
+  SetLength(Names, Listed);
+  SetLength(HelpTexts, Listed);
+  if Listed > 0 then
+    WriteOptionRows(AOutput, Names, HelpTexts);
 
   WriteLn(AOutput);
   WriteLn(AOutput, 'run "', AProgramName,
@@ -446,8 +491,8 @@ end;
 procedure TSubcommandRegistry.PrintSubcommandHelp(const AProgramName: string;
   ASub: TSubcommand);
 var
-  i, MaxOptWidth, W: Integer;
-  OptName: string;
+  i: Integer;
+  Names, HelpTexts: array of string;
 begin
   WriteLn(AProgramName, ' ', ASub.Name, ' — ', ASub.Summary);
   WriteLn;
@@ -458,28 +503,18 @@ begin
 
   if Length(ASub.Options) > 0 then
   begin
-    WriteLn;
-    WriteLn('options:');
-
-    { compute max option-token width for aligned descriptions.
-      FormatForHelp (not the bare long name) so valued options show
+    { FormatForHelp (not the bare long name) so valued options show
       their value shape (--name=<value>, --name=<N>, --name=a|b) and
       every surface rendered from the registry — this help text and the
       host program's agents block — stays identical by construction. }
-    MaxOptWidth := 0;
+    SetLength(Names, Length(ASub.Options));
+    SetLength(HelpTexts, Length(ASub.Options));
     for i := 0 to High(ASub.Options) do
     begin
-      W := Length(ASub.Options[i].FormatForHelp);
-      if W > MaxOptWidth then MaxOptWidth := W;
+      Names[i] := ASub.Options[i].FormatForHelp;
+      HelpTexts[i] := ASub.Options[i].HelpText;
     end;
-
-    for i := 0 to High(ASub.Options) do
-    begin
-      OptName := ASub.Options[i].FormatForHelp;
-      Write('  ', OptName);
-      for W := Length(OptName) to MaxOptWidth do Write(' ');
-      WriteLn('  ', ASub.Options[i].HelpText);
-    end;
+    WriteOptionRows(Output, Names, HelpTexts);
   end;
 
   WriteLn;
@@ -492,17 +527,18 @@ end;
   asks for it, up to the end-of-options marker. A pass-through command
   reads only --help and -h, and only before its first positional: from
   there on every argument belongs to the program it launches. }
-function HelpRequested(ASub: TSubcommand;
+function HelpRequested(const ASub: TSubcommand;
   const AArguments: array of string): Boolean;
 var i: Integer; A: string;
 begin
   if ASub.PassThrough then
     Exit(LeadingFlagGiven(AArguments, ASub.Options, HELP_WORD,
       HELP_SHORT_NAME));
-  for i := 0 to High(AArguments) do
+  { The parser says where the marker is: a `--` that a valued short option
+    takes as its value does not end the options. }
+  for i := 0 to EndOfOptionsIndex(AArguments, ASub.Options) - 1 do
   begin
     A := AArguments[i];
-    if A = END_OF_OPTIONS_MARKER then Break;
     if (A = HELP_LONG_FLAG) or (A = HELP_SHORT_FLAG)
        or (LowerCase(A) = HELP_WORD) then
       Exit(True);

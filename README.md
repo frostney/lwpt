@@ -322,8 +322,8 @@ differs from GocciaScript's older copy:
   matching. Space-separated long values (`--mode release`) work for plain
   string/integer options, not only repeatable ones. `--` ends option
   parsing, and a caller can stop it at the first positional to pass the
-  rest of the line through. `ParseArguments` takes the arguments as an
-  array; `ParseCommandLine` keeps its `AStartArg` parameter.
+  rest of the line through. `ParseCommandLine` takes an `AStartArg`
+  position.
 - **`packages/cli/source/CLI.Options.pas`** — `TGoccia*` type-prefix
   stripped from every public type; GocciaScript-engine-specific
   option groups removed as dead code.

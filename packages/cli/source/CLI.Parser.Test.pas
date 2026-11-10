@@ -5,9 +5,9 @@
   The child registers a representative option table, parses its own argv,
   and checks the resulting option objects and positionals.
 
-  ParseArguments and LeadingFlagGiven take the arguments as an array, so
-  the end-of-options marker and stop-at-first-positional cases run
-  in-process. }
+  ParseArguments, LeadingFlagGiven and EndOfOptionsIndex take the arguments
+  as an array, so the end-of-options marker and stop-at-first-positional
+  cases run in-process. }
 
 program CLI.Parser.Test;
 
@@ -46,7 +46,6 @@ type
     procedure TestValuelessShortFlag;
     procedure TestLongEqualsValueUnchanged;
     procedure TestLongSeparatedValueUnchanged;
-    procedure TestEndOfOptionsMarkerOverRealArgv;
     procedure TestCommandLineArgumentsStartAtTheGivenPosition;
   end;
 
@@ -57,6 +56,7 @@ type
     procedure TestEndOfOptionsMarkerMakesTheRestPositional;
     procedure TestEndOfOptionsMarkerIsNotAPositional;
     procedure TestEndOfOptionsMarkerInValuePosition;
+    procedure TestEndOfOptionsIndexFollowsTheParser;
     procedure TestStopAtFirstPositionalPassesTheRestThrough;
     procedure TestStopAtFirstPositionalConsumesOnlyALeadingMarker;
     procedure TestStopAtFirstPositionalRejectsLeadingUnknownOptions;
@@ -156,6 +156,25 @@ begin
   Result := 1;
 end;
 
+{ The child's own arguments start at position 3, after the mode word and
+  the scenario name. }
+function RunCommandLineArgumentsScenario: Integer;
+var
+  Arguments: TCommandLineArguments;
+begin
+  Arguments := GetCommandLineArguments(3);
+  if Length(Arguments) <> 3 then
+    Exit(ScenarioFailure('wrong argument count from position 3'));
+  if (Arguments[0] <> 'first') or (Arguments[1] <> '--') or
+     (Arguments[2] <> '-last') then
+    Exit(ScenarioFailure('arguments from position 3 differ from argv'));
+  if Length(GetCommandLineArguments) <> ParamCount then
+    Exit(ScenarioFailure('default position does not start at argv[1]'));
+  if Length(GetCommandLineArguments(ParamCount + 1)) <> 0 then
+    Exit(ScenarioFailure('a position past argv is not empty'));
+  Result := 0;
+end;
+
 function RunParserScenario(const AScenario: string): Integer;
 var
   Options: TOptionArray;
@@ -192,29 +211,6 @@ begin
 
   Positionals := nil;
   ExpectedError := '';
-  if AScenario = 'command-line-arguments' then
-  begin
-    { The scenario's own arguments start at position 3. }
-    try
-      if Length(GetCommandLineArguments(3)) <> 3 then
-        Exit(ScenarioFailure('wrong argument count from position 3'));
-      if (GetCommandLineArguments(3)[0] <> 'first') or
-         (GetCommandLineArguments(3)[1] <> '--') or
-         (GetCommandLineArguments(3)[2] <> '-last') then
-        Exit(ScenarioFailure('arguments from position 3 differ from argv'));
-      if Length(GetCommandLineArguments) <> ParamCount then
-        Exit(ScenarioFailure('default position does not start at argv[1]'));
-      if Length(GetCommandLineArguments(ParamCount + 1)) <> 0 then
-        Exit(ScenarioFailure('a position past argv is not empty'));
-      Exit(0);
-    finally
-      HelpOption.Free;
-      DefineOption.Free;
-      UnitDirectoryOption.Free;
-      ShortFOption.Free;
-      OutputOption.Free;
-    end;
-  end;
   if AScenario = 'missing-value' then
     ExpectedError := '-o requires a value'
   else if AScenario = 'unknown-option' then
@@ -279,18 +275,6 @@ begin
     begin
       if OutputOption.ValueOr('') <> 'out.wasm' then
         Exit(ScenarioFailure('--output did not bind its value'));
-    end
-    else if AScenario = 'end-of-options' then
-    begin
-      if OutputOption.ValueOr('') <> 'out.wasm' then
-        Exit(ScenarioFailure('an option after the marker was applied'));
-      if HelpOption.Present then
-        Exit(ScenarioFailure('a flag after the marker was applied'));
-      if (Positionals.Count <> 3) or
-         (Positionals[0] <> '--output') or
-         (Positionals[1] <> 'other.wasm') or
-         (Positionals[2] <> '-h') then
-        Exit(ScenarioFailure('arguments after the marker are not verbatim'));
     end
     else
       Exit(ScenarioFailure('unknown scenario: ' + AScenario));
@@ -417,12 +401,6 @@ begin
     ['--output', 'out.wasm'])).ToBe(0);
 end;
 
-procedure TCLIParserSuite.TestEndOfOptionsMarkerOverRealArgv;
-begin
-  Expect<Integer>(RunChild('end-of-options',
-    ['-o', 'out.wasm', '--', '--output', 'other.wasm', '-h'])).ToBe(0);
-end;
-
 procedure TCLIParserSuite.TestCommandLineArgumentsStartAtTheGivenPosition;
 begin
   Expect<Integer>(RunChild('command-line-arguments',
@@ -491,6 +469,33 @@ begin
     Expect<string>(Fixture.Parse(['-o', '--', '--verbose'])).ToBe('');
     Expect<string>(Fixture.Output.ValueOr('')).ToBe('--');
     Expect<Boolean>(Fixture.Verbose.Present).ToBe(True);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestEndOfOptionsIndexFollowsTheParser;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<Integer>(EndOfOptionsIndex([], Fixture.Options)).ToBe(0);
+    Expect<Integer>(EndOfOptionsIndex(['first', 'second'],
+      Fixture.Options)).ToBe(2);
+    Expect<Integer>(EndOfOptionsIndex(['first', '--', 'second', '--'],
+      Fixture.Options)).ToBe(1);
+    Expect<Integer>(EndOfOptionsIndex(['--bogus', '-x', '--'],
+      Fixture.Options)).ToBe(2);
+    { A valued short option reads the marker as its value; a long one
+      never does. }
+    Expect<Integer>(EndOfOptionsIndex(['-o', '--', 'first'],
+      Fixture.Options)).ToBe(3);
+    Expect<Integer>(EndOfOptionsIndex(['-o', '--', '--', 'first'],
+      Fixture.Options)).ToBe(2);
+    Expect<Integer>(EndOfOptionsIndex(['--output', '--', 'first'],
+      Fixture.Options)).ToBe(1);
+    Expect<Boolean>(Fixture.Output.Present).ToBe(False);
   finally
     Fixture.Free;
   end;
@@ -637,6 +642,8 @@ begin
     TestEndOfOptionsMarkerIsNotAPositional);
   Test('the marker is a short option''s value but never a long option''s',
     TestEndOfOptionsMarkerInValuePosition);
+  Test('the end-of-options index is the marker the parser reads',
+    TestEndOfOptionsIndexFollowsTheParser);
   Test('stop-at-first-positional returns the rest of the line verbatim',
     TestStopAtFirstPositionalPassesTheRestThrough);
   Test('stop-at-first-positional consumes only a leading marker',
@@ -673,8 +680,6 @@ begin
     TestLongEqualsValueUnchanged);
   Test('long space-separated values remain unchanged',
     TestLongSeparatedValueUnchanged);
-  Test('the end-of-options marker ends option parsing over real argv',
-    TestEndOfOptionsMarkerOverRealArgv);
   Test('GetCommandLineArguments returns argv from the given position',
     TestCommandLineArgumentsStartAtTheGivenPosition);
 end;
@@ -682,7 +687,10 @@ end;
 begin
   if (ParamCount >= 2) and (ParamStr(1) = CHILD_MODE) then
   begin
-    ExitCode := RunParserScenario(ParamStr(2));
+    if ParamStr(2) = 'command-line-arguments' then
+      ExitCode := RunCommandLineArgumentsScenario
+    else
+      ExitCode := RunParserScenario(ParamStr(2));
     Exit;
   end;
 

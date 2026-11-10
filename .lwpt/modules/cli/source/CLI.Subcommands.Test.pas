@@ -33,8 +33,6 @@ uses
 
 type
   TSubcommandRegistrySuite = class(TTestSuite)
-  private
-    function RunCompletionChild(const ARaisingCallback: Boolean): Integer;
   public
     procedure SetupTests; override;
     procedure TestCountAndItemFollowRegistrationOrder;
@@ -57,6 +55,7 @@ type
     procedure TestAliasingDispatchesTheNamedSubcommandWhenOptedIn;
     procedure TestEndOfOptionsMarkerKeepsHelpSpellingsPositional;
     procedure TestTopLevelFlagRunsItsHandlerInsteadOfACommand;
+    procedure TestTopLevelFlagsIterateInRegistrationOrder;
     procedure TestTopLevelFlagRegistrationRefusals;
     procedure TestSubcommandCannotTakeATopLevelFlagWord;
     procedure TestHandlerExitCodeIsReturnedUnchanged;
@@ -199,14 +198,15 @@ begin
 end;
 
 { A host that configures everything the registry lets a host choose:
-  a description, a listed and a hidden top-level flag, a shared flag, a
-  pass-through `run`, a usage exit code of its own, usage help on standard
-  error, and a bare invocation that is a usage error. }
+  a description, two listed top-level flags and a hidden one, a shared
+  flag, a pass-through `run`, a usage exit code of its own, usage help on
+  standard error, and a bare invocation that is a usage error. }
 function BuildHostRegistry: TSubcommandRegistry;
 var
   RunOptions, BuildOptions, NoOptions : TOptionArray;
   RunCommand : TSubcommand;
   Flag : TTopLevelFlag;
+  OutputOption : TStringOption;
 begin
   Result := TSubcommandRegistry.Create;
   Result.Description := 'demo host';
@@ -220,6 +220,8 @@ begin
   Flag.ShortName := 'V';
   Flag.BareWord := True;
   Result.AddTopLevelFlag(Flag);
+  Result.AddTopLevelFlag(TTopLevelFlag.Create('license', 'Print the license',
+    @HandleBuildInfoFlag));
   Result.AddTopLevelFlag(TTopLevelFlag.Create('build-info', '',
     @HandleBuildInfoFlag));
 
@@ -234,9 +236,12 @@ begin
   RunCommand.PassThrough := True;
   Result.Add(RunCommand);
 
-  SetLength(BuildOptions, 2);
+  SetLength(BuildOptions, 3);
   BuildOptions[0] := TFlagOption.Create('release', 'Optimize');
   BuildOptions[1] := TIntegerOption.Create('level', 'Optimization level');
+  OutputOption := TStringOption.Create('output', 'Output path');
+  OutputOption.ShortName := 'o';
+  BuildOptions[2] := OutputOption;
   Result.Add(TSubcommand.Create('build', 'Build a program', '<file>',
     @RecordBuild, BuildOptions));
 
@@ -354,7 +359,7 @@ end;
   meanwhile. A child past the deadline is killed and reported as an error. }
 function FinishChildWithin(AProcess: TProcess;
   const ATimeoutMilliseconds: QWord;
-  var AOutput, AErrorOutput: string): Integer; overload;
+  var AOutput, AErrorOutput: string): Integer;
 var
   StartedAt: QWord;
 begin
@@ -385,42 +390,6 @@ begin
     Result := AProcess.ExitStatus;
 end;
 
-function FinishChildWithin(AProcess: TProcess;
-  const ATimeoutMilliseconds: QWord): Integer; overload;
-var
-  UnusedOutput, UnusedErrorOutput: string;
-begin
-  UnusedOutput := '';
-  UnusedErrorOutput := '';
-  Result := FinishChildWithin(AProcess, ATimeoutMilliseconds, UnusedOutput,
-    UnusedErrorOutput);
-end;
-
-{ RunCommand on this executable, bounded, with standard error merged into
-  AOutput. }
-function RunSelfWithin(const AArguments: array of string;
-  out AOutput: string): Integer;
-var
-  ProcessInstance: TProcess;
-  Index: Integer;
-  UnusedErrorOutput: string;
-begin
-  AOutput := '';
-  UnusedErrorOutput := '';
-  ProcessInstance := TProcess.Create(nil);
-  try
-    ProcessInstance.Executable := ExpandFileName(ParamStr(0));
-    for Index := 0 to High(AArguments) do
-      ProcessInstance.Parameters.Add(AArguments[Index]);
-    ProcessInstance.Options := [poUsePipes, poStderrToOutPut];
-    ProcessInstance.Execute;
-    Result := FinishChildWithin(ProcessInstance, CHILD_TIMEOUT_MILLISECONDS,
-      AOutput, UnusedErrorOutput);
-  finally
-    ProcessInstance.Free;
-  end;
-end;
-
 { The outcome of one child of this binary, with its two output streams
   read apart. }
 type
@@ -430,10 +399,9 @@ type
     StandardError: string;
   end;
 
-{ Runs this executable in AMode with AArguments as the host's command
-  line, bounded. }
-function RunHostChild(const AMode: string;
-  const AArguments: array of string): TChildResult;
+{ Runs this executable with AArguments, bounded. A child mode word, when
+  there is one, is the first argument. }
+function RunSelf(const AArguments: array of string): TChildResult;
 var
   ProcessInstance: TProcess;
   Index: Integer;
@@ -443,7 +411,6 @@ begin
   ProcessInstance := TProcess.Create(nil);
   try
     ProcessInstance.Executable := ExpandFileName(ParamStr(0));
-    ProcessInstance.Parameters.Add(AMode);
     for Index := 0 to High(AArguments) do
       ProcessInstance.Parameters.Add(AArguments[Index]);
     ProcessInstance.Options := [poUsePipes];
@@ -464,24 +431,6 @@ end;
 function StartsWith(const AText, APrefix: string): Boolean;
 begin
   Result := Copy(AText, 1, Length(APrefix)) = APrefix;
-end;
-
-function TSubcommandRegistrySuite.RunCompletionChild(
-  const ARaisingCallback: Boolean): Integer;
-var
-  ProcessInstance : TProcess;
-begin
-  ProcessInstance := TProcess.Create(nil);
-  try
-    ProcessInstance.Executable := ExpandFileName(ParamStr(0));
-    ProcessInstance.Parameters.Add('alpha');
-    if ARaisingCallback then
-      ProcessInstance.Parameters.Add('raise-callback');
-    ProcessInstance.Execute;
-    Result := FinishChildWithin(ProcessInstance, CHILD_TIMEOUT_MILLISECONDS);
-  finally
-    ProcessInstance.Free;
-  end;
 end;
 
 procedure TSubcommandRegistrySuite.TestCountAndItemFollowRegistrationOrder;
@@ -559,12 +508,15 @@ end;
 
 procedure TSubcommandRegistrySuite.TestCompletionCallbackReceivesDispatchMetadata;
 var
+  HelpChild: TChildResult;
   HelpOutput: string;
 begin
-  Expect<Integer>(RunCompletionChild(False)).ToBe(0);
+  Expect<Integer>(RunSelf(['alpha']).ExitCode).ToBe(0);
   { Help for a command without options still completes and links to the
     program-wide command list, using the consumer's program name. }
-  Expect<Integer>(RunSelfWithin(['alpha', '--help'], HelpOutput)).ToBe(0);
+  HelpChild := RunSelf(['alpha', '--help']);
+  Expect<Integer>(HelpChild.ExitCode).ToBe(0);
+  HelpOutput := HelpChild.StandardOutput;
   Expect<Boolean>(Pos('fixture alpha', HelpOutput) > 0).ToBe(True);
   Expect<Boolean>(Pos('options:', HelpOutput) = 0).ToBe(True);
   Expect<Boolean>(Pos('run "fixture --help" to see all commands',
@@ -573,7 +525,8 @@ end;
 
 procedure TSubcommandRegistrySuite.TestCompletionCallbackCannotReplaceDispatchResult;
 begin
-  Expect<Integer>(RunCompletionChild(True)).ToBe(NONZERO_HANDLER_EXIT_CODE);
+  Expect<Integer>(RunSelf(['alpha', 'raise-callback']).ExitCode).ToBe(
+    NONZERO_HANDLER_EXIT_CODE);
 end;
 
 procedure TSubcommandRegistrySuite.
@@ -689,6 +642,12 @@ begin
     Expect<string>(DispatchedPositionals).ToBe(
       'main.x|--port|80|--|help|--help|-h|--json|--mode');
     Expect<string>(DispatchedOptions).ToBe('unchecked');
+
+    { The bare word is an operand even in first place. }
+    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['run', 'help'])).ToBe(
+      0);
+    Expect<Integer>(DispatchCount).ToBe(2);
+    Expect<string>(DispatchedPositionals).ToBe('help');
   finally
     Registry.Free;
   end;
@@ -753,6 +712,13 @@ begin
     Expect<string>(DispatchedCommand).ToBe('run');
     Expect<string>(DispatchedPositionals).ToBe('task|build');
     Expect<string>(CapturedCompletion.CommandName).ToBe('run');
+
+    { Only the argument directly after the command is looked up, so the
+      marker hands an operand spelled like a subcommand to the command. }
+    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['run', '--',
+      'build'])).ToBe(0);
+    Expect<string>(DispatchedCommand).ToBe('run');
+    Expect<string>(DispatchedPositionals).ToBe('build');
   finally
     Registry.Free;
   end;
@@ -807,10 +773,41 @@ begin
   end;
 end;
 
-{ AddTopLevelFlag must raise and leave the flag with the caller, who frees
-  it here: a registry that had kept it would free it a second time. }
-function TopLevelFlagIsRefused(ARegistry: TSubcommandRegistry;
-  AFlag: TTopLevelFlag): Boolean;
+procedure THostDispatchSuite.TestTopLevelFlagsIterateInRegistrationOrder;
+var
+  Registry: TSubcommandRegistry;
+  RaisedBelow, RaisedAbove: Boolean;
+begin
+  Registry := BuildHostRegistry;
+  try
+    Expect<Integer>(Registry.TopLevelFlagCount).ToBe(3);
+    Expect<string>(Registry.TopLevelFlagItem(0).LongName).ToBe('version');
+    Expect<string>(Registry.TopLevelFlagItem(0).ShortName).ToBe('V');
+    Expect<string>(Registry.TopLevelFlagItem(1).LongName).ToBe('license');
+    Expect<string>(Registry.TopLevelFlagItem(2).LongName).ToBe('build-info');
+    RaisedBelow := False;
+    try
+      Registry.TopLevelFlagItem(-1);
+    except
+      on EArgumentOutOfRangeException do RaisedBelow := True;
+    end;
+    RaisedAbove := False;
+    try
+      Registry.TopLevelFlagItem(Registry.TopLevelFlagCount);
+    except
+      on EArgumentOutOfRangeException do RaisedAbove := True;
+    end;
+    Expect<Boolean>(RaisedBelow).ToBe(True);
+    Expect<Boolean>(RaisedAbove).ToBe(True);
+  finally
+    Registry.Free;
+  end;
+end;
+
+{ Whether AddTopLevelFlag raises for AFlag. A refused flag stays with the
+  caller, so it is freed here. }
+function TopLevelFlagIsRefused(const ARegistry: TSubcommandRegistry;
+  const AFlag: TTopLevelFlag): Boolean;
 begin
   Result := False;
   try
@@ -835,7 +832,14 @@ begin
     Expect<Boolean>(TopLevelFlagIsRefused(Registry, TTopLevelFlag.Create('',
       'no name', @HandleBuildInfoFlag))).ToBe(True);
     Expect<Boolean>(TopLevelFlagIsRefused(Registry, TTopLevelFlag.Create(
-      'license', 'no handler', nil))).ToBe(True);
+      '--verbose', 'name given with its dashes',
+      @HandleBuildInfoFlag))).ToBe(True);
+    Flag := TTopLevelFlag.Create('quiet', 'short name given with its dash',
+      @HandleBuildInfoFlag);
+    Flag.ShortName := '-q';
+    Expect<Boolean>(TopLevelFlagIsRefused(Registry, Flag)).ToBe(True);
+    Expect<Boolean>(TopLevelFlagIsRefused(Registry, TTopLevelFlag.Create(
+      'credits', 'no handler', nil))).ToBe(True);
     Expect<Boolean>(TopLevelFlagIsRefused(Registry, TTopLevelFlag.Create(
       'Help', 'reserved name', @HandleBuildInfoFlag))).ToBe(True);
     Flag := TTopLevelFlag.Create('host', 'reserved short name',
@@ -853,7 +857,9 @@ begin
     Flag.BareWord := True;
     Expect<Boolean>(TopLevelFlagIsRefused(Registry, Flag)).ToBe(True);
 
-    { None of the refused spellings became a flag. }
+    { Every refusal left the registry as it was. }
+    Expect<Integer>(Registry.TopLevelFlagCount).ToBe(3);
+    Expect<string>(Registry.TopLevelFlagItem(2).LongName).ToBe('build-info');
     Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['build'])).ToBe(0);
     Expect<string>(DispatchedCommand).ToBe('build');
     Expect<Integer>(TopLevelFlagCalls).ToBe(0);
@@ -864,6 +870,7 @@ begin
       @HandleBuildInfoFlag);
     Flag.ShortName := 'v';
     Expect<Boolean>(TopLevelFlagIsRefused(Registry, Flag)).ToBe(False);
+    Expect<Integer>(Registry.TopLevelFlagCount).ToBe(4);
     Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['--build'])).ToBe(
       BUILD_INFO_FLAG_EXIT_CODE);
     Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['-v'])).ToBe(
@@ -876,12 +883,14 @@ end;
 procedure THostDispatchSuite.TestSubcommandCannotTakeATopLevelFlagWord;
 var
   Command: TSubcommand;
+  CommandCount: Integer;
   NoOptions: TOptionArray;
   Raised: Boolean;
   Registry: TSubcommandRegistry;
 begin
   Registry := BuildHostRegistry;
   try
+    CommandCount := Registry.Count;
     SetLength(NoOptions, 0);
     Command := TSubcommand.Create('Version', 'shadowed by the flag word', '',
       @StubHandler, NoOptions);
@@ -892,8 +901,12 @@ begin
       on EArgumentException do Raised := True;
     end;
     Expect<Boolean>(Raised).ToBe(True);
+    { Add rejected the command before changing it or the registry: it has
+      no shared flag, and the caller still owns it. }
+    Expect<Integer>(Registry.Count).ToBe(CommandCount);
     Expect<Boolean>(Registry.Find('version') = nil).ToBe(True);
-    { Add rejected the command before taking ownership. }
+    Expect<Integer>(Length(Command.Options)).ToBe(0);
+    Expect<string>(Command.UsageArg).ToBe('');
     if Raised then Command.Free;
 
     { A flag without the bare word leaves its name to a subcommand. }
@@ -961,7 +974,7 @@ procedure THostDispatchSuite.TestConfiguredTopLevelHelp;
 var
   Child: TChildResult;
 begin
-  Child := RunHostChild(HOST_CHILD_MODE, ['--help']);
+  Child := RunSelf([HOST_CHILD_MODE, '--help']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<string>(Child.StandardError).ToBe('');
   { The first line is the program name and the host's description. }
@@ -977,11 +990,13 @@ begin
   Expect<Boolean>(Contains(Child.StandardOutput, 'options:')).ToBe(True);
   Expect<Boolean>(Contains(Child.StandardOutput,
     '  -V, --version   Print the version')).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    '  --license       Print the license')).ToBe(True);
   Expect<Boolean>(Contains(Child.StandardOutput, 'build-info')).ToBe(False);
   Expect<Boolean>(Contains(Child.StandardOutput,
     'run "host <command> --help" for command options')).ToBe(True);
 
-  Child := RunHostChild(HOST_CHILD_MODE, ['--version']);
+  Child := RunSelf([HOST_CHILD_MODE, '--version']);
   Expect<Integer>(Child.ExitCode).ToBe(VERSION_FLAG_EXIT_CODE);
   Expect<Boolean>(StartsWith(Child.StandardOutput, 'host 1.2.3')).ToBe(True);
   Expect<string>(Child.StandardError).ToBe('');
@@ -993,7 +1008,7 @@ var
 begin
   { A bare invocation prints help and succeeds unless the host chooses
     otherwise; without a description the help starts at the usage line. }
-  Child := RunHostChild(UNCONFIGURED_CHILD_MODE, []);
+  Child := RunSelf([UNCONFIGURED_CHILD_MODE]);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<string>(Child.StandardError).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardOutput,
@@ -1009,11 +1024,11 @@ var
 begin
   { `build-info` is a flag without the bare word, so the word alone is an
     unknown command; so is a flag in the wrong letter case. }
-  Child := RunHostChild(HOST_CHILD_MODE, ['build-info']);
+  Child := RunSelf([HOST_CHILD_MODE, 'build-info']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<Boolean>(Contains(Child.StandardError,
     'unknown command: build-info')).ToBe(True);
-  Child := RunHostChild(HOST_CHILD_MODE, ['--VERSION']);
+  Child := RunSelf([HOST_CHILD_MODE, '--VERSION']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<Boolean>(Contains(Child.StandardError, 'unknown command:')).ToBe(
     True);
@@ -1023,7 +1038,7 @@ procedure THostDispatchSuite.TestConfiguredUsageErrors;
 var
   Child: TChildResult;
 begin
-  Child := RunHostChild(HOST_CHILD_MODE, ['nosuch']);
+  Child := RunSelf([HOST_CHILD_MODE, 'nosuch']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardError,
@@ -1031,7 +1046,7 @@ begin
   Expect<Boolean>(Contains(Child.StandardError,
     'usage: host <command> [options]')).ToBe(True);
 
-  Child := RunHostChild(HOST_CHILD_MODE, []);
+  Child := RunSelf([HOST_CHILD_MODE]);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardError, 'missing command')).ToBe(
@@ -1039,32 +1054,28 @@ begin
   Expect<Boolean>(Contains(Child.StandardError,
     'usage: host <command> [options]')).ToBe(True);
 
-  Child := RunHostChild(HOST_CHILD_MODE, ['build', '--bogus']);
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '--bogus']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardError,
     'host build: Unknown option: --bogus')).ToBe(True);
 
-  Child := RunHostChild(HOST_CHILD_MODE, ['build', '--level=high']);
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '--level=high']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<Boolean>(StartsWith(Child.StandardError,
     'host build: Invalid integer value for --level: high')).ToBe(True);
 
-  Child := RunHostChild(HOST_CHILD_MODE, ['run', '--bogus', 'main.x']);
+  Child := RunSelf([HOST_CHILD_MODE, 'run', '--bogus', 'main.x']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardError,
     'host run: Unknown option: --bogus')).ToBe(True);
 
-  Child := RunHostChild(HOST_CHILD_MODE, ['reject']);
+  Child := RunSelf([HOST_CHILD_MODE, 'reject']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardError,
     'host reject: not allowed')).ToBe(True);
-
-  { A failing handler keeps its own code. }
-  Child := RunHostChild(HOST_CHILD_MODE, ['fail']);
-  Expect<Integer>(Child.ExitCode).ToBe(NONZERO_HANDLER_EXIT_CODE);
 end;
 
 procedure THostDispatchSuite.TestUnconfiguredUsageErrors;
@@ -1073,7 +1084,7 @@ var
 begin
   { Without host configuration a usage error exits like a failing handler
     and the help after an unknown command goes to standard output. }
-  Child := RunHostChild(UNCONFIGURED_CHILD_MODE, ['nosuch']);
+  Child := RunSelf([UNCONFIGURED_CHILD_MODE, 'nosuch']);
   Expect<Integer>(Child.ExitCode).ToBe(DEFAULT_USAGE_EXIT_CODE);
   Expect<Boolean>(StartsWith(Child.StandardError,
     'unknown command: nosuch')).ToBe(True);
@@ -1081,14 +1092,14 @@ begin
   Expect<Boolean>(StartsWith(Child.StandardOutput,
     'usage: fixture <command> [options]')).ToBe(True);
 
-  Child := RunHostChild(UNCONFIGURED_CHILD_MODE, ['beta', '--bogus']);
+  Child := RunSelf([UNCONFIGURED_CHILD_MODE, 'beta', '--bogus']);
   Expect<Integer>(Child.ExitCode).ToBe(DEFAULT_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardError,
     'fixture beta: Unknown option: --bogus')).ToBe(True);
 
   { No top-level flag exists unless the host registers one. }
-  Child := RunHostChild(UNCONFIGURED_CHILD_MODE, ['--version']);
+  Child := RunSelf([UNCONFIGURED_CHILD_MODE, '--version']);
   Expect<Integer>(Child.ExitCode).ToBe(DEFAULT_USAGE_EXIT_CODE);
   Expect<Boolean>(StartsWith(Child.StandardError,
     'unknown command: --version')).ToBe(True);
@@ -1100,36 +1111,20 @@ const
 var
   Child: TChildResult;
 begin
-  Child := RunHostChild(HOST_CHILD_MODE, ['run', '--help']);
+  Child := RunSelf([HOST_CHILD_MODE, 'run', '--help']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, RUN_USAGE)).ToBe(True);
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 
-  Child := RunHostChild(HOST_CHILD_MODE, ['run', '--mode', 'fast', '-h']);
+  Child := RunSelf([HOST_CHILD_MODE, 'run', '--mode', 'fast', '-h']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, RUN_USAGE)).ToBe(True);
 
   { Help wins over an argument the parser would reject, as it does for
     every other command. }
-  Child := RunHostChild(HOST_CHILD_MODE, ['run', '--bogus', '--help']);
+  Child := RunSelf([HOST_CHILD_MODE, 'run', '--bogus', '--help']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, RUN_USAGE)).ToBe(True);
-
-  { From the first positional on, help spellings belong to the program
-    the command launches. }
-  Child := RunHostChild(HOST_CHILD_MODE, ['run', 'main.x', '--help', '-h',
-    'help']);
-  Expect<Integer>(Child.ExitCode).ToBe(0);
-  Expect<Boolean>(Contains(Child.StandardOutput, 'usage:')).ToBe(False);
-  Expect<Boolean>(Contains(Child.StandardOutput,
-    'positionals: main.x|--help|-h|help')).ToBe(True);
-
-  { The bare word is an operand even in first place. }
-  Child := RunHostChild(HOST_CHILD_MODE, ['run', 'help']);
-  Expect<Integer>(Child.ExitCode).ToBe(0);
-  Expect<Boolean>(Contains(Child.StandardOutput, 'usage:')).ToBe(False);
-  Expect<Boolean>(Contains(Child.StandardOutput,
-    'positionals: help')).ToBe(True);
 end;
 
 procedure THostDispatchSuite.TestHelpWordOutsidePassThrough;
@@ -1138,21 +1133,21 @@ const
 var
   Child: TChildResult;
 begin
-  Child := RunHostChild(HOST_CHILD_MODE, ['build', 'main.x', 'help']);
+  Child := RunSelf([HOST_CHILD_MODE, 'build', 'main.x', 'help']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 
-  Child := RunHostChild(HOST_CHILD_MODE, ['build', '--bogus', '-h']);
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '--bogus', '-h']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
 
-  { After the end-of-options marker the same words are operands. }
-  Child := RunHostChild(HOST_CHILD_MODE, ['build', '--', 'help', '--help']);
+  { A `--` that a valued short option takes as its value is not the
+    marker, so a help spelling after it still asks for help. }
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '-o', '--', '--help']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
-  Expect<Boolean>(Contains(Child.StandardOutput, 'usage:')).ToBe(False);
-  Expect<Boolean>(Contains(Child.StandardOutput,
-    'positionals: help|--help')).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
 procedure THostDispatchSuite.SetupTests;
@@ -1171,6 +1166,8 @@ begin
     TestEndOfOptionsMarkerKeepsHelpSpellingsPositional);
   Test('a top-level flag runs its handler instead of a command',
     TestTopLevelFlagRunsItsHandlerInsteadOfACommand);
+  Test('top-level flags iterate in registration order',
+    TestTopLevelFlagsIterateInRegistrationOrder);
   Test('top-level flag registration refuses unusable and clashing flags',
     TestTopLevelFlagRegistrationRefusals);
   Test('a subcommand cannot take the name of a top-level flag word',
@@ -1189,9 +1186,9 @@ begin
     TestConfiguredUsageErrors);
   Test('usage errors keep the unconfigured exit code and streams',
     TestUnconfiguredUsageErrors);
-  Test('a pass-through command reads help before its first positional only',
+  Test('a pass-through command reads --help and -h before its first positional',
     TestPassThroughHelp);
-  Test('the help word asks for help up to the end-of-options marker',
+  Test('the help word asks for help up to the parser''s end-of-options marker',
     TestHelpWordOutsidePassThrough);
 end;
 

@@ -8,6 +8,15 @@ This page describes `cli` 0.6.0. LWPT 0.8.1 ships `cli` 0.5.1, which has none
 of the host settings below. The [consumer guide](consumer-guide.md) shows how
 to add the package to a project.
 
+A host that moves from 0.5.1 to 0.6.0 without changing its code sees three
+differences:
+
+- Top-level help no longer prints LWPT's tagline. Set `Description` to print
+  the host's own.
+- A command named `run` no longer dispatches the subcommand its first argument
+  names. Set `AliasesSubcommands` on it to keep that.
+- `--` ends option parsing; 0.5.1 rejected it as an unknown option.
+
 ## A complete host
 
 ```pascal
@@ -161,11 +170,14 @@ code. Arguments after the flag are ignored.
 - A flag with `HelpText` is listed under `options:` in top-level help. A flag
   without help text is accepted but not listed.
 
+Set a flag's fields before `AddTopLevelFlag`, which checks them once.
 `AddTopLevelFlag` raises `EArgumentException`, and leaves the flag with the
-caller, for an empty name, a missing handler, the name `help` or the short name
-`h`, a name or short name that is already registered, and a bare word that is
-also a subcommand name. `Add` refuses a subcommand whose name is a registered
-bare word.
+caller, for an empty name, a name or short name written with its leading
+dashes, a missing handler, the name `help` or the short name `h`, a name or
+short name that is already registered, and a bare word that is also a
+subcommand name. `Add` refuses a subcommand whose name is a registered bare
+word. `TopLevelFlagCount` and `TopLevelFlagItem` iterate the registered flags,
+as `Count` and `Item` iterate the subcommands.
 
 An option that changes how a command runs belongs after the command name. Give
 it to one command through its options, or to every command with
@@ -194,6 +206,9 @@ to the registry. Option parsing then stops at the first positional:
   begin with a hyphen: `demo run -- --unchecked` runs the file `--unchecked`.
 - An unknown option before the first positional is still a usage error:
   `demo run --port 80` fails with `Unknown option: --port`.
+- A single-dash argument of more than one character that matches no option is
+  a positional, here as everywhere in the parser. `demo run -xyz main.x`
+  therefore runs the file `-xyz` and hands it `main.x`.
 - A flag added with `AddSharedFlag` is shown ahead of the command's own usage,
   because it counts only there. With a shared `--json`, the usage line of
   `demo run` reads `usage: demo run [--json] [--unchecked] <file> [arguments]`.
@@ -205,10 +220,11 @@ the command's help, so `demo check a help` prints the help of `check`.
 
 A command that sets `AliasesSubcommands` hands its line to another subcommand
 when its first argument names one: `lwpt run build --clean` dispatches `build`
-with `--clean`, and reports completion as `build`. Its own handler only sees a
-first argument that names no subcommand. Without the setting, a subcommand
-name after the command is an ordinary positional, as `demo run check` shows
-above.
+with `--clean`, and reports completion as `build`. Only the argument directly
+after the command is looked up. An option or `--` in that place keeps the line
+with the command, so `lwpt run -- build` hands `build` to the handler of `run`.
+Without the setting, a subcommand name after the command is an ordinary
+positional, as `demo run check` shows above.
 
 ## Usage errors
 
@@ -245,6 +261,10 @@ Expect<Integer>(Registry.Run('demo', ['run', 'main.x', '--port'])).ToBe(0);
 
 Positionals := ParseArguments(['--unchecked', 'main.x'], RunOptions);
 ```
+
+Option objects keep what a dispatch applied to them, and nothing resets them.
+Build a fresh registry, or fresh options, for each dispatch a test asserts on;
+a second `Run` on the same registry still sees the options of the first.
 
 `ParseArguments` takes `AStopAtFirstPositional` as an optional third argument
 for the pass-through rule. `Run(AProgramName)` and `ParseCommandLine` read the

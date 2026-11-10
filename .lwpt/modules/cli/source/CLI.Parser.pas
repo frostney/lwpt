@@ -37,7 +37,7 @@ type
   program uses it to hand the rest of the line through untouched. }
 function ParseArguments(const AArguments: array of string;
   const AOptions: TOptionArray;
-  AStopAtFirstPositional: Boolean = False): TStringList;
+  const AStopAtFirstPositional: Boolean = False): TStringList;
 
 { Reports whether `--<ALongName>` or `-<AShortName>` is spelled out as an
   option before option parsing ends at the first positional or at
@@ -48,9 +48,16 @@ function ParseArguments(const AArguments: array of string;
 function LeadingFlagGiven(const AArguments: array of string;
   const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
 
+{ The index of END_OF_OPTIONS_MARKER as ParseArguments reads it, or
+  Length(AArguments) when the arguments have none. A `--` that a valued
+  short option takes as its value is not the marker. Applies no option and
+  raises nothing. }
+function EndOfOptionsIndex(const AArguments: array of string;
+  const AOptions: TOptionArray): Integer;
+
 { The process's own arguments from position AStartArg onward. }
 function GetCommandLineArguments(
-  AStartArg: Integer = 1): TCommandLineArguments;
+  const AStartArg: Integer = 1): TCommandLineArguments;
 
 { ParseArguments over the process's own arguments.
 
@@ -151,8 +158,8 @@ begin
   end;
 end;
 
-function ReadArgument(const AArguments: array of string; AIndex: Integer;
-  const AOptions: TOptionArray): TArgumentReading;
+function ReadArgument(const AArguments: array of string;
+  const AIndex: Integer; const AOptions: TOptionArray): TArgumentReading;
 var
   Arg, Name: string;
   HasEquals, HasNext: Boolean;
@@ -243,7 +250,7 @@ end;
 
 function ParseArguments(const AArguments: array of string;
   const AOptions: TOptionArray;
-  AStopAtFirstPositional: Boolean = False): TStringList;
+  const AStopAtFirstPositional: Boolean = False): TStringList;
 var
   I, VerbatimFrom: Integer;
   Reading: TArgumentReading;
@@ -300,8 +307,23 @@ begin
   Result := False;
 end;
 
+function EndOfOptionsIndex(const AArguments: array of string;
+  const AOptions: TOptionArray): Integer;
+var
+  Reading: TArgumentReading;
+begin
+  Result := 0;
+  while Result <= High(AArguments) do
+  begin
+    Reading := ReadArgument(AArguments, Result, AOptions);
+    if Reading.Kind = akEndOfOptions then
+      Exit;
+    Inc(Result, Reading.Width);
+  end;
+end;
+
 function GetCommandLineArguments(
-  AStartArg: Integer = 1): TCommandLineArguments;
+  const AStartArg: Integer = 1): TCommandLineArguments;
 var
   I: Integer;
 begin
