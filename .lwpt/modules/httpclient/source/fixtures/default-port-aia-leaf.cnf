@@ -6,9 +6,9 @@ prompt = no
 CN = localhost
 
 # http://localhost/ (port 80) is the tests' default-port retrieval recorder
-# on macOS, whose trustd refuses IP-literal hosts and non-default ports: it
-# counts every fetch of these URLs, so a test can prove an evaluation made
-# none.
+# on macOS, where trustd on 26.7.2 stopped fetching the 127.0.0.1:6741 shape:
+# it counts every fetch of these URLs, so a test can prove an evaluation
+# made none.
 [leaf_extensions]
 basicConstraints = critical,CA:false
 keyUsage = critical,digitalSignature,keyEncipherment

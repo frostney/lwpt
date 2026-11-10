@@ -11,14 +11,16 @@
   - rreLoopbackPort, http://127.0.0.1:6741/ (localhost-loopback-aia), bound
     on 127.0.0.1 only.
   - rreLocalhostDefaultPort, http://localhost/ (localhost-default-port-aia),
-    for macOS. trustd on macOS 26.7.2 refuses to fetch a certificate URL
-    whose host is an IP literal or whose port is not the scheme's default,
-    logging "skipping SSRF-denied destination", so only a host name on port
-    80 still reaches a local recorder. macOS lets an unprivileged process
-    bind port 80 on the wildcard address but not on a loopback address, so
-    this endpoint binds [::]:80 dual-stack (localhost may resolve to ::1 or
-    127.0.0.1) and counts only connections from a loopback peer; any other
-    peer is closed uncounted.
+    macOS only. On macOS 26.7.2 trustd refused to fetch the CA-issuer URL
+    of a leaf when the URL named a local endpoint by IP literal or on a
+    non-default port, logging "skipping SSRF-denied destination"; of the
+    local shapes tried, only a host name on port 80 was still fetched. macOS
+    lets an unprivileged process bind port 80 on the wildcard address but
+    refuses a loopback address with EACCES, so this endpoint binds [::]:80
+    dual-stack (localhost may resolve to ::1 or 127.0.0.1) and counts only
+    connections from a loopback peer; any other peer is closed uncounted.
+    Port 80 must therefore be free while the test runs, and a host firewall
+    may ask once to let the test program accept connections.
 
   The port is fixed because it is baked into the certificate, so it sits
   below every supported platform's default ephemeral range: Linux
@@ -172,7 +174,7 @@ begin
     Result := Format('127.0.0.1:%d', [RETRIEVAL_RECORDER_PORT]);
 end;
 
-{$IFDEF UNIX}
+{$IFDEF DARWIN}
 { Opens a dual-stack listener on [::]:RETRIEVAL_RECORDER_DEFAULT_HTTP_PORT.
   On failure it returns False with the socket closed, the failing call in
   AStage and its operating-system error in AError. }
@@ -292,6 +294,18 @@ begin
   end;
 end;
 
+{ Opens the listener for AEndpoint, reporting failure as
+  OpenRecorderListener does. }
+function OpenEndpointListener(const AEndpoint: TRetrievalRecorderEndpoint;
+  out ASocket: TSocket; out AStage: string; out AError: Integer): Boolean;
+begin
+  {$IFDEF DARWIN}
+  if AEndpoint = rreLocalhostDefaultPort then
+    Exit(OpenDefaultPortListener(ASocket, AStage, AError));
+  {$ENDIF}
+  Result := OpenRecorderListener(ASocket, AStage, AError);
+end;
+
 constructor TRetrievalRecorder.Create(
   const AEndpoint: TRetrievalRecorderEndpoint);
 var
@@ -308,13 +322,15 @@ begin
   InitCriticalSection(FLock);
   FRequestLines := TStringList.Create;
   FListenSocket := INVALID_RECORDER_SOCKET;
+  {$IFNDEF DARWIN}
+  if AEndpoint = rreLocalhostDefaultPort then
+    raise ERetrievalRecorderError.Create(
+      'the default-port retrieval recorder is available on macOS only');
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   if WinSock2.WSAStartup($0202, WSAData) <> 0 then
     raise ERetrievalRecorderError.Create('WSAStartup failed');
   FWinSockStarted := True;
-  if AEndpoint = rreLocalhostDefaultPort then
-    raise ERetrievalRecorderError.Create(
-      'the default-port retrieval recorder is not available on Windows');
   {$ENDIF}
   { Another process can hold the port briefly, for example a loopback
     connection that is closing; only that error is worth waiting out. }
@@ -322,15 +338,7 @@ begin
   StartedAt := GetTickCount64;
   repeat
     Inc(Attempts);
-    {$IFDEF UNIX}
-    if AEndpoint = rreLocalhostDefaultPort then
-    begin
-      if OpenDefaultPortListener(FListenSocket, Stage, ErrorCode) then
-        Break;
-    end
-    else
-    {$ENDIF}
-    if OpenRecorderListener(FListenSocket, Stage, ErrorCode) then
+    if OpenEndpointListener(AEndpoint, FListenSocket, Stage, ErrorCode) then
       Break;
     if (Stage <> 'bind()') or not RecorderAddressInUse(ErrorCode) or
        (GetTickCount64 - StartedAt >= RETRIEVAL_RECORDER_BIND_MILLISECONDS) then
@@ -438,7 +446,7 @@ begin
     {$ENDIF}
     if not RecorderSocketValid(Accepted) then
       Continue;
-    {$IFDEF UNIX}
+    {$IFDEF DARWIN}
     { The default-port listener is bound on every address; a connection
       from off the host is not a certificate fetch by this machine. }
     if (FEndpoint = rreLocalhostDefaultPort) and

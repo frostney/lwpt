@@ -5683,60 +5683,58 @@ begin
   {$ENDIF}
 end;
 
+{ Counts the http:// URLs in the leaf at APath, and how many of them start
+  with ARecorderPrefix. The URLs are IA5Strings, so they appear verbatim in
+  the DER. }
+procedure CountLeafURLs(const APath: string; const ARecorderPrefix: AnsiString;
+  out AHTTPURLs, ARecorderURLs: Integer);
+var
+  Leaf: TBytes;
+  Remaining: AnsiString;
+begin
+  Leaf := PEMCertificateDER(APath);
+  SetString(Remaining, PAnsiChar(@Leaf[0]), Length(Leaf));
+  AHTTPURLs := 0;
+  ARecorderURLs := 0;
+  while Pos(AnsiString('http://'), Remaining) > 0 do
+  begin
+    Delete(Remaining, 1, Pos(AnsiString('http://'), Remaining) - 1);
+    Inc(AHTTPURLs);
+    if Pos(ARecorderPrefix, Remaining) = 1 then
+      Inc(ARecorderURLs);
+    Delete(Remaining, 1, 1);
+  end;
+end;
+
 { The recorder's port is baked into the loopback-AIA leaf, so the two must
   agree: a mismatch would leave the zero-request assertions vacuous wherever
   no positive control runs. The port must also stay below every
   platform's default ephemeral range, where a concurrent test's outbound
-  loopback connection can take it (Tests.RetrievalRecorder). The URLs are
-  IA5Strings, so they appear verbatim in the DER. }
+  loopback connection can take it (Tests.RetrievalRecorder). }
 procedure TTransportSecurityClientOptionTests.TestLoopbackAIAFixtureNamesRecorderPort;
 var
-  Leaf: TBytes;
-  Remaining: AnsiString;
-  LoopbackURLs, RecorderURLs: Integer;
+  HTTPURLs, RecorderURLs: Integer;
 begin
   Expect<Boolean>(RETRIEVAL_RECORDER_PORT < EPHEMERAL_RANGE_FLOOR).ToBe(True);
-  Leaf := PEMCertificateDER(LOOPBACK_AIA_LEAF_PATH);
-  SetString(Remaining, PAnsiChar(@Leaf[0]), Length(Leaf));
-  LoopbackURLs := 0;
-  RecorderURLs := 0;
-  while Pos(AnsiString('http://127.0.0.1:'), Remaining) > 0 do
-  begin
-    Delete(Remaining, 1, Pos(AnsiString('http://127.0.0.1:'), Remaining) - 1);
-    Inc(LoopbackURLs);
-    if Pos(AnsiString('http://127.0.0.1:' + IntToStr(RETRIEVAL_RECORDER_PORT)
-       + '/'), Remaining) = 1 then
-      Inc(RecorderURLs);
-    Delete(Remaining, 1, 1);
-  end;
+  CountLeafURLs(LOOPBACK_AIA_LEAF_PATH,
+    AnsiString('http://127.0.0.1:' + IntToStr(RETRIEVAL_RECORDER_PORT) + '/'),
+    HTTPURLs, RecorderURLs);
   { The AIA issuer, OCSP, and CRL distribution-point URLs. }
-  Expect<Integer>(LoopbackURLs).ToBe(3);
+  Expect<Integer>(HTTPURLs).ToBe(3);
   Expect<Integer>(RecorderURLs).ToBe(3);
 end;
 
-{ The macOS leaf names its URLs by host name without a port, the shape
-  trustd still fetches from a local endpoint, so they reach the recorder's
-  default-port endpoint only while that endpoint is the HTTP default port.
-  Every http:// URL in the leaf must have that shape. }
+{ The macOS leaf names its URLs by host name without a port, the local
+  shape trustd still fetched (Tests.RetrievalRecorder), so they reach the
+  recorder's default-port endpoint only while that endpoint is the HTTP
+  default port. }
 procedure TTransportSecurityClientOptionTests.TestDefaultPortAIAFixtureNamesRecorderEndpoint;
 var
-  Leaf: TBytes;
-  Remaining: AnsiString;
   HTTPURLs, RecorderURLs: Integer;
 begin
   Expect<Integer>(RETRIEVAL_RECORDER_DEFAULT_HTTP_PORT).ToBe(80);
-  Leaf := PEMCertificateDER(DEFAULT_PORT_AIA_LEAF_PATH);
-  SetString(Remaining, PAnsiChar(@Leaf[0]), Length(Leaf));
-  HTTPURLs := 0;
-  RecorderURLs := 0;
-  while Pos(AnsiString('http://'), Remaining) > 0 do
-  begin
-    Delete(Remaining, 1, Pos(AnsiString('http://'), Remaining) - 1);
-    Inc(HTTPURLs);
-    if Pos(AnsiString('http://localhost/'), Remaining) = 1 then
-      Inc(RecorderURLs);
-    Delete(Remaining, 1, 1);
-  end;
+  CountLeafURLs(DEFAULT_PORT_AIA_LEAF_PATH, AnsiString('http://localhost/'),
+    HTTPURLs, RecorderURLs);
   { The AIA issuer, OCSP, and CRL distribution-point URLs. }
   Expect<Integer>(HTTPURLs).ToBe(3);
   Expect<Integer>(RecorderURLs).ToBe(3);
