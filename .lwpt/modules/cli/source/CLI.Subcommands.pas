@@ -114,7 +114,7 @@ type
     HelpText  : string;   { listed in top-level help; empty hides the flag }
     Handler   : TTopLevelFlagHandler;
     constructor Create(const ALongName, AHelpText: string;
-      AHandler: TTopLevelFlagHandler);
+      const AHandler: TTopLevelFlagHandler);
   end;
 
   TSubcommandRegistry = class
@@ -143,7 +143,7 @@ type
       also a subcommand name. }
     procedure AddTopLevelFlag(const AFlag: TTopLevelFlag);
     { Read iteration over the top-level flags, in registration order: the
-      rest of the command surface that Count and Item iterate. }
+      part of the command surface that Count and Item do not cover. }
     function TopLevelFlagCount: Integer;
     function TopLevelFlagItem(const AIndex: Integer): TTopLevelFlag;
     function Find(const AName: string): TSubcommand;
@@ -195,7 +195,6 @@ uses
   CLI.Parser;
 
 const
-  OPTION_DASH = '-';
   HELP_WORD = 'help';
   HELP_SHORT_NAME = 'h';
   HELP_LONG_FLAG = '--' + HELP_WORD;
@@ -212,7 +211,7 @@ begin
 end;
 
 constructor TTopLevelFlag.Create(const ALongName, AHelpText: string;
-  AHandler: TTopLevelFlagHandler);
+  const AHandler: TTopLevelFlagHandler);
 begin
   LongName := ALongName;
   HelpText := AHelpText;
@@ -336,11 +335,14 @@ begin
   if AFlag.LongName = '' then
     raise EArgumentException.Create('top-level flag name cannot be empty');
   { A name given with its dashes would never match what the user types. }
-  if (AFlag.LongName[1] = OPTION_DASH)
-     or ((AFlag.ShortName <> '') and (AFlag.ShortName[1] = OPTION_DASH)) then
+  if AFlag.LongName[1] = '-' then
     raise EArgumentException.CreateFmt(
-      'top-level flag %s is named without its leading dashes',
+      'top-level flag name "%s" must be given without its leading dashes',
       [AFlag.LongName]);
+  if (AFlag.ShortName <> '') and (AFlag.ShortName[1] = '-') then
+    raise EArgumentException.CreateFmt(
+      'top-level flag short name "%s" must be given without its leading dash',
+      [AFlag.ShortName]);
   if not Assigned(AFlag.Handler) then
     raise EArgumentException.CreateFmt(
       'top-level flag --%s has no handler', [AFlag.LongName]);

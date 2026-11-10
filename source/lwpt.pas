@@ -698,10 +698,11 @@ begin
   { Subcommand-aliasing (`lwpt run install`) is intercepted in
     CLI.Subcommands.Run BEFORE this handler is called, because the run
     command opts in to it at registration. So when we arrive here, the
-    name (if any) is a user-declared run task name. The one exception is
-    a name after the end-of-options marker (`lwpt run -- install`), which
-    stays a task name and fails as an unknown task. Empty positionals =
-    list mode. }
+    name (if any) is a user-declared run task name. The exception is a
+    subcommand name after an option or the end-of-options marker
+    (`lwpt run --silent install`, `lwpt run -- install`): only the
+    argument directly after `run` is looked up, so that name stays a task
+    name and fails as an unknown task. Empty positionals = list mode. }
   if APositionals.Count = 0 then
     Name := ''
   else

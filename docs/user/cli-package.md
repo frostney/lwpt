@@ -167,8 +167,9 @@ code. Arguments after the flag are ignored.
 - `BareWord`, when `True`, also matches `<LongName>` without dashes in any
   letter case, the way the built-in `help` word does. `lwpt` uses it for
   `lwpt version`.
-- A flag with `HelpText` is listed under `options:` in top-level help. A flag
-  without help text is accepted but not listed.
+- A flag with `HelpText` is listed under `options:` in top-level help, with
+  its short name. A flag without help text is accepted but not listed. A
+  command's own help lists its options by long name only.
 
 Set a flag's fields before `AddTopLevelFlag`, which checks them once.
 `AddTopLevelFlag` raises `EArgumentException`, and leaves the flag with the

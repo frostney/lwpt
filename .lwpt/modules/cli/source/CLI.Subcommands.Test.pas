@@ -78,13 +78,13 @@ var
   DispatchedPositionals : string = '';
   DispatchedOptions : string = '';
   TopLevelFlagCalls : Integer = 0;
-  { Set in the host children, whose parent reads the dispatch from
-    standard output. }
+  { Set in the host children, whose parent tells a dispatch from a help
+    page by the `command:` line on standard output. }
   EchoDispatch : Boolean = False;
 
 const
   NONZERO_HANDLER_EXIT_CODE = 7;
-  { The completion child dispatches one command and exits at once. }
+  { Every child dispatches one command line and exits at once. }
   CHILD_TIMEOUT_MILLISECONDS = 60000;
   { Child modes: the arguments after the mode word are the host's. }
   HOST_CHILD_MODE = '--host-child';
@@ -144,11 +144,7 @@ begin
       DispatchedOptions := DispatchedOptions + AOptions[Index].LongName;
     end;
   if EchoDispatch then
-  begin
     WriteLn('command: ', ACommand);
-    WriteLn('positionals: ', DispatchedPositionals);
-    WriteLn('options: ', DispatchedOptions);
-  end;
 end;
 
 procedure ResetDispatch;
@@ -322,12 +318,11 @@ function TerminateChildHandle(AProcess: THandle;
 { Appends the bytes a child has written to one of its pipes so far, never
   waiting for more: a snapshot of what is available, so a continuous writer
   cannot keep the caller from its deadline. }
-procedure DrainChildPipe(APipe: TInputPipeStream; var AText: string);
+procedure DrainChildPipe(const APipe: TInputPipeStream; var AText: string);
 var
   Buffer: array[0..4095] of Byte;
   Available, Count: Integer;
 begin
-  if APipe = nil then Exit;
   Available := APipe.NumBytesAvailable;
   while Available > 0 do
   begin
@@ -341,15 +336,12 @@ begin
   end;
 end;
 
-{ Drains both pipes of a poUsePipes child. Standard error has no pipe of
-  its own when it is merged into standard output. }
-procedure DrainChildOutput(AProcess: TProcess;
+{ Drains both pipes of a poUsePipes child. }
+procedure DrainChildOutput(const AProcess: TProcess;
   var AOutput, AErrorOutput: string);
 begin
-  if not (poUsePipes in AProcess.Options) then Exit;
   DrainChildPipe(AProcess.Output, AOutput);
-  if not (poStderrToOutPut in AProcess.Options) then
-    DrainChildPipe(AProcess.Stderr, AErrorOutput);
+  DrainChildPipe(AProcess.Stderr, AErrorOutput);
 end;
 
 { A bounded replacement for poWaitOnExit and RunCommand, which wait forever
@@ -1142,6 +1134,13 @@ begin
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
 
+  { Without a help spelling the command is dispatched instead. }
+  Child := RunSelf([HOST_CHILD_MODE, 'build', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command: build')).ToBe(
+    True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'usage:')).ToBe(False);
+
   { A `--` that a valued short option takes as its value is not the
     marker, so a help spelling after it still asks for help. }
   Child := RunSelf([HOST_CHILD_MODE, 'build', '-o', '--', '--help']);
@@ -1188,7 +1187,7 @@ begin
     TestUnconfiguredUsageErrors);
   Test('a pass-through command reads --help and -h before its first positional',
     TestPassThroughHelp);
-  Test('the help word asks for help up to the parser''s end-of-options marker',
+  Test('help spellings ask for help outside pass-through, also after a -- taken as a value',
     TestHelpWordOutsidePassThrough);
 end;
 

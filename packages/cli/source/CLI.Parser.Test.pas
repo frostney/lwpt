@@ -77,10 +77,10 @@ type
     destructor Destroy; override;
     { ParseArguments, with the positionals joined by `|`. }
     function Parse(const AArguments: array of string;
-      AStopAtFirstPositional: Boolean = False): string;
+      const AStopAtFirstPositional: Boolean = False): string;
     { The TParseError message ParseArguments raises, or '' for none. }
     function ParseError(const AArguments: array of string;
-      AStopAtFirstPositional: Boolean = False): string;
+      const AStopAtFirstPositional: Boolean = False): string;
     function HelpGiven(const AArguments: array of string): Boolean;
   end;
 
@@ -114,7 +114,7 @@ begin
 end;
 
 function TParserFixture.Parse(const AArguments: array of string;
-  AStopAtFirstPositional: Boolean = False): string;
+  const AStopAtFirstPositional: Boolean = False): string;
 var
   Positionals: TStringList;
   I: Integer;
@@ -133,7 +133,7 @@ begin
 end;
 
 function TParserFixture.ParseError(const AArguments: array of string;
-  AStopAtFirstPositional: Boolean = False): string;
+  const AStopAtFirstPositional: Boolean = False): string;
 begin
   Result := '';
   try

@@ -48,10 +48,10 @@ function ParseArguments(const AArguments: array of string;
 function LeadingFlagGiven(const AArguments: array of string;
   const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
 
-{ The index of END_OF_OPTIONS_MARKER as ParseArguments reads it, or
-  Length(AArguments) when the arguments have none. A `--` that a valued
-  short option takes as its value is not the marker. Applies no option and
-  raises nothing. }
+{ The index of END_OF_OPTIONS_MARKER as ParseArguments reads it without
+  AStopAtFirstPositional, or Length(AArguments) when the arguments have
+  none. A `--` that a valued short option takes as its value is not the
+  marker. Applies no option and raises nothing. }
 function EndOfOptionsIndex(const AArguments: array of string;
   const AOptions: TOptionArray): Integer;
 
@@ -80,7 +80,8 @@ type
   TArgumentKind = (akPositional, akEndOfOptions, akOption, akRejected);
 
   { How one argument reads at its position: the single description of the
-    option syntax that ParseArguments and LeadingFlagGiven share. }
+    option syntax that ParseArguments, LeadingFlagGiven and
+    EndOfOptionsIndex share. }
   TArgumentReading = record
     Kind: TArgumentKind;
     Option: TOptionBase;  { akOption }

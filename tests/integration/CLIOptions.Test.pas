@@ -1,11 +1,10 @@
 { CLIOptions.Test — spawn ./build/lwpt with various argv shapes
   and assert on exit codes + stdout/stderr.
 
-  Lives in the repository's integration group because the CLI parser lives
-  BEHIND ParamStr /
-  ParamCount; a unit test inside the test process would parse its own
-  argv, not arbitrary input. The only way to test option-parsing
-  realistically is to spawn the binary.
+  Lives in the repository's integration group because it covers the built
+  binary: how LWPT's own command registration, handlers and exit codes
+  answer an argv. The parser's and the registry's own rules are covered
+  in-process by the cli package's tests.
 
   Coverage:
 
