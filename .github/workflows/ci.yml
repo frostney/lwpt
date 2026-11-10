@@ -636,6 +636,25 @@ jobs:
   # serving container, live publication from the runner, graceful stop and
   # container replacement on the same volume, and the reverse-proxy example.
   # Full matrix only; release.yml repeats it against the published assets.
+  # Temporary evidence for issue 411: which certificate-URL shapes trustd
+  # fetches on the current macOS image. Removed before the pull request is
+  # ready.
+  trustd-probe:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Probe trustd certificate retrieval
+        run: |
+          sw_vers
+          python3 -I .github/ci/trustd-probe.py \
+            packages/httpclient/source/fixtures "$RUNNER_TEMP/trustd-probe"
+          log show --last 5m --style compact --info --debug \
+            --predicate 'process == "trustd" AND eventMessage CONTAINS[c] "SSRF"' || true
+
   registry-container:
     needs:
       - validate-inputs
