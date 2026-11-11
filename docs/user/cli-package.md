@@ -4,8 +4,8 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.6.0. LWPT 0.8.1 ships `cli` 0.5.1, which has none
-of the host settings below. The [consumer guide](consumer-guide.md) shows how
+This page describes `cli` 0.6.0. LWPT 0.8.1 and earlier ship `cli` 0.5.1,
+which has none of the host settings below. The [consumer guide](consumer-guide.md) shows how
 to add the package to a project.
 
 A host that moves from 0.5.1 to 0.6.0 without changing its code sees three
