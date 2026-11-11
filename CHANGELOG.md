@@ -1,6 +1,24 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.9.0] - 2026-11-11
+
+### Upgrade notes
+
+- **`--` ends option parsing.** `lwpt` and any program built on the `cli` package now read `--` as the end-of-options marker instead of rejecting it as an unknown option. `lwpt health --` runs as it does without arguments, and an argument after `--` is a positional, so commands that take none still refuse it (#410).
+- **Hosts moving from `cli` 0.5.1 to 0.6.0.** Top-level help no longer prints LWPT's tagline: set `Description` to print the host's own. A command named `run` no longer dispatches the subcommand its first argument names unless it sets `AliasesSubcommands`. See `docs/user/cli-package.md` (#410).
+
+### Documentation
+
+- docs: sync the cli guide and release steps with shipped behavior for 0.9.0 (#413)
+
+### Internal
+
+- test(httpclient): keep the macOS certificate-retrieval control observable under trustd's SSRF policy (#412)
+
+### New Features
+
+- feat(cli): let any host program build its whole command line on the subcommand registry (#410)
 ## [0.8.1] - 2026-11-03
 
 ### Upgrade notes
