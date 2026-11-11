@@ -1,14 +1,30 @@
-{ Tests.RetrievalRecorder — loopback HTTP endpoint that counts certificate
-  URL fetches.
+{ Tests.RetrievalRecorder — HTTP endpoint that counts certificate URL
+  fetches from this host.
 
-  The client-options tests use a fixture leaf whose AIA issuer, OCSP, and
-  CRL URLs all point at http://127.0.0.1:6741/. The recorder binds exactly
-  that port, answers every request with an uncacheable 404, and counts the
-  connections it accepted, so a test can prove that a chain evaluation made
-  no retrieval (zero requests) and that the same endpoint is observable when
-  retrieval is allowed (at least one request).
+  The client-options tests use fixture leaves whose AIA issuer, OCSP, and
+  CRL URLs all point at the recorder. The recorder answers every request
+  with an uncacheable 404 and counts the loopback connections it accepted,
+  so a test can prove that a chain evaluation made no retrieval (zero
+  requests) and that the same endpoint is observable when retrieval is
+  allowed (at least one request). It listens where one of two leaves
+  points:
 
-  The port is fixed because it is baked into the certificate, so it sits
+  - rreLoopbackPort, http://127.0.0.1:6741/ (localhost-loopback-aia), bound
+    on 127.0.0.1 only.
+  - rreLocalhostDefaultPort, http://localhost/ (localhost-default-port-aia),
+    macOS only. On macOS 26.7.2 trustd refused to fetch the CA-issuer URL
+    of a leaf when the URL named a local endpoint by IP literal or on a
+    non-default port, logging "skipping SSRF-denied destination"; of the
+    local shapes tried, only a host name on port 80 was still fetched. macOS
+    lets an unprivileged process bind port 80 on the wildcard address but
+    refuses a loopback address with EACCES (observed on 26.5.2), so this
+    endpoint binds [::]:80 dual-stack (localhost may resolve to ::1 or
+    127.0.0.1) and counts only connections from a loopback peer; any other
+    peer is closed uncounted.
+    Port 80 must therefore be free while the test runs, and a host firewall
+    may ask once to let the test program accept connections.
+
+  Port 6741 is fixed because it is baked into the certificate, so it sits
   below every supported platform's default ephemeral range: Linux
   32768-60999, Windows and macOS 49152-65535, and FreeBSD 10000-65535.
   Inside such a range, any outbound loopback connection a concurrent test
@@ -37,14 +53,20 @@ uses
 
 const
   RETRIEVAL_RECORDER_PORT = 6741;
+  { The port of the localhost-default-port-aia URLs, which name no port. }
+  RETRIEVAL_RECORDER_DEFAULT_HTTP_PORT = 80;
   { How long Create retries a bind refused because the port is in use. }
   RETRIEVAL_RECORDER_BIND_MILLISECONDS = 5000;
 
 type
   ERetrievalRecorderError = class(Exception);
 
+  { Where the recorder listens; each matches one fixture leaf's URLs. }
+  TRetrievalRecorderEndpoint = (rreLoopbackPort, rreLocalhostDefaultPort);
+
   TRetrievalRecorder = class(TThread)
   private
+    FEndpoint: TRetrievalRecorderEndpoint;
     FListenSocket: TSocket;
     FRequests: LongInt;
     FRequestLines: TStringList;
@@ -56,7 +78,8 @@ type
   protected
     procedure Execute; override;
   public
-    constructor Create;
+    constructor Create(
+      const AEndpoint: TRetrievalRecorderEndpoint = rreLoopbackPort);
     destructor Destroy; override;
     { Connections accepted so far. }
     function Requests: Integer;
@@ -144,6 +167,77 @@ begin
   {$ENDIF}
 end;
 
+function RecorderEndpointText(
+  const AEndpoint: TRetrievalRecorderEndpoint): string;
+begin
+  if AEndpoint = rreLocalhostDefaultPort then
+    Result := Format('[::]:%d', [RETRIEVAL_RECORDER_DEFAULT_HTTP_PORT])
+  else
+    Result := Format('127.0.0.1:%d', [RETRIEVAL_RECORDER_PORT]);
+end;
+
+{$IFDEF DARWIN}
+{ Opens a dual-stack listener on [::]:RETRIEVAL_RECORDER_DEFAULT_HTTP_PORT.
+  On failure it returns False with the socket closed, the failing call in
+  AStage and its operating-system error in AError. }
+function OpenDefaultPortListener(out ASocket: TSocket; out AStage: string;
+  out AError: Integer): Boolean;
+var
+  Address: TInetSockAddr6;
+  Flag: LongInt;
+begin
+  Result := False;
+  AError := 0;
+  AStage := 'socket()';
+  ASocket := FpSocket(AF_INET6, SOCK_STREAM, 0);
+  if not RecorderSocketValid(ASocket) then
+  begin
+    AError := LastRecorderSocketError;
+    ASocket := INVALID_RECORDER_SOCKET;
+    Exit;
+  end;
+  Flag := 1;
+  FpSetSockOpt(ASocket, SOL_SOCKET, SO_REUSEADDR, @Flag, SizeOf(Flag));
+  { localhost resolves to ::1 or 127.0.0.1, so accept both families. }
+  Flag := 0;
+  AStage := 'setsockopt(IPV6_V6ONLY)';
+  if FpSetSockOpt(ASocket, IPPROTO_IPV6, IPV6_V6ONLY, @Flag,
+     SizeOf(Flag)) = 0 then
+  begin
+    FillChar(Address, SizeOf(Address), 0);
+    Address.sin6_family := AF_INET6;
+    Address.sin6_port := HToNs(RETRIEVAL_RECORDER_DEFAULT_HTTP_PORT);
+    AStage := 'bind()';
+    if FpBind(ASocket, @Address, SizeOf(Address)) = 0 then
+    begin
+      AStage := 'listen()';
+      Result := FpListen(ASocket, 16) = 0;
+    end;
+  end;
+  if not Result then
+  begin
+    AError := LastRecorderSocketError;
+    CloseRecorderSocket(ASocket);
+  end;
+end;
+
+{ Whether APeer, as accepted on the dual-stack listener, is ::1 or an
+  IPv4-mapped 127.0.0.0/8 address. }
+function RecorderPeerIsLoopback(const APeer: TInetSockAddr6): Boolean;
+begin
+  if APeer.sin6_family <> AF_INET6 then
+    Exit(False);
+  if (APeer.sin6_addr.u6_addr32[0] <> 0) or
+     (APeer.sin6_addr.u6_addr32[1] <> 0) then
+    Exit(False);
+  if APeer.sin6_addr.u6_addr32[2] = 0 then
+    Result := APeer.sin6_addr.u6_addr32[3] = HToNl(1)
+  else
+    Result := (APeer.sin6_addr.u6_addr32[2] = HToNl($FFFF)) and
+      (APeer.sin6_addr.u6_addr8[12] = 127);
+end;
+{$ENDIF}
+
 { Opens a listener on 127.0.0.1:RETRIEVAL_RECORDER_PORT. On failure it
   returns False with the socket closed, the failing call in AStage and its
   operating-system error in AError. }
@@ -202,7 +296,20 @@ begin
   end;
 end;
 
-constructor TRetrievalRecorder.Create;
+{ Opens the listener for AEndpoint, reporting failure as
+  OpenRecorderListener does. }
+function OpenEndpointListener(const AEndpoint: TRetrievalRecorderEndpoint;
+  out ASocket: TSocket; out AStage: string; out AError: Integer): Boolean;
+begin
+  {$IFDEF DARWIN}
+  if AEndpoint = rreLocalhostDefaultPort then
+    Exit(OpenDefaultPortListener(ASocket, AStage, AError));
+  {$ENDIF}
+  Result := OpenRecorderListener(ASocket, AStage, AError);
+end;
+
+constructor TRetrievalRecorder.Create(
+  const AEndpoint: TRetrievalRecorderEndpoint);
 var
   Attempts, ErrorCode: Integer;
   Stage: string;
@@ -213,9 +320,15 @@ var
 begin
   inherited Create(True);
   FreeOnTerminate := False;
+  FEndpoint := AEndpoint;
   InitCriticalSection(FLock);
   FRequestLines := TStringList.Create;
   FListenSocket := INVALID_RECORDER_SOCKET;
+  {$IFNDEF DARWIN}
+  if AEndpoint = rreLocalhostDefaultPort then
+    raise ERetrievalRecorderError.Create(
+      'the default-port retrieval recorder is available on macOS only');
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   if WinSock2.WSAStartup($0202, WSAData) <> 0 then
     raise ERetrievalRecorderError.Create('WSAStartup failed');
@@ -227,15 +340,15 @@ begin
   StartedAt := GetTickCount64;
   repeat
     Inc(Attempts);
-    if OpenRecorderListener(FListenSocket, Stage, ErrorCode) then
+    if OpenEndpointListener(AEndpoint, FListenSocket, Stage, ErrorCode) then
       Break;
     if (Stage <> 'bind()') or not RecorderAddressInUse(ErrorCode) or
        (GetTickCount64 - StartedAt >= RETRIEVAL_RECORDER_BIND_MILLISECONDS) then
       raise ERetrievalRecorderError.CreateFmt(
-        'retrieval recorder could not listen on 127.0.0.1:%d (the port is ' +
-        'baked into the fixture certificate): %s failed with error %d (%s) ' +
+        'retrieval recorder could not listen on %s (the port the fixture ' +
+        'certificate''s URLs imply): %s failed with error %d (%s) ' +
         'after %d attempt(s) in %d ms',
-        [RETRIEVAL_RECORDER_PORT, Stage, ErrorCode,
+        [RecorderEndpointText(AEndpoint), Stage, ErrorCode,
          SysErrorMessage(ErrorCode), Attempts,
          GetTickCount64 - StartedAt]);
     Sleep(100);
@@ -317,18 +430,36 @@ end;
 procedure TRetrievalRecorder.Execute;
 var
   Accepted: TSocket;
+  {$IFDEF DARWIN}
+  Peer: TInetSockAddr6;
+  PeerLength: TSockLen;
+  {$ENDIF}
 begin
   while not Terminated do
   begin
     if not RecorderReadable(FListenSocket, 50) then
       Continue;
-    {$IFDEF MSWINDOWS}
+    {$IF DEFINED(MSWINDOWS)}
     Accepted := WinSock2.accept(FListenSocket, nil, nil);
+    {$ELSEIF DEFINED(DARWIN)}
+    FillChar(Peer, SizeOf(Peer), 0);
+    PeerLength := SizeOf(Peer);
+    Accepted := FpAccept(FListenSocket, @Peer, @PeerLength);
     {$ELSE}
     Accepted := FpAccept(FListenSocket, nil, nil);
     {$ENDIF}
     if not RecorderSocketValid(Accepted) then
       Continue;
+    {$IFDEF DARWIN}
+    { The default-port listener is bound on every address; a connection
+      from off the host is not a certificate fetch by this machine. }
+    if (FEndpoint = rreLocalhostDefaultPort) and
+       not RecorderPeerIsLoopback(Peer) then
+    begin
+      CloseRecorderSocket(Accepted);
+      Continue;
+    end;
+    {$ENDIF}
     { Counted on accept: a fetch attempt is what matters, and the count is
       final before the fetching evaluation can see the response. }
     InterlockedIncrement(FRequests);

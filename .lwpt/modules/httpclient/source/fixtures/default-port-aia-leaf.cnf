@@ -1,0 +1,20 @@
+[req]
+distinguished_name = leaf_name
+prompt = no
+
+[leaf_name]
+CN = localhost
+
+# http://localhost/ (port 80) is the tests' default-port retrieval recorder
+# on macOS, where trustd on 26.7.2 stopped fetching the 127.0.0.1:6741 shape:
+# it counts every fetch of these URLs, so a test can prove an evaluation
+# made none.
+[leaf_extensions]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+authorityInfoAccess = caIssuers;URI:http://localhost/issuer.crt,OCSP;URI:http://localhost/ocsp
+crlDistributionPoints = URI:http://localhost/leaf.crl
