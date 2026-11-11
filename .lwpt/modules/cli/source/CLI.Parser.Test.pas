@@ -1,9 +1,13 @@
-{ CLI.Parser.Test — real-argv coverage for valued short options.
+{ CLI.Parser.Test — option syntax over real argv and over argument arrays.
 
-  ParseCommandLine reads ParamStr / ParamCount directly, so each test
-  spawns this binary in child mode with the argv shape under test. The
-  child registers a representative option table, parses its own argv,
-  and checks the resulting option objects and positionals. }
+  ParseCommandLine reads ParamStr / ParamCount directly, so each of its
+  tests spawns this binary in child mode with the argv shape under test.
+  The child registers a representative option table, parses its own argv,
+  and checks the resulting option objects and positionals.
+
+  ParseArguments, LeadingFlagGiven and EndOfOptionsIndex take the arguments
+  as an array, so the end-of-options marker and stop-at-first-positional
+  cases run in-process. }
 
 program CLI.Parser.Test;
 
@@ -42,12 +46,133 @@ type
     procedure TestValuelessShortFlag;
     procedure TestLongEqualsValueUnchanged;
     procedure TestLongSeparatedValueUnchanged;
+    procedure TestCommandLineArgumentsStartAtTheGivenPosition;
   end;
+
+  TCLIParserArgumentsSuite = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestOptionsAreReadAfterPositionalsByDefault;
+    procedure TestEndOfOptionsMarkerMakesTheRestPositional;
+    procedure TestEndOfOptionsMarkerIsNotAPositional;
+    procedure TestEndOfOptionsMarkerInValuePosition;
+    procedure TestEndOfOptionsIndexFollowsTheParser;
+    procedure TestStopAtFirstPositionalPassesTheRestThrough;
+    procedure TestStopAtFirstPositionalConsumesOnlyALeadingMarker;
+    procedure TestStopAtFirstPositionalRejectsLeadingUnknownOptions;
+    procedure TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken;
+    procedure TestLeadingFlagGivenBeforeTheFirstPositional;
+    procedure TestLeadingFlagNotGivenPastTheEndOfOptions;
+    procedure TestLeadingFlagGivenAppliesNothing;
+  end;
+
+  { A representative option table for the in-process tests. }
+  TParserFixture = class
+  public
+    Options: TOptionArray;
+    Output: TStringOption;
+    Define: TRepeatableOption;
+    Verbose: TFlagOption;
+    constructor Create;
+    destructor Destroy; override;
+    { ParseArguments, with the positionals joined by `|`. }
+    function Parse(const AArguments: array of string;
+      const AStopAtFirstPositional: Boolean = False): string;
+    { The TParseError message ParseArguments raises, or '' for none. }
+    function ParseError(const AArguments: array of string;
+      const AStopAtFirstPositional: Boolean = False): string;
+    function HelpGiven(const AArguments: array of string): Boolean;
+  end;
+
+const
+  POSITIONAL_SEPARATOR = '|';
+  HELP_LONG_NAME = 'help';
+  HELP_SHORT_NAME = 'h';
+
+constructor TParserFixture.Create;
+begin
+  inherited Create;
+  Output := TStringOption.Create('output', 'output path');
+  Output.ShortName := 'o';
+  Define := TRepeatableOption.Create('define', 'conditional symbol');
+  Define.ShortName := 'd';
+  Define.AllowAttachedShortValue := True;
+  Verbose := TFlagOption.Create('verbose', 'say more');
+  Verbose.ShortName := 'V';
+  SetLength(Options, 3);
+  Options[0] := Output;
+  Options[1] := Define;
+  Options[2] := Verbose;
+end;
+
+destructor TParserFixture.Destroy;
+begin
+  Verbose.Free;
+  Define.Free;
+  Output.Free;
+  inherited Destroy;
+end;
+
+function TParserFixture.Parse(const AArguments: array of string;
+  const AStopAtFirstPositional: Boolean = False): string;
+var
+  Positionals: TStringList;
+  I: Integer;
+begin
+  Result := '';
+  Positionals := ParseArguments(AArguments, Options, AStopAtFirstPositional);
+  try
+    for I := 0 to Positionals.Count - 1 do
+    begin
+      if I > 0 then Result := Result + POSITIONAL_SEPARATOR;
+      Result := Result + Positionals[I];
+    end;
+  finally
+    Positionals.Free;
+  end;
+end;
+
+function TParserFixture.ParseError(const AArguments: array of string;
+  const AStopAtFirstPositional: Boolean = False): string;
+begin
+  Result := '';
+  try
+    Parse(AArguments, AStopAtFirstPositional);
+  except
+    on E: TParseError do Result := E.Message;
+  end;
+end;
+
+function TParserFixture.HelpGiven(
+  const AArguments: array of string): Boolean;
+begin
+  Result := LeadingFlagGiven(AArguments, Options, HELP_LONG_NAME,
+    HELP_SHORT_NAME);
+end;
 
 function ScenarioFailure(const AMessage: string): Integer;
 begin
   WriteLn(ErrOutput, AMessage);
   Result := 1;
+end;
+
+{ The child's own arguments start at position 3, after the mode word and
+  the scenario name. }
+function RunCommandLineArgumentsScenario: Integer;
+var
+  Arguments: TCommandLineArguments;
+begin
+  Arguments := GetCommandLineArguments(3);
+  if Length(Arguments) <> 3 then
+    Exit(ScenarioFailure('wrong argument count from position 3'));
+  if (Arguments[0] <> 'first') or (Arguments[1] <> '--') or
+     (Arguments[2] <> '-last') then
+    Exit(ScenarioFailure('arguments from position 3 differ from argv'));
+  if Length(GetCommandLineArguments) <> ParamCount then
+    Exit(ScenarioFailure('default position does not start at argv[1]'));
+  if Length(GetCommandLineArguments(ParamCount + 1)) <> 0 then
+    Exit(ScenarioFailure('a position past argv is not empty'));
+  Result := 0;
 end;
 
 function RunParserScenario(const AScenario: string): Integer;
@@ -276,6 +401,265 @@ begin
     ['--output', 'out.wasm'])).ToBe(0);
 end;
 
+procedure TCLIParserSuite.TestCommandLineArgumentsStartAtTheGivenPosition;
+begin
+  Expect<Integer>(RunChild('command-line-arguments',
+    ['first', '--', '-last'])).ToBe(0);
+end;
+
+procedure TCLIParserArgumentsSuite.TestOptionsAreReadAfterPositionalsByDefault;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['main.x', '--verbose', 'other',
+      '-o', 'out'])).ToBe('main.x|other');
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(True);
+    Expect<string>(Fixture.Output.ValueOr('')).ToBe('out');
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestEndOfOptionsMarkerMakesTheRestPositional;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['--verbose', 'first', '--', '--output',
+      'out', '-dDEBUG', '--unknown', '-x', '--', 'help'])).ToBe(
+      'first|--output|out|-dDEBUG|--unknown|-x|--|help');
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(True);
+    Expect<Boolean>(Fixture.Output.Present).ToBe(False);
+    Expect<Integer>(Fixture.Define.Values.Count).ToBe(0);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestEndOfOptionsMarkerIsNotAPositional;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['--'])).ToBe('');
+    Expect<string>(Fixture.Parse(['--verbose', '--'])).ToBe('');
+    Expect<string>(Fixture.Parse(['first', '--', 'second'])).ToBe(
+      'first|second');
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestEndOfOptionsMarkerInValuePosition;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    { A separated long value never begins with a hyphen, so the marker
+      is not taken for one. }
+    Expect<string>(Fixture.ParseError(['--output', '--', 'out'])).ToBe(
+      '--output requires a value');
+    { A separated short value may begin with a hyphen, the marker
+      included. }
+    Expect<string>(Fixture.Parse(['-o', '--', '--verbose'])).ToBe('');
+    Expect<string>(Fixture.Output.ValueOr('')).ToBe('--');
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(True);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestEndOfOptionsIndexFollowsTheParser;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<Integer>(EndOfOptionsIndex([], Fixture.Options)).ToBe(0);
+    Expect<Integer>(EndOfOptionsIndex(['first', 'second'],
+      Fixture.Options)).ToBe(2);
+    Expect<Integer>(EndOfOptionsIndex(['first', '--', 'second', '--'],
+      Fixture.Options)).ToBe(1);
+    Expect<Integer>(EndOfOptionsIndex(['--bogus', '-x', '--'],
+      Fixture.Options)).ToBe(2);
+    { A valued short option reads the marker as its value; a long one
+      never does. }
+    Expect<Integer>(EndOfOptionsIndex(['-o', '--', 'first'],
+      Fixture.Options)).ToBe(3);
+    Expect<Integer>(EndOfOptionsIndex(['-o', '--', '--', 'first'],
+      Fixture.Options)).ToBe(2);
+    Expect<Integer>(EndOfOptionsIndex(['--output', '--', 'first'],
+      Fixture.Options)).ToBe(1);
+    Expect<Boolean>(Fixture.Output.Present).ToBe(False);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestStopAtFirstPositionalPassesTheRestThrough;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['--output', 'out', '-dDEBUG', 'main.x',
+      '--port', '80', '--', '--verbose', '-o', 'help', '--help'],
+      True)).ToBe('main.x|--port|80|--|--verbose|-o|help|--help');
+    Expect<string>(Fixture.Output.ValueOr('')).ToBe('out');
+    Expect<Integer>(Fixture.Define.Values.Count).ToBe(1);
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(False);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.
+  TestStopAtFirstPositionalConsumesOnlyALeadingMarker;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['--verbose', '--', '--port', 'main.x',
+      '--'], True)).ToBe('--port|main.x|--');
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(True);
+    Expect<string>(Fixture.Parse(['--'], True)).ToBe('');
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.
+  TestStopAtFirstPositionalRejectsLeadingUnknownOptions;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.ParseError(['--bogus', 'main.x'], True)).ToBe(
+      'Unknown option: --bogus');
+    Expect<string>(Fixture.ParseError(['-x', 'main.x'], True)).ToBe(
+      'Unknown option: -x');
+    Expect<string>(Fixture.ParseError(['--output'], True)).ToBe(
+      '--output requires a value');
+    { The same spellings after the first positional are not read. }
+    Expect<string>(Fixture.ParseError(['main.x', '--bogus', '-x',
+      '--output'], True)).ToBe('');
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.
+  TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    { An unmatched multi-character single-dash token and a lone hyphen
+      are positionals, so each one ends option parsing. }
+    Expect<string>(Fixture.Parse(['-abc', '--verbose'], True)).ToBe(
+      '-abc|--verbose');
+    Expect<string>(Fixture.Parse(['-', '--verbose'], True)).ToBe(
+      '-|--verbose');
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(False);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestLeadingFlagGivenBeforeTheFirstPositional;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<Boolean>(Fixture.HelpGiven(['--help'])).ToBe(True);
+    Expect<Boolean>(Fixture.HelpGiven(['-h'])).ToBe(True);
+    Expect<Boolean>(Fixture.HelpGiven(['--verbose', '--output', 'out',
+      '-dDEBUG', '-h', 'main.x'])).ToBe(True);
+    { Arguments the parser would reject do not hide the flag. }
+    Expect<Boolean>(Fixture.HelpGiven(['--bogus', '-x', '--help'])).ToBe(
+      True);
+    Expect<Boolean>(Fixture.HelpGiven(['--output', '--help'])).ToBe(True);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestLeadingFlagNotGivenPastTheEndOfOptions;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<Boolean>(Fixture.HelpGiven([])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpGiven(['main.x', '--help', '-h'])).ToBe(
+      False);
+    Expect<Boolean>(Fixture.HelpGiven(['--', '--help'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpGiven(['-abc', '-h'])).ToBe(False);
+    { A valued short option reads the next argument as its value. }
+    Expect<Boolean>(Fixture.HelpGiven(['-o', '-h'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpGiven(['-d', '--help'])).ToBe(False);
+    { Only the exact spellings count. }
+    Expect<Boolean>(Fixture.HelpGiven(['--help=yes'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpGiven(['--HELP', '-H'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpGiven(['help'])).ToBe(False);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestLeadingFlagGivenAppliesNothing;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<Boolean>(Fixture.HelpGiven(['--verbose', '--output', 'out',
+      '-dDEBUG', '--help'])).ToBe(True);
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(False);
+    Expect<Boolean>(Fixture.Output.Present).ToBe(False);
+    Expect<Integer>(Fixture.Define.Values.Count).ToBe(0);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.SetupTests;
+begin
+  Test('options are read after positionals by default',
+    TestOptionsAreReadAfterPositionalsByDefault);
+  Test('the end-of-options marker makes every later argument positional',
+    TestEndOfOptionsMarkerMakesTheRestPositional);
+  Test('the end-of-options marker itself is not a positional',
+    TestEndOfOptionsMarkerIsNotAPositional);
+  Test('the marker is a short option''s value but never a long option''s',
+    TestEndOfOptionsMarkerInValuePosition);
+  Test('the end-of-options index is the marker the parser reads',
+    TestEndOfOptionsIndexFollowsTheParser);
+  Test('stop-at-first-positional returns the rest of the line verbatim',
+    TestStopAtFirstPositionalPassesTheRestThrough);
+  Test('stop-at-first-positional consumes only a leading marker',
+    TestStopAtFirstPositionalConsumesOnlyALeadingMarker);
+  Test('stop-at-first-positional rejects unknown options before the positional',
+    TestStopAtFirstPositionalRejectsLeadingUnknownOptions);
+  Test('stop-at-first-positional ends at an unmatched single-dash token',
+    TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken);
+  Test('a leading flag is found before the first positional',
+    TestLeadingFlagGivenBeforeTheFirstPositional);
+  Test('a leading flag is not found past the end of options or as a value',
+    TestLeadingFlagNotGivenPastTheEndOfOptions);
+  Test('looking for a leading flag applies no option',
+    TestLeadingFlagGivenAppliesNothing);
+end;
+
 procedure TCLIParserSuite.SetupTests;
 begin
   Test('separated valued short option binds the following argv',
@@ -296,17 +680,24 @@ begin
     TestLongEqualsValueUnchanged);
   Test('long space-separated values remain unchanged',
     TestLongSeparatedValueUnchanged);
+  Test('GetCommandLineArguments returns argv from the given position',
+    TestCommandLineArgumentsStartAtTheGivenPosition);
 end;
 
 begin
   if (ParamCount >= 2) and (ParamStr(1) = CHILD_MODE) then
   begin
-    ExitCode := RunParserScenario(ParamStr(2));
+    if ParamStr(2) = 'command-line-arguments' then
+      ExitCode := RunCommandLineArgumentsScenario
+    else
+      ExitCode := RunParserScenario(ParamStr(2));
     Exit;
   end;
 
   TestRunnerProgram.AddSuite(TCLIParserSuite.Create(
-    'CLI.Parser: valued short options'));
+    'CLI.Parser: process arguments'));
+  TestRunnerProgram.AddSuite(TCLIParserArgumentsSuite.Create(
+    'CLI.Parser: argument arrays'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

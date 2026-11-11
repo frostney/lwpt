@@ -8,8 +8,8 @@ platform	windows/x86
 platform	windows/x86_64
 # kind	platform rule	project-relative program	suites	cases
 program	*	packages/cli/source/CLI.Events.Test.pas	1	5
-program	*	packages/cli/source/CLI.Parser.Test.pas	1	9
-program	*	packages/cli/source/CLI.Subcommands.Test.pas	1	8
+program	*	packages/cli/source/CLI.Parser.Test.pas	2	22
+program	*	packages/cli/source/CLI.Subcommands.Test.pas	2	27
 program	*	packages/httpclient/source/HTTPClient.Test.pas	5	63
 program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	61
 program	*	packages/httpclient/source/TransportSecurity.Test.pas	2	56
@@ -106,7 +106,7 @@ program	windows/*	tests/integration/BuildEntries.Test.pas	1	13
 program	*	tests/integration/BuildFairness.Test.pas	1	2
 program	*	tests/integration/BuildSessions.Test.pas	1	16
 program	*	tests/integration/ChildWaitGuard.Test.pas	1	12
-program	*	tests/integration/CLIOptions.Test.pas	1	36
+program	*	tests/integration/CLIOptions.Test.pas	1	39
 program	*	tests/integration/CompilerProfiles.Test.pas	1	18
 program	*	tests/integration/Duplication.Test.pas	1	6
 program	*	tests/integration/ExtractPathological.Test.pas	2	22

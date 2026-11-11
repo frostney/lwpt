@@ -1,20 +1,23 @@
 { CLIOptions.Test — spawn ./build/lwpt with various argv shapes
   and assert on exit codes + stdout/stderr.
 
-  Lives in the repository's integration group because the CLI parser lives
-  BEHIND ParamStr /
-  ParamCount; a unit test inside the test process would parse its own
-  argv, not arbitrary input. The only way to test option-parsing
-  realistically is to spawn the binary.
+  Lives in the repository's integration group because it covers the built
+  binary: how LWPT's own command registration, handlers and exit codes
+  answer an argv. The parser's and the registry's own rules are covered
+  by the cli package's tests.
 
   Coverage:
 
     - `lwpt --help` and `lwpt -h` (alias) → exit 0, stdout lists every
       registered subcommand. Catches accidental subcommand removal +
       help formatting regressions.
-    - `lwpt unknownsubcommand` → exit != 0, stderr names the unknown
-      subcommand. Catches "silent fallthrough" regressions where an
-      unknown verb does nothing.
+    - `lwpt unknownsubcommand` → exit 1, stderr names the unknown
+      subcommand, the help that follows goes to stdout. Catches "silent
+      fallthrough" regressions where an unknown verb does nothing.
+    - The other registry defaults LWPT keeps: a bare `lwpt` prints help
+      and exits 0, and an unknown option exits 1.
+    - `--` ends option parsing: what follows is positional, including
+      option and help spellings.
     - `lwpt build --mode release <scratch project>` → the space-separated
       option-value regression. CLI.Parser accepts the space-separated
       form (`--mode release`) for plain string/integer options as well
@@ -53,7 +56,10 @@ type
     procedure SetupTests; override;
     procedure TestHelpListsAllSubcommands;
     procedure TestShortHelpAlias;
-    procedure TestUnknownSubcommandExitsNonZero;
+    procedure TestUnknownSubcommandExitsOneWithHelpOnStdout;
+    procedure TestBareInvocationPrintsHelpAndSucceeds;
+    procedure TestUnknownOptionExitsOne;
+    procedure TestEndOfOptionsMarkerMakesLaterArgumentsPositional;
     procedure TestBuildModeSpaceSeparatedValueParses;
     procedure TestBuildModeEqualsSeparatedValueParses;
     procedure TestBuildModeInvalidValueExitsNonZero;
@@ -266,18 +272,58 @@ begin
   Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
 end;
 
-procedure TCLIOptionsE2E.TestUnknownSubcommandExitsNonZero;
+procedure TCLIOptionsE2E.TestUnknownSubcommandExitsOneWithHelpOnStdout;
 var R: TLwptResult;
 begin
+  { LWPT keeps the registry's usage-error defaults: the code a failing
+    command returns, the message on stderr, the help on stdout. }
   R := RunLwpt(['does-not-exist-as-a-subcommand']);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('unknown command: does-not-exist-as-a-subcommand',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('usage: lwpt <command> [options]', R.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('usage:', R.Stderr) > 0).ToBe(False);
+end;
+
+procedure TCLIOptionsE2E.TestBareInvocationPrintsHelpAndSucceeds;
+var R: TLwptResult;
+begin
+  R := RunLwpt([]);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  { LWPT's description leads the help. Its version flag is accepted
+    without being listed, so the help has no options section. }
+  Expect<Boolean>(Pos('lightweight Pascal toolkit', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('lightweight Pascal toolkit', R.Stdout)
+    < Pos('usage: lwpt <command> [options]', R.Stdout)).ToBe(True);
+  Expect<Boolean>(Pos('install', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('options:', R.Stdout) > 0).ToBe(False);
+end;
+
+procedure TCLIOptionsE2E.TestUnknownOptionExitsOne;
+var R: TLwptResult;
+begin
+  R := RunLwpt(['build', '--does-not-exist'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('lwpt build: Unknown option: --does-not-exist',
+    R.Stderr) > 0).ToBe(True);
+end;
+
+procedure TCLIOptionsE2E.TestEndOfOptionsMarkerMakesLaterArgumentsPositional;
+var R: TLwptResult;
+begin
+  { format rejects a positional before it touches any file, so the
+    rejection shows how each argument after the marker was read. }
+  R := RunLwpt(['format', '--', '--check'], FScratch);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  { Error message should mention the unknown subcommand somewhere
-    (stdout or stderr; the framework hasn't standardised which yet). }
-  Expect<Boolean>(
-    (Pos('does-not-exist', R.Stdout) > 0)
-    or (Pos('does-not-exist', R.Stderr) > 0)
-    or (Pos('unknown', LowerCase(R.Stdout + R.Stderr)) > 0)
-  ).ToBe(True);
+  Expect<Boolean>(Pos('lwpt format: unexpected argument "--check"',
+    R.Stderr) > 0).ToBe(True);
+
+  R := RunLwpt(['format', '--', 'help'], FScratch);
+  Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('lwpt format: unexpected argument "help"',
+    R.Stderr) > 0).ToBe(True);
+  Expect<Boolean>(Pos('usage:', R.Stdout) > 0).ToBe(False);
 end;
 
 procedure TCLIOptionsE2E.TestBuildModeSpaceSeparatedValueParses;
@@ -978,8 +1024,14 @@ begin
     TestHelpListsAllSubcommands);
   Test('-h is an alias for --help and produces equivalent output',
     TestShortHelpAlias);
-  Test('unknown subcommand exits non-zero + names the unknown verb',
-    TestUnknownSubcommandExitsNonZero);
+  Test('unknown subcommand exits 1, named on stderr, with help on stdout',
+    TestUnknownSubcommandExitsOneWithHelpOnStdout);
+  Test('bare lwpt prints help led by its description and exits 0',
+    TestBareInvocationPrintsHelpAndSucceeds);
+  Test('unknown option exits 1 and is named on stderr',
+    TestUnknownOptionExitsOne);
+  Test('-- makes option and help spellings after it positional',
+    TestEndOfOptionsMarkerMakesLaterArgumentsPositional);
   Test('build --mode release (space-separated value) parses correctly',
     TestBuildModeSpaceSeparatedValueParses);
   Test('build --mode=release (equals-separated value) parses correctly',

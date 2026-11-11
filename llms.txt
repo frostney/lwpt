@@ -30,6 +30,7 @@ released packages; main-branch references may describe newer behavior.
 - [Run tasks](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0013-run-subcommand-and-build-rename.md): Manifest commands for project-specific work.
 - [Lifecycle hooks](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0011-build-lifecycle-hooks.md): Hook commands and staleness checks.
 - [Agent reference](https://raw.githubusercontent.com/frostney/lwpt/main/docs/adr/0027-agents-subcommand.md): Generate and check project command documentation.
+- [CLI package](https://raw.githubusercontent.com/frostney/lwpt/main/docs/user/cli-package.md): Build a program's command line: description, top-level flags, argument pass-through, and usage errors.
 - [CLI options](https://raw.githubusercontent.com/frostney/lwpt/main/packages/cli/source/CLI.Options.pas): Application argument types.
 - [CLI subcommands](https://raw.githubusercontent.com/frostney/lwpt/main/packages/cli/source/CLI.Subcommands.pas): Command registration, dispatch, and help.
 

@@ -5,6 +5,7 @@ Documentation for using LWPT in your own project and for running an LWPT registr
 | File | Covers |
 | --- | --- |
 | [`consumer-guide.md`](./consumer-guide.md) | Released-tool installation, CLI and testing dependencies, runnable consumer example, tasks, and capability references |
+| [`cli-package.md`](./cli-package.md) | Building a program's command line on the `cli` package: host description, top-level flags, argument pass-through, the end-of-options marker, subcommand aliasing, usage errors, and in-process tests |
 | [`build-system.md`](./build-system.md) | Bootstrap pattern, `lwpt build` contract, `[build]` section + lifecycle hooks (`[prebuild]` / `[postbuild]` / `[pretest]` / etc.), `build/` output rules, cross-compile |
 | [`health.md`](./health.md) | `lwpt health` scope, Pascal complexity scoring, thresholds, Git hotspot formula, and JSON schema |
 | [`registry-spec.md`](./registry-spec.md) | Open origin-and-mirror HTTP registry protocol: stable identity, immutable records/objects, signed snapshots, publication, synchronization, and conformance fixtures |

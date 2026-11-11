@@ -298,7 +298,7 @@ subcommand names hard-error. Dependency tasks are dropped without execution.
 interpreters), "recipe" (Just-specific).
 
 **Run**:
-The `lwpt run <name>` subcommand. Two behaviours under one verb: if `<name>` matches any registered subcommand, aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Run task](#run-task) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, not in the run-handler — option parsing for subcommands works unchanged.
+The `lwpt run <name>` subcommand. Two behaviours under one verb: if `<name>` matches any registered subcommand, aliases to that subcommand with the remaining args (`lwpt run install --frozen` ≡ `lwpt install --frozen`); otherwise looks up `<name>` in the manifest's [Run task](#run-task) entries and invokes it. `lwpt run` alone lists every callable name. The aliasing layer is in the CLI dispatcher, which the `run` command opts in to at registration, not in the run-handler — option parsing for subcommands works unchanged.
 *Avoid*: "exec" (executes-into-this connotation; lwpt run is dispatch + spawn).
 
 **Agents block**:
