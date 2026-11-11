@@ -5,7 +5,7 @@ All notable changes to LWPT are documented in this file. The format follows [Kee
 
 ### Upgrade notes
 
-- **`--` ends option parsing.** `lwpt` and any program built on the `cli` package now read `--` as the end-of-options marker instead of rejecting it as an unknown option. `lwpt health --` runs as it does without arguments, and an argument after `--` is a positional, so commands that take none still refuse it (#410).
+- **`--` ends option parsing.** `lwpt` and any program built on the `cli` package now read `--` after a command name as the end-of-options marker instead of rejecting it as an unknown option. `lwpt health --` runs as it does without arguments, and an argument after `--` is a positional, so commands that take none still refuse it (#410).
 - **Hosts moving from `cli` 0.5.1 to 0.6.0.** Top-level help no longer prints LWPT's tagline: set `Description` to print the host's own. A command named `run` no longer dispatches the subcommand its first argument names unless it sets `AliasesSubcommands`. See `docs/user/cli-package.md` (#410).
 
 ### Documentation
