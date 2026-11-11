@@ -13,7 +13,7 @@
 # --with-tag-message and prepend only the new section, so published
 # sections stay byte-identical:
 #
-#   git-cliff --unreleased --tag <version> --with-tag-message "$(cat notes.md)" --prepend CHANGELOG.md
+#   git-cliff --unreleased --tag <version> --with-tag-message="$(cat notes.md)" --prepend CHANGELOG.md
 #
 # Tag the merged release commit with the same notes:
 #
