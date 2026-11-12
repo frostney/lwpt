@@ -113,6 +113,7 @@ type
     Kind: TArgumentKind;
     Option: TOptionBase;  { akOption }
     Value: string;        { akOption }
+    HasEquals: Boolean;   { akOption: the argument spelled `=` }
     Width: Integer;       { arguments read: 2 with a separated value }
     Rejection: string;    { akRejected: the TParseError message }
   end;
@@ -222,6 +223,7 @@ begin
   Result.Option := nil;
   Result.Value := '';
   Result.Width := 1;
+  Result.HasEquals := False;
   Result.Rejection := '';
 
   if Arg = END_OF_OPTIONS_MARKER then
@@ -229,17 +231,18 @@ begin
   else if Copy(Arg, 1, Length(LONG_FLAG_PREFIX)) = LONG_FLAG_PREFIX then
   begin
     SplitFlag(Arg, Name, Result.Value, HasEquals);
+    Result.HasEquals := HasEquals;
     Result.Option := FindOption(AOptions, Name);
     if Result.Option = nil then
     begin
       Result.Kind := akRejected;
       Result.Rejection := Format('Unknown option: --%s', [Name]);
     end
-    { Plain string/integer options accept the space-separated form
-      (--mode release) as well as --mode=release; flag options
-      still take no value. }
+    { Valued options accept the space-separated form (--mode release) as
+      well as --mode=release; an option that declines a separated value,
+      such as a flag, takes none. }
     else if (Result.Value = '') and (not HasEquals) and
-            not (Result.Option is TFlagOption) then
+            Result.Option.ConsumesSeparateValue then
     begin
       if (not HasNext) or
          (Copy(AArguments[AIndex + 1], 1, 1) = SHORT_FLAG_CHAR) then
@@ -262,7 +265,7 @@ begin
     Result.Option := FindOptionShortExact(AOptions, Name);
     if Result.Option <> nil then
     begin
-      if not (Result.Option is TFlagOption) then
+      if Result.Option.ConsumesSeparateValue then
       begin
         if not HasNext then
         begin
@@ -322,7 +325,7 @@ begin
         akRejected:
           raise TParseError.Create(Reading.Rejection);
         akOption:
-          Reading.Option.Apply(Reading.Value);
+          Reading.Option.ApplyExplicit(Reading.Value, Reading.HasEquals);
         akEndOfOptions:
           VerbatimFrom := I + 1;
         akPositional:
