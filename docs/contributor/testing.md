@@ -523,7 +523,7 @@ inventory never touches the network.
 <!-- lwpt:test-inventory-counts:begin -->
 | Files | Registered test cases |
 | ---: | --- |
-| **114** | **2016 Darwin / 2018 Linux / 1977 Windows** |
+| **114** | **2017 Darwin / 2019 Linux / 1978 Windows** |
 <!-- lwpt:test-inventory-counts:end -->
 
 ## TestingPascalLibrary self-test
