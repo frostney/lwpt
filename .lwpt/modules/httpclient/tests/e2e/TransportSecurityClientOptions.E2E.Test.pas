@@ -6,8 +6,9 @@
   Windows, Secure Transport on macOS) over a real loopback socket. The client
   side is the production StartTransportSecurity path and HTTPClient, so each
   case exercises the platform's native client backend end to end. Requiring a
-  client certificate uses the test-only server seam; nothing else reaches
-  past the published API. }
+  client certificate uses the test-only server seam, and on macOS reading
+  back the trust passes' network-fetch settings uses the test-only client
+  seam; nothing else reaches past the published API. }
 
 program TransportSecurityClientOptions.E2E.Test;
 
@@ -134,6 +135,7 @@ type
     procedure TestAnchorsOnlyRejectsUnrelatedCA;
     procedure TestAnchorsOnlyNeverFetchesUnreachableURLs;
     procedure TestAnchorPassMakesNoObservableRetrieval;
+    procedure TestAnchorPassEvaluatesWithNetworkFetchDisabled;
     procedure TestSystemAndAnchorsVerifiesConfiguredCA;
     procedure TestSystemAndAnchorsRejectsUnrelatedCA;
     procedure TestPeerCertificateIsServerLeaf;
@@ -802,6 +804,31 @@ begin
     Contains(ARequestLines, ' /leaf.crl ');
 end;
 
+{$IFDEF DARWIN}
+function NetworkFetchName(
+  const ASetting: TTransportSecurityTestNetworkFetch): string;
+begin
+  Result := '';
+  case ASetting of
+    tstnfNotEvaluated: Result := 'not evaluated';
+    tstnfUnreadable: Result := 'unreadable';
+    tstnfDisabled: Result := 'fetch disabled';
+    tstnfAllowed: Result := 'fetch allowed';
+  end;
+end;
+
+{ The network-fetch settings the latest client trust evaluation's passes
+  evaluated with, labelled with the step, so that a failure names both. }
+function DescribeTrustPasses(const AStep: string): string;
+var
+  AnchorPass, FallbackPass: TTransportSecurityTestNetworkFetch;
+begin
+  TransportSecurityTestSecureTransportTrustPasses(AnchorPass, FallbackPass);
+  Result := Format('%s: anchor pass %s, fallback %s', [AStep,
+    NetworkFetchName(AnchorPass), NetworkFetchName(FallbackPass)]);
+end;
+{$ENDIF}
+
 { ── tests ────────────────────────────────────────────────────────── }
 
 procedure TTransportSecurityClientOptionsE2ETests.TestAnchorsOnlyVerifiesConfiguredCA;
@@ -918,6 +945,57 @@ begin
   finally
     Recorder.Free;
   end;
+  {$ENDIF}
+end;
+
+{ The macOS proof that does not depend on trustd's fetch policy: the
+  client seam reads the network-fetch setting back from the SecTrust each
+  pass evaluates, just before it evaluates. The anchor pass must evaluate
+  with fetching disabled whether it accepts or rejects and in both trust
+  modes. Neither mode may reach the fallback once the anchor pass accepts,
+  anchors-only never reaches it, and the system-plus-anchors fallback must
+  evaluate with fetching allowed, as ADR-0050 allows. Should trustd stop
+  fetching from the recorder, this case and the recorder's zero-request
+  assertion remain the proof. }
+procedure TTransportSecurityClientOptionsE2ETests.TestAnchorPassEvaluatesWithNetworkFetchDisabled;
+{$IFDEF DARWIN}
+var
+  ErrorMessage: string;
+  Peer: TBytes;
+  Response: AnsiString;
+  Served: TServedConnection;
+{$ENDIF}
+begin
+  {$IFDEF DARWIN}
+  TransportSecurityTestResetSecureTransportTrustPasses;
+  Expect<string>(RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
+    AnchorsOnly(TEST_ROOT_PATH), False, Response, Peer, Served)).ToBe('');
+  Expect<string>(DescribeTrustPasses('accepting anchors-only')).ToBe(
+    'accepting anchors-only: anchor pass fetch disabled, ' +
+    'fallback not evaluated');
+
+  TransportSecurityTestResetSecureTransportTrustPasses;
+  ErrorMessage := RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
+    AnchorsOnly(UNRELATED_ROOT_PATH), False, Response, Peer, Served);
+  Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
+  Expect<string>(DescribeTrustPasses('rejecting anchors-only')).ToBe(
+    'rejecting anchors-only: anchor pass fetch disabled, ' +
+    'fallback not evaluated');
+
+  TransportSecurityTestResetSecureTransportTrustPasses;
+  Expect<string>(RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
+    SystemAndAnchors(TEST_ROOT_PATH), False, Response, Peer, Served)).ToBe('');
+  Expect<string>(DescribeTrustPasses('accepting system plus anchors')).ToBe(
+    'accepting system plus anchors: anchor pass fetch disabled, ' +
+    'fallback not evaluated');
+
+  TransportSecurityTestResetSecureTransportTrustPasses;
+  ErrorMessage := RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
+    SystemAndAnchors(UNRELATED_ROOT_PATH), False, Response, Peer, Served);
+  Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
+  Expect<string>(DescribeTrustPasses('rejecting system plus anchors')).ToBe(
+    'rejecting system plus anchors: anchor pass fetch disabled, ' +
+    'fallback fetch allowed');
   {$ENDIF}
 end;
 
@@ -1516,6 +1594,15 @@ begin
     TestAnchorsOnlyNeverFetchesUnreachableURLs);
   Test('the anchor pass makes no observable certificate retrieval',
     TestAnchorPassMakesNoObservableRetrieval);
+  {$ENDIF}
+  {$IFDEF DARWIN}
+  Test('the macOS anchor pass evaluates with network fetching disabled',
+    TestAnchorPassEvaluatesWithNetworkFetchDisabled);
+  {$ELSE}
+  Skip('the macOS anchor pass evaluates with network fetching disabled',
+    TestAnchorPassEvaluatesWithNetworkFetchDisabled,
+    'Secure Transport only: OpenSSL never fetches, and Windows pins its ' +
+    'offline anchor engine in TransportSecurity.Test');
   {$ENDIF}
   Test('system-plus-anchors trust verifies the configured CA',
     TestSystemAndAnchorsVerifiesConfiguredCA);

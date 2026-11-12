@@ -342,3 +342,17 @@ the handshake version of the check runs on Unix and macOS only. A second
 fixture pointing at never-routed TEST-NET-1 (`192.0.2.1`) and the
 anchors-only E2E cases keep 5 s and 8 s bounds as latency checks, not as
 proof.
+
+The macOS positive control depends on trustd's fetch policy, so macOS has
+a second proof that does not. A test-only client seam, compiled only when
+`PRODUCTION` is not defined, reads the network-fetch setting back with
+`SecTrustGetNetworkFetchAllowed` from the `SecTrust` each pass evaluates,
+just before it evaluates. An E2E case asserts that the anchor pass
+evaluates with fetching disabled whether it accepts or rejects, in both
+trust modes; that neither mode reaches the fallback once the anchor pass
+accepts, and anchors-only never does; and that the system-plus-anchors
+fallback evaluates with fetching allowed. Removing
+`SecTrustSetNetworkFetchAllowed(false)` from the anchor pass fails that
+case. If a later macOS also refuses to fetch from `localhost:80`, the
+recorder's macOS positive control is dropped, and the zero-request
+assertion and the read-back assertion remain the macOS proof.

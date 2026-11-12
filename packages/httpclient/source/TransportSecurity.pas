@@ -293,6 +293,21 @@ procedure TransportSecurityTestForceSecureTransportNetworkFetchStatus(
 procedure TransportSecurityTestForceSecureTransportTrustEvaluationFailure(
   const AEnabled: Boolean);
 function TransportSecurityTestSecureTransportNetworkFetchWasDisabled: Boolean;
+type
+  { A Secure Transport client trust pass's network-fetch setting, read
+    back with SecTrustGetNetworkFetchAllowed from the SecTrust the pass
+    evaluates, just before it evaluates (ADR-0050). }
+  TTransportSecurityTestNetworkFetch = (tstnfNotEvaluated, tstnfUnreadable,
+    tstnfDisabled, tstnfAllowed);
+{ Forgets the trust passes recorded so far, so that the next outbound
+  server-trust evaluation is the only one reported. }
+procedure TransportSecurityTestResetSecureTransportTrustPasses;
+{ The settings the latest outbound server-trust evaluation's passes
+  evaluated with: the offline anchor pass, and the system-plus-anchors
+  fallback, which is tstnfNotEvaluated when that evaluation did not reach
+  it. Recorded by the thread that ran the client handshake. }
+procedure TransportSecurityTestSecureTransportTrustPasses(
+  out AAnchorPass, AFallbackPass: TTransportSecurityTestNetworkFetch);
 function TransportSecurityTestInjectSecureTransportFatalStatus(
   var AConnection: TTransportSecurityConnection): TTransportSecurityState;
 function TransportSecurityTestInjectSecureTransportPeerClose(
@@ -1043,6 +1058,12 @@ function SecTrustSetAnchorCertificatesOnly(ATrust: Pointer;
 function SecTrustSetNetworkFetchAllowed(ATrust: Pointer;
   AAllowFetch: ByteBool): OSStatus; cdecl;
   external name 'SecTrustSetNetworkFetchAllowed';
+{$IFNDEF PRODUCTION}
+{ AAllowFetch is a CoreFoundation Boolean, one byte. }
+function SecTrustGetNetworkFetchAllowed(ATrust: Pointer;
+  out AAllowFetch: Byte): OSStatus; cdecl;
+  external name 'SecTrustGetNetworkFetchAllowed';
+{$ENDIF}
 function Dlsym(AHandle: Pointer; AName: PAnsiChar): Pointer; cdecl;
   external name 'dlsym';
 function RenameAtXNP(AFromFD: LongInt; AFromPath: PAnsiChar;
@@ -1091,6 +1112,8 @@ var
   SecureTransportTestReplacementPreservedPath: string;
   SecureTransportTestNetworkFetchStatus: OSStatus;
   SecureTransportTestNetworkFetchCalled: Boolean;
+  SecureTransportTestAnchorPassFetch: TTransportSecurityTestNetworkFetch;
+  SecureTransportTestFallbackPassFetch: TTransportSecurityTestNetworkFetch;
   {$ENDIF}
 
 procedure ResolveSecureTransportServerSymbols;
@@ -2030,6 +2053,24 @@ begin
   end;
 end;
 
+{$IFNDEF PRODUCTION}
+{ Test-only: the network-fetch setting ATrust will evaluate with, read back
+  from the trust object itself rather than inferred from the calls made. }
+function SecureTransportTestNetworkFetchSetting(
+  const ATrust: Pointer): TTransportSecurityTestNetworkFetch;
+var
+  Allowed: Byte;
+begin
+  Allowed := 0;
+  if SecTrustGetNetworkFetchAllowed(ATrust, Allowed) <> ERR_SEC_SUCCESS then
+    Exit(tstnfUnreadable);
+  if Allowed <> 0 then
+    Result := tstnfAllowed
+  else
+    Result := tstnfDisabled;
+end;
+{$ENDIF}
+
 procedure EvaluateSecureTransportServerTrust(const AContext: SSLContextRef;
   const AHost: string; const AOptions: TTransportSecurityClientOptions;
   const AAnchors: Pointer);
@@ -2074,6 +2115,11 @@ begin
        (SecTrustSetNetworkFetchAllowed(Trust, False) <> ERR_SEC_SUCCESS) then
       raise ETransportSecurityError.Create(
         'Failed to configure the TLS trust anchors');
+    {$IFNDEF PRODUCTION}
+    SecureTransportTestAnchorPassFetch :=
+      SecureTransportTestNetworkFetchSetting(Trust);
+    SecureTransportTestFallbackPassFetch := tstnfNotEvaluated;
+    {$ENDIF}
     if SecTrustEvaluateWithError(Trust, ErrorReference) then
       Exit;
     if AOptions.TrustMode = tstmSystemAndAnchors then
@@ -2086,6 +2132,10 @@ begin
          (SecTrustSetNetworkFetchAllowed(Trust, True) <> ERR_SEC_SUCCESS) then
         raise ETransportSecurityError.Create(
           'Failed to configure the TLS system trust');
+      {$IFNDEF PRODUCTION}
+      SecureTransportTestFallbackPassFetch :=
+        SecureTransportTestNetworkFetchSetting(Trust);
+      {$ENDIF}
       if SecTrustEvaluateWithError(Trust, ErrorReference) then
         Exit;
     end;
@@ -9767,6 +9817,19 @@ end;
 function TransportSecurityTestSecureTransportNetworkFetchWasDisabled: Boolean;
 begin
   Result := SecureTransportTestNetworkFetchCalled;
+end;
+
+procedure TransportSecurityTestResetSecureTransportTrustPasses;
+begin
+  SecureTransportTestAnchorPassFetch := tstnfNotEvaluated;
+  SecureTransportTestFallbackPassFetch := tstnfNotEvaluated;
+end;
+
+procedure TransportSecurityTestSecureTransportTrustPasses(
+  out AAnchorPass, AFallbackPass: TTransportSecurityTestNetworkFetch);
+begin
+  AAnchorPass := SecureTransportTestAnchorPassFetch;
+  AFallbackPass := SecureTransportTestFallbackPassFetch;
 end;
 
 function TransportSecurityTestInjectSecureTransportFatalStatus(
