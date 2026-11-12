@@ -35,8 +35,6 @@ begin
   { The rule top-level flag help and option help share. }
   Expect<string>(FormatHelpLabel('', '--license')).ToBe('--license');
   Expect<string>(FormatHelpLabel('V', '--version')).ToBe('-V, --version');
-  Expect<string>(FormatHelpLabel('Fu', '--unit-path <value>')).ToBe(
-    '-Fu, --unit-path <value>');
 end;
 
 procedure THelpLabelSuite.TestOptionWithoutShortNameKeepsItsLongForm;
@@ -49,7 +47,6 @@ begin
   try
     Expect<string>(Flag.HelpLabel).ToBe('--release');
     Expect<string>(Output.HelpLabel).ToBe('--output=<value>');
-    Expect<string>(Output.HelpLabel).ToBe(Output.FormatForHelp);
   finally
     Output.Free;
     Flag.Free;

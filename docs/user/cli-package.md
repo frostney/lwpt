@@ -4,10 +4,9 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.7.0. LWPT 0.9.0 ships `cli` 0.6.0, which lists
-a command's options by long name only. LWPT 0.8.0 and 0.8.1 ship `cli` 0.5.1,
-and earlier releases ship older versions; none of them has the host settings
-below. The [consumer guide](consumer-guide.md) shows how to add the package
+This page describes `cli` 0.7.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
+and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
+them has the host settings below. The [consumer guide](consumer-guide.md) shows how to add the package
 to a project.
 
 A host that moves from 0.6.0 to 0.7.0 without changing its code sees one
@@ -186,7 +185,7 @@ command reference from the registry can use it to match the help.
 
 Write a command option's `ShortName` without its dash, as for a top-level
 flag. `h` is not available: `-h` after a command name always asks for help,
-so an option with the short name `h` is never set.
+so an option with the short name `h` cannot be given as `-h`.
 
 ## Top-level flags
 

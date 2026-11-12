@@ -17,16 +17,14 @@ uses
   CLI.Options,
   CLI.Subcommands,
   LWPT.Command.Agents,
-  LWPT.Core,
-  TestingPascalLibrary;
+  TestingPascalLibrary,
+  Tests.Scratch;
 
 type
   TAgentsBlockTests = class(TTestSuite)
   private
     FOriginalDir: string;
     FRoot: string;
-    procedure WriteText(const APath, AText: string);
-    function ReadText(const APath: string): string;
   protected
     procedure BeforeAll; override;
     procedure AfterAll; override;
@@ -41,48 +39,22 @@ begin
   Result := 0;
 end;
 
-procedure TAgentsBlockTests.WriteText(const APath, AText: string);
-var
-  Stream: TFileStream;
-begin
-  ForceDirectories(ExtractFileDir(APath));
-  Stream := TFileStream.Create(APath, fmCreate);
-  try
-    if AText <> '' then Stream.WriteBuffer(AText[1], Length(AText));
-  finally
-    Stream.Free;
-  end;
-end;
-
-function TAgentsBlockTests.ReadText(const APath: string): string;
-var
-  Stream: TFileStream;
-begin
-  Result := '';
-  Stream := TFileStream.Create(APath, fmOpenRead);
-  try
-    SetLength(Result, Stream.Size);
-    if Stream.Size > 0 then Stream.ReadBuffer(Result[1], Stream.Size);
-  finally
-    Stream.Free;
-  end;
-end;
-
 procedure TAgentsBlockTests.BeforeAll;
 begin
   FOriginalDir := GetCurrentDir;
-  FRoot := ExpandFileName('build/tests/tmp/command-agents');
-  if DirectoryExists(FRoot) then WipeDir(FRoot);
-  ForceDirectories(FRoot);
-  WriteText(FRoot + '/lwpt.toml',
+  FRoot := CreateScratchRoot('command-agents');
+  WriteTextFile(FRoot + '/lwpt.toml',
     '[package]'#10'name = "agents-fixture"'#10'version = "1.0.0"'#10);
-  { CmdAgents writes AGENTS.md in the current directory. }
-  SetCurrentDir(FRoot);
+  { CmdAgents writes AGENTS.md in the current directory; failing here
+    keeps it from writing the repository's own. }
+  if not SetCurrentDir(FRoot) then
+    raise Exception.CreateFmt('cannot enter scratch root "%s"', [FRoot]);
 end;
 
 procedure TAgentsBlockTests.AfterAll;
 begin
   SetCurrentDir(FOriginalDir);
+  RecursiveDelete(FRoot);
 end;
 
 procedure TAgentsBlockTests.TestOptionsAreListedByTheirHelpLabel;
@@ -103,7 +75,7 @@ begin
       @HandleNothing, Options));
 
     Expect<Integer>(CmdAgents(FRoot + '/lwpt.toml', Registry, False)).ToBe(0);
-    Block := ReadText(FRoot + '/AGENTS.md');
+    Block := ReadBinaryFile(FRoot + '/AGENTS.md');
     Expect<Boolean>(Pos(#10'  - `--release` — Optimize'#10, Block) > 0).ToBe(
       True);
     Expect<Boolean>(Pos(#10'  - `-o, --output=<value>` — Output path'#10,

@@ -503,11 +503,8 @@ begin
 
   if Length(ASub.Options) > 0 then
   begin
-    { HelpLabel (not the bare long name) so options show their short
-      name (-o, --name=<value>) and value shape (--name=<value>,
-      --name=<N>, --name=a|b), and every surface rendered from the
-      registry — this help text and the host program's agents block —
-      stays identical by construction. }
+    { HelpLabel (see CLI.Options) shows the short name and value shape:
+      -o, --name=<value>. }
     SetLength(Names, Length(ASub.Options));
     SetLength(HelpTexts, Length(ASub.Options));
     for i := 0 to High(ASub.Options) do
