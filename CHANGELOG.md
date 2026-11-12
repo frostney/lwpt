@@ -1,6 +1,38 @@
 # Changelog
 
 All notable changes to LWPT are documented in this file. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the GitHub Release notes are published from the matching section below.
+## [0.10.0] - 2026-11-12
+
+### Upgrade notes
+
+- **An option value spelled `help` is a value.** `lwpt` and any program built on the `cli` package give `help` to the option that takes it instead of printing the command's help. `lwpt build --mode help` reports an invalid mode, and `lwpt registry init --data-dir help` initializes a directory named `help` (#425).
+- **Hosts moving from `cli` 0.6.0 to 0.13.0.** `TOptionBaseList` is gone: a host that names it declares `TObjectList<TOptionBase>` from `Generics.Collections` itself (#426). Command help lists an option's short name (#416), and every new host setting is off by default. See `docs/user/cli-package.md`.
+
+### Bug Fixes
+
+- fix(httpclient): compile the OpenSSL loader with FPC 3.2.4 (#434)
+- fix(cli): never read an option value spelled help or -h as a help request (#425)
+
+### Documentation
+
+- docs: sync the cli guide with shipped behavior for 0.10.0 (#435)
+
+### Internal
+
+- test(httpclient): prove the macOS anchor pass is offline without relying on trustd's fetch policy (#430)
+- test(cache): count admission work instead of timing it so a slow runner cannot fail the flat-cost case (#418)
+
+### New Features
+
+- feat(cli): let a host match command names exactly (#433)
+- feat(cli): let a host make words after a top-level flag usage errors (#431)
+- feat(cli): let an option tell --name= from --name, and add an optional-value option (#428)
+- feat(cli): let a host make unknown single-dash words usage errors (#427)
+- feat(cli): list an option's short name in command help (#416)
+
+### Performance
+
+- perf(cli): keep Generics.Collections out of every host of the package (#426)
 ## [0.9.0] - 2026-11-11
 
 ### Upgrade notes

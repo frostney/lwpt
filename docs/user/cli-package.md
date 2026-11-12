@@ -4,12 +4,13 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.13.0. LWPT 0.9.0 ships `cli` 0.6.0, which lacks
-`StrictSingleDash`, `StrictTopLevelFlags`, `ExactCommandNames` and the other
-additions the notes below list for 0.7.0 and later. LWPT 0.8.0 and 0.8.1 ship
-`cli` 0.5.1, and earlier releases ship older versions; none of them has the
-host settings below. The [consumer guide](consumer-guide.md) shows how to add
-the package to a project.
+This page describes `cli` 0.13.0, which LWPT 0.10.0 ships. LWPT 0.9.0 ships
+`cli` 0.6.0, which lacks `StrictSingleDash`, `StrictTopLevelFlags`,
+`ExactCommandNames` and the other additions the notes below list for 0.7.0
+and later. LWPT 0.8.0 and 0.8.1 ship `cli` 0.5.1, and earlier releases ship
+older versions; none of them has the host settings below. The
+[consumer guide](consumer-guide.md) shows how to add the package to a
+project.
 
 A host that moves from 0.12.0 to 0.13.0 without changing its code sees no
 difference. `ExactCommandNames` is new and off by default.
