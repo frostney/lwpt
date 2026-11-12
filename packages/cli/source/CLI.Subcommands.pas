@@ -174,14 +174,17 @@ type
       empty, that line is left out. }
     property Description: string read FDescription write FDescription;
     { Returned for a usage error: an unknown command, an option or value
-      the parser rejects, a rejected preparation, and a bare invocation
-      under biUsageError. A host that needs to tell a usage error from a
+      the parser rejects, a rejected preparation, a bare invocation under
+      biUsageError, and an argument after a top-level flag or the top-level
+      help under StrictTopLevelFlags. A host that needs to tell a usage error from a
       failing handler sets a code its handlers do not return,
       conventionally 2. }
     property UsageExitCode: Integer read FUsageExitCode write FUsageExitCode;
-    { When True, the top-level help that follows an unknown or missing
-      command goes to standard error with the message, and standard output
-      stays empty. When False it goes to standard output. }
+    { When True, the top-level help that follows a usage error the
+      registry reports itself (an unknown or missing command, or an
+      argument after a top-level flag under StrictTopLevelFlags) goes to
+      standard error with the message, and standard output stays empty.
+      When False it goes to standard output. }
     property UsageHelpToStandardError: Boolean
       read FUsageHelpToStandardError write FUsageHelpToStandardError;
     property BareInvocation: TBareInvocation
@@ -559,8 +562,10 @@ begin
       HELP_SHORT_NAME, HELP_WORD);
 end;
 
-{ An unknown or missing command: the message on standard error, then the
-  top-level help on the stream the host chose. On standard error a blank
+{ A usage error of the whole line (an unknown or missing command, or an
+  argument after a top-level flag under StrictTopLevelFlags): the message
+  on standard error, then the top-level help on the stream the host
+  chose. On standard error a blank
   line sets the help apart from the message. }
 function TSubcommandRegistry.ReportUsageError(
   const AProgramName, AMessage: string): Integer;

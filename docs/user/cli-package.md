@@ -178,7 +178,7 @@ defaults column says.
 | `Registry.Description` | empty | Printed after the program name on the first line of top-level help. When empty, the help starts at the `usage:` line. |
 | `Registry.AddTopLevelFlag` | no flags | Registers a flag such as `--version` that runs a handler in place of a command. |
 | `Registry.UsageExitCode` | 1 (`DEFAULT_USAGE_EXIT_CODE`) | The exit code of a usage error. |
-| `Registry.UsageHelpToStandardError` | `False` | Sends the help that follows an unknown or missing command to standard error. |
+| `Registry.UsageHelpToStandardError` | `False` | Sends the help that follows an unknown or missing command, or an argument after a top-level flag under `StrictTopLevelFlags`, to standard error. |
 | `Registry.BareInvocation` | `biShowHelp` | What the program does without arguments: print help and exit 0, or report a usage error (`biUsageError`). |
 | `Registry.StrictSingleDash` | `False` | Makes an unknown single-dash argument such as `-verify` a usage error instead of a positional (see [Strict single-dash parsing](#strict-single-dash-parsing)). |
 | `Registry.StrictTopLevelFlags` | `False` | Makes any argument after a top-level flag or the built-in top-level help a usage error instead of ignoring it (see [Top-level flags](#top-level-flags)). |
@@ -381,10 +381,11 @@ positional, as `demo run check` shows above.
 A usage error is an unknown command, an option or value the parser rejects, a
 dispatch that `OnCommandPrepared` rejects, a bare invocation under
 `biUsageError`, and an argument after a top-level flag or the top-level help
-under `StrictTopLevelFlags`. Each returns `UsageExitCode`. A failing handler's own exit code
-is returned unchanged, so a host that sets a code its handlers never return can
-tell the two apart. The conventional choice is 2. A handler that finds a usage
-error of its own, such as a missing operand, returns the same code itself.
+under `StrictTopLevelFlags`. Each returns `UsageExitCode`. A failing handler's
+own exit code is returned unchanged, so a host that sets a code its handlers
+never return can tell the two apart. The conventional choice is 2. A handler
+that finds a usage error of its own, such as a missing operand, returns the
+same code itself.
 
 ```text
 $ demo frobnicate

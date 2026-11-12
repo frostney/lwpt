@@ -160,6 +160,18 @@ begin
     WriteLn('command: ', ACommand);
 end;
 
+{ AFirst followed by ARest, as one argument array. }
+function PrependArgument(const AFirst: string;
+  const ARest: array of string): TCommandLineArguments;
+var
+  Index: Integer;
+begin
+  SetLength(Result, Length(ARest) + 1);
+  Result[0] := AFirst;
+  for Index := 0 to High(ARest) do
+    Result[Index + 1] := ARest[Index];
+end;
+
 procedure ResetDispatch;
 begin
   DispatchCount := 0;
@@ -1200,18 +1212,14 @@ var
   Registry: TSubcommandRegistry;
   Build: TSubcommand;
   Output: TStringOption;
-  Arguments: array of string;
   Index, RunExitCode: Integer;
 begin
   ResetDispatch;
-  SetLength(Arguments, Length(AArguments) + 1);
-  Arguments[0] := 'build';
-  for Index := 0 to High(AArguments) do
-    Arguments[Index + 1] := AArguments[Index];
   Registry := BuildHostRegistry;
   try
     Registry.StrictSingleDash := AStrictSingleDash;
-    RunExitCode := Registry.Run(HOST_PROGRAM_NAME, Arguments);
+    RunExitCode := Registry.Run(HOST_PROGRAM_NAME,
+      PrependArgument('build', AArguments));
     if DispatchCount <> 1 then
       Exit(Format('<exit %d>', [RunExitCode]));
     Build := Registry.Find('build');
@@ -1311,15 +1319,10 @@ end;
 procedure ExpectExtraArgumentRejected(const ACommandLine: array of string;
   const AFlag, AExtra: string);
 var
-  Arguments: array of string;
   Child: TChildResult;
-  Index: Integer;
 begin
-  SetLength(Arguments, Length(ACommandLine) + 1);
-  Arguments[0] := STRICT_TOP_LEVEL_CHILD_MODE;
-  for Index := 0 to High(ACommandLine) do
-    Arguments[Index + 1] := ACommandLine[Index];
-  Child := RunSelf(Arguments);
+  Child := RunSelf(PrependArgument(STRICT_TOP_LEVEL_CHILD_MODE,
+    ACommandLine));
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
   Expect<Boolean>(StartsWith(Child.StandardError,
