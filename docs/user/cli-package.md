@@ -320,8 +320,10 @@ reads `--hot[=<value>]`.
 It never takes the next argument as its value: in `--hot main.x`, `--hot` has
 no value and `main.x` is a positional. Read `HasValue` rather than `ValueOr`:
 once the option is given, `ValueOr` returns its value, empty for `--hot`. A
-subclass may override `Apply` to check or change the value; every occurrence
-reaches it.
+subclass that overrides `Apply` sees every occurrence, but `--hot` reaches it
+with an empty value, like `--hot=`, and `HasValue` is set only after `Apply`
+returns. A subclass that checks the value must accept the empty one, or
+override `ApplyExplicit` and read `AHasEquals` to tell the two apart.
 
 A host that writes its own option kind gets the same information. The parser
 applies every occurrence through `ApplyExplicit(AValue, AHasEquals)`, where

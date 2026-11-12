@@ -124,7 +124,10 @@ type
     given, HasValue whether a value came with it; Value is empty without
     one, and so is ValueOr once the option is present. A direct Apply, as
     from a config file, counts as a value; MarkPresent does not. A
-    subclass may override Apply: ApplyExplicit calls it. }
+    subclass may override Apply, which ApplyExplicit calls for every
+    occurrence: `--hot` reaches it with an empty value, like `--hot=`, and
+    HasValue is set only after it returns. A subclass that must tell the
+    two apart overrides ApplyExplicit and reads AHasEquals. }
   TOptionalStringOption = class(TStringOption)
   private
     FHasValue: Boolean;

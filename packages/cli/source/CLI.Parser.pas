@@ -25,8 +25,9 @@ type
 
   A short option whose ConsumesSeparateValue is True consumes the
   following argument (`-o output`) when its ShortName matches exactly,
-  including a value that begins with `-`. AllowAttachedShortValue additionally enables an attached suffix
-  (`-dDEBUG`, `-Fusource`); the longest registered short-name prefix wins.
+  including a value that begins with `-`. AllowAttachedShortValue
+  additionally enables an attached suffix (`-dDEBUG`, `-Fusource`); the
+  longest registered short-name prefix wins.
 
   END_OF_OPTIONS_MARKER ends option parsing: the arguments after it are
   returned as positionals, verbatim.
@@ -173,9 +174,9 @@ begin
   for I := 0 to High(AOptions) do
   begin
     ShortName := AOptions[I].ShortName;
-    { A flag takes no value at all. An option that declines a separated
-      value, such as an optional-value option, may still take an
-      attached one, so this is not ConsumesSeparateValue. }
+    { A flag takes no attached short value. An option that declines a
+      separated value, such as an optional-value option, may still take
+      an attached one, so this is not ConsumesSeparateValue. }
     if (ShortName <> '') and
        not (AOptions[I] is TFlagOption) and
        AOptions[I].AllowAttachedShortValue and
