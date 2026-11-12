@@ -10,12 +10,18 @@
 
   Surface kept:
     - TParseError                  — raised on user input errors
-    - TOptionBase + subclasses     — Flag / String / Integer / Int64 /
-                                     Repeatable / Enum<T>
+    - TOptionBase + subclasses     — Flag / String / OptionalString /
+                                     Integer / Int64 / Repeatable / Enum<T>
     - TOptionArray                 — flat array; the consumer-facing
                                      shape that ParseCommandLine eats
-    - TOptionList                  — fluent registry that owns options
-                                     until you .Options it out
+    - TOptionList                  — fluent registry that owns the
+                                     options added to it; .Options
+                                     returns a copy of their order
+
+  No Generics.* unit: every host that uses this unit, directly or through
+  CLI.Parser / CLI.Help / CLI.Subcommands, would link that unit closure
+  and run its initialization at every start. TOptionList keeps its items
+  in a plain array instead (#419).
 
   Lives under the CLI namespace (no LWPT prefix) so it can graduate
   into a standalone reusable package alongside CLI.Parser /
@@ -29,7 +35,6 @@ interface
 
 uses
   Classes,
-  Generics.Collections,
   SysUtils,
   TypInfo;
 
@@ -50,6 +55,19 @@ type
     constructor Create(const ALongName, AHelpText: string; const AGroup: string = '');
 
     procedure Apply(const AValue: string); virtual; abstract;
+    { Applies one occurrence from the command line. AHasEquals tells
+      `--name=` (True, empty AValue) from `--name` (False); it is False for
+      a separated value (`--name value`, `-n value`) and an attached short
+      value (`-nvalue`). The parser calls this, never Apply; the default
+      forwards AValue to Apply, so a subclass that overrides only Apply
+      keeps working. }
+    procedure ApplyExplicit(const AValue: string;
+      const AHasEquals: Boolean); virtual;
+    { Whether the option takes the next argument as its value when it is
+      named without one (`--name value`, `-n value`). True by default;
+      False for a flag and for an optional-value option, which then take a
+      value only as `--name=value` (or an opted-in attached short value). }
+    function ConsumesSeparateValue: Boolean; virtual;
     function FormatForHelp: string; virtual; abstract;
     { The option as help lists it: FormatHelpLabel of its short name and
       FormatForHelp (`-o, --output=<value>`). Every help surface built
@@ -70,9 +88,9 @@ type
 
     property LongName: string read FLongName;
     property ShortName: string read FShortName write FShortName;
-    { When True, a valued short option accepts its value in the same
-      argument (`-dDEBUG`, `-Fusource`). Separated values remain
-      available to every non-flag short option. }
+    { When True, a short option other than a flag accepts its value in
+      the same argument (`-dDEBUG`, `-Fusource`). A separated value stays
+      available to every option whose ConsumesSeparateValue is True. }
     property AllowAttachedShortValue: Boolean read FAllowAttachedShortValue
       write FAllowAttachedShortValue;
     { Alternate name used in config files when different from LongName.
@@ -89,6 +107,7 @@ type
   TFlagOption = class(TOptionBase)
   public
     procedure Apply(const AValue: string); override;
+    function ConsumesSeparateValue: Boolean; override;
     function FormatForHelp: string; override;
   end;
 
@@ -102,6 +121,29 @@ type
     function ValueOr(const ADefault: string): string;
 
     property Value: string read FValue;
+  end;
+
+  { An option whose value is optional: `--hot` sets it without a value,
+    `--hot=` with an empty one and `--hot=restart` with `restart`. It never
+    takes the next argument as its value. Present tells whether it was
+    given, HasValue whether a value came with it; Value is empty without
+    one, and so is ValueOr once the option is present. A direct Apply, as
+    from a config file, counts as a value; MarkPresent does not. A
+    subclass may override Apply, which ApplyExplicit calls for every
+    occurrence: `--hot` reaches it with an empty value, like `--hot=`, and
+    HasValue is set only after it returns. A subclass that must tell the
+    two apart overrides ApplyExplicit and reads AHasEquals. }
+  TOptionalStringOption = class(TStringOption)
+  private
+    FHasValue: Boolean;
+  public
+    procedure Apply(const AValue: string); override;
+    procedure ApplyExplicit(const AValue: string;
+      const AHasEquals: Boolean); override;
+    function ConsumesSeparateValue: Boolean; override;
+    function FormatForHelp: string; override;
+
+    property HasValue: Boolean read FHasValue;
   end;
 
   TIntegerOption = class(TOptionBase)
@@ -159,11 +201,11 @@ type
     function Matches(const AValue: T): Boolean;
   end;
 
-  TOptionBaseList = TObjectList<TOptionBase>;
-
+  { Owns every option added to it and frees them when it is freed. }
   TOptionList = class
   private
-    FItems: TOptionBaseList;
+    FItems: TOptionArray;
+    FCount: Integer;
   public
     constructor Create;
     destructor Destroy; override;
@@ -253,11 +295,27 @@ begin
   Result := '';
 end;
 
+procedure TOptionBase.ApplyExplicit(const AValue: string;
+  const AHasEquals: Boolean);
+begin
+  Apply(AValue);
+end;
+
+function TOptionBase.ConsumesSeparateValue: Boolean;
+begin
+  Result := True;
+end;
+
 { TFlagOption }
 
 procedure TFlagOption.Apply(const AValue: string);
 begin
   FPresent := True;
+end;
+
+function TFlagOption.ConsumesSeparateValue: Boolean;
+begin
+  Result := False;
 end;
 
 function TFlagOption.FormatForHelp: string;
@@ -284,6 +342,34 @@ begin
     Result := FValue
   else
     Result := ADefault;
+end;
+
+{ TOptionalStringOption }
+
+procedure TOptionalStringOption.Apply(const AValue: string);
+begin
+  inherited Apply(AValue);
+  FHasValue := True;
+end;
+
+procedure TOptionalStringOption.ApplyExplicit(const AValue: string;
+  const AHasEquals: Boolean);
+begin
+  { The virtual Apply, so a subclass's override sees every occurrence;
+    HasValue is then set from what the argument spelled. An attached
+    short value (`-Hrestart`) carries a value without `=`. }
+  Apply(AValue);
+  FHasValue := AHasEquals or (AValue <> '');
+end;
+
+function TOptionalStringOption.ConsumesSeparateValue: Boolean;
+begin
+  Result := False;
+end;
+
+function TOptionalStringOption.FormatForHelp: string;
+begin
+  Result := '--' + LongName + '[=<value>]';
 end;
 
 { TIntegerOption }
@@ -458,12 +544,14 @@ end;
 constructor TOptionList.Create;
 begin
   inherited Create;
-  FItems := TOptionBaseList.Create(True);
 end;
 
 destructor TOptionList.Destroy;
+var
+  I: Integer;
 begin
-  FItems.Free;
+  for I := 0 to FCount - 1 do
+    FItems[I].Free;
   inherited Destroy;
 end;
 
@@ -471,43 +559,43 @@ function TOptionList.AddFlag(const ALongName, AHelpText: string;
   const AGroup: string): TFlagOption;
 begin
   Result := TFlagOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.AddString(const ALongName, AHelpText: string;
   const AGroup: string): TStringOption;
 begin
   Result := TStringOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.AddInteger(const ALongName, AHelpText: string;
   const AGroup: string): TIntegerOption;
 begin
   Result := TIntegerOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.AddRepeatable(const ALongName, AHelpText: string;
   const AGroup: string): TRepeatableOption;
 begin
   Result := TRepeatableOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.Add(const AOption: TOptionBase): TOptionBase;
 begin
-  FItems.Add(AOption);
+  { Grow geometrically so a long run of Add calls stays linear. }
+  if FCount = Length(FItems) then
+    SetLength(FItems, 2 * FCount + 4);
+  FItems[FCount] := AOption;
+  Inc(FCount);
   Result := AOption;
 end;
 
 function TOptionList.Options: TOptionArray;
-var
-  I: Integer;
 begin
-  SetLength(Result, FItems.Count);
-  for I := 0 to FItems.Count - 1 do
-    Result[I] := FItems[I];
+  Result := Copy(FItems, 0, FCount);
 end;
 
 end.

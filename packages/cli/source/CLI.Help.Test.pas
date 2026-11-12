@@ -59,6 +59,7 @@ var
   Output: TStringOption;
   Jobs: TIntegerOption;
   Color: TEnumOption<TTestColor>;
+  Hot: TOptionalStringOption;
 begin
   Flag := TFlagOption.Create('verbose', 'Talk more');
   Flag.ShortName := 'V';
@@ -68,14 +69,18 @@ begin
   Jobs.ShortName := 'j';
   Color := TEnumOption<TTestColor>.Create('color', 'Color', '', 2);
   Color.ShortName := 'c';
+  Hot := TOptionalStringOption.Create('hot', 'Reload');
+  Hot.ShortName := 'H';
   try
     Expect<string>(Flag.HelpLabel).ToBe('-V, --verbose');
     Expect<string>(Output.HelpLabel).ToBe('-o, --output=<value>');
     Expect<string>(Jobs.HelpLabel).ToBe('-j, --jobs=<N>');
     Expect<string>(Color.HelpLabel).ToBe('-c, --color=red|green');
+    Expect<string>(Hot.HelpLabel).ToBe('-H, --hot[=<value>]');
     { FormatForHelp keeps its meaning: the long form only. }
     Expect<string>(Output.FormatForHelp).ToBe('--output=<value>');
   finally
+    Hot.Free;
     Color.Free;
     Jobs.Free;
     Output.Free;
