@@ -34,19 +34,31 @@ type
   AStopAtFirstPositional ends option parsing at the first positional as
   well: that argument and every argument after it are returned verbatim,
   including a later END_OF_OPTIONS_MARKER. A program that launches another
-  program uses it to hand the rest of the line through untouched. }
+  program uses it to hand the rest of the line through untouched.
+
+  AStrictSingleDash makes every single-dash argument read as an option
+  that matches no short option or attached short value a TParseError
+  (`Unknown option: -verify`), whatever its length. A negative number
+  (`-5`, `-1.5`) and a lone `-` stay positionals, and a value a valued
+  option consumes is unaffected (`-o -verify`). }
 function ParseArguments(const AArguments: array of string;
   const AOptions: TOptionArray;
-  const AStopAtFirstPositional: Boolean = False): TStringList;
+  const AStopAtFirstPositional: Boolean = False;
+  const AStrictSingleDash: Boolean = False): TStringList;
 
 { Reports whether `--<ALongName>` or `-<AShortName>` is spelled out as an
   option before option parsing ends at the first positional or at
   END_OF_OPTIONS_MARKER. Reads AArguments under ParseArguments' rules, so a
   value consumed by a valued option is never taken for the flag. An empty
   ALongName or AShortName matches nothing. Applies no option and raises
-  nothing: an argument ParseArguments would reject is still compared. }
+  nothing: an argument ParseArguments would reject is still compared.
+  AStrictSingleDash reads the arguments as ParseArguments does with it, so
+  an unknown single-dash argument is a rejected option, not the first
+  positional. FlagGiven and EndOfOptionsIndex need no such choice: they
+  read the same arguments either way. }
 function LeadingFlagGiven(const AArguments: array of string;
-  const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
+  const AOptions: TOptionArray; const ALongName, AShortName: string;
+  const AStrictSingleDash: Boolean = False): Boolean;
 
 { Reports whether `--<ALongName>`, `-<AShortName>` or, when ABareWord is
   not empty, ABareWord in any letter case is given as an argument of its
@@ -75,9 +87,11 @@ function GetCommandLineArguments(
 { ParseArguments over the process's own arguments.
 
   AStartArg defaults to 1 (the first real argv after the program name).
-  Callers that need to skip leading words pass a higher position. }
+  Callers that need to skip leading words pass a higher position.
+  AStrictSingleDash is ParseArguments' choice of the same name. }
 function ParseCommandLine(const AOptions: TOptionArray;
-  AStartArg: Integer = 1): TStringList;
+  AStartArg: Integer = 1;
+  const AStrictSingleDash: Boolean = False): TStringList;
 
 implementation
 
@@ -172,8 +186,32 @@ begin
   end;
 end;
 
+{ A negative decimal number: `-` and digits, optionally with a fraction
+  (`-5`, `-42`, `-1.5`). }
+function IsNegativeNumber(const AArg: string): Boolean;
+var
+  I, Digits: Integer;
+  SeenPoint: Boolean;
+begin
+  Result := False;
+  if (Length(AArg) < 2) or (AArg[1] <> SHORT_FLAG_CHAR) then
+    Exit;
+  Digits := 0;
+  SeenPoint := False;
+  for I := 2 to Length(AArg) do
+    if AArg[I] in ['0'..'9'] then
+      Inc(Digits)
+    else if (AArg[I] = '.') and (not SeenPoint) and (Digits > 0) and
+            (I < Length(AArg)) then
+      SeenPoint := True
+    else
+      Exit;
+  Result := Digits > 0;
+end;
+
 function ReadArgument(const AArguments: array of string;
-  const AIndex: Integer; const AOptions: TOptionArray): TArgumentReading;
+  const AIndex: Integer; const AOptions: TOptionArray;
+  const AStrictSingleDash: Boolean): TArgumentReading;
 var
   Arg, Name: string;
   HasEquals, HasNext: Boolean;
@@ -247,8 +285,11 @@ begin
           single-dash tokens when no option opted into attachment:
           they remain positional. A one-character short name is the
           only shape that was previously recognized and rejected as
-          unknown. }
-        if Length(Name) = 1 then
+          unknown. Strict parsing rejects every unknown single-dash
+          argument except a negative number. }
+        if AStrictSingleDash and IsNegativeNumber(Arg) then
+          Result.Kind := akPositional
+        else if AStrictSingleDash or (Length(Name) = 1) then
         begin
           Result.Kind := akRejected;
           Result.Rejection := Format('Unknown option: %s', [Arg]);
@@ -264,7 +305,8 @@ end;
 
 function ParseArguments(const AArguments: array of string;
   const AOptions: TOptionArray;
-  const AStopAtFirstPositional: Boolean = False): TStringList;
+  const AStopAtFirstPositional: Boolean = False;
+  const AStrictSingleDash: Boolean = False): TStringList;
 var
   I, VerbatimFrom: Integer;
   Reading: TArgumentReading;
@@ -275,7 +317,7 @@ begin
     VerbatimFrom := Length(AArguments);
     while I < VerbatimFrom do
     begin
-      Reading := ReadArgument(AArguments, I, AOptions);
+      Reading := ReadArgument(AArguments, I, AOptions, AStrictSingleDash);
       case Reading.Kind of
         akRejected:
           raise TParseError.Create(Reading.Rejection);
@@ -306,7 +348,8 @@ end;
   never compared. }
 function ScanForFlag(const AArguments: array of string;
   const AOptions: TOptionArray; const ALongName, AShortName,
-  ABareWord: string; const AStopAtFirstPositional: Boolean): Boolean;
+  ABareWord: string; const AStopAtFirstPositional,
+  AStrictSingleDash: Boolean): Boolean;
 var
   I: Integer;
   Reading: TArgumentReading;
@@ -314,7 +357,7 @@ begin
   I := 0;
   while I <= High(AArguments) do
   begin
-    Reading := ReadArgument(AArguments, I, AOptions);
+    Reading := ReadArgument(AArguments, I, AOptions, AStrictSingleDash);
     if (Reading.Kind = akEndOfOptions) or
        (AStopAtFirstPositional and (Reading.Kind = akPositional)) then
       Exit(False);
@@ -330,10 +373,11 @@ begin
 end;
 
 function LeadingFlagGiven(const AArguments: array of string;
-  const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
+  const AOptions: TOptionArray; const ALongName, AShortName: string;
+  const AStrictSingleDash: Boolean = False): Boolean;
 begin
   Result := ScanForFlag(AArguments, AOptions, ALongName, AShortName, '',
-    True);
+    True, AStrictSingleDash);
 end;
 
 function FlagGiven(const AArguments: array of string;
@@ -341,7 +385,7 @@ function FlagGiven(const AArguments: array of string;
   const ABareWord: string = ''): Boolean;
 begin
   Result := ScanForFlag(AArguments, AOptions, ALongName, AShortName,
-    ABareWord, False);
+    ABareWord, False, False);
 end;
 
 function EndOfOptionsIndex(const AArguments: array of string;
@@ -352,7 +396,7 @@ begin
   Result := 0;
   while Result <= High(AArguments) do
   begin
-    Reading := ReadArgument(AArguments, Result, AOptions);
+    Reading := ReadArgument(AArguments, Result, AOptions, False);
     if Reading.Kind = akEndOfOptions then
       Exit;
     Inc(Result, Reading.Width);
@@ -373,9 +417,11 @@ begin
 end;
 
 function ParseCommandLine(const AOptions: TOptionArray;
-  AStartArg: Integer = 1): TStringList;
+  AStartArg: Integer = 1;
+  const AStrictSingleDash: Boolean = False): TStringList;
 begin
-  Result := ParseArguments(GetCommandLineArguments(AStartArg), AOptions);
+  Result := ParseArguments(GetCommandLineArguments(AStartArg), AOptions,
+    False, AStrictSingleDash);
 end;
 
 end.
