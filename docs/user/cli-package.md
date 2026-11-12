@@ -4,10 +4,12 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.13.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
-and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
-them has the host settings below. The [consumer guide](consumer-guide.md)
-shows how to add the package to a project.
+This page describes `cli` 0.13.0. LWPT 0.9.0 ships `cli` 0.6.0, which lacks
+`StrictSingleDash`, `StrictTopLevelFlags`, `ExactCommandNames` and the other
+additions the notes below list for 0.7.0 and later. LWPT 0.8.0 and 0.8.1 ship
+`cli` 0.5.1, and earlier releases ship older versions; none of them has the
+host settings below. The [consumer guide](consumer-guide.md) shows how to add
+the package to a project.
 
 A host that moves from 0.12.0 to 0.13.0 without changing its code sees no
 difference. `ExactCommandNames` is new and off by default.
@@ -34,11 +36,12 @@ difference: a value that a command option takes is never a help request.
 With a valued option `--output` (`-o`), `demo build -o help main.x` used to
 print the help of `build`; it now runs `build` with `help` as the value. An
 option that rejects the value, such as an integer option, now reports a usage
-error where 0.7.0 printed help.
+error where 0.7.0 printed help. `FlagGiven` is new.
 
 A host that moves from 0.6.0 to 0.7.0 without changing its code sees one
 difference: a command option with a short name is listed with it in the
 command's help and in `GenerateHelpText` (`-o, --output=<value>`).
+`HelpLabel` and `FormatHelpLabel` are new.
 
 A host that moves from 0.5.1 to 0.6.0 without changing its code sees three
 differences:
