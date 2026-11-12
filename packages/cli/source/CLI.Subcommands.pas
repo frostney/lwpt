@@ -101,8 +101,9 @@ type
 
   { A flag the program accepts in place of a command, such as `--version`.
     It is matched against the first argument only, the way the built-in
-    `--help` is; later arguments are ignored. Set its fields before it is
-    added to a registry, which checks them once, on registration. }
+    `--help` is; later arguments are ignored unless the registry sets
+    StrictTopLevelFlags. Set its fields before it is added to a registry,
+    which checks them once, on registration. }
   TTopLevelFlag = class
   public
     { Both names are given without their leading dashes. }
@@ -127,6 +128,7 @@ type
     FUsageHelpToStandardError : Boolean;
     FBareInvocation : TBareInvocation;
     FStrictSingleDash : Boolean;
+    FStrictTopLevelFlags : Boolean;
     FOnCommandCompleted : TSubcommandCompletionHandler;
     FOnCommandPrepared : TSubcommandPreparedHandler;
     function FindTopLevelFlag(const AArgument: string): TTopLevelFlag;
@@ -193,6 +195,13 @@ type
       default. }
     property StrictSingleDash: Boolean
       read FStrictSingleDash write FStrictSingleDash;
+    { When True, a top-level flag or the built-in top-level help (`help`,
+      `--help`, `-h`) must be the only argument: any argument after it is a
+      usage error (`unexpected argument after --version: extra`), and the
+      flag's handler does not run. False by default: arguments after them
+      are ignored. }
+    property StrictTopLevelFlags: Boolean
+      read FStrictTopLevelFlags write FStrictTopLevelFlags;
     property OnCommandCompleted: TSubcommandCompletionHandler
       read FOnCommandCompleted write FOnCommandCompleted;
     property OnCommandPrepared: TSubcommandPreparedHandler
@@ -584,6 +593,7 @@ var
   StartedAt : QWord;
   Completion : TSubcommandCompletion;
   PreparationError : string;
+  TopLevelHelp : Boolean;
 begin
   if Length(AArguments) < 1 then
   begin
@@ -594,12 +604,18 @@ begin
   end;
 
   Flag := FindTopLevelFlag(AArguments[0]);
+  CmdName := LowerCase(AArguments[0]);
+  TopLevelHelp := (CmdName = HELP_WORD) or (CmdName = HELP_LONG_FLAG)
+    or (CmdName = HELP_SHORT_FLAG);
+  if FStrictTopLevelFlags and ((Flag <> nil) or TopLevelHelp)
+     and (Length(AArguments) > 1) then
+    Exit(ReportUsageError(AProgramName, 'unexpected argument after '
+      + AArguments[0] + ': ' + AArguments[1]));
+
   if Flag <> nil then
     Exit(Flag.Handler());
 
-  CmdName := LowerCase(AArguments[0]);
-  if (CmdName = HELP_WORD) or (CmdName = HELP_LONG_FLAG)
-     or (CmdName = HELP_SHORT_FLAG) then
+  if TopLevelHelp then
   begin
     PrintTopLevelHelp(AProgramName);
     Exit(0);
