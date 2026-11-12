@@ -952,9 +952,9 @@ end;
   client seam reads the network-fetch setting back from the SecTrust each
   pass evaluates, just before it evaluates. The anchor pass must evaluate
   with fetching disabled whether it accepts or rejects and in both trust
-  modes, anchors-only must never reach the fallback, and the
-  system-plus-anchors fallback must evaluate with fetching allowed, as
-  ADR-0050 allows. Should trustd stop fetching from the recorder, this
+  modes. Neither mode may reach the fallback once the anchor pass accepts,
+  anchors-only never reaches it, and the system-plus-anchors fallback must
+  evaluate with fetching allowed, as ADR-0050 allows. Should trustd stop fetching from the recorder, this
   case and the recorder's zero-request assertion remain the proof. }
 procedure TTransportSecurityClientOptionsE2ETests.TestAnchorPassEvaluatesWithNetworkFetchDisabled;
 {$IFDEF DARWIN}
@@ -979,6 +979,13 @@ begin
   Expect<Boolean>(Contains(ErrorMessage, 'verification')).ToBe(True);
   Expect<string>(DescribeTrustPasses('rejecting anchors-only')).ToBe(
     'rejecting anchors-only: anchor pass fetch disabled, ' +
+    'fallback not evaluated');
+
+  TransportSecurityTestResetSecureTransportTrustPasses;
+  Expect<string>(RunExchange(SERVER_PKCS12_PATH, tsivStrict, 'localhost',
+    SystemAndAnchors(TEST_ROOT_PATH), False, Response, Peer, Served)).ToBe('');
+  Expect<string>(DescribeTrustPasses('accepting system plus anchors')).ToBe(
+    'accepting system plus anchors: anchor pass fetch disabled, ' +
     'fallback not evaluated');
 
   TransportSecurityTestResetSecureTransportTrustPasses;

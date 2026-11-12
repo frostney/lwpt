@@ -348,8 +348,9 @@ a second proof that does not. A test-only client seam, compiled only when
 `PRODUCTION` is not defined, reads the network-fetch setting back with
 `SecTrustGetNetworkFetchAllowed` from the `SecTrust` each pass evaluates,
 just before it evaluates. An E2E case asserts that the anchor pass
-evaluates with fetching disabled whether it accepts or rejects, that
-anchors-only never reaches the fallback, and that the system-plus-anchors
+evaluates with fetching disabled whether it accepts or rejects, in both
+trust modes; that neither mode reaches the fallback once the anchor pass
+accepts, and anchors-only never does; and that the system-plus-anchors
 fallback evaluates with fetching allowed. Removing
 `SecTrustSetNetworkFetchAllowed(false)` from the anchor pass fails that
 case. If a later macOS also refuses to fetch from `localhost:80`, the
