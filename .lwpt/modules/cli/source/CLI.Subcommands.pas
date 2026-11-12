@@ -186,11 +186,11 @@ type
       read FBareInvocation write FBareInvocation;
     { When True, a single-dash argument read as an option that is neither a
       declared short option nor an opted-in attached short value is a usage
-      error (`Unknown option: -verify`),
-      whatever its length, instead of a positional. A negative number
-      (`-5`, `-1.5`), a lone `-`, a value an option takes, everything after
-      `--`, and everything from a pass-through command's first positional
-      on are unaffected. False by default. }
+      error (`Unknown option: -verify`), whatever its length, instead of a
+      positional. A negative number (`-5`, `-1.5`), a lone `-`, a value an
+      option takes, everything after `--`, and everything from a
+      pass-through command's first positional on are unaffected. False by
+      default. }
     property StrictSingleDash: Boolean
       read FStrictSingleDash write FStrictSingleDash;
     property OnCommandCompleted: TSubcommandCompletionHandler
