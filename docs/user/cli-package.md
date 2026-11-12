@@ -4,10 +4,16 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.10.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
+This page describes `cli` 0.11.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
 and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
 them has the host settings below. The [consumer guide](consumer-guide.md)
 shows how to add the package to a project.
+
+From 0.11.0 the package uses no `Generics.*` unit, so a host that uses none
+itself no longer links `Generics.Collections` and its unit closure or runs
+their initialization at start. `TOptionList` is unchanged. A host that moves
+from 0.10.0 to 0.11.0 and names `TOptionBaseList`, which is gone, declares
+`TObjectList<TOptionBase>` from `Generics.Collections` itself.
 
 A host that moves from 0.9.0 to 0.10.0 without changing its code sees no
 difference. `TOptionalStringOption`, `ApplyExplicit` and
