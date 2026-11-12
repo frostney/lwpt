@@ -13,5 +13,5 @@
 
 [package]
 name    = "httpclient"
-version = "0.8.0"
+version = "0.8.1"
 units   = ["source"]
