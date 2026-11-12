@@ -67,6 +67,7 @@ type
     procedure TestUnconfiguredUsageErrors;
     procedure TestPassThroughHelp;
     procedure TestHelpWordOutsidePassThrough;
+    procedure TestOptionValueIsNeverAHelpRequest;
     procedure TestCommandHelpListsOptionShortNames;
   end;
 
@@ -1170,6 +1171,54 @@ begin
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
+{ Dispatches `build` with AArguments on a fresh host registry and returns
+  the value its `--output` option received, or `<help>` when the line was
+  taken for a help request instead. }
+function BuildOutputFor(const AArguments: array of string): string;
+var
+  Registry: TSubcommandRegistry;
+  Arguments: array of string;
+  Index: Integer;
+begin
+  ResetDispatch;
+  SetLength(Arguments, Length(AArguments) + 1);
+  Arguments[0] := 'build';
+  for Index := 0 to High(AArguments) do
+    Arguments[Index + 1] := AArguments[Index];
+  Registry := BuildHostRegistry;
+  try
+    if (Registry.Run(HOST_PROGRAM_NAME, Arguments) <> 0)
+       or (DispatchCount <> 1) then
+      Exit('<help>');
+    Result := TStringOption(Registry.Find('build').Options[2]).Value + ' ' +
+      DispatchedPositionals;
+  finally
+    Registry.Free;
+  end;
+end;
+
+procedure THostDispatchSuite.TestOptionValueIsNeverAHelpRequest;
+var
+  Child: TChildResult;
+begin
+  Expect<string>(BuildOutputFor(['-o', 'help', 'main.x'])).ToBe(
+    'help main.x');
+  Expect<string>(BuildOutputFor(['--output', 'help', 'main.x'])).ToBe(
+    'help main.x');
+  Expect<string>(BuildOutputFor(['main.x', '-o', 'HELP'])).ToBe(
+    'HELP main.x');
+  Expect<string>(BuildOutputFor(['-o', '-h', 'main.x'])).ToBe('-h main.x');
+  Expect<string>(BuildOutputFor(['-o', '--help', 'main.x'])).ToBe(
+    '--help main.x');
+
+  { A help spelling of its own after the value still asks for help. }
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '-o', 'help', '--help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host build <file> [--json]')).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
+end;
+
 procedure THostDispatchSuite.SetupTests;
 begin
   Test('an unconfigured registry keeps the defaults every host started with',
@@ -1210,6 +1259,8 @@ begin
     TestPassThroughHelp);
   Test('outside pass-through a help spelling asks for help, even after a -- value',
     TestHelpWordOutsidePassThrough);
+  Test('a value that an option takes is never a help request',
+    TestOptionValueIsNeverAHelpRequest);
   Test('command help lists an option''s short name and keeps one help column',
     TestCommandHelpListsOptionShortNames);
 end;

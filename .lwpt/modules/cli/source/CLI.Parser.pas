@@ -48,6 +48,17 @@ function ParseArguments(const AArguments: array of string;
 function LeadingFlagGiven(const AArguments: array of string;
   const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
 
+{ Reports whether `--<ALongName>`, `-<AShortName>` or, when ABareWord is
+  not empty, ABareWord in any letter case is given as an argument of its
+  own before END_OF_OPTIONS_MARKER. Reads AArguments under ParseArguments'
+  rules without AStopAtFirstPositional, so a value consumed by a valued
+  option (`-o help`, `--output help`) is never taken for one of them.
+  Applies no option and raises nothing: an argument ParseArguments would
+  reject is still compared. }
+function FlagGiven(const AArguments: array of string;
+  const AOptions: TOptionArray; const ALongName, AShortName: string;
+  const ABareWord: string = ''): Boolean;
+
 { The index of END_OF_OPTIONS_MARKER as ParseArguments reads it without
   AStopAtFirstPositional, or Length(AArguments) when the arguments have
   none. A `--` that a valued short option takes as its value is not the
@@ -289,8 +300,12 @@ begin
   end;
 end;
 
-function LeadingFlagGiven(const AArguments: array of string;
-  const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
+{ The scan LeadingFlagGiven and FlagGiven share. It compares only the
+  argument each reading starts at, so a value a valued option consumes is
+  never compared. }
+function ScanForFlag(const AArguments: array of string;
+  const AOptions: TOptionArray; const ALongName, AShortName,
+  ABareWord: string; const AStopAtFirstPositional: Boolean): Boolean;
 var
   I: Integer;
   Reading: TArgumentReading;
@@ -299,14 +314,31 @@ begin
   while I <= High(AArguments) do
   begin
     Reading := ReadArgument(AArguments, I, AOptions);
-    if Reading.Kind in [akPositional, akEndOfOptions] then
+    if (Reading.Kind = akEndOfOptions) or
+       (AStopAtFirstPositional and (Reading.Kind = akPositional)) then
       Exit(False);
     if (AArguments[I] = LONG_FLAG_PREFIX + ALongName) or
-       (AArguments[I] = SHORT_FLAG_CHAR + AShortName) then
+       (AArguments[I] = SHORT_FLAG_CHAR + AShortName) or
+       ((ABareWord <> '') and SameText(AArguments[I], ABareWord)) then
       Exit(True);
     Inc(I, Reading.Width);
   end;
   Result := False;
+end;
+
+function LeadingFlagGiven(const AArguments: array of string;
+  const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
+begin
+  Result := ScanForFlag(AArguments, AOptions, ALongName, AShortName, '',
+    True);
+end;
+
+function FlagGiven(const AArguments: array of string;
+  const AOptions: TOptionArray; const ALongName, AShortName: string;
+  const ABareWord: string = ''): Boolean;
+begin
+  Result := ScanForFlag(AArguments, AOptions, ALongName, AShortName,
+    ABareWord, False);
 end;
 
 function EndOfOptionsIndex(const AArguments: array of string;

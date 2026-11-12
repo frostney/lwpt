@@ -524,24 +524,19 @@ end;
   unknown option. Any argument that spells --help, -h or the word `help`
   asks for it, up to the end-of-options marker. A pass-through command
   reads only --help and -h, and only before its first positional: from
-  there on every argument belongs to the program it launches. }
+  there on every argument belongs to the program it launches. Both read
+  the arguments the way the parser does, so a value that a valued option
+  takes (`-o help`, a `--` after `-o`) is neither a help request nor the
+  end of options. }
 function HelpRequested(const ASub: TSubcommand;
   const AArguments: array of string): Boolean;
-var i: Integer; A: string;
 begin
   if ASub.PassThrough then
-    Exit(LeadingFlagGiven(AArguments, ASub.Options, HELP_WORD,
-      HELP_SHORT_NAME));
-  { The parser says where the marker is: a `--` that a valued short option
-    takes as its value does not end the options. }
-  for i := 0 to EndOfOptionsIndex(AArguments, ASub.Options) - 1 do
-  begin
-    A := AArguments[i];
-    if (A = HELP_LONG_FLAG) or (A = HELP_SHORT_FLAG)
-       or (LowerCase(A) = HELP_WORD) then
-      Exit(True);
-  end;
-  Result := False;
+    Result := LeadingFlagGiven(AArguments, ASub.Options, HELP_WORD,
+      HELP_SHORT_NAME)
+  else
+    Result := FlagGiven(AArguments, ASub.Options, HELP_WORD,
+      HELP_SHORT_NAME, HELP_WORD);
 end;
 
 { An unknown or missing command: the message on standard error, then the
