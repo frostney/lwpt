@@ -10,8 +10,8 @@
 
   Surface kept:
     - TParseError                  — raised on user input errors
-    - TOptionBase + subclasses     — Flag / String / Integer / Int64 /
-                                     Repeatable / Enum<T>
+    - TOptionBase + subclasses     — Flag / String / OptionalString /
+                                     Integer / Int64 / Repeatable / Enum<T>
     - TOptionArray                 — flat array; the consumer-facing
                                      shape that ParseCommandLine eats
     - TOptionList                  — fluent registry that owns the
@@ -55,6 +55,19 @@ type
     constructor Create(const ALongName, AHelpText: string; const AGroup: string = '');
 
     procedure Apply(const AValue: string); virtual; abstract;
+    { Applies one occurrence from the command line. AHasEquals tells
+      `--name=` (True, empty AValue) from `--name` (False); it is False for
+      a separated value (`--name value`, `-n value`) and an attached short
+      value (`-nvalue`). The parser calls this, never Apply; the default
+      forwards AValue to Apply, so a subclass that overrides only Apply
+      keeps working. }
+    procedure ApplyExplicit(const AValue: string;
+      const AHasEquals: Boolean); virtual;
+    { Whether the option takes the next argument as its value when it is
+      named without one (`--name value`, `-n value`). True by default;
+      False for a flag and for an optional-value option, which then take a
+      value only as `--name=value` (or an opted-in attached short value). }
+    function ConsumesSeparateValue: Boolean; virtual;
     function FormatForHelp: string; virtual; abstract;
     { The option as help lists it: FormatHelpLabel of its short name and
       FormatForHelp (`-o, --output=<value>`). Every help surface built
@@ -75,9 +88,9 @@ type
 
     property LongName: string read FLongName;
     property ShortName: string read FShortName write FShortName;
-    { When True, a valued short option accepts its value in the same
-      argument (`-dDEBUG`, `-Fusource`). Separated values remain
-      available to every non-flag short option. }
+    { When True, a short option other than a flag accepts its value in
+      the same argument (`-dDEBUG`, `-Fusource`). A separated value stays
+      available to every option whose ConsumesSeparateValue is True. }
     property AllowAttachedShortValue: Boolean read FAllowAttachedShortValue
       write FAllowAttachedShortValue;
     { Alternate name used in config files when different from LongName.
@@ -94,6 +107,7 @@ type
   TFlagOption = class(TOptionBase)
   public
     procedure Apply(const AValue: string); override;
+    function ConsumesSeparateValue: Boolean; override;
     function FormatForHelp: string; override;
   end;
 
@@ -107,6 +121,29 @@ type
     function ValueOr(const ADefault: string): string;
 
     property Value: string read FValue;
+  end;
+
+  { An option whose value is optional: `--hot` sets it without a value,
+    `--hot=` with an empty one and `--hot=restart` with `restart`. It never
+    takes the next argument as its value. Present tells whether it was
+    given, HasValue whether a value came with it; Value is empty without
+    one, and so is ValueOr once the option is present. A direct Apply, as
+    from a config file, counts as a value; MarkPresent does not. A
+    subclass may override Apply, which ApplyExplicit calls for every
+    occurrence: `--hot` reaches it with an empty value, like `--hot=`, and
+    HasValue is set only after it returns. A subclass that must tell the
+    two apart overrides ApplyExplicit and reads AHasEquals. }
+  TOptionalStringOption = class(TStringOption)
+  private
+    FHasValue: Boolean;
+  public
+    procedure Apply(const AValue: string); override;
+    procedure ApplyExplicit(const AValue: string;
+      const AHasEquals: Boolean); override;
+    function ConsumesSeparateValue: Boolean; override;
+    function FormatForHelp: string; override;
+
+    property HasValue: Boolean read FHasValue;
   end;
 
   TIntegerOption = class(TOptionBase)
@@ -258,11 +295,27 @@ begin
   Result := '';
 end;
 
+procedure TOptionBase.ApplyExplicit(const AValue: string;
+  const AHasEquals: Boolean);
+begin
+  Apply(AValue);
+end;
+
+function TOptionBase.ConsumesSeparateValue: Boolean;
+begin
+  Result := True;
+end;
+
 { TFlagOption }
 
 procedure TFlagOption.Apply(const AValue: string);
 begin
   FPresent := True;
+end;
+
+function TFlagOption.ConsumesSeparateValue: Boolean;
+begin
+  Result := False;
 end;
 
 function TFlagOption.FormatForHelp: string;
@@ -289,6 +342,34 @@ begin
     Result := FValue
   else
     Result := ADefault;
+end;
+
+{ TOptionalStringOption }
+
+procedure TOptionalStringOption.Apply(const AValue: string);
+begin
+  inherited Apply(AValue);
+  FHasValue := True;
+end;
+
+procedure TOptionalStringOption.ApplyExplicit(const AValue: string;
+  const AHasEquals: Boolean);
+begin
+  { The virtual Apply, so a subclass's override sees every occurrence;
+    HasValue is then set from what the argument spelled. An attached
+    short value (`-Hrestart`) carries a value without `=`. }
+  Apply(AValue);
+  FHasValue := AHasEquals or (AValue <> '');
+end;
+
+function TOptionalStringOption.ConsumesSeparateValue: Boolean;
+begin
+  Result := False;
+end;
+
+function TOptionalStringOption.FormatForHelp: string;
+begin
+  Result := '--' + LongName + '[=<value>]';
 end;
 
 { TIntegerOption }
