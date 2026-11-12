@@ -954,8 +954,9 @@ end;
   with fetching disabled whether it accepts or rejects and in both trust
   modes. Neither mode may reach the fallback once the anchor pass accepts,
   anchors-only never reaches it, and the system-plus-anchors fallback must
-  evaluate with fetching allowed, as ADR-0050 allows. Should trustd stop fetching from the recorder, this
-  case and the recorder's zero-request assertion remain the proof. }
+  evaluate with fetching allowed, as ADR-0050 allows. Should trustd stop
+  fetching from the recorder, this case and the recorder's zero-request
+  assertion remain the proof. }
 procedure TTransportSecurityClientOptionsE2ETests.TestAnchorPassEvaluatesWithNetworkFetchDisabled;
 {$IFDEF DARWIN}
 var
