@@ -11,7 +11,7 @@ program	*	packages/cli/source/CLI.Events.Test.pas	1	5
 program	*	packages/cli/source/CLI.Help.Test.pas	1	5
 program	*	packages/cli/source/CLI.Options.Test.pas	1	6
 program	*	packages/cli/source/CLI.Parser.Test.pas	2	34
-program	*	packages/cli/source/CLI.Subcommands.Test.pas	2	33
+program	*	packages/cli/source/CLI.Subcommands.Test.pas	2	35
 program	*	packages/httpclient/source/HTTPClient.Test.pas	5	63
 program	windows/*	packages/httpclient/source/HTTPClient.Test.pas	5	61
 program	*	packages/httpclient/source/TransportSecurity.Test.pas	2	57
