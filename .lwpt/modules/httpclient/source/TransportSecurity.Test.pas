@@ -170,6 +170,7 @@ type
     procedure TestSChannelPendingCiphertextPointerAndPartialConsumption;
     procedure TestSChannelWriteWantRetryRetainsPlaintext;
     procedure TestStaleErrorQueueIsCleared;
+    procedure TestLoaderNeverFallsBackToLibreSSL;
     procedure TestStrictIdentityAllowsLeafWithoutBasicConstraints;
     procedure TestStrictIdentityValidation;
     procedure TestSyscallErrorPoisonsConnection;
@@ -3921,6 +3922,19 @@ begin
   {$ENDIF}
 end;
 
+{ FPC 3.2.4's openssl unit falls back to LibreSSL names once every OpenSSL
+  version fails. The loader turns that off, so it tries the same libraries
+  as with FPC 3.2.2, whose openssl unit has no fallback. }
+procedure TTransportSecurityServerTests.TestLoaderNeverFallsBackToLibreSSL;
+begin
+  {$IFDEF TRANSPORT_SECURITY_OPENSSL}
+  {$IF DECLARED(LibreSSLSupport)}
+  Expect<Boolean>(TransportSecurityServerBackendAvailable).ToBe(True);
+  Expect<Integer>(Ord(LibreSSLSupport)).ToBe(Ord(lssDisabled));
+  {$ENDIF}
+  {$ENDIF}
+end;
+
 procedure TTransportSecurityServerTests.TestStaleErrorQueueIsCleared;
 {$IFDEF TRANSPORT_SECURITY_OPENSSL}
 var
@@ -5177,6 +5191,9 @@ begin
   Skip('stale OpenSSL error queue is cleared before server operations',
     TestStaleErrorQueueIsCleared,
     DARWIN_SKIP_REASON);
+  Skip('the OpenSSL loader never falls back to LibreSSL names',
+    TestLoaderNeverFallsBackToLibreSSL,
+    DARWIN_SKIP_REASON);
   Skip('SSL_ERROR_SYSCALL poisons the connection',
     TestSyscallErrorPoisonsConnection,
     DARWIN_SKIP_REASON);
@@ -5306,6 +5323,14 @@ begin
     TestRenegotiationIsRefused);
   ServerTest('stale OpenSSL error queue is cleared before server operations',
     TestStaleErrorQueueIsCleared);
+  {$IF DECLARED(LibreSSLSupport)}
+  ServerTest('the OpenSSL loader never falls back to LibreSSL names',
+    TestLoaderNeverFallsBackToLibreSSL);
+  {$ELSE}
+  Skip('the OpenSSL loader never falls back to LibreSSL names',
+    TestLoaderNeverFallsBackToLibreSSL,
+    'this FPC''s openssl unit has no LibreSSL fallback');
+  {$ENDIF}
   ServerTest('SSL_ERROR_SYSCALL poisons the connection',
     TestSyscallErrorPoisonsConnection);
   ServerTest('TLS floor rejects TLS 1.1',
@@ -5354,6 +5379,9 @@ begin
     OPENSSL_CLIENT_SKIP_REASON);
   Skip('stale OpenSSL error queue is cleared before server operations',
     TestStaleErrorQueueIsCleared,
+    OPENSSL_CLIENT_SKIP_REASON);
+  Skip('the OpenSSL loader never falls back to LibreSSL names',
+    TestLoaderNeverFallsBackToLibreSSL,
     OPENSSL_CLIENT_SKIP_REASON);
   Skip('SSL_ERROR_SYSCALL poisons the connection',
     TestSyscallErrorPoisonsConnection,

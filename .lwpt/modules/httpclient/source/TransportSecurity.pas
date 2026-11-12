@@ -3506,9 +3506,10 @@ begin
     FileExists(CryptoBase + '.so' + AVersion);
   if Result then
   begin
-    { FPC 3.2.4 renamed the openssl unit's DLLSSLName and DLLUtilName to
-      BaseSSLName and BaseCryptoName. }
-    {$IF FPC_FULLVERSION >= 30204}
+    { FPC's openssl unit replaced DLLSSLName and DLLUtilName with
+      BaseSSLName and BaseCryptoName in FPC 3.2.4 (and in 3.2 fixes-branch
+      snapshots since January 2024, which still report 3.2.3). }
+    {$IF DECLARED(BaseSSLName)}
     BaseSSLName := SSLBase;
     BaseCryptoName := CryptoBase;
     {$ELSE}
@@ -3547,9 +3548,10 @@ begin
   DLLSSLName := OPENSSL_VERSION_THREE_SSL_LIBRARY;
   DLLUtilName := OPENSSL_VERSION_THREE_CRYPTO_LIBRARY;
   {$ELSE}
-  {$IF FPC_FULLVERSION >= 30204}
-  { FPC 3.2.4 tries LibreSSL names once every OpenSSL version fails; 3.2.2
-    tries OpenSSL names only. Keep both on the same candidates. }
+  {$IF DECLARED(LibreSSLSupport)}
+  { An openssl unit with LibreSSL support (FPC 3.2.4) tries LibreSSL names
+    once every OpenSSL version fails; FPC 3.2.2's tries OpenSSL names only.
+    Keep both on the same candidates. }
   LibreSSLSupport := lssDisabled;
   {$ENDIF}
   PreferOpenSSLVersionThree;
