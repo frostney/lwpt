@@ -67,6 +67,7 @@ type
     procedure TestUnconfiguredUsageErrors;
     procedure TestPassThroughHelp;
     procedure TestHelpWordOutsidePassThrough;
+    procedure TestOptionValueIsNeverAHelpRequest;
     procedure TestCommandHelpListsOptionShortNames;
   end;
 
@@ -1168,6 +1169,63 @@ begin
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
+
+  { A help spelling of its own after an option's value still asks for
+    help, and so does `-h` after a long option, which takes no separated
+    value that begins with `-`. }
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '-o', 'help', '--help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '--output', '-h', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
+end;
+
+{ Dispatches `build` with AArguments on a fresh host registry and returns
+  the value its `--output` option received and the positionals. A line
+  that dispatched nothing returns `<exit N>`, the exit code of Run. }
+function BuildOutputFor(const AArguments: array of string): string;
+var
+  Registry: TSubcommandRegistry;
+  Build: TSubcommand;
+  Output: TStringOption;
+  Arguments: array of string;
+  Index, RunExitCode: Integer;
+begin
+  ResetDispatch;
+  SetLength(Arguments, Length(AArguments) + 1);
+  Arguments[0] := 'build';
+  for Index := 0 to High(AArguments) do
+    Arguments[Index + 1] := AArguments[Index];
+  Registry := BuildHostRegistry;
+  try
+    RunExitCode := Registry.Run(HOST_PROGRAM_NAME, Arguments);
+    if DispatchCount <> 1 then
+      Exit(Format('<exit %d>', [RunExitCode]));
+    Build := Registry.Find('build');
+    Output := nil;
+    for Index := 0 to High(Build.Options) do
+      if Build.Options[Index].LongName = 'output' then
+        Output := Build.Options[Index] as TStringOption;
+    Result := Output.Value + ' ' + DispatchedPositionals;
+  finally
+    Registry.Free;
+  end;
+end;
+
+procedure THostDispatchSuite.TestOptionValueIsNeverAHelpRequest;
+begin
+  Expect<string>(BuildOutputFor(['-o', 'help', 'main.x'])).ToBe(
+    'help main.x');
+  Expect<string>(BuildOutputFor(['--output', 'help', 'main.x'])).ToBe(
+    'help main.x');
+  Expect<string>(BuildOutputFor(['main.x', '-o', 'HELP'])).ToBe(
+    'HELP main.x');
+  Expect<string>(BuildOutputFor(['-o', '-h', 'main.x'])).ToBe('-h main.x');
+  Expect<string>(BuildOutputFor(['-o', '--help', 'main.x'])).ToBe(
+    '--help main.x');
 end;
 
 procedure THostDispatchSuite.SetupTests;
@@ -1210,6 +1268,8 @@ begin
     TestPassThroughHelp);
   Test('outside pass-through a help spelling asks for help, even after a -- value',
     TestHelpWordOutsidePassThrough);
+  Test('a value that an option takes is never a help request',
+    TestOptionValueIsNeverAHelpRequest);
   Test('command help lists an option''s short name and keeps one help column',
     TestCommandHelpListsOptionShortNames);
 end;

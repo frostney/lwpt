@@ -5,7 +5,7 @@
   The child registers a representative option table, parses its own argv,
   and checks the resulting option objects and positionals.
 
-  ParseArguments, LeadingFlagGiven and EndOfOptionsIndex take the arguments
+  ParseArguments, LeadingFlagGiven, FlagGiven and EndOfOptionsIndex take the arguments
   as an array, so the end-of-options marker and stop-at-first-positional
   cases run in-process. }
 
@@ -64,6 +64,8 @@ type
     procedure TestLeadingFlagGivenBeforeTheFirstPositional;
     procedure TestLeadingFlagNotGivenPastTheEndOfOptions;
     procedure TestLeadingFlagGivenAppliesNothing;
+    procedure TestFlagGivenAnywhereBeforeTheEndOfOptions;
+    procedure TestFlagGivenSkipsAValueAnOptionTakes;
   end;
 
   { A representative option table for the in-process tests. }
@@ -82,6 +84,8 @@ type
     function ParseError(const AArguments: array of string;
       const AStopAtFirstPositional: Boolean = False): string;
     function HelpGiven(const AArguments: array of string): Boolean;
+    { FlagGiven for --help, -h and the word `help`. }
+    function HelpAnywhere(const AArguments: array of string): Boolean;
   end;
 
 const
@@ -148,6 +152,13 @@ function TParserFixture.HelpGiven(
 begin
   Result := LeadingFlagGiven(AArguments, Options, HELP_LONG_NAME,
     HELP_SHORT_NAME);
+end;
+
+function TParserFixture.HelpAnywhere(
+  const AArguments: array of string): Boolean;
+begin
+  Result := FlagGiven(AArguments, Options, HELP_LONG_NAME, HELP_SHORT_NAME,
+    HELP_LONG_NAME);
 end;
 
 function ScenarioFailure(const AMessage: string): Integer;
@@ -632,6 +643,57 @@ begin
   end;
 end;
 
+procedure TCLIParserArgumentsSuite.TestFlagGivenAnywhereBeforeTheEndOfOptions;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<Boolean>(Fixture.HelpAnywhere(['--help'])).ToBe(True);
+    Expect<Boolean>(Fixture.HelpAnywhere(['main.x', '-h'])).ToBe(True);
+    Expect<Boolean>(Fixture.HelpAnywhere(['main.x', 'help'])).ToBe(True);
+    { The bare word matches in any letter case; the flags do not. }
+    Expect<Boolean>(Fixture.HelpAnywhere(['main.x', 'HELP'])).ToBe(True);
+    Expect<Boolean>(Fixture.HelpAnywhere(['--HELP', '-H'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpAnywhere(['-o', 'out', '--help'])).ToBe(True);
+    { A `--` that a valued short option takes does not end the options. }
+    Expect<Boolean>(Fixture.HelpAnywhere(['-o', '--', '--help'])).ToBe(True);
+    Expect<Boolean>(Fixture.HelpAnywhere(['main.x', '--', 'help'])).ToBe(
+      False);
+    Expect<Boolean>(Fixture.HelpAnywhere(['--output=help', '-o=-h'])).ToBe(
+      False);
+    { Without a bare word only the flags count. }
+    Expect<Boolean>(FlagGiven(['main.x', 'help'], Fixture.Options,
+      HELP_LONG_NAME, HELP_SHORT_NAME)).ToBe(False);
+    { An empty name matches nothing: a lone `-` is an operand, not the
+      short form of a flag that has none. }
+    Expect<Boolean>(FlagGiven(['-', 'main.x'], Fixture.Options, 'verbose',
+      '')).ToBe(False);
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestFlagGivenSkipsAValueAnOptionTakes;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<Boolean>(Fixture.HelpAnywhere(['-o', 'help', 'main.x'])).ToBe(
+      False);
+    Expect<Boolean>(Fixture.HelpAnywhere(['--output', 'help'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpAnywhere(['-o', '-h'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpAnywhere(['-o', '--help'])).ToBe(False);
+    Expect<Boolean>(Fixture.HelpAnywhere(['-d', 'help', '-d', '-h'])).ToBe(
+      False);
+    { A help spelling after the value still counts. }
+    Expect<Boolean>(Fixture.HelpAnywhere(['-o', 'help', 'help'])).ToBe(True);
+  finally
+    Fixture.Free;
+  end;
+end;
+
 procedure TCLIParserArgumentsSuite.SetupTests;
 begin
   Test('options are read after positionals by default',
@@ -658,6 +720,10 @@ begin
     TestLeadingFlagNotGivenPastTheEndOfOptions);
   Test('looking for a leading flag applies no option',
     TestLeadingFlagGivenAppliesNothing);
+  Test('a flag or bare word is found anywhere before the end of options',
+    TestFlagGivenAnywhereBeforeTheEndOfOptions);
+  Test('a value that an option takes is never the flag or bare word',
+    TestFlagGivenSkipsAValueAnOptionTakes);
 end;
 
 procedure TCLIParserSuite.SetupTests;

@@ -73,7 +73,7 @@ type
     {$ENDIF}
     procedure TestRepairReclaimsAbandonedAndPreservesLiveLease;
     procedure TestBudgetParsing;
-    procedure TestAdmissionCostStaysFlatNearBudget;
+    procedure TestAdmissionWorkStaysFlatNearBudget;
     procedure TestStaleLedgerMakesAdmissionMeasure;
     procedure TestRecreatedIndexMakesAdmissionMeasure;
     procedure TestRemovalLeavesTheLedgerUntilAWalk;
@@ -1292,32 +1292,32 @@ begin
   end;
 end;
 
-procedure TCacheLifecycleContract.TestAdmissionCostStaysFlatNearBudget;
+procedure TCacheLifecycleContract.TestAdmissionWorkStaysFlatNearBudget;
 const
   SmallResults = 200;
   LargeResults = 2000;
   Inserts = 12;
   ArtifactBytes = 1024;
-  { Steady-state admissions no longer walk the cache or its references,
-    so ten times the results costs about the same per admission; only the
-    in-memory index load grows. Before, each admission walked the tree
-    three times and each evicted build object rescanned every reference,
-    which made this ratio about ten. }
-  ScaleMultiple = 3;
-  ScaleSlackMs = 100;
+
+type
+  { The work the admissions did, counted by the lifecycle's test counters:
+    the first admission's, and the steady state's after it. }
+  TAdmissionWork = record
+    FirstEnforcements, FirstCollections, FirstWalks: Integer;
+    SteadyEnforcements, SteadyCollections, SteadyWalks,
+      SteadyIndexPasses: Integer;
+    Ledger: string;
+  end;
 
   { Fabricates AResults build results (artifact, result manifest and
     reference each, all indexed in order) with the cache at its budget,
     then stores Inserts new results. }
-  procedure Measure(const AResults: Integer; out AMedianMs: Int64;
-    out AEnforcements, ACollections: Integer; out ALedger: string);
+  procedure Measure(const AResults: Integer; out AWork: TAdmissionWork);
   var
     Artifact, Fingerprint, IndexText, Manifest, Path, Source: string;
     Artifacts, Fingerprints, Manifests: array of string;
     Cache: TLWPTBuildCache;
-    Times: TStringList;
     Index: Integer;
-    Started: QWord;
 
     procedure Fabricate(const ADigest, ABytes: string);
     begin
@@ -1369,39 +1369,46 @@ const
       + 'sequence=' + IntToStr(Length(IndexText) + 1) + #10 + IndexText);
     SetBudget(IntToStr(CacheBytes(FCacheRoot)));
     Cache := TLWPTBuildCache.Create(FCacheRoot);
-    Times := TStringList.Create;
     try
-      CacheLifecycleEnforcementCount := 0;
-      CacheLifecycleReferenceCollectionCount := 0;
+      AWork := Default(TAdmissionWork);
       for Index := 0 to Inserts - 1 do
       begin
         Source := FScratch + '/sources/flat-' + IntToStr(Index);
         WriteTextFile(Source, ArtifactText('new-artifact-'
           + IntToStr(Index) + '-'));
-        Started := GetTickCount64;
+        CacheLifecycleEnforcementCount := 0;
+        CacheLifecycleReferenceCollectionCount := 0;
+        CacheLifecycleDirectoryWalkCount := 0;
+        CacheLifecycleIndexPassCount := 0;
         Expect<Boolean>(Cache.Store('sha256:' + LowerCase(SHA256Hex(
           BytesOf('new-fingerprint-' + IntToStr(Index)))), Source,
           'executable', 493)).ToBe(True);
-        { The first admission measures the cache and evicts a band, whose
-          cost the collection count below bounds; the rest are the steady
-          state this timing bounds. }
-        if Index > 0 then
-          Times.Add(Format('%.12d', [GetTickCount64 - Started]));
+        { The first admission measures the cache and evicts a band; the
+          rest are the steady state. }
+        if Index = 0 then
+        begin
+          AWork.FirstEnforcements := CacheLifecycleEnforcementCount;
+          AWork.FirstCollections := CacheLifecycleReferenceCollectionCount;
+          AWork.FirstWalks := CacheLifecycleDirectoryWalkCount;
+        end
+        else
+        begin
+          Inc(AWork.SteadyEnforcements, CacheLifecycleEnforcementCount);
+          Inc(AWork.SteadyCollections,
+            CacheLifecycleReferenceCollectionCount);
+          Inc(AWork.SteadyWalks, CacheLifecycleDirectoryWalkCount);
+          Inc(AWork.SteadyIndexPasses, CacheLifecycleIndexPassCount);
+        end;
       end;
-      AEnforcements := CacheLifecycleEnforcementCount;
-      ACollections := CacheLifecycleReferenceCollectionCount;
-      ALedger := '';
       if FileExists(FCacheRoot + '/lifecycle/usage') then
         with TStringList.Create do
           try
             LoadFromFile(FCacheRoot + '/lifecycle/usage');
-            ALedger := Values['bytes'] + ' bytes, ' + Values['growth']
+            AWork.Ledger := Values['bytes'] + ' bytes, ' + Values['growth']
               + ' growth, budget ' + IntToStr(ResolveCacheMaxBytes);
           finally
             Free;
           end;
-      Times.Sort;
-      AMedianMs := StrToInt64(Times[Times.Count div 2]);
       if CacheBytes(FCacheRoot) > ResolveCacheMaxBytes then
         Fail(Format('%d results: the cache is over budget', [AResults]));
       { Eviction removed whole results, oldest first: a surviving
@@ -1416,37 +1423,58 @@ const
           Fail(Format('%d results: reference %d outlived its result',
             [AResults, Index]));
     finally
-      Times.Free;
       Cache.Free;
     end;
   end;
 
+  function Describe(const AResults: Integer;
+    const AWork: TAdmissionWork): string;
+  begin
+    Result := Format('%d results: first admission %d enforcements, %d '
+      + 'reference walks, %d walk steps; steady state %d enforcements, %d '
+      + 'reference walks, %d walk steps, %d index passes (ledger %s)',
+      [AResults, AWork.FirstEnforcements, AWork.FirstCollections,
+      AWork.FirstWalks, AWork.SteadyEnforcements, AWork.SteadyCollections,
+      AWork.SteadyWalks, AWork.SteadyIndexPasses, AWork.Ledger]);
+  end;
+
 var
-  SmallMs, LargeMs: Int64;
-  SmallCollections, LargeCollections, SmallEnforcements,
-    LargeEnforcements: Integer;
-  SmallLedger, LargeLedger: string;
+  Small, Large: TAdmissionWork;
 begin
-  Measure(SmallResults, SmallMs, SmallEnforcements, SmallCollections,
-    SmallLedger);
-  Measure(LargeResults, LargeMs, LargeEnforcements, LargeCollections,
-    LargeLedger);
-  { One authoritative enforcement for all the admissions, at either size:
-    the first evicts down to the low-water mark, and the band it leaves
-    holds the rest. That batch evicts a tenth of the results, artifacts
-    and manifests alike, yet walks the references once; a walk per
-    evicted object would count in the dozens or hundreds here. }
-  if (SmallEnforcements <> 1) or (LargeEnforcements <> 1)
-     or (SmallCollections <> 1) or (LargeCollections <> 1) then
-    Fail(Format('expected one enforcement and one reference walk at each '
-      + 'size; %d results: %d and %d (ledger %s); %d results: %d and %d '
-      + '(ledger %s)', [SmallResults, SmallEnforcements, SmallCollections,
-      SmallLedger, LargeResults, LargeEnforcements, LargeCollections,
-      LargeLedger]));
-  if LargeMs >= ScaleMultiple * SmallMs + ScaleSlackMs then
-    Fail(Format('median admission took %d ms at %d results against %d ms '
-      + 'at %d; bound %d x + %d ms', [LargeMs, LargeResults, SmallMs,
-      SmallResults, ScaleMultiple, ScaleSlackMs]));
+  { This counts work instead of timing it. Each admission reads and
+    rewrites the whole LRU index (the format ADR-0040 defines), so its
+    wall time grows with the index whatever else it does; a timed bound
+    therefore measures the host's speed and load as much as the code
+    (#417). What must not grow is everything else: walks of the tree and
+    of the references, and the number of index passes per admission. }
+  Measure(SmallResults, Small);
+  Measure(LargeResults, Large);
+  { The first admission at either size measures the cache and evicts down
+    to the low-water mark. That batch evicts a tenth of the results,
+    artifacts and manifests alike, yet walks the references once; a walk
+    per evicted object would count in the dozens or hundreds here. }
+  if (Small.FirstEnforcements <> 1) or (Large.FirstEnforcements <> 1)
+     or (Small.FirstCollections <> 1) or (Large.FirstCollections <> 1)
+     or (Small.FirstWalks = 0) or (Large.FirstWalks = 0) then
+    Fail('expected the first admission to enforce once, walk the cache and '
+      + 'walk the references once at each size; '
+      + Describe(SmallResults, Small) + '; '
+      + Describe(LargeResults, Large));
+  { The band it leaves holds the rest, so they judge the budget from the
+    ledger without walking anything. Before #405, each admission walked
+    the tree three times. }
+  if (Small.SteadyEnforcements <> 0) or (Large.SteadyEnforcements <> 0)
+     or (Small.SteadyCollections <> 0) or (Large.SteadyCollections <> 0)
+     or (Small.SteadyWalks <> 0) or (Large.SteadyWalks <> 0) then
+    Fail('expected later admissions to walk nothing at each size; '
+      + Describe(SmallResults, Small) + '; '
+      + Describe(LargeResults, Large));
+  { Ten times the results costs as many index passes per admission. }
+  if (Small.SteadyIndexPasses = 0)
+     or (Large.SteadyIndexPasses <> Small.SteadyIndexPasses) then
+    Fail('expected as many index passes in the large cache as in the '
+      + 'small one; ' + Describe(SmallResults, Small) + '; '
+      + Describe(LargeResults, Large));
 end;
 
 procedure TCacheLifecycleContract.TestStaleLedgerMakesAdmissionMeasure;
@@ -1864,8 +1892,8 @@ begin
   {$ENDIF}
   Test('repair reclaims abandoned and preserves live producer leases',
     TestRepairReclaimsAbandonedAndPreservesLiveLease);
-  Test('admission cost stays flat near the budget as the cache grows',
-    TestAdmissionCostStaysFlatNearBudget);
+  Test('admission work stays flat near the budget as the cache grows',
+    TestAdmissionWorkStaysFlatNearBudget);
   Test('a ledger another writer left stale makes admission measure',
     TestStaleLedgerMakesAdmissionMeasure);
   Test('a recreated index with the same sequence and size makes admission '

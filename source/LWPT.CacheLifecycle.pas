@@ -76,6 +76,16 @@ var
   { Counts walks of the build references, so a test can show that one
     eviction batch collects them once however many objects it evicts. }
   CacheLifecycleReferenceCollectionCount: Integer;
+  { Counts cache-tree walk steps: each directory a byte measurement
+    enumerates and each object root object discovery scans. A test can
+    show that an admission the ledger admits walks nothing, whatever the
+    cache's size. }
+  CacheLifecycleDirectoryWalkCount: Integer;
+  { Counts whole-index passes (each load, write and size computation of
+    the LRU index). Their cost grows with the index, which is rewritten on
+    every access, so a test can show that an admission makes as many of
+    them in a large cache as in a small one. }
+  CacheLifecycleIndexPassCount: Integer;
 {$ENDIF}
 
 implementation
@@ -312,6 +322,9 @@ var
   Value: Int64;
   Values: array of Int64;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleIndexPassCount);
+  {$ENDIF}
   AEntries.Clear;
   ASequence := 0;
   AValid := False;
@@ -395,6 +408,9 @@ var
   Index: Integer;
   Lines: TStringList;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleIndexPassCount);
+  {$ENDIF}
   Lines := TStringList.Create;
   try
     Lines.LineBreak := #10;
@@ -421,6 +437,9 @@ var
   Index: Integer;
   Lines: TStringList;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleIndexPassCount);
+  {$ENDIF}
   Lines := TStringList.Create;
   try
     Lines.LineBreak := #10;
@@ -758,6 +777,9 @@ var
   PrefixSearch, ObjectSearch: TSearchRec;
   LengthBefore: Integer;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleDirectoryWalkCount);
+  {$ENDIF}
   if IsDirSymlinkOrJunction(AObjectRoot) then Exit;
   SHA256Root := IncludeTrailingPathDelimiter(AObjectRoot) + 'sha256';
   if IsDirSymlinkOrJunction(SHA256Root) then Exit;
@@ -1795,6 +1817,9 @@ var
   Child: string;
   Search: TSearchRec;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleDirectoryWalkCount);
+  {$ENDIF}
   Result := 0;
   if FindFirst(IncludeTrailingPathDelimiter(APath) + '*',
        faAnyFile or faSymLink,
