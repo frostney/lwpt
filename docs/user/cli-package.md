@@ -4,10 +4,17 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.7.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
+This page describes `cli` 0.8.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
 and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
 them has the host settings below. The [consumer guide](consumer-guide.md)
 shows how to add the package to a project.
+
+A host that moves from 0.7.0 to 0.8.0 without changing its code sees one
+difference: a value that a command option takes is never a help request.
+With a valued option `--output` (`-o`), `demo build -o help main.x` used to
+print the help of `build`; it now runs `build` with `help` as the value. An
+option that rejects the value, such as an integer option, now reports a usage
+error where 0.7.0 printed help.
 
 A host that moves from 0.6.0 to 0.7.0 without changing its code sees one
 difference: a command option with a short name is listed with it in the
@@ -160,7 +167,9 @@ defaults column says.
 | `TSubcommand.AliasesSubcommands` | `False` | Lets `<program> <command> <subcommand>` dispatch `<subcommand>`. |
 
 Help is built in: `help`, `--help` and `-h` as the first argument print the
-top-level help, and after a command name they print that command's help.
+top-level help, and after a command name they print that command's help,
+unless an option takes them as its value (see
+[End of options and pass-through](#end-of-options-and-pass-through)).
 
 A command's help lists its options under `options:`. An option with a
 `ShortName` is listed with it, the way top-level help lists a flag's short
@@ -184,8 +193,9 @@ run "demo --help" to see all commands
 command reference from the registry can use it to match the help.
 
 Write a command option's `ShortName` without its dash, as for a top-level
-flag. `h` is not available: `-h` after a command name always asks for help,
-so an option with the short name `h` cannot be given as `-h`.
+flag. `h` is not available: after a command name, `-h` asks for help
+wherever an option name may stand, so an option with the short name `h`
+cannot be given as `-h`.
 
 ## Top-level flags
 
@@ -245,7 +255,12 @@ to the registry. Option parsing then stops at the first positional:
   `demo run` reads `usage: demo run [--json] [--unchecked] <file> [arguments]`.
 
 Outside pass-through commands, the word `help` anywhere before `--` asks for
-the command's help, so `demo check a help` prints the help of `check`.
+the command's help, so `demo check a help` prints the help of `check`. An
+argument that an option takes as its value is not a help request, in any
+command: with a valued option `--output` (`-o`), `--output help`, `-o help`
+and `-o -h` give the option that value, and `-o help --help` still prints the
+help. `FlagGiven` in `CLI.Parser` finds a flag or word under the same reading,
+and `LeadingFlagGiven` does so before the first positional.
 
 ## Subcommand aliasing
 
