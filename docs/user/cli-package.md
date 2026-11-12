@@ -4,10 +4,15 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.9.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
+This page describes `cli` 0.10.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
 and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
 them has the host settings below. The [consumer guide](consumer-guide.md)
 shows how to add the package to a project.
+
+A host that moves from 0.9.0 to 0.10.0 without changing its code sees no
+difference. `TOptionalStringOption`, `ApplyExplicit` and
+`ConsumesSeparateValue` are new; an option subclass that overrides only
+`Apply` keeps working.
 
 A host that moves from 0.8.0 to 0.9.0 without changing its code sees no
 difference. `StrictSingleDash` is new and off by default.
@@ -298,6 +303,38 @@ These stay as they are:
 `ParseArguments` and `ParseCommandLine` take the same choice as an optional
 `AStrictSingleDash` argument, and `LeadingFlagGiven` takes it to read the
 arguments the same way.
+
+## Options with an optional value
+
+`TOptionalStringOption` is an option whose value may be left out. Its help
+reads `--hot[=<value>]`.
+
+| Argument | `Present` | `HasValue` | `Value` |
+| --- | --- | --- | --- |
+| not given | `False` | `False` | empty |
+| `--hot` or `-H` | `True` | `False` | empty |
+| `--hot=` | `True` | `True` | empty |
+| `--hot=restart` | `True` | `True` | `restart` |
+| `-Hrestart`, with `AllowAttachedShortValue` | `True` | `True` | `restart` |
+
+It never takes the next argument as its value: in `--hot main.x`, `--hot` has
+no value and `main.x` is a positional. Read `HasValue` rather than `ValueOr`:
+once the option is given, `ValueOr` returns its value, empty for `--hot`. A
+subclass that overrides `Apply` sees every occurrence, but `--hot` reaches it
+with an empty value, like `--hot=`, and `HasValue` is set only after `Apply`
+returns. A subclass that checks the value must accept the empty one, or
+override `ApplyExplicit` and read `AHasEquals` to tell the two apart.
+
+A host that writes its own option kind gets the same information. The parser
+applies every occurrence through `ApplyExplicit(AValue, AHasEquals)`, where
+`AHasEquals` is `True` when the argument spelled `=` (`--name=` and
+`--name=value`) and `False` otherwise, including a separated value
+(`--name value`) and an attached short value. Its default calls
+`Apply(AValue)`, so a subclass that overrides only `Apply` behaves as before.
+`ConsumesSeparateValue` says whether the option takes the next argument as its
+value when it is named without one; it is `True` for every option kind except
+`TFlagOption` and `TOptionalStringOption`. A flag still accepts a value
+spelled with `=` (`--verify=yes`) and ignores it.
 
 ## Subcommand aliasing
 

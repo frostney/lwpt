@@ -62,6 +62,11 @@ type
     procedure TestStopAtFirstPositionalConsumesOnlyALeadingMarker;
     procedure TestStopAtFirstPositionalRejectsLeadingUnknownOptions;
     procedure TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken;
+    procedure TestOptionalValueOptionTakesAValueOnlyWithEquals;
+    procedure TestOptionalValueSubclassAndDirectCalls;
+    procedure TestApplyExplicitTellsEqualsFromNoValue;
+    procedure TestApplyOnlySubclassesKeepWorking;
+    procedure TestConsumesSeparateValueDefaults;
     procedure TestUnknownDashWordsArePositionalByDefault;
     procedure TestStrictSingleDashRejectsUnknownDashWords;
     procedure TestStrictSingleDashKeepsNumbersValuesAndOperands;
@@ -72,6 +77,38 @@ type
     procedure TestFlagGivenAnywhereBeforeTheEndOfOptions;
     procedure TestFlagGivenSkipsAValueAnOptionTakes;
   end;
+
+  { Records each ApplyExplicit call as `<value>|<has equals>`. }
+  TRecordingFlag = class(TFlagOption)
+  public
+    Calls: string;
+    procedure ApplyExplicit(const AValue: string;
+      const AHasEquals: Boolean); override;
+  end;
+
+  TRecordingString = class(TStringOption)
+  public
+    Calls: string;
+    procedure ApplyExplicit(const AValue: string;
+      const AHasEquals: Boolean); override;
+  end;
+
+  { A flag subclass that reads its value in Apply only, the way a host
+    had to before ApplyExplicit existed. }
+  TApplyOnlyFlag = class(TFlagOption)
+  public
+    Seen: string;
+    procedure Apply(const AValue: string); override;
+  end;
+
+  { An optional-value option whose Apply override changes the value. }
+  TUpperOptional = class(TOptionalStringOption)
+  public
+    ApplyCalls: Integer;
+    procedure Apply(const AValue: string); override;
+  end;
+
+  TTestColor = (tcRed, tcGreen);
 
   { A representative option table for the in-process tests. }
   TParserFixture = class
@@ -100,6 +137,68 @@ const
   HELP_LONG_NAME = 'help';
   HELP_SHORT_NAME = 'h';
 
+function RecordedCall(const AValue: string;
+  const AHasEquals: Boolean): string;
+begin
+  Result := AValue + '|' + BoolToStr(AHasEquals, 'equals', 'none') + ';';
+end;
+
+procedure TRecordingFlag.ApplyExplicit(const AValue: string;
+  const AHasEquals: Boolean);
+begin
+  inherited ApplyExplicit(AValue, AHasEquals);
+  Calls := Calls + RecordedCall(AValue, AHasEquals);
+end;
+
+procedure TRecordingString.ApplyExplicit(const AValue: string;
+  const AHasEquals: Boolean);
+begin
+  inherited ApplyExplicit(AValue, AHasEquals);
+  Calls := Calls + RecordedCall(AValue, AHasEquals);
+end;
+
+procedure TApplyOnlyFlag.Apply(const AValue: string);
+begin
+  inherited Apply(AValue);
+  Seen := AValue;
+end;
+
+procedure TUpperOptional.Apply(const AValue: string);
+begin
+  inherited Apply(UpperCase(AValue));
+  Inc(ApplyCalls);
+end;
+
+{ The positionals ParseArguments returned, joined by `|`; frees them. }
+function JoinedPositionals(const APositionals: TStringList): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  try
+    for I := 0 to APositionals.Count - 1 do
+    begin
+      if I > 0 then Result := Result + POSITIONAL_SEPARATOR;
+      Result := Result + APositionals[I];
+    end;
+  finally
+    APositionals.Free;
+  end;
+end;
+
+{ ParseArguments over AOptions, with the positionals joined by `|`. }
+function ParseWith(const AArguments: array of string;
+  const AOptions: array of TOptionBase): string;
+var
+  Options: TOptionArray;
+  I: Integer;
+begin
+  SetLength(Options, Length(AOptions));
+  for I := 0 to High(AOptions) do
+    Options[I] := AOptions[I];
+  Result := JoinedPositionals(ParseArguments(AArguments, Options));
+end;
+
 constructor TParserFixture.Create;
 begin
   inherited Create;
@@ -127,22 +226,9 @@ end;
 function TParserFixture.Parse(const AArguments: array of string;
   const AStopAtFirstPositional: Boolean = False;
   const AStrictSingleDash: Boolean = False): string;
-var
-  Positionals: TStringList;
-  I: Integer;
 begin
-  Result := '';
-  Positionals := ParseArguments(AArguments, Options, AStopAtFirstPositional,
-    AStrictSingleDash);
-  try
-    for I := 0 to Positionals.Count - 1 do
-    begin
-      if I > 0 then Result := Result + POSITIONAL_SEPARATOR;
-      Result := Result + Positionals[I];
-    end;
-  finally
-    Positionals.Free;
-  end;
+  Result := JoinedPositionals(ParseArguments(AArguments, Options,
+    AStopAtFirstPositional, AStrictSingleDash));
 end;
 
 function TParserFixture.ParseError(const AArguments: array of string;
@@ -713,6 +799,150 @@ begin
   end;
 end;
 
+procedure TCLIParserArgumentsSuite.
+  TestOptionalValueOptionTakesAValueOnlyWithEquals;
+
+  { Parses AArguments with a fresh `--hot` (`-H`) and returns its state:
+    `absent`, `none` or `value=<value>`, then the positionals. }
+  function HotAfter(const AArguments: array of string): string;
+  var
+    Hot: TOptionalStringOption;
+    Positionals: string;
+  begin
+    Hot := TOptionalStringOption.Create('hot', 'reload');
+    try
+      Hot.ShortName := 'H';
+      Hot.AllowAttachedShortValue := True;
+      Positionals := ParseWith(AArguments, [Hot]);
+      if not Hot.Present then
+        Result := 'absent'
+      else if Hot.HasValue then
+        Result := 'value=' + Hot.Value
+      else
+        Result := 'none';
+      Result := Result + ' ' + Positionals;
+    finally
+      Hot.Free;
+    end;
+  end;
+
+begin
+  Expect<string>(HotAfter(['main.x'])).ToBe('absent main.x');
+  { Named alone it never takes the next argument. }
+  Expect<string>(HotAfter(['--hot', 'main.x'])).ToBe('none main.x');
+  Expect<string>(HotAfter(['--hot=', 'main.x'])).ToBe('value= main.x');
+  Expect<string>(HotAfter(['--hot=restart', 'main.x'])).ToBe(
+    'value=restart main.x');
+  Expect<string>(HotAfter(['-H', 'main.x'])).ToBe('none main.x');
+  Expect<string>(HotAfter(['-Hrestart', 'main.x'])).ToBe(
+    'value=restart main.x');
+  { The last occurrence wins, including whether it carried a value. }
+  Expect<string>(HotAfter(['--hot=restart', '--hot'])).ToBe('none ');
+end;
+
+procedure TCLIParserArgumentsSuite.TestOptionalValueSubclassAndDirectCalls;
+var
+  Watch: TUpperOptional;
+  Hot: TOptionalStringOption;
+begin
+  { A subclass's Apply override sees every command-line occurrence. }
+  Watch := TUpperOptional.Create('watch', 'watch');
+  try
+    Expect<string>(ParseWith(['--watch=abc'], [Watch])).ToBe('');
+    Expect<string>(Watch.Value).ToBe('ABC');
+    Expect<Boolean>(Watch.HasValue).ToBe(True);
+    Expect<string>(ParseWith(['--watch'], [Watch])).ToBe('');
+    Expect<Boolean>(Watch.HasValue).ToBe(False);
+    Expect<Integer>(Watch.ApplyCalls).ToBe(2);
+  finally
+    Watch.Free;
+  end;
+
+  { A direct Apply, as from a config file, counts as a value; MarkPresent
+    does not. Given without a value, ValueOr returns the empty value. }
+  Hot := TOptionalStringOption.Create('hot', 'reload');
+  try
+    Hot.MarkPresent;
+    Expect<Boolean>(Hot.Present).ToBe(True);
+    Expect<Boolean>(Hot.HasValue).ToBe(False);
+    Hot.Apply('');
+    Expect<Boolean>(Hot.HasValue).ToBe(True);
+    Expect<string>(ParseWith(['--hot'], [Hot])).ToBe('');
+    Expect<string>(Hot.ValueOr('default')).ToBe('');
+  finally
+    Hot.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestApplyExplicitTellsEqualsFromNoValue;
+var
+  Verify: TRecordingFlag;
+  Name: TRecordingString;
+begin
+  Verify := TRecordingFlag.Create('verify', 'verify');
+  Name := TRecordingString.Create('name', 'name');
+  try
+    Verify.ShortName := 'v';
+    Name.ShortName := 'n';
+    Name.AllowAttachedShortValue := True;
+    Expect<string>(ParseWith(['--verify', '--verify=', '--verify=yes', '-v',
+      'main.x'], [Verify, Name])).ToBe('main.x');
+    Expect<string>(Verify.Calls).ToBe(
+      '|none;|equals;yes|equals;|none;');
+    Expect<string>(ParseWith(['--name=a', '--name', 'b', '-n', 'c', '-nd',
+      '--name='], [Verify, Name])).ToBe('');
+    Expect<string>(Name.Calls).ToBe(
+      'a|equals;b|none;c|none;d|none;|equals;');
+    Expect<string>(Name.Value).ToBe('');
+  finally
+    Name.Free;
+    Verify.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestApplyOnlySubclassesKeepWorking;
+var
+  Hot: TApplyOnlyFlag;
+begin
+  Hot := TApplyOnlyFlag.Create('hot', 'reload');
+  try
+    Expect<string>(ParseWith(['--hot=restart', 'main.x'], [Hot])).ToBe(
+      'main.x');
+    Expect<string>(Hot.Seen).ToBe('restart');
+    Expect<Boolean>(Hot.Present).ToBe(True);
+    Expect<string>(ParseWith(['--hot', 'main.x'], [Hot])).ToBe('main.x');
+    Expect<string>(Hot.Seen).ToBe('');
+  finally
+    Hot.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestConsumesSeparateValueDefaults;
+var
+  Options: array[0..6] of TOptionBase;
+  I: Integer;
+begin
+  Options[0] := TFlagOption.Create('flag', '');
+  Options[1] := TStringOption.Create('string', '');
+  Options[2] := TIntegerOption.Create('integer', '');
+  Options[3] := TInt64Option.Create('int64', '');
+  Options[4] := TRepeatableOption.Create('repeatable', '');
+  Options[5] := TOptionalStringOption.Create('optional', '');
+  Options[6] := TEnumOption<TTestColor>.Create('color', '');
+  try
+    Expect<Boolean>(Options[0].ConsumesSeparateValue).ToBe(False);
+    Expect<Boolean>(Options[1].ConsumesSeparateValue).ToBe(True);
+    Expect<Boolean>(Options[2].ConsumesSeparateValue).ToBe(True);
+    Expect<Boolean>(Options[3].ConsumesSeparateValue).ToBe(True);
+    Expect<Boolean>(Options[4].ConsumesSeparateValue).ToBe(True);
+    Expect<Boolean>(Options[5].ConsumesSeparateValue).ToBe(False);
+    Expect<Boolean>(Options[6].ConsumesSeparateValue).ToBe(True);
+  finally
+    for I := 0 to High(Options) do
+      Options[I].Free;
+  end;
+end;
+
 procedure TCLIParserArgumentsSuite.TestUnknownDashWordsArePositionalByDefault;
 var
   Fixture: TParserFixture;
@@ -818,6 +1048,16 @@ begin
     TestStopAtFirstPositionalRejectsLeadingUnknownOptions);
   Test('stop-at-first-positional ends at an unmatched single-dash token',
     TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken);
+  Test('an optional-value option takes a value only with = or attached',
+    TestOptionalValueOptionTakesAValueOnlyWithEquals);
+  Test('an optional-value subclass sees Apply; direct calls set HasValue',
+    TestOptionalValueSubclassAndDirectCalls);
+  Test('ApplyExplicit tells --name= from --name and a separated value',
+    TestApplyExplicitTellsEqualsFromNoValue);
+  Test('a flag subclass that overrides only Apply keeps its value',
+    TestApplyOnlySubclassesKeepWorking);
+  Test('only flags and optional-value options decline a separated value',
+    TestConsumesSeparateValueDefaults);
   Test('an unknown dash word of several characters is positional by default',
     TestUnknownDashWordsArePositionalByDefault);
   Test('strict single-dash parsing rejects every unknown dash word',

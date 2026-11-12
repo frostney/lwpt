@@ -23,10 +23,11 @@ type
   single-character short options. An unmatched multi-character
   single-dash token remains positional.
 
-  A valued short option consumes the following argument (`-o output`)
-  when its ShortName matches exactly, including a value that begins with
-  `-`. AllowAttachedShortValue additionally enables an attached suffix
-  (`-dDEBUG`, `-Fusource`); the longest registered short-name prefix wins.
+  A short option whose ConsumesSeparateValue is True consumes the
+  following argument (`-o output`) when its ShortName matches exactly,
+  including a value that begins with `-`. AllowAttachedShortValue
+  additionally enables an attached suffix (`-dDEBUG`, `-Fusource`); the
+  longest registered short-name prefix wins.
 
   END_OF_OPTIONS_MARKER ends option parsing: the arguments after it are
   returned as positionals, verbatim.
@@ -114,6 +115,7 @@ type
     Kind: TArgumentKind;
     Option: TOptionBase;  { akOption }
     Value: string;        { akOption }
+    HasEquals: Boolean;   { akOption: the argument spelled `=` }
     Width: Integer;       { arguments read: 2 with a separated value }
     Rejection: string;    { akRejected: the TParseError message }
   end;
@@ -173,6 +175,9 @@ begin
   for I := 0 to High(AOptions) do
   begin
     ShortName := AOptions[I].ShortName;
+    { A flag takes no attached short value. An option that declines a
+      separated value, such as an optional-value option, may still take
+      an attached one, so this is not ConsumesSeparateValue. }
     if (ShortName <> '') and
        not (AOptions[I] is TFlagOption) and
        AOptions[I].AllowAttachedShortValue and
@@ -223,6 +228,7 @@ begin
   Result.Option := nil;
   Result.Value := '';
   Result.Width := 1;
+  Result.HasEquals := False;
   Result.Rejection := '';
 
   if Arg = END_OF_OPTIONS_MARKER then
@@ -230,17 +236,18 @@ begin
   else if Copy(Arg, 1, Length(LONG_FLAG_PREFIX)) = LONG_FLAG_PREFIX then
   begin
     SplitFlag(Arg, Name, Result.Value, HasEquals);
+    Result.HasEquals := HasEquals;
     Result.Option := FindOption(AOptions, Name);
     if Result.Option = nil then
     begin
       Result.Kind := akRejected;
       Result.Rejection := Format('Unknown option: --%s', [Name]);
     end
-    { Plain string/integer options accept the space-separated form
-      (--mode release) as well as --mode=release; flag options
-      still take no value. }
+    { Valued options accept the space-separated form (--mode release) as
+      well as --mode=release; an option that declines a separated value,
+      such as a flag, takes none. }
     else if (Result.Value = '') and (not HasEquals) and
-            not (Result.Option is TFlagOption) then
+            Result.Option.ConsumesSeparateValue then
     begin
       if (not HasNext) or
          (Copy(AArguments[AIndex + 1], 1, 1) = SHORT_FLAG_CHAR) then
@@ -263,7 +270,7 @@ begin
     Result.Option := FindOptionShortExact(AOptions, Name);
     if Result.Option <> nil then
     begin
-      if not (Result.Option is TFlagOption) then
+      if Result.Option.ConsumesSeparateValue then
       begin
         if not HasNext then
         begin
@@ -323,7 +330,7 @@ begin
         akRejected:
           raise TParseError.Create(Reading.Rejection);
         akOption:
-          Reading.Option.Apply(Reading.Value);
+          Reading.Option.ApplyExplicit(Reading.Value, Reading.HasEquals);
         akEndOfOptions:
           VerbatimFrom := I + 1;
         akPositional:
