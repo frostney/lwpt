@@ -14,8 +14,9 @@
                                      Repeatable / Enum<T>
     - TOptionArray                 — flat array; the consumer-facing
                                      shape that ParseCommandLine eats
-    - TOptionList                  — fluent registry that owns options
-                                     until you .Options it out
+    - TOptionList                  — fluent registry that owns the
+                                     options added to it; .Options
+                                     returns a copy of their order
 
   No Generics.* unit: every host that uses this unit, directly or through
   CLI.Parser / CLI.Help / CLI.Subcommands, would link that unit closure
@@ -462,7 +463,6 @@ end;
 constructor TOptionList.Create;
 begin
   inherited Create;
-  FCount := 0;
 end;
 
 destructor TOptionList.Destroy;

@@ -1,13 +1,14 @@
 { CLIUnitClosure.Test — a host of the cli package links no Generics.* unit.
 
   Every unit a program uses is linked into it and initialized at every
-  start. Generics.Collections brings a closure of its own (on FPC 3.2.2:
-  Generics.MemoryExpanders, Generics.Defaults, Generics.Helpers,
-  Generics.Strings, Generics.Hashes, Variants, VarUtils) that costs a host
-  start-up time, peak memory and binary size even when the host never uses
-  a generic collection (#419). This program compiles a probe host that uses
-  every unit in packages/cli/source with the real compiler and `-vu`, and
-  fails when the compiler registers any Generics.* unit for it.
+  start. Generics.Collections brings a closure of its own (with FPC 3.2.2
+  on Linux and macOS: Generics.MemoryExpanders, Generics.Defaults,
+  Generics.Helpers, Generics.Strings, Generics.Hashes, Variants, VarUtils)
+  that costs a host start-up time, peak memory and binary size even when
+  the host never uses a generic collection (#419). This program compiles a
+  probe host that uses every unit in packages/cli/source with the real
+  compiler and `-vu`, and fails when the compiler registers any Generics.*
+  unit for it.
 
   A canary probe that uses Generics.Collections directly proves the
   detection: if the compiler stops reporting units the way this program
@@ -33,7 +34,6 @@ const
   { How the compiler reports, under -vu, each unit a compilation uses. }
   REGISTERED_UNIT_MARKER = 'Registering new unit ';
   FORBIDDEN_UNIT_PREFIX = 'GENERICS.';
-  COMPILE_TIMEOUT_MILLISECONDS = 180000;
 
 type
   TCLIUnitClosure = class(TTestSuite)
@@ -122,12 +122,11 @@ begin
     + 'begin'#10
     + 'end.'#10);
   ExitStatus := RunChildCommand(Directory, TestCompilerExecutable,
-    ['-B', '-Cn', '-vu', '-Fu' + CLISource, '-Fi' + CLISource,
-     '-FU' + Directory + '/units', 'probe.pas'],
-    Log, COMPILE_TIMEOUT_MILLISECONDS);
+    ['-B', '-Cn', '-vu', '-Fu' + CLISource, '-FU' + Directory + '/units',
+     'probe.pas'], Log);
   if ExitStatus <> 0 then
     Fail(Format('probe %s did not compile (exit %d):'#10'%s',
-      [AName, ExitStatus, Log]));
+      [AName, ExitStatus, CapturedOutputTail(Log)]));
   Result := RegisteredUnits(Log);
 end;
 
