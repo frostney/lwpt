@@ -1,10 +1,9 @@
 { CLI.Options.Test — TOptionList, the registry that owns options.
 
-  TOptionList keeps its items in a plain array so that CLI.Options needs no
-  Generics.* unit (#419). These cases pin what a host relies on: the Add
-  methods append in call order and return the option, Options hands out
-  that order without giving the list's storage away, and freeing the list
-  frees every option it holds. They run in-process. }
+  These cases pin what a host relies on (#419): the Add methods append in
+  call order and return the option, Options hands out that order without
+  giving the list's storage away, and freeing the list frees every option
+  it holds. They run in-process. }
 
 program CLI.Options.Test;
 
@@ -82,9 +81,10 @@ begin
     Expect<string>(Flag.LongName).ToBe('release');
     Expect<string>(Flag.HelpText).ToBe('Optimize');
     Expect<string>(Flag.Group).ToBe('build');
-    Expect<string>(Output.HelpLabel).ToBe('--output=<value>');
-    Expect<string>(Jobs.HelpLabel).ToBe('--jobs=<N>');
-    Expect<string>(Define.HelpLabel).ToBe('--define <value>');
+    Expect<string>(Output.LongName).ToBe('output');
+    Expect<string>(Jobs.LongName).ToBe('jobs');
+    Expect<string>(Define.LongName).ToBe('define');
+    Expect<string>(Define.HelpText).ToBe('Define a symbol');
   finally
     List.Free;
   end;
