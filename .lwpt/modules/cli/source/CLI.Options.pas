@@ -17,6 +17,11 @@
     - TOptionList                  — fluent registry that owns options
                                      until you .Options it out
 
+  No Generics.* unit: every host that uses this unit, directly or through
+  CLI.Parser / CLI.Help / CLI.Subcommands, would link that unit closure
+  and run its initialization at every start. TOptionList keeps its items
+  in a plain array instead (#419).
+
   Lives under the CLI namespace (no LWPT prefix) so it can graduate
   into a standalone reusable package alongside CLI.Parser /
   CLI.Subcommands / CLI.Prompts / CLI.Help when the LWPT bootstrap
@@ -29,7 +34,6 @@ interface
 
 uses
   Classes,
-  Generics.Collections,
   SysUtils,
   TypInfo;
 
@@ -159,11 +163,11 @@ type
     function Matches(const AValue: T): Boolean;
   end;
 
-  TOptionBaseList = TObjectList<TOptionBase>;
-
+  { Owns every option added to it and frees them when it is freed. }
   TOptionList = class
   private
-    FItems: TOptionBaseList;
+    FItems: TOptionArray;
+    FCount: Integer;
   public
     constructor Create;
     destructor Destroy; override;
@@ -458,12 +462,15 @@ end;
 constructor TOptionList.Create;
 begin
   inherited Create;
-  FItems := TOptionBaseList.Create(True);
+  FCount := 0;
 end;
 
 destructor TOptionList.Destroy;
+var
+  I: Integer;
 begin
-  FItems.Free;
+  for I := 0 to FCount - 1 do
+    FItems[I].Free;
   inherited Destroy;
 end;
 
@@ -471,43 +478,43 @@ function TOptionList.AddFlag(const ALongName, AHelpText: string;
   const AGroup: string): TFlagOption;
 begin
   Result := TFlagOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.AddString(const ALongName, AHelpText: string;
   const AGroup: string): TStringOption;
 begin
   Result := TStringOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.AddInteger(const ALongName, AHelpText: string;
   const AGroup: string): TIntegerOption;
 begin
   Result := TIntegerOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.AddRepeatable(const ALongName, AHelpText: string;
   const AGroup: string): TRepeatableOption;
 begin
   Result := TRepeatableOption.Create(ALongName, AHelpText, AGroup);
-  FItems.Add(Result);
+  Add(Result);
 end;
 
 function TOptionList.Add(const AOption: TOptionBase): TOptionBase;
 begin
-  FItems.Add(AOption);
+  { Grow geometrically so a long run of Add calls stays linear. }
+  if FCount = Length(FItems) then
+    SetLength(FItems, 2 * FCount + 4);
+  FItems[FCount] := AOption;
+  Inc(FCount);
   Result := AOption;
 end;
 
 function TOptionList.Options: TOptionArray;
-var
-  I: Integer;
 begin
-  SetLength(Result, FItems.Count);
-  for I := 0 to FItems.Count - 1 do
-    Result[I] := FItems[I];
+  Result := Copy(FItems, 0, FCount);
 end;
 
 end.
