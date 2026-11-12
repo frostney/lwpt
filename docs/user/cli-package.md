@@ -4,10 +4,13 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.12.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
+This page describes `cli` 0.13.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
 and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
 them has the host settings below. The [consumer guide](consumer-guide.md)
 shows how to add the package to a project.
+
+A host that moves from 0.12.0 to 0.13.0 without changing its code sees no
+difference. `ExactCommandNames` is new and off by default.
 
 A host that moves from 0.11.0 to 0.12.0 without changing its code sees no
 difference. `StrictTopLevelFlags` is new and off by default.
@@ -182,6 +185,7 @@ defaults column says.
 | `Registry.BareInvocation` | `biShowHelp` | What the program does without arguments: print help and exit 0, or report a usage error (`biUsageError`). |
 | `Registry.StrictSingleDash` | `False` | Makes an unknown single-dash argument such as `-verify` a usage error instead of a positional (see [Strict single-dash parsing](#strict-single-dash-parsing)). |
 | `Registry.StrictTopLevelFlags` | `False` | Makes any argument after a top-level flag or the built-in top-level help a usage error instead of ignoring it (see [Top-level flags](#top-level-flags)). |
+| `Registry.ExactCommandNames` | `False` | Matches command names only in the letter case they were registered in (see [Command names](#command-names)). |
 | `TSubcommand.PassThrough` | `False` | Stops option parsing at the command's first positional. |
 | `TSubcommand.AliasesSubcommands` | `False` | Lets `<program> <command> <subcommand>` dispatch `<subcommand>`. |
 
@@ -365,6 +369,38 @@ applies every occurrence through `ApplyExplicit(AValue, AHasEquals)`, where
 value when it is named without one; it is `True` for every option kind except
 `TFlagOption` and `TOptionalStringOption`. A flag still accepts a value
 spelled with `=` (`--verify=yes`) and ignores it.
+
+## Command names
+
+By default the ASCII letters of a command name match in any letter case:
+`demo CHECK f.src` runs `check`, and an unknown name is reported with its
+ASCII letters lowercased, so `demo Frobnicate` reports
+`unknown command: frobnicate`.
+
+A host that sets `Registry.ExactCommandNames := True` matches a command name
+only in the letter case it was registered in. A wrongly cased name is an
+unknown command, reported as typed:
+
+```text
+$ demo CHECK f.src
+unknown command: CHECK
+
+demo — run and check demo programs
+...
+$ echo $?
+2
+```
+
+- An aliasing command looks up the subcommand name after it the same way, so
+  a name in another letter case stays with the command as an operand.
+- A host can register commands whose names differ in letter case only, and
+  each is dispatched, and passed to `OnCommandPrepared` and
+  `OnCommandCompleted`, by its own name.
+- `Find` uses the same letter-case rule for command names as `Run`.
+- The built-in help (`help`, `--help` and `-h` as the first argument, and the
+  word `help` after a command name) and a top-level flag's bare word still
+  match in any letter case. `AddTopLevelFlag` still refuses a bare word that
+  differs from a command name in letter case only.
 
 ## Subcommand aliasing
 
