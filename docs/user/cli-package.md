@@ -12,6 +12,9 @@ shows how to add the package to a project.
 A host that moves from 0.12.0 to 0.13.0 without changing its code sees no
 difference. `ExactCommandNames` is new and off by default.
 
+A host that moves from 0.11.0 to 0.12.0 without changing its code sees no
+difference. `StrictTopLevelFlags` is new and off by default.
+
 From 0.11.0 the package uses no `Generics.*` unit, so a host that uses none
 itself no longer links `Generics.Collections` and its unit closure or runs
 their initialization at start. `TOptionList` is unchanged. A host that moves
@@ -178,9 +181,10 @@ defaults column says.
 | `Registry.Description` | empty | Printed after the program name on the first line of top-level help. When empty, the help starts at the `usage:` line. |
 | `Registry.AddTopLevelFlag` | no flags | Registers a flag such as `--version` that runs a handler in place of a command. |
 | `Registry.UsageExitCode` | 1 (`DEFAULT_USAGE_EXIT_CODE`) | The exit code of a usage error. |
-| `Registry.UsageHelpToStandardError` | `False` | Sends the help that follows an unknown or missing command to standard error. |
+| `Registry.UsageHelpToStandardError` | `False` | Sends the help that follows an unknown or missing command, or an argument after a top-level flag under `StrictTopLevelFlags`, to standard error. |
 | `Registry.BareInvocation` | `biShowHelp` | What the program does without arguments: print help and exit 0, or report a usage error (`biUsageError`). |
 | `Registry.StrictSingleDash` | `False` | Makes an unknown single-dash argument such as `-verify` a usage error instead of a positional (see [Strict single-dash parsing](#strict-single-dash-parsing)). |
+| `Registry.StrictTopLevelFlags` | `False` | Makes any argument after a top-level flag or the built-in top-level help a usage error instead of ignoring it (see [Top-level flags](#top-level-flags)). |
 | `Registry.ExactCommandNames` | `False` | Matches command names only in the letter case they were registered in (see [Command names](#command-names)). |
 | `TSubcommand.PassThrough` | `False` | Stops option parsing at the command's first positional. |
 | `TSubcommand.AliasesSubcommands` | `False` | Lets `<program> <command> <subcommand>` dispatch `<subcommand>`. |
@@ -220,7 +224,8 @@ cannot be given as `-h`.
 
 A top-level flag is read from the first argument only, the way `--help` is.
 Its handler runs instead of a command, and the handler's result is the exit
-code. Arguments after the flag are ignored.
+code. Arguments after the flag are ignored, as they are after the built-in
+top-level help: `demo --version extra` prints the version and exits 0.
 
 - `LongName` matches `--<LongName>`, in that letter case.
 - `ShortName`, when set, matches `-<ShortName>`, in that letter case.
@@ -238,6 +243,25 @@ short name that is already registered, and a bare word that is also a
 subcommand name. `Add` refuses a subcommand whose name is a registered bare
 word. `TopLevelFlagCount` and `TopLevelFlagItem` iterate the registered flags,
 as `Count` and `Item` iterate the subcommands.
+
+A host that sets `Registry.StrictTopLevelFlags := True` makes a top-level
+flag, and the built-in top-level help, the only argument it accepts on its
+line. Any argument after one is a usage error, reported like an unknown
+command, and the flag's handler does not run:
+
+```text
+$ demo --version extra
+unexpected argument after --version: extra
+
+demo — run and check demo programs
+...
+$ echo $?
+2
+```
+
+`demo --help check` is a usage error too. A flag or the help alone runs as
+before, and a command's own line is not affected: `demo check a help` still
+prints the help of `check`.
 
 An option that changes how a command runs belongs after the command name. Give
 it to one command through its options, or to every command with
@@ -348,13 +372,14 @@ spelled with `=` (`--verify=yes`) and ignores it.
 
 ## Command names
 
-By default a command name matches in any letter case: `demo CHECK f.src` runs
-`check`, and an unknown name is reported in lowercase, so `demo Frobnicate`
-reports `unknown command: frobnicate`.
+By default the ASCII letters of a command name match in any letter case:
+`demo CHECK f.src` runs `check`, and an unknown name is reported with its
+ASCII letters lowercased, so `demo Frobnicate` reports
+`unknown command: frobnicate`.
 
 A host that sets `Registry.ExactCommandNames := True` matches a command name
-only in the letter case it was registered in, as options are matched. A
-wrongly cased name is an unknown command, reported as typed:
+only in the letter case it was registered in. A wrongly cased name is an
+unknown command, reported as typed:
 
 ```text
 $ demo CHECK f.src
@@ -367,12 +392,15 @@ $ echo $?
 ```
 
 - An aliasing command looks up the subcommand name after it the same way, so
-  a wrongly cased name stays with the command as an operand.
-- `Find` follows the setting, so it answers which command `Run` dispatches
-  for a name.
-- The built-in `help` word and a top-level flag's bare word still match in any
-  letter case, and `AddTopLevelFlag` still refuses a bare word that differs
-  from a command name only in letter case.
+  a name in another letter case stays with the command as an operand.
+- A host can register commands whose names differ in letter case only, and
+  each is dispatched, and passed to `OnCommandPrepared` and
+  `OnCommandCompleted`, by its own name.
+- `Find` uses the same letter-case rule for command names as `Run`.
+- The built-in help (`help`, `--help` and `-h` as the first argument, and the
+  word `help` after a command name) and a top-level flag's bare word still
+  match in any letter case. `AddTopLevelFlag` still refuses a bare word that
+  differs from a command name in letter case only.
 
 ## Subcommand aliasing
 
@@ -387,11 +415,13 @@ positional, as `demo run check` shows above.
 ## Usage errors
 
 A usage error is an unknown command, an option or value the parser rejects, a
-dispatch that `OnCommandPrepared` rejects, and a bare invocation under
-`biUsageError`. Each returns `UsageExitCode`. A failing handler's own exit code
-is returned unchanged, so a host that sets a code its handlers never return can
-tell the two apart. The conventional choice is 2. A handler that finds a usage
-error of its own, such as a missing operand, returns the same code itself.
+dispatch that `OnCommandPrepared` rejects, a bare invocation under
+`biUsageError`, and an argument after a top-level flag or the top-level help
+under `StrictTopLevelFlags`. Each returns `UsageExitCode`. A failing handler's
+own exit code is returned unchanged, so a host that sets a code its handlers
+never return can tell the two apart. The conventional choice is 2. A handler
+that finds a usage error of its own, such as a missing operand, returns the
+same code itself.
 
 ```text
 $ demo frobnicate

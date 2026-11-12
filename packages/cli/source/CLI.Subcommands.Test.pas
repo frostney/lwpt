@@ -70,6 +70,8 @@ type
     procedure TestOptionValueIsNeverAHelpRequest;
     procedure TestStrictSingleDashIsOptIn;
     procedure TestStrictSingleDashUsageErrors;
+    procedure TestStrictTopLevelFlagsIsOptIn;
+    procedure TestStrictTopLevelFlagsUsageErrors;
     procedure TestExactCommandNamesIsOptIn;
     procedure TestExactCommandNamesUsageErrors;
     procedure TestCommandHelpListsOptionShortNames;
@@ -98,8 +100,14 @@ const
   UNCONFIGURED_CHILD_MODE = '--unconfigured-child';
   { The host registry with StrictSingleDash set. }
   STRICT_HOST_CHILD_MODE = '--strict-host-child';
+  { The host registry with StrictTopLevelFlags set. }
+  STRICT_TOP_LEVEL_CHILD_MODE = '--strict-top-level-child';
   { The host registry with ExactCommandNames set. }
   EXACT_HOST_CHILD_MODE = '--exact-host-child';
+  { Every child mode, for the program to recognize. }
+  HOST_CHILD_MODES: array[0..4] of string = (HOST_CHILD_MODE,
+    UNCONFIGURED_CHILD_MODE, STRICT_HOST_CHILD_MODE,
+    STRICT_TOP_LEVEL_CHILD_MODE, EXACT_HOST_CHILD_MODE);
   HOST_PROGRAM_NAME = 'host';
   UNCONFIGURED_PROGRAM_NAME = 'fixture';
   HOST_USAGE_EXIT_CODE = 2;
@@ -160,6 +168,18 @@ begin
     WriteLn('command: ', ACommand);
 end;
 
+{ AFirst followed by ARest, as one argument array. }
+function PrependArgument(const AFirst: string;
+  const ARest: array of string): TCommandLineArguments;
+var
+  Index: Integer;
+begin
+  SetLength(Result, Length(ARest) + 1);
+  Result[0] := AFirst;
+  for Index := 0 to High(ARest) do
+    Result[Index + 1] := ARest[Index];
+end;
+
 procedure ResetDispatch;
 begin
   DispatchCount := 0;
@@ -174,6 +194,14 @@ function RecordRun(const APositionals: TStringList;
   const AOptions: TOptionArray): Integer;
 begin
   RecordDispatch('run', APositionals, AOptions);
+  Result := 0;
+end;
+
+{ The handler of a command registered as `Build`, next to `build`. }
+function RecordCapitalBuild(const APositionals: TStringList;
+  const AOptions: TOptionArray): Integer;
+begin
+  RecordDispatch('Build', APositionals, AOptions);
   Result := 0;
 end;
 
@@ -1200,18 +1228,14 @@ var
   Registry: TSubcommandRegistry;
   Build: TSubcommand;
   Output: TStringOption;
-  Arguments: array of string;
   Index, RunExitCode: Integer;
 begin
   ResetDispatch;
-  SetLength(Arguments, Length(AArguments) + 1);
-  Arguments[0] := 'build';
-  for Index := 0 to High(AArguments) do
-    Arguments[Index + 1] := AArguments[Index];
   Registry := BuildHostRegistry;
   try
     Registry.StrictSingleDash := AStrictSingleDash;
-    RunExitCode := Registry.Run(HOST_PROGRAM_NAME, Arguments);
+    RunExitCode := Registry.Run(HOST_PROGRAM_NAME,
+      PrependArgument('build', AArguments));
     if DispatchCount <> 1 then
       Exit(Format('<exit %d>', [RunExitCode]));
     Build := Registry.Find('build');
@@ -1285,44 +1309,150 @@ begin
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
+procedure THostDispatchSuite.TestStrictTopLevelFlagsIsOptIn;
+var
+  Registry: TSubcommandRegistry;
+  Child: TChildResult;
+begin
+  Registry := TSubcommandRegistry.Create;
+  try
+    Expect<Boolean>(Registry.StrictTopLevelFlags).ToBe(False);
+  finally
+    Registry.Free;
+  end;
+  { By default the built-in top-level help ignores what follows it, as a
+    top-level flag does. }
+  Child := RunSelf([HOST_CHILD_MODE, '--help', 'build']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host <command> [options]')).ToBe(True);
+  Expect<string>(Child.StandardError).ToBe('');
+end;
+
+{ Expects ACommandLine to be a usage error under StrictTopLevelFlags that
+  names AFlag and AExtra, with nothing on standard output: no flag output,
+  no help page there, no dispatch. }
+procedure ExpectExtraArgumentRejected(const ACommandLine: array of string;
+  const AFlag, AExtra: string);
+var
+  Child: TChildResult;
+begin
+  Child := RunSelf(PrependArgument(STRICT_TOP_LEVEL_CHILD_MODE,
+    ACommandLine));
+  Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
+  Expect<string>(Child.StandardOutput).ToBe('');
+  Expect<Boolean>(StartsWith(Child.StandardError,
+    'unexpected argument after ' + AFlag + ': ' + AExtra)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardError,
+    'usage: host <command> [options]')).ToBe(True);
+end;
+
+procedure THostDispatchSuite.TestStrictTopLevelFlagsUsageErrors;
+var
+  Child: TChildResult;
+begin
+  { Every spelling of a flag, a hidden flag, and the built-in help. }
+  ExpectExtraArgumentRejected(['--version', 'extra'], '--version', 'extra');
+  ExpectExtraArgumentRejected(['-V', 'build', '--bogus'], '-V', 'build');
+  ExpectExtraArgumentRejected(['Version', 'x'], 'Version', 'x');
+  ExpectExtraArgumentRejected(['--build-info', '--'], '--build-info', '--');
+  ExpectExtraArgumentRejected(['--help', 'build'], '--help', 'build');
+  ExpectExtraArgumentRejected(['-h', 'x'], '-h', 'x');
+  ExpectExtraArgumentRejected(['HELP', 'build'], 'HELP', 'build');
+
+  { Alone, a flag and the help still run. }
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, '--version']);
+  Expect<Integer>(Child.ExitCode).ToBe(VERSION_FLAG_EXIT_CODE);
+  Expect<Boolean>(StartsWith(Child.StandardOutput, 'host 1.2.3')).ToBe(True);
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, 'help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host <command> [options]')).ToBe(True);
+
+  { A command's line is not affected. }
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, 'build', 'main.x',
+    'help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host build')).ToBe(True);
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, 'build', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command: build')).ToBe(
+    True);
+end;
+
+var
+  PreparedCommand : string = '';
+
+function CapturePreparedCommand(const ACommandName: string;
+  const AOptions: TOptionArray): string;
+begin
+  PreparedCommand := ACommandName;
+  Result := '';
+end;
+
+{ Runs AArguments on ARegistry and returns the command name the handler,
+  OnCommandPrepared and OnCommandCompleted each saw, or `<exit N>` when
+  nothing was dispatched. }
+function DispatchNames(const ARegistry: TSubcommandRegistry;
+  const AArguments: array of string): string;
+var
+  RunExitCode: Integer;
+begin
+  ResetDispatch;
+  PreparedCommand := '';
+  CapturedCompletion.CommandName := '';
+  RunExitCode := ARegistry.Run(HOST_PROGRAM_NAME, AArguments);
+  if DispatchCount <> 1 then
+    Exit(Format('<exit %d>', [RunExitCode]));
+  Result := DispatchedCommand + ' ' + PreparedCommand + ' '
+    + CapturedCompletion.CommandName;
+end;
+
 procedure THostDispatchSuite.TestExactCommandNamesIsOptIn;
 var
   Registry: TSubcommandRegistry;
   Flag: TTopLevelFlag;
+  NoOptions: TOptionArray;
 begin
-  ResetDispatch;
   Registry := BuildHostRegistry;
   try
     Expect<Boolean>(Registry.ExactCommandNames).ToBe(False);
     Expect<Boolean>(Registry.Find('BUILD') = Registry.Find('build')).ToBe(
       True);
 
+    { Exact names let a host register commands that differ in letter case
+      only; each one is found, dispatched and reported by its own name. }
     Registry.ExactCommandNames := True;
+    SetLength(NoOptions, 0);
+    Registry.Add(TSubcommand.Create('Build', 'Build, capitalized', '',
+      @RecordCapitalBuild, NoOptions));
+    Registry.OnCommandPrepared := @CapturePreparedCommand;
     Registry.OnCommandCompleted := @CaptureCompletion;
-    Expect<Boolean>(Registry.Find('build') <> nil).ToBe(True);
+    Expect<string>(Registry.Find('build').Name).ToBe('build');
+    Expect<string>(Registry.Find('Build').Name).ToBe('Build');
     Expect<Boolean>(Registry.Find('BUILD') = nil).ToBe(True);
-    Expect<Boolean>(Registry.Find('Build') = nil).ToBe(True);
-    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['build',
-      'main.x'])).ToBe(0);
-    Expect<string>(DispatchedCommand).ToBe('build');
-    Expect<string>(CapturedCompletion.CommandName).ToBe('build');
+    Expect<Boolean>(Registry.Find('bUILD') = nil).ToBe(True);
+    Expect<string>(DispatchNames(Registry, ['build', 'main.x'])).ToBe(
+      'build build build');
+    Expect<string>(DispatchNames(Registry, ['Build'])).ToBe(
+      'Build Build Build');
 
     { An aliasing command looks its first argument up exactly too, so a
-      wrongly cased name stays with the command. }
+      name in another letter case stays with the command. }
     Registry.Find('run').AliasesSubcommands := True;
-    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['run', 'build',
-      '--release', 'main.x'])).ToBe(0);
-    Expect<string>(DispatchedCommand).ToBe('build');
+    Expect<string>(DispatchNames(Registry, ['run', 'Build'])).ToBe(
+      'Build Build Build');
+    Expect<string>(DispatchNames(Registry, ['run', 'build', '--release',
+      'main.x'])).ToBe('build build build');
     Expect<string>(DispatchedOptions).ToBe('release');
-    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['run', 'BUILD',
-      'main.x'])).ToBe(0);
-    Expect<string>(DispatchedCommand).ToBe('run');
+    Expect<string>(DispatchNames(Registry, ['run', 'BUILD', 'main.x'])).ToBe(
+      'run run run');
     Expect<string>(DispatchedPositionals).ToBe('BUILD|main.x');
-    Expect<string>(CapturedCompletion.CommandName).ToBe('run');
 
     { A bare word matches in any letter case, so it still may not differ
       from a subcommand name in letter case only. }
-    Flag := TTopLevelFlag.Create('Build', 'word of a subcommand',
+    Flag := TTopLevelFlag.Create('BUILD', 'word of a subcommand',
       @HandleBuildInfoFlag);
     Flag.BareWord := True;
     Expect<Boolean>(TopLevelFlagIsRefused(Registry, Flag)).ToBe(True);
@@ -1335,7 +1465,14 @@ procedure THostDispatchSuite.TestExactCommandNamesUsageErrors;
 var
   Child: TChildResult;
 begin
-  { A wrongly cased command is unknown, and named as typed. }
+  { By default an unknown name is reported lowercased. }
+  Child := RunSelf([HOST_CHILD_MODE, 'NoSuch']);
+  Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
+  Expect<Boolean>(StartsWith(Child.StandardError,
+    'unknown command: nosuch')).ToBe(True);
+
+  { Under exact names a wrongly cased command is unknown, and named as
+    typed. }
   Child := RunSelf([EXACT_HOST_CHILD_MODE, 'BUILD', 'main.x']);
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<string>(Child.StandardOutput).ToBe('');
@@ -1346,11 +1483,20 @@ begin
   Expect<Boolean>(StartsWith(Child.StandardError,
     'unknown command: Build')).ToBe(True);
 
-  { The help word and a flag's bare word still match in any letter case. }
+  { The built-in help and a flag's bare word still match in any letter
+    case. }
   Child := RunSelf([EXACT_HOST_CHILD_MODE, 'HELP']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput,
     'usage: host <command> [options]')).ToBe(True);
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, '--HELP']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host <command> [options]')).ToBe(True);
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, 'build', 'main.x', 'Help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'usage: host build')).ToBe(
+    True);
   Child := RunSelf([EXACT_HOST_CHILD_MODE, 'VERSION']);
   Expect<Integer>(Child.ExitCode).ToBe(VERSION_FLAG_EXIT_CODE);
 
@@ -1408,7 +1554,11 @@ begin
     TestStrictSingleDashUsageErrors);
   Test('command help lists an option''s short name and keeps one help column',
     TestCommandHelpListsOptionShortNames);
-  Test('exact command names are opt-in and cover Find and aliasing',
+  Test('arguments after a top-level flag are ignored unless the host is strict',
+    TestStrictTopLevelFlagsIsOptIn);
+  Test('strict top-level flags make any argument after them a usage error',
+    TestStrictTopLevelFlagsUsageErrors);
+  Test('exact command names are opt-in and cover Find, hooks and aliasing',
     TestExactCommandNamesIsOptIn);
   Test('under exact command names a wrongly cased command is unknown',
     TestExactCommandNamesUsageErrors);
@@ -1447,6 +1597,7 @@ begin
     Registry := BuildHostRegistry;
   try
     Registry.StrictSingleDash := AMode = STRICT_HOST_CHILD_MODE;
+    Registry.StrictTopLevelFlags := AMode = STRICT_TOP_LEVEL_CHILD_MODE;
     Registry.ExactCommandNames := AMode = EXACT_HOST_CHILD_MODE;
     if AMode <> UNCONFIGURED_CHILD_MODE then
       Result := Registry.Run(HOST_PROGRAM_NAME, GetCommandLineArguments(2))
@@ -1458,11 +1609,18 @@ begin
   end;
 end;
 
+function IsHostChildMode(const AArgument: string): Boolean;
+var
+  Mode: string;
 begin
-  if (ParamCount >= 1) and ((ParamStr(1) = HOST_CHILD_MODE)
-    or (ParamStr(1) = STRICT_HOST_CHILD_MODE)
-    or (ParamStr(1) = EXACT_HOST_CHILD_MODE)
-    or (ParamStr(1) = UNCONFIGURED_CHILD_MODE)) then
+  for Mode in HOST_CHILD_MODES do
+    if AArgument = Mode then
+      Exit(True);
+  Result := False;
+end;
+
+begin
+  if (ParamCount >= 1) and IsHostChildMode(ParamStr(1)) then
   begin
     ExitCode := RunHostChildMode(ParamStr(1));
     Exit;

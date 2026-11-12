@@ -101,8 +101,9 @@ type
 
   { A flag the program accepts in place of a command, such as `--version`.
     It is matched against the first argument only, the way the built-in
-    `--help` is; later arguments are ignored. Set its fields before it is
-    added to a registry, which checks them once, on registration. }
+    `--help` is; later arguments are ignored unless the registry sets
+    StrictTopLevelFlags. Set its fields before it is added to a registry,
+    which checks them once, on registration. }
   TTopLevelFlag = class
   public
     { Both names are given without their leading dashes. }
@@ -127,6 +128,7 @@ type
     FUsageHelpToStandardError : Boolean;
     FBareInvocation : TBareInvocation;
     FStrictSingleDash : Boolean;
+    FStrictTopLevelFlags : Boolean;
     FExactCommandNames : Boolean;
     FOnCommandCompleted : TSubcommandCompletionHandler;
     FOnCommandPrepared : TSubcommandPreparedHandler;
@@ -151,8 +153,9 @@ type
       part of the command surface that Count and Item do not cover. }
     function TopLevelFlagCount: Integer;
     function TopLevelFlagItem(const AIndex: Integer): TTopLevelFlag;
-    { The subcommand named AName, or nil: in any letter case, or exactly
-      under ExactCommandNames, as Run looks a command up. }
+    { The subcommand named AName, or nil. Find uses Run's letter-case rule
+      for command names: ASCII letters match in any case, or only in the
+      registered case under ExactCommandNames. }
     function Find(const AName: string): TSubcommand;
     { Read iteration over the registered subcommands, in registration
       order. The registry is the single source of truth for the
@@ -178,14 +181,17 @@ type
       empty, that line is left out. }
     property Description: string read FDescription write FDescription;
     { Returned for a usage error: an unknown command, an option or value
-      the parser rejects, a rejected preparation, and a bare invocation
-      under biUsageError. A host that needs to tell a usage error from a
+      the parser rejects, a rejected preparation, a bare invocation under
+      biUsageError, and an argument after a top-level flag or the top-level
+      help under StrictTopLevelFlags. A host that needs to tell a usage error from a
       failing handler sets a code its handlers do not return,
       conventionally 2. }
     property UsageExitCode: Integer read FUsageExitCode write FUsageExitCode;
-    { When True, the top-level help that follows an unknown or missing
-      command goes to standard error with the message, and standard output
-      stays empty. When False it goes to standard output. }
+    { When True, the top-level help that follows a usage error the
+      registry reports itself (an unknown or missing command, or an
+      argument after a top-level flag under StrictTopLevelFlags) goes to
+      standard error with the message, and standard output stays empty.
+      When False it goes to standard output. }
     property UsageHelpToStandardError: Boolean
       read FUsageHelpToStandardError write FUsageHelpToStandardError;
     property BareInvocation: TBareInvocation
@@ -199,14 +205,23 @@ type
       default. }
     property StrictSingleDash: Boolean
       read FStrictSingleDash write FStrictSingleDash;
+    { When True, a top-level flag or the built-in top-level help (`help`,
+      `--help`, `-h`) must be the only argument: any argument after it is a
+      usage error (`unexpected argument after --version: extra`), and the
+      flag's handler does not run. False by default: arguments after them
+      are ignored. }
+    property StrictTopLevelFlags: Boolean
+      read FStrictTopLevelFlags write FStrictTopLevelFlags;
     { When True, a command name, and the subcommand name an aliasing
       command looks up, match only in the letter case it was registered
       in: `BUILD` is an unknown command, reported as typed, rather than
-      `build`. Find follows the same rule. The built-in `help` word and a
-      top-level flag's bare word still match in any letter case, and
-      registration still refuses a bare word that differs from a
-      subcommand name only in letter case. False by default: command names
-      match in any letter case. }
+      `build`. Find follows the same rule. The built-in help (`help`,
+      `--help` and `-h` as the first argument, the `help` word after a
+      command) and a top-level flag's bare word still match in any letter
+      case, and registration still refuses a bare word that differs from a
+      subcommand name only in letter case. False by default: ASCII letters
+      in a command name match in any case, and an unknown name is reported
+      with them lowercased. }
     property ExactCommandNames: Boolean
       read FExactCommandNames write FExactCommandNames;
     property OnCommandCompleted: TSubcommandCompletionHandler
@@ -585,8 +600,10 @@ begin
       HELP_SHORT_NAME, HELP_WORD);
 end;
 
-{ An unknown or missing command: the message on standard error, then the
-  top-level help on the stream the host chose. On standard error a blank
+{ A usage error of the whole line (an unknown or missing command, or an
+  argument after a top-level flag under StrictTopLevelFlags): the message
+  on standard error, then the top-level help on the stream the host
+  chose. On standard error a blank
   line sets the help apart from the message. }
 function TSubcommandRegistry.ReportUsageError(
   const AProgramName, AMessage: string): Integer;
@@ -619,6 +636,7 @@ var
   StartedAt : QWord;
   Completion : TSubcommandCompletion;
   PreparationError : string;
+  TopLevelHelp : Boolean;
 begin
   if Length(AArguments) < 1 then
   begin
@@ -629,12 +647,20 @@ begin
   end;
 
   Flag := FindTopLevelFlag(AArguments[0]);
+  { The built-in help matches in any letter case, whatever
+    ExactCommandNames is. }
+  TopLevelHelp := SameText(AArguments[0], HELP_WORD)
+    or SameText(AArguments[0], HELP_LONG_FLAG)
+    or SameText(AArguments[0], HELP_SHORT_FLAG);
+  if FStrictTopLevelFlags and ((Flag <> nil) or TopLevelHelp)
+     and (Length(AArguments) > 1) then
+    Exit(ReportUsageError(AProgramName, 'unexpected argument after '
+      + AArguments[0] + ': ' + AArguments[1]));
+
   if Flag <> nil then
     Exit(Flag.Handler());
 
-  CmdName := LowerCase(AArguments[0]);
-  if (CmdName = HELP_WORD) or (CmdName = HELP_LONG_FLAG)
-     or (CmdName = HELP_SHORT_FLAG) then
+  if TopLevelHelp then
   begin
     PrintTopLevelHelp(AProgramName);
     Exit(0);
