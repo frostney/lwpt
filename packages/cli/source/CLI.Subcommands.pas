@@ -473,10 +473,8 @@ begin
   for i := 0 to High(FTopLevelFlags) do
     if FTopLevelFlags[i].HelpText <> '' then
     begin
-      Names[Listed] := '--' + FTopLevelFlags[i].LongName;
-      if FTopLevelFlags[i].ShortName <> '' then
-        Names[Listed] := '-' + FTopLevelFlags[i].ShortName + ', '
-          + Names[Listed];
+      Names[Listed] := FormatHelpLabel(FTopLevelFlags[i].ShortName,
+        '--' + FTopLevelFlags[i].LongName);
       HelpTexts[Listed] := FTopLevelFlags[i].HelpText;
       Inc(Listed);
     end;
@@ -505,15 +503,13 @@ begin
 
   if Length(ASub.Options) > 0 then
   begin
-    { FormatForHelp (not the bare long name) so valued options show
-      their value shape (--name=<value>, --name=<N>, --name=a|b) and
-      every surface rendered from the registry — this help text and the
-      host program's agents block — stays identical by construction. }
+    { HelpLabel (see CLI.Options) shows the short name and value shape:
+      -o, --name=<value>. }
     SetLength(Names, Length(ASub.Options));
     SetLength(HelpTexts, Length(ASub.Options));
     for i := 0 to High(ASub.Options) do
     begin
-      Names[i] := ASub.Options[i].FormatForHelp;
+      Names[i] := ASub.Options[i].HelpLabel;
       HelpTexts[i] := ASub.Options[i].HelpText;
     end;
     WriteOptionRows(Output, Names, HelpTexts);
