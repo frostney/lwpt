@@ -63,6 +63,7 @@ type
     procedure TestStopAtFirstPositionalRejectsLeadingUnknownOptions;
     procedure TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken;
     procedure TestOptionalValueOptionTakesAValueOnlyWithEquals;
+    procedure TestOptionalValueSubclassAndDirectCalls;
     procedure TestApplyExplicitTellsEqualsFromNoValue;
     procedure TestApplyOnlySubclassesKeepWorking;
     procedure TestConsumesSeparateValueDefaults;
@@ -99,6 +100,15 @@ type
     Seen: string;
     procedure Apply(const AValue: string); override;
   end;
+
+  { An optional-value option whose Apply override changes the value. }
+  TUpperOptional = class(TOptionalStringOption)
+  public
+    ApplyCalls: Integer;
+    procedure Apply(const AValue: string); override;
+  end;
+
+  TTestColor = (tcRed, tcGreen);
 
   { A representative option table for the in-process tests. }
   TParserFixture = class
@@ -153,28 +163,40 @@ begin
   Seen := AValue;
 end;
 
+procedure TUpperOptional.Apply(const AValue: string);
+begin
+  inherited Apply(UpperCase(AValue));
+  Inc(ApplyCalls);
+end;
+
+{ The positionals ParseArguments returned, joined by `|`; frees them. }
+function JoinedPositionals(const APositionals: TStringList): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  try
+    for I := 0 to APositionals.Count - 1 do
+    begin
+      if I > 0 then Result := Result + POSITIONAL_SEPARATOR;
+      Result := Result + APositionals[I];
+    end;
+  finally
+    APositionals.Free;
+  end;
+end;
+
 { ParseArguments over AOptions, with the positionals joined by `|`. }
 function ParseWith(const AArguments: array of string;
   const AOptions: array of TOptionBase): string;
 var
   Options: TOptionArray;
-  Positionals: TStringList;
   I: Integer;
 begin
   SetLength(Options, Length(AOptions));
   for I := 0 to High(AOptions) do
     Options[I] := AOptions[I];
-  Result := '';
-  Positionals := ParseArguments(AArguments, Options);
-  try
-    for I := 0 to Positionals.Count - 1 do
-    begin
-      if I > 0 then Result := Result + POSITIONAL_SEPARATOR;
-      Result := Result + Positionals[I];
-    end;
-  finally
-    Positionals.Free;
-  end;
+  Result := JoinedPositionals(ParseArguments(AArguments, Options));
 end;
 
 constructor TParserFixture.Create;
@@ -204,22 +226,9 @@ end;
 function TParserFixture.Parse(const AArguments: array of string;
   const AStopAtFirstPositional: Boolean = False;
   const AStrictSingleDash: Boolean = False): string;
-var
-  Positionals: TStringList;
-  I: Integer;
 begin
-  Result := '';
-  Positionals := ParseArguments(AArguments, Options, AStopAtFirstPositional,
-    AStrictSingleDash);
-  try
-    for I := 0 to Positionals.Count - 1 do
-    begin
-      if I > 0 then Result := Result + POSITIONAL_SEPARATOR;
-      Result := Result + Positionals[I];
-    end;
-  finally
-    Positionals.Free;
-  end;
+  Result := JoinedPositionals(ParseArguments(AArguments, Options,
+    AStopAtFirstPositional, AStrictSingleDash));
 end;
 
 function TParserFixture.ParseError(const AArguments: array of string;
@@ -831,6 +840,40 @@ begin
   Expect<string>(HotAfter(['--hot=restart', '--hot'])).ToBe('none ');
 end;
 
+procedure TCLIParserArgumentsSuite.TestOptionalValueSubclassAndDirectCalls;
+var
+  Watch: TUpperOptional;
+  Hot: TOptionalStringOption;
+begin
+  { A subclass's Apply override sees every command-line occurrence. }
+  Watch := TUpperOptional.Create('watch', 'watch');
+  try
+    Expect<string>(ParseWith(['--watch=abc'], [Watch])).ToBe('');
+    Expect<string>(Watch.Value).ToBe('ABC');
+    Expect<Boolean>(Watch.HasValue).ToBe(True);
+    Expect<string>(ParseWith(['--watch'], [Watch])).ToBe('');
+    Expect<Boolean>(Watch.HasValue).ToBe(False);
+    Expect<Integer>(Watch.ApplyCalls).ToBe(2);
+  finally
+    Watch.Free;
+  end;
+
+  { A direct Apply, as from a config file, counts as a value; MarkPresent
+    does not. Given without a value, ValueOr returns the empty value. }
+  Hot := TOptionalStringOption.Create('hot', 'reload');
+  try
+    Hot.MarkPresent;
+    Expect<Boolean>(Hot.Present).ToBe(True);
+    Expect<Boolean>(Hot.HasValue).ToBe(False);
+    Hot.Apply('');
+    Expect<Boolean>(Hot.HasValue).ToBe(True);
+    Expect<string>(ParseWith(['--hot'], [Hot])).ToBe('');
+    Expect<string>(Hot.ValueOr('default')).ToBe('');
+  finally
+    Hot.Free;
+  end;
+end;
+
 procedure TCLIParserArgumentsSuite.TestApplyExplicitTellsEqualsFromNoValue;
 var
   Verify: TRecordingFlag;
@@ -876,7 +919,7 @@ end;
 
 procedure TCLIParserArgumentsSuite.TestConsumesSeparateValueDefaults;
 var
-  Options: array[0..5] of TOptionBase;
+  Options: array[0..6] of TOptionBase;
   I: Integer;
 begin
   Options[0] := TFlagOption.Create('flag', '');
@@ -885,6 +928,7 @@ begin
   Options[3] := TInt64Option.Create('int64', '');
   Options[4] := TRepeatableOption.Create('repeatable', '');
   Options[5] := TOptionalStringOption.Create('optional', '');
+  Options[6] := TEnumOption<TTestColor>.Create('color', '');
   try
     Expect<Boolean>(Options[0].ConsumesSeparateValue).ToBe(False);
     Expect<Boolean>(Options[1].ConsumesSeparateValue).ToBe(True);
@@ -892,6 +936,7 @@ begin
     Expect<Boolean>(Options[3].ConsumesSeparateValue).ToBe(True);
     Expect<Boolean>(Options[4].ConsumesSeparateValue).ToBe(True);
     Expect<Boolean>(Options[5].ConsumesSeparateValue).ToBe(False);
+    Expect<Boolean>(Options[6].ConsumesSeparateValue).ToBe(True);
   finally
     for I := 0 to High(Options) do
       Options[I].Free;
@@ -1005,6 +1050,8 @@ begin
     TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken);
   Test('an optional-value option takes a value only with = or attached',
     TestOptionalValueOptionTakesAValueOnlyWithEquals);
+  Test('an optional-value subclass sees Apply; direct calls set HasValue',
+    TestOptionalValueSubclassAndDirectCalls);
   Test('ApplyExplicit tells --name= from --name and a separated value',
     TestApplyExplicitTellsEqualsFromNoValue);
   Test('a flag subclass that overrides only Apply keeps its value',

@@ -83,9 +83,9 @@ type
 
     property LongName: string read FLongName;
     property ShortName: string read FShortName write FShortName;
-    { When True, a valued short option accepts its value in the same
-      argument (`-dDEBUG`, `-Fusource`). Separated values remain
-      available to every non-flag short option. }
+    { When True, a short option other than a flag accepts its value in
+      the same argument (`-dDEBUG`, `-Fusource`). A separated value stays
+      available to every option whose ConsumesSeparateValue is True. }
     property AllowAttachedShortValue: Boolean read FAllowAttachedShortValue
       write FAllowAttachedShortValue;
     { Alternate name used in config files when different from LongName.
@@ -122,7 +122,9 @@ type
     `--hot=` with an empty one and `--hot=restart` with `restart`. It never
     takes the next argument as its value. Present tells whether it was
     given, HasValue whether a value came with it; Value is empty without
-    one. }
+    one, and so is ValueOr once the option is present. A direct Apply, as
+    from a config file, counts as a value; MarkPresent does not. A
+    subclass may override Apply: ApplyExplicit calls it. }
   TOptionalStringOption = class(TStringOption)
   private
     FHasValue: Boolean;
@@ -345,8 +347,10 @@ end;
 procedure TOptionalStringOption.ApplyExplicit(const AValue: string;
   const AHasEquals: Boolean);
 begin
-  inherited Apply(AValue);
-  { An attached short value (`-Hrestart`) carries a value without `=`. }
+  { The virtual Apply, so a subclass's override sees every occurrence;
+    HasValue is then set from what the argument spelled. An attached
+    short value (`-Hrestart`) carries a value without `=`. }
+  Apply(AValue);
   FHasValue := AHasEquals or (AValue <> '');
 end;
 

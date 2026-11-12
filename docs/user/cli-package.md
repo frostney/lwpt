@@ -318,7 +318,10 @@ reads `--hot[=<value>]`.
 | `-Hrestart`, with `AllowAttachedShortValue` | `True` | `True` | `restart` |
 
 It never takes the next argument as its value: in `--hot main.x`, `--hot` has
-no value and `main.x` is a positional.
+no value and `main.x` is a positional. Read `HasValue` rather than `ValueOr`:
+once the option is given, `ValueOr` returns its value, empty for `--hot`. A
+subclass may override `Apply` to check or change the value; every occurrence
+reaches it.
 
 A host that writes its own option kind gets the same information. The parser
 applies every occurrence through `ApplyExplicit(AValue, AHasEquals)`, where
