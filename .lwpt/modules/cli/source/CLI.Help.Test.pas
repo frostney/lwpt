@@ -2,8 +2,9 @@
 
   TOptionBase.HelpLabel is the one label every help surface prints for an
   option: command help, GenerateHelpText, and a host's generated command
-  reference. These cases run in-process: the label and the generated help
-  are plain strings. }
+  reference. FormatHelpLabel is the rule it shares with top-level flag
+  help. These cases run in-process: the labels and the generated help are
+  plain strings. }
 
 program CLI.Help.Test;
 
@@ -20,6 +21,7 @@ type
   THelpLabelSuite = class(TTestSuite)
   public
     procedure SetupTests; override;
+    procedure TestFormatHelpLabelAddsAShortNameOnlyWhenGiven;
     procedure TestOptionWithoutShortNameKeepsItsLongForm;
     procedure TestShortNameLeadsTheLongForm;
     procedure TestMultiCharacterShortNameLeadsTheLongForm;
@@ -27,6 +29,15 @@ type
   end;
 
   TTestColor = (tcRed, tcGreen);
+
+procedure THelpLabelSuite.TestFormatHelpLabelAddsAShortNameOnlyWhenGiven;
+begin
+  { The rule top-level flag help and option help share. }
+  Expect<string>(FormatHelpLabel('', '--license')).ToBe('--license');
+  Expect<string>(FormatHelpLabel('V', '--version')).ToBe('-V, --version');
+  Expect<string>(FormatHelpLabel('Fu', '--unit-path <value>')).ToBe(
+    '-Fu, --unit-path <value>');
+end;
 
 procedure THelpLabelSuite.TestOptionWithoutShortNameKeepsItsLongForm;
 var
@@ -116,6 +127,8 @@ end;
 
 procedure THelpLabelSuite.SetupTests;
 begin
+  Test('FormatHelpLabel adds a short name only when one is given',
+    TestFormatHelpLabelAddsAShortNameOnlyWhenGiven);
   Test('an option without a short name keeps its long form',
     TestOptionWithoutShortNameKeepsItsLongForm);
   Test('a short name leads the long form of every option kind',

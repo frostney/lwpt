@@ -184,6 +184,10 @@ run "demo --help" to see all commands
 `GenerateHelpText` lists options with it too, and a host that renders its own
 command reference from the registry can use it to match the help.
 
+Write a command option's `ShortName` without its dash, as for a top-level
+flag. `h` is not available: `-h` after a command name always asks for help,
+so an option with the short name `h` is never set.
+
 ## Top-level flags
 
 A top-level flag is read from the first argument only, the way `--help` is.

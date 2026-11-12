@@ -473,10 +473,8 @@ begin
   for i := 0 to High(FTopLevelFlags) do
     if FTopLevelFlags[i].HelpText <> '' then
     begin
-      Names[Listed] := '--' + FTopLevelFlags[i].LongName;
-      if FTopLevelFlags[i].ShortName <> '' then
-        Names[Listed] := '-' + FTopLevelFlags[i].ShortName + ', '
-          + Names[Listed];
+      Names[Listed] := FormatHelpLabel(FTopLevelFlags[i].ShortName,
+        '--' + FTopLevelFlags[i].LongName);
       HelpTexts[Listed] := FTopLevelFlags[i].HelpText;
       Inc(Listed);
     end;

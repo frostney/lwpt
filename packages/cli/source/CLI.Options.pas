@@ -51,9 +51,8 @@ type
 
     procedure Apply(const AValue: string); virtual; abstract;
     function FormatForHelp: string; virtual; abstract;
-    { The option as help lists it: FormatForHelp, led by `-<ShortName>, `
-      when the option has a short name (`-o, --output=<value>`), the way
-      top-level help lists a flag's short name. Every help surface built
+    { The option as help lists it: FormatHelpLabel of its short name and
+      FormatForHelp (`-o, --output=<value>`). Every help surface built
       from an option uses it, so they cannot drift apart. }
     function HelpLabel: string;
     function ValidValues: string; virtual;
@@ -184,7 +183,20 @@ type
 
 function ConcatOptions(const AArrays: array of TOptionArray): TOptionArray;
 
+{ A name as help lists it: ALongForm (`--output=<value>`), led by
+  `-<AShortName>, ` when there is a short name. Option help and top-level
+  flag help both use it, so the two help screens agree. }
+function FormatHelpLabel(const AShortName, ALongForm: string): string;
+
 implementation
+
+function FormatHelpLabel(const AShortName, ALongForm: string): string;
+begin
+  if AShortName = '' then
+    Result := ALongForm
+  else
+    Result := '-' + AShortName + ', ' + ALongForm;
+end;
 
 function ConcatOptions(const AArrays: array of TOptionArray): TOptionArray;
 var
@@ -233,9 +245,7 @@ end;
 
 function TOptionBase.HelpLabel: string;
 begin
-  Result := FormatForHelp;
-  if FShortName <> '' then
-    Result := '-' + FShortName + ', ' + Result;
+  Result := FormatHelpLabel(FShortName, FormatForHelp);
 end;
 
 function TOptionBase.ValidValues: string;
