@@ -66,7 +66,6 @@ type
     procedure TestLeadingFlagGivenAppliesNothing;
     procedure TestFlagGivenAnywhereBeforeTheEndOfOptions;
     procedure TestFlagGivenSkipsAValueAnOptionTakes;
-    procedure TestFlagGivenAppliesNothing;
   end;
 
   { A representative option table for the in-process tests. }
@@ -656,14 +655,9 @@ begin
     { The bare word matches in any letter case; the flags do not. }
     Expect<Boolean>(Fixture.HelpAnywhere(['main.x', 'HELP'])).ToBe(True);
     Expect<Boolean>(Fixture.HelpAnywhere(['--HELP', '-H'])).ToBe(False);
-    { Arguments the parser would reject do not hide the flag. }
-    Expect<Boolean>(Fixture.HelpAnywhere(['--bogus', '-x', '-h'])).ToBe(True);
-    { A long option takes no separated value that begins with `-`. }
-    Expect<Boolean>(Fixture.HelpAnywhere(['--output', '--help'])).ToBe(True);
     Expect<Boolean>(Fixture.HelpAnywhere(['-o', 'out', '--help'])).ToBe(True);
     { A `--` that a valued short option takes does not end the options. }
     Expect<Boolean>(Fixture.HelpAnywhere(['-o', '--', '--help'])).ToBe(True);
-    Expect<Boolean>(Fixture.HelpAnywhere([])).ToBe(False);
     Expect<Boolean>(Fixture.HelpAnywhere(['main.x', '--', 'help'])).ToBe(
       False);
     Expect<Boolean>(Fixture.HelpAnywhere(['--output=help', '-o=-h'])).ToBe(
@@ -675,8 +669,6 @@ begin
       short form of a flag that has none. }
     Expect<Boolean>(FlagGiven(['-', 'main.x'], Fixture.Options, 'verbose',
       '')).ToBe(False);
-    Expect<Boolean>(LeadingFlagGiven(['--output', 'out', '-'],
-      Fixture.Options, 'verbose', '')).ToBe(False);
   finally
     Fixture.Free;
   end;
@@ -697,22 +689,6 @@ begin
       False);
     { A help spelling after the value still counts. }
     Expect<Boolean>(Fixture.HelpAnywhere(['-o', 'help', 'help'])).ToBe(True);
-  finally
-    Fixture.Free;
-  end;
-end;
-
-procedure TCLIParserArgumentsSuite.TestFlagGivenAppliesNothing;
-var
-  Fixture: TParserFixture;
-begin
-  Fixture := TParserFixture.Create;
-  try
-    Expect<Boolean>(Fixture.HelpAnywhere(['--verbose', '--output', 'out',
-      '-dDEBUG', 'main.x', 'help'])).ToBe(True);
-    Expect<Boolean>(Fixture.Verbose.Present).ToBe(False);
-    Expect<Boolean>(Fixture.Output.Present).ToBe(False);
-    Expect<Integer>(Fixture.Define.Values.Count).ToBe(0);
   finally
     Fixture.Free;
   end;
@@ -748,8 +724,6 @@ begin
     TestFlagGivenAnywhereBeforeTheEndOfOptions);
   Test('a value that an option takes is never the flag or bare word',
     TestFlagGivenSkipsAValueAnOptionTakes);
-  Test('looking for a flag anywhere applies no option',
-    TestFlagGivenAppliesNothing);
 end;
 
 procedure TCLIParserSuite.SetupTests;

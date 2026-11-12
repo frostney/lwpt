@@ -193,9 +193,9 @@ run "demo --help" to see all commands
 command reference from the registry can use it to match the help.
 
 Write a command option's `ShortName` without its dash, as for a top-level
-flag. `h` is not available: `-h` as an argument of its own after a command
-name asks for help, so an option with the short name `h` cannot be given as
-`-h`.
+flag. `h` is not available: after a command name, `-h` asks for help
+wherever an option name may stand, so an option with the short name `h`
+cannot be given as `-h`.
 
 ## Top-level flags
 

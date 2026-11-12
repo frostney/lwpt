@@ -1169,6 +1169,18 @@ begin
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
+
+  { A help spelling of its own after an option's value still asks for
+    help, and so does `-h` after a long option, which takes no separated
+    value that begins with `-`. }
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '-o', 'help', '--help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '--output', '-h', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, BUILD_USAGE)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
 { Dispatches `build` with AArguments on a fresh host registry and returns
@@ -1204,8 +1216,6 @@ begin
 end;
 
 procedure THostDispatchSuite.TestOptionValueIsNeverAHelpRequest;
-var
-  Child: TChildResult;
 begin
   Expect<string>(BuildOutputFor(['-o', 'help', 'main.x'])).ToBe(
     'help main.x');
@@ -1216,20 +1226,6 @@ begin
   Expect<string>(BuildOutputFor(['-o', '-h', 'main.x'])).ToBe('-h main.x');
   Expect<string>(BuildOutputFor(['-o', '--help', 'main.x'])).ToBe(
     '--help main.x');
-
-  { A help spelling of its own after the value still asks for help, and
-    so does `-h` after a long option, which takes no separated value that
-    begins with `-`. }
-  Child := RunSelf([HOST_CHILD_MODE, 'build', '-o', 'help', '--help']);
-  Expect<Integer>(Child.ExitCode).ToBe(0);
-  Expect<Boolean>(Contains(Child.StandardOutput,
-    'usage: host build <file> [--json]')).ToBe(True);
-  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
-  Child := RunSelf([HOST_CHILD_MODE, 'build', '--output', '-h', 'main.x']);
-  Expect<Integer>(Child.ExitCode).ToBe(0);
-  Expect<Boolean>(Contains(Child.StandardOutput,
-    'usage: host build <file> [--json]')).ToBe(True);
-  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
 procedure THostDispatchSuite.SetupTests;
