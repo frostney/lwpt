@@ -70,6 +70,8 @@ type
     procedure TestOptionValueIsNeverAHelpRequest;
     procedure TestStrictSingleDashIsOptIn;
     procedure TestStrictSingleDashUsageErrors;
+    procedure TestExactCommandNamesIsOptIn;
+    procedure TestExactCommandNamesUsageErrors;
     procedure TestCommandHelpListsOptionShortNames;
   end;
 
@@ -96,6 +98,8 @@ const
   UNCONFIGURED_CHILD_MODE = '--unconfigured-child';
   { The host registry with StrictSingleDash set. }
   STRICT_HOST_CHILD_MODE = '--strict-host-child';
+  { The host registry with ExactCommandNames set. }
+  EXACT_HOST_CHILD_MODE = '--exact-host-child';
   HOST_PROGRAM_NAME = 'host';
   UNCONFIGURED_PROGRAM_NAME = 'fixture';
   HOST_USAGE_EXIT_CODE = 2;
@@ -1281,6 +1285,81 @@ begin
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
+procedure THostDispatchSuite.TestExactCommandNamesIsOptIn;
+var
+  Registry: TSubcommandRegistry;
+  Flag: TTopLevelFlag;
+begin
+  ResetDispatch;
+  Registry := BuildHostRegistry;
+  try
+    Expect<Boolean>(Registry.ExactCommandNames).ToBe(False);
+    Expect<Boolean>(Registry.Find('BUILD') = Registry.Find('build')).ToBe(
+      True);
+
+    Registry.ExactCommandNames := True;
+    Registry.OnCommandCompleted := @CaptureCompletion;
+    Expect<Boolean>(Registry.Find('build') <> nil).ToBe(True);
+    Expect<Boolean>(Registry.Find('BUILD') = nil).ToBe(True);
+    Expect<Boolean>(Registry.Find('Build') = nil).ToBe(True);
+    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['build',
+      'main.x'])).ToBe(0);
+    Expect<string>(DispatchedCommand).ToBe('build');
+    Expect<string>(CapturedCompletion.CommandName).ToBe('build');
+
+    { An aliasing command looks its first argument up exactly too, so a
+      wrongly cased name stays with the command. }
+    Registry.Find('run').AliasesSubcommands := True;
+    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['run', 'build',
+      '--release', 'main.x'])).ToBe(0);
+    Expect<string>(DispatchedCommand).ToBe('build');
+    Expect<string>(DispatchedOptions).ToBe('release');
+    Expect<Integer>(Registry.Run(HOST_PROGRAM_NAME, ['run', 'BUILD',
+      'main.x'])).ToBe(0);
+    Expect<string>(DispatchedCommand).ToBe('run');
+    Expect<string>(DispatchedPositionals).ToBe('BUILD|main.x');
+    Expect<string>(CapturedCompletion.CommandName).ToBe('run');
+
+    { A bare word matches in any letter case, so it still may not differ
+      from a subcommand name in letter case only. }
+    Flag := TTopLevelFlag.Create('Build', 'word of a subcommand',
+      @HandleBuildInfoFlag);
+    Flag.BareWord := True;
+    Expect<Boolean>(TopLevelFlagIsRefused(Registry, Flag)).ToBe(True);
+  finally
+    Registry.Free;
+  end;
+end;
+
+procedure THostDispatchSuite.TestExactCommandNamesUsageErrors;
+var
+  Child: TChildResult;
+begin
+  { A wrongly cased command is unknown, and named as typed. }
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, 'BUILD', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
+  Expect<string>(Child.StandardOutput).ToBe('');
+  Expect<Boolean>(StartsWith(Child.StandardError,
+    'unknown command: BUILD')).ToBe(True);
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, 'Build']);
+  Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
+  Expect<Boolean>(StartsWith(Child.StandardError,
+    'unknown command: Build')).ToBe(True);
+
+  { The help word and a flag's bare word still match in any letter case. }
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, 'HELP']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host <command> [options]')).ToBe(True);
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, 'VERSION']);
+  Expect<Integer>(Child.ExitCode).ToBe(VERSION_FLAG_EXIT_CODE);
+
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, 'build', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command: build')).ToBe(
+    True);
+end;
+
 procedure THostDispatchSuite.SetupTests;
 begin
   Test('an unconfigured registry keeps the defaults every host started with',
@@ -1329,6 +1408,10 @@ begin
     TestStrictSingleDashUsageErrors);
   Test('command help lists an option''s short name and keeps one help column',
     TestCommandHelpListsOptionShortNames);
+  Test('exact command names are opt-in and cover Find and aliasing',
+    TestExactCommandNamesIsOptIn);
+  Test('under exact command names a wrongly cased command is unknown',
+    TestExactCommandNamesUsageErrors);
 end;
 
 procedure TSubcommandRegistrySuite.SetupTests;
@@ -1358,13 +1441,14 @@ var
   Registry : TSubcommandRegistry;
 begin
   EchoDispatch := True;
-  if (AMode = HOST_CHILD_MODE) or (AMode = STRICT_HOST_CHILD_MODE) then
-    Registry := BuildHostRegistry
+  if AMode = UNCONFIGURED_CHILD_MODE then
+    Registry := BuildRegistry
   else
-    Registry := BuildRegistry;
+    Registry := BuildHostRegistry;
   try
     Registry.StrictSingleDash := AMode = STRICT_HOST_CHILD_MODE;
-    if (AMode = HOST_CHILD_MODE) or (AMode = STRICT_HOST_CHILD_MODE) then
+    Registry.ExactCommandNames := AMode = EXACT_HOST_CHILD_MODE;
+    if AMode <> UNCONFIGURED_CHILD_MODE then
       Result := Registry.Run(HOST_PROGRAM_NAME, GetCommandLineArguments(2))
     else
       Result := Registry.Run(UNCONFIGURED_PROGRAM_NAME,
@@ -1377,6 +1461,7 @@ end;
 begin
   if (ParamCount >= 1) and ((ParamStr(1) = HOST_CHILD_MODE)
     or (ParamStr(1) = STRICT_HOST_CHILD_MODE)
+    or (ParamStr(1) = EXACT_HOST_CHILD_MODE)
     or (ParamStr(1) = UNCONFIGURED_CHILD_MODE)) then
   begin
     ExitCode := RunHostChildMode(ParamStr(1));

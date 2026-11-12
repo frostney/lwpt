@@ -127,9 +127,13 @@ type
     FUsageHelpToStandardError : Boolean;
     FBareInvocation : TBareInvocation;
     FStrictSingleDash : Boolean;
+    FExactCommandNames : Boolean;
     FOnCommandCompleted : TSubcommandCompletionHandler;
     FOnCommandPrepared : TSubcommandPreparedHandler;
     function FindTopLevelFlag(const AArgument: string): TTopLevelFlag;
+    function FindCommand(const AName: string;
+      const AExact: Boolean): TSubcommand;
+    function CommandName(const AArgument: string): string;
     function ReportUsageError(const AProgramName, AMessage: string): Integer;
   public
     constructor Create;
@@ -147,6 +151,8 @@ type
       part of the command surface that Count and Item do not cover. }
     function TopLevelFlagCount: Integer;
     function TopLevelFlagItem(const AIndex: Integer): TTopLevelFlag;
+    { The subcommand named AName, or nil: in any letter case, or exactly
+      under ExactCommandNames, as Run looks a command up. }
     function Find(const AName: string): TSubcommand;
     { Read iteration over the registered subcommands, in registration
       order. The registry is the single source of truth for the
@@ -193,6 +199,16 @@ type
       default. }
     property StrictSingleDash: Boolean
       read FStrictSingleDash write FStrictSingleDash;
+    { When True, a command name, and the subcommand name an aliasing
+      command looks up, match only in the letter case it was registered
+      in: `BUILD` is an unknown command, reported as typed, rather than
+      `build`. Find follows the same rule. The built-in `help` word and a
+      top-level flag's bare word still match in any letter case, and
+      registration still refuses a bare word that differs from a
+      subcommand name only in letter case. False by default: command names
+      match in any letter case. }
+    property ExactCommandNames: Boolean
+      read FExactCommandNames write FExactCommandNames;
     property OnCommandCompleted: TSubcommandCompletionHandler
       read FOnCommandCompleted write FOnCommandCompleted;
     property OnCommandPrepared: TSubcommandPreparedHandler
@@ -368,7 +384,9 @@ begin
          and (FTopLevelFlags[FlagIndex].ShortName = AFlag.ShortName)) then
       raise EArgumentException.CreateFmt(
         'top-level flag --%s is already registered', [AFlag.LongName]);
-  if AFlag.BareWord and (Find(AFlag.LongName) <> nil) then
+  { A bare word matches in any letter case, so it may not differ from a
+    subcommand name in letter case only, whatever ExactCommandNames is. }
+  if AFlag.BareWord and (FindCommand(AFlag.LongName, False) <> nil) then
     raise EArgumentException.CreateFmt(
       'top-level flag word %s is already a subcommand', [AFlag.LongName]);
 
@@ -407,13 +425,30 @@ begin
   Result := nil;
 end;
 
-function TSubcommandRegistry.Find(const AName: string): TSubcommand;
+function TSubcommandRegistry.FindCommand(const AName: string;
+  const AExact: Boolean): TSubcommand;
 var i: Integer;
 begin
   Result := nil;
   for i := 0 to High(FItems) do
-    if SameText(FItems[i].Name, AName) then
+    if (AExact and (FItems[i].Name = AName))
+       or ((not AExact) and SameText(FItems[i].Name, AName)) then
       Exit(FItems[i]);
+end;
+
+function TSubcommandRegistry.Find(const AName: string): TSubcommand;
+begin
+  Result := FindCommand(AName, FExactCommandNames);
+end;
+
+{ The command name Run looks up and reports for AArgument: as typed under
+  ExactCommandNames, lowercased otherwise. }
+function TSubcommandRegistry.CommandName(const AArgument: string): string;
+begin
+  if FExactCommandNames then
+    Result := AArgument
+  else
+    Result := LowerCase(AArgument);
 end;
 
 function TSubcommandRegistry.Count: Integer;
@@ -605,6 +640,7 @@ begin
     Exit(0);
   end;
 
+  CmdName := CommandName(AArguments[0]);
   Sub := Find(CmdName);
   if Sub = nil then
     Exit(ReportUsageError(AProgramName, 'unknown command: ' + CmdName));
@@ -620,12 +656,12 @@ begin
     FirstArgument := 1;
     if Sub.AliasesSubcommands and (Length(AArguments) >= 2) then
     begin
-      AliasSub := Find(LowerCase(AArguments[1]));
+      AliasSub := Find(CommandName(AArguments[1]));
       if AliasSub <> nil then
       begin
         Sub := AliasSub;
         FirstArgument := 2;
-        CmdName := LowerCase(AArguments[1]);
+        CmdName := CommandName(AArguments[1]);
       end;
     end;
 
