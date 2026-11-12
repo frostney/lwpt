@@ -12,7 +12,9 @@ shows how to add the package to a project.
 A host that moves from 0.7.0 to 0.8.0 without changing its code sees one
 difference: a value that a command option takes is never a help request.
 With a valued option `--output` (`-o`), `demo build -o help main.x` used to
-print the help of `build`; it now runs `build` with `help` as the value.
+print the help of `build`; it now runs `build` with `help` as the value. An
+option that rejects the value, such as an integer option, now reports a usage
+error where 0.7.0 printed help.
 
 A host that moves from 0.6.0 to 0.7.0 without changing its code sees one
 difference: a command option with a short name is listed with it in the
@@ -165,7 +167,9 @@ defaults column says.
 | `TSubcommand.AliasesSubcommands` | `False` | Lets `<program> <command> <subcommand>` dispatch `<subcommand>`. |
 
 Help is built in: `help`, `--help` and `-h` as the first argument print the
-top-level help, and after a command name they print that command's help.
+top-level help, and after a command name they print that command's help,
+unless an option takes them as its value (see
+[End of options and pass-through](#end-of-options-and-pass-through)).
 
 A command's help lists its options under `options:`. An option with a
 `ShortName` is listed with it, the way top-level help lists a flag's short
@@ -189,8 +193,9 @@ run "demo --help" to see all commands
 command reference from the registry can use it to match the help.
 
 Write a command option's `ShortName` without its dash, as for a top-level
-flag. `h` is not available: `-h` after a command name always asks for help,
-so an option with the short name `h` cannot be given as `-h`.
+flag. `h` is not available: `-h` as an argument of its own after a command
+name asks for help, so an option with the short name `h` cannot be given as
+`-h`.
 
 ## Top-level flags
 

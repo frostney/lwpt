@@ -1172,13 +1172,15 @@ begin
 end;
 
 { Dispatches `build` with AArguments on a fresh host registry and returns
-  the value its `--output` option received, or `<help>` when the line was
-  taken for a help request instead. }
+  the value its `--output` option received and the positionals. A line
+  that dispatched nothing returns `<exit N>`, the exit code of Run. }
 function BuildOutputFor(const AArguments: array of string): string;
 var
   Registry: TSubcommandRegistry;
+  Build: TSubcommand;
+  Output: TStringOption;
   Arguments: array of string;
-  Index: Integer;
+  Index, RunExitCode: Integer;
 begin
   ResetDispatch;
   SetLength(Arguments, Length(AArguments) + 1);
@@ -1187,11 +1189,15 @@ begin
     Arguments[Index + 1] := AArguments[Index];
   Registry := BuildHostRegistry;
   try
-    if (Registry.Run(HOST_PROGRAM_NAME, Arguments) <> 0)
-       or (DispatchCount <> 1) then
-      Exit('<help>');
-    Result := TStringOption(Registry.Find('build').Options[2]).Value + ' ' +
-      DispatchedPositionals;
+    RunExitCode := Registry.Run(HOST_PROGRAM_NAME, Arguments);
+    if DispatchCount <> 1 then
+      Exit(Format('<exit %d>', [RunExitCode]));
+    Build := Registry.Find('build');
+    Output := nil;
+    for Index := 0 to High(Build.Options) do
+      if Build.Options[Index].LongName = 'output' then
+        Output := Build.Options[Index] as TStringOption;
+    Result := Output.Value + ' ' + DispatchedPositionals;
   finally
     Registry.Free;
   end;
@@ -1211,8 +1217,15 @@ begin
   Expect<string>(BuildOutputFor(['-o', '--help', 'main.x'])).ToBe(
     '--help main.x');
 
-  { A help spelling of its own after the value still asks for help. }
+  { A help spelling of its own after the value still asks for help, and
+    so does `-h` after a long option, which takes no separated value that
+    begins with `-`. }
   Child := RunSelf([HOST_CHILD_MODE, 'build', '-o', 'help', '--help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host build <file> [--json]')).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '--output', '-h', 'main.x']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput,
     'usage: host build <file> [--json]')).ToBe(True);

@@ -671,6 +671,12 @@ begin
     { Without a bare word only the flags count. }
     Expect<Boolean>(FlagGiven(['main.x', 'help'], Fixture.Options,
       HELP_LONG_NAME, HELP_SHORT_NAME)).ToBe(False);
+    { An empty name matches nothing: a lone `-` is an operand, not the
+      short form of a flag that has none. }
+    Expect<Boolean>(FlagGiven(['-', 'main.x'], Fixture.Options, 'verbose',
+      '')).ToBe(False);
+    Expect<Boolean>(LeadingFlagGiven(['--output', 'out', '-'],
+      Fixture.Options, 'verbose', '')).ToBe(False);
   finally
     Fixture.Free;
   end;

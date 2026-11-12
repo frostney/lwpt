@@ -42,9 +42,9 @@ function ParseArguments(const AArguments: array of string;
 { Reports whether `--<ALongName>` or `-<AShortName>` is spelled out as an
   option before option parsing ends at the first positional or at
   END_OF_OPTIONS_MARKER. Reads AArguments under ParseArguments' rules, so a
-  value consumed by a valued option is never taken for the flag. Applies no
-  option and raises nothing: an argument ParseArguments would reject is
-  skipped. }
+  value consumed by a valued option is never taken for the flag. An empty
+  ALongName or AShortName matches nothing. Applies no option and raises
+  nothing: an argument ParseArguments would reject is still compared. }
 function LeadingFlagGiven(const AArguments: array of string;
   const AOptions: TOptionArray; const ALongName, AShortName: string): Boolean;
 
@@ -52,9 +52,10 @@ function LeadingFlagGiven(const AArguments: array of string;
   not empty, ABareWord in any letter case is given as an argument of its
   own before END_OF_OPTIONS_MARKER. Reads AArguments under ParseArguments'
   rules without AStopAtFirstPositional, so a value consumed by a valued
-  option (`-o help`, `--output help`) is never taken for one of them.
-  Applies no option and raises nothing: an argument ParseArguments would
-  reject is still compared. }
+  option (`-o help`, `--output help`) is never taken for one of them. An
+  empty ALongName, AShortName or ABareWord matches nothing, so a lone `-`
+  is never a flag without a short name. Applies no option and raises
+  nothing: an argument ParseArguments would reject is still compared. }
 function FlagGiven(const AArguments: array of string;
   const AOptions: TOptionArray; const ALongName, AShortName: string;
   const ABareWord: string = ''): Boolean;
@@ -92,7 +93,7 @@ type
   TArgumentKind = (akPositional, akEndOfOptions, akOption, akRejected);
 
   { How one argument reads at its position: the single description of the
-    option syntax that ParseArguments, LeadingFlagGiven and
+    option syntax that ParseArguments, LeadingFlagGiven, FlagGiven and
     EndOfOptionsIndex share. }
   TArgumentReading = record
     Kind: TArgumentKind;
@@ -317,8 +318,10 @@ begin
     if (Reading.Kind = akEndOfOptions) or
        (AStopAtFirstPositional and (Reading.Kind = akPositional)) then
       Exit(False);
-    if (AArguments[I] = LONG_FLAG_PREFIX + ALongName) or
-       (AArguments[I] = SHORT_FLAG_CHAR + AShortName) or
+    if ((ALongName <> '') and
+        (AArguments[I] = LONG_FLAG_PREFIX + ALongName)) or
+       ((AShortName <> '') and
+        (AArguments[I] = SHORT_FLAG_CHAR + AShortName)) or
        ((ABareWord <> '') and SameText(AArguments[I], ABareWord)) then
       Exit(True);
     Inc(I, Reading.Width);
