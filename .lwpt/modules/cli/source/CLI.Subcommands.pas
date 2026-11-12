@@ -126,6 +126,7 @@ type
     FUsageExitCode : Integer;
     FUsageHelpToStandardError : Boolean;
     FBareInvocation : TBareInvocation;
+    FStrictSingleDash : Boolean;
     FOnCommandCompleted : TSubcommandCompletionHandler;
     FOnCommandPrepared : TSubcommandPreparedHandler;
     function FindTopLevelFlag(const AArgument: string): TTopLevelFlag;
@@ -183,6 +184,15 @@ type
       read FUsageHelpToStandardError write FUsageHelpToStandardError;
     property BareInvocation: TBareInvocation
       read FBareInvocation write FBareInvocation;
+    { When True, a single-dash argument read as an option that is neither a
+      declared short option nor an opted-in attached short value is a usage
+      error (`Unknown option: -verify`), whatever its length, instead of a
+      positional. A negative number (`-5`, `-1.5`), a lone `-`, a value an
+      option takes, everything after `--`, and everything from a
+      pass-through command's first positional on are unaffected. False by
+      default. }
+    property StrictSingleDash: Boolean
+      read FStrictSingleDash write FStrictSingleDash;
     property OnCommandCompleted: TSubcommandCompletionHandler
       read FOnCommandCompleted write FOnCommandCompleted;
     property OnCommandPrepared: TSubcommandPreparedHandler
@@ -529,11 +539,12 @@ end;
   takes (`-o help`, a `--` after `-o`) is neither a help request nor the
   end of options. }
 function HelpRequested(const ASub: TSubcommand;
-  const AArguments: array of string): Boolean;
+  const AArguments: array of string;
+  const AStrictSingleDash: Boolean): Boolean;
 begin
   if ASub.PassThrough then
     Result := LeadingFlagGiven(AArguments, ASub.Options, HELP_WORD,
-      HELP_SHORT_NAME)
+      HELP_SHORT_NAME, AStrictSingleDash)
   else
     Result := FlagGiven(AArguments, ASub.Options, HELP_WORD,
       HELP_SHORT_NAME, HELP_WORD);
@@ -622,7 +633,7 @@ begin
     for i := FirstArgument to High(AArguments) do
       CommandArguments[i - FirstArgument] := AArguments[i];
 
-    if HelpRequested(Sub, CommandArguments) then
+    if HelpRequested(Sub, CommandArguments, FStrictSingleDash) then
     begin
       PrintSubcommandHelp(AProgramName, Sub);
       Exit(0);
@@ -630,7 +641,7 @@ begin
 
     try
       Positionals := ParseArguments(CommandArguments, Sub.Options,
-        Sub.PassThrough);
+        Sub.PassThrough, FStrictSingleDash);
     except
       on E: TParseError do
       begin

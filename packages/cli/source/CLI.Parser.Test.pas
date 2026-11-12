@@ -43,6 +43,7 @@ type
     procedure TestAttachedValueRequiresOptIn;
     procedure TestMissingShortValue;
     procedure TestUnknownShortOption;
+    procedure TestStrictSingleDashOverProcessArguments;
     procedure TestValuelessShortFlag;
     procedure TestLongEqualsValueUnchanged;
     procedure TestLongSeparatedValueUnchanged;
@@ -61,6 +62,10 @@ type
     procedure TestStopAtFirstPositionalConsumesOnlyALeadingMarker;
     procedure TestStopAtFirstPositionalRejectsLeadingUnknownOptions;
     procedure TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken;
+    procedure TestUnknownDashWordsArePositionalByDefault;
+    procedure TestStrictSingleDashRejectsUnknownDashWords;
+    procedure TestStrictSingleDashKeepsNumbersValuesAndOperands;
+    procedure TestStrictSingleDashWithStopAtFirstPositional;
     procedure TestLeadingFlagGivenBeforeTheFirstPositional;
     procedure TestLeadingFlagNotGivenPastTheEndOfOptions;
     procedure TestLeadingFlagGivenAppliesNothing;
@@ -79,10 +84,12 @@ type
     destructor Destroy; override;
     { ParseArguments, with the positionals joined by `|`. }
     function Parse(const AArguments: array of string;
-      const AStopAtFirstPositional: Boolean = False): string;
+      const AStopAtFirstPositional: Boolean = False;
+      const AStrictSingleDash: Boolean = False): string;
     { The TParseError message ParseArguments raises, or '' for none. }
     function ParseError(const AArguments: array of string;
-      const AStopAtFirstPositional: Boolean = False): string;
+      const AStopAtFirstPositional: Boolean = False;
+      const AStrictSingleDash: Boolean = False): string;
     function HelpGiven(const AArguments: array of string): Boolean;
     { FlagGiven for --help, -h and the word `help`. }
     function HelpAnywhere(const AArguments: array of string): Boolean;
@@ -118,13 +125,15 @@ begin
 end;
 
 function TParserFixture.Parse(const AArguments: array of string;
-  const AStopAtFirstPositional: Boolean = False): string;
+  const AStopAtFirstPositional: Boolean = False;
+  const AStrictSingleDash: Boolean = False): string;
 var
   Positionals: TStringList;
   I: Integer;
 begin
   Result := '';
-  Positionals := ParseArguments(AArguments, Options, AStopAtFirstPositional);
+  Positionals := ParseArguments(AArguments, Options, AStopAtFirstPositional,
+    AStrictSingleDash);
   try
     for I := 0 to Positionals.Count - 1 do
     begin
@@ -137,11 +146,12 @@ begin
 end;
 
 function TParserFixture.ParseError(const AArguments: array of string;
-  const AStopAtFirstPositional: Boolean = False): string;
+  const AStopAtFirstPositional: Boolean = False;
+  const AStrictSingleDash: Boolean = False): string;
 begin
   Result := '';
   try
-    Parse(AArguments, AStopAtFirstPositional);
+    Parse(AArguments, AStopAtFirstPositional, AStrictSingleDash);
   except
     on E: TParseError do Result := E.Message;
   end;
@@ -225,11 +235,14 @@ begin
   if AScenario = 'missing-value' then
     ExpectedError := '-o requires a value'
   else if AScenario = 'unknown-option' then
-    ExpectedError := 'Unknown option: -x';
+    ExpectedError := 'Unknown option: -x'
+  else if AScenario = 'strict-unknown-word' then
+    ExpectedError := 'Unknown option: -verify';
 
   try
     try
-      Positionals := ParseCommandLine(Options, 3);
+      Positionals := ParseCommandLine(Options, 3,
+        AScenario = 'strict-unknown-word');
     except
       on E: TParseError do
       begin
@@ -393,6 +406,12 @@ end;
 procedure TCLIParserSuite.TestUnknownShortOption;
 begin
   Expect<Integer>(RunChild('unknown-option', ['-x'])).ToBe(0);
+end;
+
+procedure TCLIParserSuite.TestStrictSingleDashOverProcessArguments;
+begin
+  Expect<Integer>(RunChild('strict-unknown-word', ['main.x',
+    '-verify'])).ToBe(0);
 end;
 
 procedure TCLIParserSuite.TestValuelessShortFlag;
@@ -694,6 +713,91 @@ begin
   end;
 end;
 
+procedure TCLIParserArgumentsSuite.TestUnknownDashWordsArePositionalByDefault;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['-verify', 'f.src', '-42'])).ToBe(
+      '-verify|f.src|-42');
+    Expect<string>(Fixture.ParseError(['-5'])).ToBe('Unknown option: -5');
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.TestStrictSingleDashRejectsUnknownDashWords;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.ParseError(['-verify', 'f.src'], False, True)).ToBe(
+      'Unknown option: -verify');
+    Expect<string>(Fixture.ParseError(['f.src', '-Vx'], False, True)).ToBe(
+      'Unknown option: -Vx');
+    Expect<string>(Fixture.ParseError(['-x'], False, True)).ToBe(
+      'Unknown option: -x');
+    { Only a plain decimal number is excepted. }
+    Expect<string>(Fixture.ParseError(['-1e5'], False, True)).ToBe(
+      'Unknown option: -1e5');
+    Expect<string>(Fixture.ParseError(['-1.'], False, True)).ToBe(
+      'Unknown option: -1.');
+    Expect<string>(Fixture.ParseError(['-.5'], False, True)).ToBe(
+      'Unknown option: -.5');
+    Expect<string>(Fixture.ParseError(['-1.2.3'], False, True)).ToBe(
+      'Unknown option: -1.2.3');
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.
+  TestStrictSingleDashKeepsNumbersValuesAndOperands;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['-5', '-42', '-1.5', '-', 'f.src'], False,
+      True)).ToBe('-5|-42|-1.5|-|f.src');
+    { Declared short options, attached values and consumed values. }
+    Expect<string>(Fixture.Parse(['-V', '-dDEBUG', '-o', '-verify', 'f.src'],
+      False, True)).ToBe('f.src');
+    Expect<string>(Fixture.Output.Value).ToBe('-verify');
+    Expect<Boolean>(Fixture.Verbose.Present).ToBe(True);
+    Expect<string>(Fixture.Define.Values.CommaText).ToBe('DEBUG');
+    Expect<string>(Fixture.Parse(['f.src', '--', '-verify'], False,
+      True)).ToBe('f.src|-verify');
+  finally
+    Fixture.Free;
+  end;
+end;
+
+procedure TCLIParserArgumentsSuite.
+  TestStrictSingleDashWithStopAtFirstPositional;
+var
+  Fixture: TParserFixture;
+begin
+  Fixture := TParserFixture.Create;
+  try
+    Expect<string>(Fixture.Parse(['main.x', '-verify', '-x'], True,
+      True)).ToBe('main.x|-verify|-x');
+    Expect<string>(Fixture.ParseError(['-verify', 'main.x'], True,
+      True)).ToBe('Unknown option: -verify');
+    { An unknown dash word is a rejected option, not the first
+      positional, so a help flag after it is still leading; a negative
+      number is the first positional. }
+    Expect<Boolean>(LeadingFlagGiven(['-abc', '-h'], Fixture.Options,
+      HELP_LONG_NAME, HELP_SHORT_NAME, True)).ToBe(True);
+    Expect<Boolean>(LeadingFlagGiven(['-5', '-h'], Fixture.Options,
+      HELP_LONG_NAME, HELP_SHORT_NAME, True)).ToBe(False);
+  finally
+    Fixture.Free;
+  end;
+end;
+
 procedure TCLIParserArgumentsSuite.SetupTests;
 begin
   Test('options are read after positionals by default',
@@ -714,6 +818,14 @@ begin
     TestStopAtFirstPositionalRejectsLeadingUnknownOptions);
   Test('stop-at-first-positional ends at an unmatched single-dash token',
     TestStopAtFirstPositionalEndsAtAnUnmatchedDashToken);
+  Test('an unknown dash word of several characters is positional by default',
+    TestUnknownDashWordsArePositionalByDefault);
+  Test('strict single-dash parsing rejects every unknown dash word',
+    TestStrictSingleDashRejectsUnknownDashWords);
+  Test('strict single-dash parsing keeps numbers, values and operands',
+    TestStrictSingleDashKeepsNumbersValuesAndOperands);
+  Test('strict single-dash parsing ends at the first positional when asked',
+    TestStrictSingleDashWithStopAtFirstPositional);
   Test('a leading flag is found before the first positional',
     TestLeadingFlagGivenBeforeTheFirstPositional);
   Test('a leading flag is not found past the end of options or as a value',
@@ -740,6 +852,8 @@ begin
     TestMissingShortValue);
   Test('unknown short option raises TParseError',
     TestUnknownShortOption);
+  Test('strict single-dash parsing applies to the process arguments',
+    TestStrictSingleDashOverProcessArguments);
   Test('existing valueless short flags remain unchanged',
     TestValuelessShortFlag);
   Test('long equals-separated values remain unchanged',

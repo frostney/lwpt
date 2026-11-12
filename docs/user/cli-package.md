@@ -4,16 +4,19 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.9.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
+This page describes `cli` 0.10.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
 and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
 them has the host settings below. The [consumer guide](consumer-guide.md)
 shows how to add the package to a project.
 
-From 0.9.0 the package uses no `Generics.*` unit, so a host that uses none
+From 0.10.0 the package uses no `Generics.*` unit, so a host that uses none
 itself no longer links `Generics.Collections` and its unit closure or runs
 their initialization at start. `TOptionList` is unchanged. A host that moves
-from 0.8.0 to 0.9.0 and names `TOptionBaseList`, which is gone, declares
+from 0.9.0 to 0.10.0 and names `TOptionBaseList`, which is gone, declares
 `TObjectList<TOptionBase>` from `Generics.Collections` itself.
+
+A host that moves from 0.8.0 to 0.9.0 without changing its code sees no
+difference. `StrictSingleDash` is new and off by default.
 
 A host that moves from 0.7.0 to 0.8.0 without changing its code sees one
 difference: a value that a command option takes is never a help request.
@@ -169,6 +172,7 @@ defaults column says.
 | `Registry.UsageExitCode` | 1 (`DEFAULT_USAGE_EXIT_CODE`) | The exit code of a usage error. |
 | `Registry.UsageHelpToStandardError` | `False` | Sends the help that follows an unknown or missing command to standard error. |
 | `Registry.BareInvocation` | `biShowHelp` | What the program does without arguments: print help and exit 0, or report a usage error (`biUsageError`). |
+| `Registry.StrictSingleDash` | `False` | Makes an unknown single-dash argument such as `-verify` a usage error instead of a positional (see [Strict single-dash parsing](#strict-single-dash-parsing)). |
 | `TSubcommand.PassThrough` | `False` | Stops option parsing at the command's first positional. |
 | `TSubcommand.AliasesSubcommands` | `False` | Lets `<program> <command> <subcommand>` dispatch `<subcommand>`. |
 
@@ -255,7 +259,8 @@ to the registry. Option parsing then stops at the first positional:
   `demo run --port 80` fails with `Unknown option: --port`.
 - A single-dash argument of more than one character that matches no option is
   a positional, here as everywhere in the parser. `demo run -xyz main.x`
-  therefore runs the file `-xyz` and hands it `main.x`.
+  therefore runs the file `-xyz` and hands it `main.x`. Under
+  `StrictSingleDash` it is a usage error instead.
 - A flag added with `AddSharedFlag` is shown ahead of the command's own usage,
   because it counts only there. With a shared `--json`, the usage line of
   `demo run` reads `usage: demo run [--json] [--unchecked] <file> [arguments]`.
@@ -267,6 +272,38 @@ command: with a valued option `--output` (`-o`), `--output help`, `-o help`
 and `-o -h` give the option that value, and `-o help --help` still prints the
 help. `FlagGiven` in `CLI.Parser` finds a flag or word under the same reading,
 and `LeadingFlagGiven` does so before the first positional.
+
+## Strict single-dash parsing
+
+By default a single-dash argument that matches no short option is a usage
+error only when it is one character long (`-x`). A longer one, such as
+`-verify` typed for `--verify`, is a positional, so `demo check -verify`
+prints `checked: -verify`.
+
+A host that sets `Registry.StrictSingleDash := True` makes every such argument
+a usage error, whatever its length:
+
+```text
+$ demo check -verify f.src
+demo check: Unknown option: -verify
+$ echo $?
+2
+```
+
+These stay as they are:
+
+- A negative number, `-` and digits with an optional fraction (`-5`, `-42`,
+  `-1.5`), is a positional, so a command can take one as an operand. In the
+  default mode a one-character `-5` is still rejected.
+- A lone `-`, conventionally standard input, is a positional.
+- A value that a valued option takes: `-o -verify` gives `-verify` to `-o`.
+- Everything after `--`, and in a pass-through command everything from the
+  first positional on: `demo run main.x -verify` hands `-verify` to the
+  program it runs, while `demo run -verify main.x` is a usage error.
+
+`ParseArguments` and `ParseCommandLine` take the same choice as an optional
+`AStrictSingleDash` argument, and `LeadingFlagGiven` takes it to read the
+arguments the same way.
 
 ## Subcommand aliasing
 
