@@ -68,6 +68,8 @@ type
     procedure TestPassThroughHelp;
     procedure TestHelpWordOutsidePassThrough;
     procedure TestOptionValueIsNeverAHelpRequest;
+    procedure TestStrictSingleDashIsOptIn;
+    procedure TestStrictSingleDashUsageErrors;
     procedure TestCommandHelpListsOptionShortNames;
   end;
 
@@ -92,12 +94,16 @@ const
   { Child modes: the arguments after the mode word are the host's. }
   HOST_CHILD_MODE = '--host-child';
   UNCONFIGURED_CHILD_MODE = '--unconfigured-child';
+  { The host registry with StrictSingleDash set. }
+  STRICT_HOST_CHILD_MODE = '--strict-host-child';
   HOST_PROGRAM_NAME = 'host';
   UNCONFIGURED_PROGRAM_NAME = 'fixture';
   HOST_USAGE_EXIT_CODE = 2;
   VERSION_FLAG_EXIT_CODE = 3;
   BUILD_INFO_FLAG_EXIT_CODE = 4;
   LIST_SEPARATOR = '|';
+  { The usage line of the host's pass-through `run` command. }
+  RUN_USAGE = 'usage: host run [--json] <file> [arguments]';
 
 procedure CaptureCompletion(const ACompletion: TSubcommandCompletion);
 begin
@@ -1101,8 +1107,6 @@ begin
 end;
 
 procedure THostDispatchSuite.TestPassThroughHelp;
-const
-  RUN_USAGE = 'usage: host run [--json] <file> [arguments]';
 var
   Child: TChildResult;
 begin
@@ -1186,7 +1190,8 @@ end;
 { Dispatches `build` with AArguments on a fresh host registry and returns
   the value its `--output` option received and the positionals. A line
   that dispatched nothing returns `<exit N>`, the exit code of Run. }
-function BuildOutputFor(const AArguments: array of string): string;
+function BuildOutputFor(const AArguments: array of string;
+  const AStrictSingleDash: Boolean = False): string;
 var
   Registry: TSubcommandRegistry;
   Build: TSubcommand;
@@ -1201,6 +1206,7 @@ begin
     Arguments[Index + 1] := AArguments[Index];
   Registry := BuildHostRegistry;
   try
+    Registry.StrictSingleDash := AStrictSingleDash;
     RunExitCode := Registry.Run(HOST_PROGRAM_NAME, Arguments);
     if DispatchCount <> 1 then
       Exit(Format('<exit %d>', [RunExitCode]));
@@ -1226,6 +1232,53 @@ begin
   Expect<string>(BuildOutputFor(['-o', '-h', 'main.x'])).ToBe('-h main.x');
   Expect<string>(BuildOutputFor(['-o', '--help', 'main.x'])).ToBe(
     '--help main.x');
+end;
+
+procedure THostDispatchSuite.TestStrictSingleDashIsOptIn;
+var
+  Registry: TSubcommandRegistry;
+begin
+  Registry := TSubcommandRegistry.Create;
+  try
+    Expect<Boolean>(Registry.StrictSingleDash).ToBe(False);
+  finally
+    Registry.Free;
+  end;
+  Expect<string>(BuildOutputFor(['-verify', 'main.x'])).ToBe(
+    ' -verify|main.x');
+  { Strict parsing still takes numbers, values and a lone `-`. }
+  Expect<string>(BuildOutputFor(['-o', '-verify', '-5', '-', 'main.x'],
+    True)).ToBe('-verify -5|-|main.x');
+end;
+
+procedure THostDispatchSuite.TestStrictSingleDashUsageErrors;
+var
+  Child: TChildResult;
+begin
+  Child := RunSelf([STRICT_HOST_CHILD_MODE, 'build', '-verify', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
+  Expect<Boolean>(Contains(Child.StandardError,
+    'host build: Unknown option: -verify')).ToBe(True);
+  Expect<string>(Child.StandardOutput).ToBe('');
+
+  { A pass-through command hands everything from its first positional on
+    to the program it launches. }
+  Child := RunSelf([STRICT_HOST_CHILD_MODE, 'run', 'main.x', '-verify']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command: run')).ToBe(True);
+  Child := RunSelf([STRICT_HOST_CHILD_MODE, 'run', '-verify', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
+  Expect<Boolean>(Contains(Child.StandardError,
+    'host run: Unknown option: -verify')).ToBe(True);
+
+  { The help scan reads the line as the parser does: the unknown word is a
+    rejected option, so a help flag after it still asks for help, as it
+    does after `--bogus`. }
+  Child := RunSelf([STRICT_HOST_CHILD_MODE, 'run', '-verify', '--help',
+    'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, RUN_USAGE)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
 procedure THostDispatchSuite.SetupTests;
@@ -1270,6 +1323,10 @@ begin
     TestHelpWordOutsidePassThrough);
   Test('a value that an option takes is never a help request',
     TestOptionValueIsNeverAHelpRequest);
+  Test('strict single-dash parsing is opt-in and keeps numbers and values',
+    TestStrictSingleDashIsOptIn);
+  Test('strict single-dash parsing reports unknown dash words as usage errors',
+    TestStrictSingleDashUsageErrors);
   Test('command help lists an option''s short name and keeps one help column',
     TestCommandHelpListsOptionShortNames);
 end;
@@ -1301,12 +1358,13 @@ var
   Registry : TSubcommandRegistry;
 begin
   EchoDispatch := True;
-  if AMode = HOST_CHILD_MODE then
+  if (AMode = HOST_CHILD_MODE) or (AMode = STRICT_HOST_CHILD_MODE) then
     Registry := BuildHostRegistry
   else
     Registry := BuildRegistry;
   try
-    if AMode = HOST_CHILD_MODE then
+    Registry.StrictSingleDash := AMode = STRICT_HOST_CHILD_MODE;
+    if (AMode = HOST_CHILD_MODE) or (AMode = STRICT_HOST_CHILD_MODE) then
       Result := Registry.Run(HOST_PROGRAM_NAME, GetCommandLineArguments(2))
     else
       Result := Registry.Run(UNCONFIGURED_PROGRAM_NAME,
@@ -1318,6 +1376,7 @@ end;
 
 begin
   if (ParamCount >= 1) and ((ParamStr(1) = HOST_CHILD_MODE)
+    or (ParamStr(1) = STRICT_HOST_CHILD_MODE)
     or (ParamStr(1) = UNCONFIGURED_CHILD_MODE)) then
   begin
     ExitCode := RunHostChildMode(ParamStr(1));
