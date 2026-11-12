@@ -67,6 +67,7 @@ type
     procedure TestUnconfiguredUsageErrors;
     procedure TestPassThroughHelp;
     procedure TestHelpWordOutsidePassThrough;
+    procedure TestCommandHelpListsOptionShortNames;
   end;
 
 var
@@ -1120,6 +1121,25 @@ begin
   Expect<Boolean>(Contains(Child.StandardOutput, RUN_USAGE)).ToBe(True);
 end;
 
+procedure THostDispatchSuite.TestCommandHelpListsOptionShortNames;
+var
+  Child: TChildResult;
+begin
+  { `--output` has the short name `o`. It is listed the way top-level
+    help lists a flag's short name; the other rows keep their long form,
+    and every help text starts in the column after the widest label. }
+  Child := RunSelf([HOST_CHILD_MODE, 'build', '--help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<string>(Child.StandardError).ToBe('');
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'options:' + sLineBreak +
+    '  --release              Optimize' + sLineBreak +
+    '  --level=<N>            Optimization level' + sLineBreak +
+    '  -o, --output=<value>   Output path' + sLineBreak +
+    '  --json                 Print diagnostics as JSON' + sLineBreak)).ToBe(
+    True);
+end;
+
 procedure THostDispatchSuite.TestHelpWordOutsidePassThrough;
 const
   BUILD_USAGE = 'usage: host build <file> [--json]';
@@ -1190,6 +1210,8 @@ begin
     TestPassThroughHelp);
   Test('outside pass-through a help spelling asks for help, even after a -- value',
     TestHelpWordOutsidePassThrough);
+  Test('command help lists an option''s short name and keeps one help column',
+    TestCommandHelpListsOptionShortNames);
 end;
 
 procedure TSubcommandRegistrySuite.SetupTests;

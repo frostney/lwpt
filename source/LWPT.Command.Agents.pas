@@ -109,7 +109,7 @@ begin
     Line := Line + '` — ' + Sub.Summary;
     AddLine(AText, Line);
     for j := 0 to High(Sub.Options) do
-      AddLine(AText, '  - `' + Sub.Options[j].FormatForHelp
+      AddLine(AText, '  - `' + Sub.Options[j].HelpLabel
         + '` — ' + Sub.Options[j].HelpText);
   end;
 end;
