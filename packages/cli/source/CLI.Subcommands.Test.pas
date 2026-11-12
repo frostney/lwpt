@@ -102,6 +102,8 @@ const
   VERSION_FLAG_EXIT_CODE = 3;
   BUILD_INFO_FLAG_EXIT_CODE = 4;
   LIST_SEPARATOR = '|';
+  { The usage line of the host's pass-through `run` command. }
+  RUN_USAGE = 'usage: host run [--json] <file> [arguments]';
 
 procedure CaptureCompletion(const ACompletion: TSubcommandCompletion);
 begin
@@ -1105,8 +1107,6 @@ begin
 end;
 
 procedure THostDispatchSuite.TestPassThroughHelp;
-const
-  RUN_USAGE = 'usage: host run [--json] <file> [arguments]';
 var
   Child: TChildResult;
 begin
@@ -1249,8 +1249,6 @@ begin
   { Strict parsing still takes numbers, values and a lone `-`. }
   Expect<string>(BuildOutputFor(['-o', '-verify', '-5', '-', 'main.x'],
     True)).ToBe('-verify -5|-|main.x');
-  Expect<string>(BuildOutputFor(['-verify', 'main.x'], True)).ToBe(
-    '<exit ' + IntToStr(HOST_USAGE_EXIT_CODE) + '>');
 end;
 
 procedure THostDispatchSuite.TestStrictSingleDashUsageErrors;
@@ -1272,6 +1270,15 @@ begin
   Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
   Expect<Boolean>(Contains(Child.StandardError,
     'host run: Unknown option: -verify')).ToBe(True);
+
+  { The help scan reads the line as the parser does: the unknown word is a
+    rejected option, so a help flag after it still asks for help, as it
+    does after `--bogus`. }
+  Child := RunSelf([STRICT_HOST_CHILD_MODE, 'run', '-verify', '--help',
+    'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, RUN_USAGE)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
 procedure THostDispatchSuite.SetupTests;

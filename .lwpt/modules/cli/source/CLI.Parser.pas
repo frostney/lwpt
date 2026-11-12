@@ -54,7 +54,7 @@ function ParseArguments(const AArguments: array of string;
   nothing: an argument ParseArguments would reject is still compared.
   AStrictSingleDash reads the arguments as ParseArguments does with it, so
   an unknown single-dash argument is a rejected option, not the first
-  positional. FlagGiven and EndOfOptionsIndex need no such choice: they
+  positional, and a negative number is the first positional. FlagGiven and EndOfOptionsIndex need no such choice: they
   read the same arguments either way. }
 function LeadingFlagGiven(const AArguments: array of string;
   const AOptions: TOptionArray; const ALongName, AShortName: string;

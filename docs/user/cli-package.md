@@ -271,8 +271,8 @@ and `LeadingFlagGiven` does so before the first positional.
 
 By default a single-dash argument that matches no short option is a usage
 error only when it is one character long (`-x`). A longer one, such as
-`-verify` typed for `--verify`, is a positional, so `demo check -verify f.src`
-checks two files, `-verify` and `f.src`.
+`-verify` typed for `--verify`, is a positional, so `demo check -verify`
+prints `checked: -verify`.
 
 A host that sets `Registry.StrictSingleDash := True` makes every such argument
 a usage error, whatever its length:

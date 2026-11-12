@@ -43,6 +43,7 @@ type
     procedure TestAttachedValueRequiresOptIn;
     procedure TestMissingShortValue;
     procedure TestUnknownShortOption;
+    procedure TestStrictSingleDashOverProcessArguments;
     procedure TestValuelessShortFlag;
     procedure TestLongEqualsValueUnchanged;
     procedure TestLongSeparatedValueUnchanged;
@@ -234,11 +235,14 @@ begin
   if AScenario = 'missing-value' then
     ExpectedError := '-o requires a value'
   else if AScenario = 'unknown-option' then
-    ExpectedError := 'Unknown option: -x';
+    ExpectedError := 'Unknown option: -x'
+  else if AScenario = 'strict-unknown-word' then
+    ExpectedError := 'Unknown option: -verify';
 
   try
     try
-      Positionals := ParseCommandLine(Options, 3);
+      Positionals := ParseCommandLine(Options, 3,
+        AScenario = 'strict-unknown-word');
     except
       on E: TParseError do
       begin
@@ -402,6 +406,12 @@ end;
 procedure TCLIParserSuite.TestUnknownShortOption;
 begin
   Expect<Integer>(RunChild('unknown-option', ['-x'])).ToBe(0);
+end;
+
+procedure TCLIParserSuite.TestStrictSingleDashOverProcessArguments;
+begin
+  Expect<Integer>(RunChild('strict-unknown-word', ['main.x',
+    '-verify'])).ToBe(0);
 end;
 
 procedure TCLIParserSuite.TestValuelessShortFlag;
@@ -711,7 +721,6 @@ begin
   try
     Expect<string>(Fixture.Parse(['-verify', 'f.src', '-42'])).ToBe(
       '-verify|f.src|-42');
-    Expect<string>(Fixture.ParseError(['-x'])).ToBe('Unknown option: -x');
     Expect<string>(Fixture.ParseError(['-5'])).ToBe('Unknown option: -5');
   finally
     Fixture.Free;
@@ -737,6 +746,8 @@ begin
       'Unknown option: -1.');
     Expect<string>(Fixture.ParseError(['-.5'], False, True)).ToBe(
       'Unknown option: -.5');
+    Expect<string>(Fixture.ParseError(['-1.2.3'], False, True)).ToBe(
+      'Unknown option: -1.2.3');
   finally
     Fixture.Free;
   end;
@@ -776,9 +787,8 @@ begin
     Expect<string>(Fixture.ParseError(['-verify', 'main.x'], True,
       True)).ToBe('Unknown option: -verify');
     { An unknown dash word is a rejected option, not the first
-      positional, so a help flag after it is still leading. }
-    Expect<Boolean>(LeadingFlagGiven(['-abc', '-h'], Fixture.Options,
-      HELP_LONG_NAME, HELP_SHORT_NAME)).ToBe(False);
+      positional, so a help flag after it is still leading; a negative
+      number is the first positional. }
     Expect<Boolean>(LeadingFlagGiven(['-abc', '-h'], Fixture.Options,
       HELP_LONG_NAME, HELP_SHORT_NAME, True)).ToBe(True);
     Expect<Boolean>(LeadingFlagGiven(['-5', '-h'], Fixture.Options,
@@ -842,6 +852,8 @@ begin
     TestMissingShortValue);
   Test('unknown short option raises TParseError',
     TestUnknownShortOption);
+  Test('strict single-dash parsing applies to the process arguments',
+    TestStrictSingleDashOverProcessArguments);
   Test('existing valueless short flags remain unchanged',
     TestValuelessShortFlag);
   Test('long equals-separated values remain unchanged',
