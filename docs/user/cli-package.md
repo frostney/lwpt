@@ -6,8 +6,8 @@ other program: the registry carries no host's name, description or policy.
 
 This page describes `cli` 0.7.0. LWPT 0.9.0 ships `cli` 0.6.0. LWPT 0.8.0
 and 0.8.1 ship `cli` 0.5.1, and earlier releases ship older versions; none of
-them has the host settings below. The [consumer guide](consumer-guide.md) shows how to add the package
-to a project.
+them has the host settings below. The [consumer guide](consumer-guide.md)
+shows how to add the package to a project.
 
 A host that moves from 0.6.0 to 0.7.0 without changing its code sees one
 difference: a command option with a short name is listed with it in the
