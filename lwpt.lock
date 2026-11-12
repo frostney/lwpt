@@ -8,7 +8,7 @@ resolvedCommit = ""
 sourceIdentity = "local|packages/cli/"
 constraintFingerprint = "sha256:ebe789efbbee1de9efe362ed426d9b22acb99c6336bdf8368db8cac56ac86ebb"
 resolvedURL = ""
-computedHash = "sha256-tree2:d6e7978f392b76aadde6d07cd60ba68b474c8728dee019932d12e3a115795415"
+computedHash = "sha256-tree2:e275bca7158916902906c9b1539292213848a2e21ee2c877dafe5ab291df5ee0"
 archiveHash = ""
 
 [package.httpclient]

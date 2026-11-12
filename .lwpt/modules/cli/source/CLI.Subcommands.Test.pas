@@ -1493,6 +1493,10 @@ begin
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput,
     'usage: host <command> [options]')).ToBe(True);
+  Child := RunSelf([EXACT_HOST_CHILD_MODE, '-H']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host <command> [options]')).ToBe(True);
   Child := RunSelf([EXACT_HOST_CHILD_MODE, 'build', 'main.x', 'Help']);
   Expect<Integer>(Child.ExitCode).ToBe(0);
   Expect<Boolean>(Contains(Child.StandardOutput, 'usage: host build')).ToBe(
