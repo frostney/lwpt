@@ -70,6 +70,8 @@ type
     procedure TestOptionValueIsNeverAHelpRequest;
     procedure TestStrictSingleDashIsOptIn;
     procedure TestStrictSingleDashUsageErrors;
+    procedure TestStrictTopLevelFlagsIsOptIn;
+    procedure TestStrictTopLevelFlagsUsageErrors;
     procedure TestCommandHelpListsOptionShortNames;
   end;
 
@@ -96,6 +98,8 @@ const
   UNCONFIGURED_CHILD_MODE = '--unconfigured-child';
   { The host registry with StrictSingleDash set. }
   STRICT_HOST_CHILD_MODE = '--strict-host-child';
+  { The host registry with StrictTopLevelFlags set. }
+  STRICT_TOP_LEVEL_CHILD_MODE = '--strict-top-level-child';
   HOST_PROGRAM_NAME = 'host';
   UNCONFIGURED_PROGRAM_NAME = 'fixture';
   HOST_USAGE_EXIT_CODE = 2;
@@ -154,6 +158,18 @@ begin
     end;
   if EchoDispatch then
     WriteLn('command: ', ACommand);
+end;
+
+{ AFirst followed by ARest, as one argument array. }
+function PrependArgument(const AFirst: string;
+  const ARest: array of string): TCommandLineArguments;
+var
+  Index: Integer;
+begin
+  SetLength(Result, Length(ARest) + 1);
+  Result[0] := AFirst;
+  for Index := 0 to High(ARest) do
+    Result[Index + 1] := ARest[Index];
 end;
 
 procedure ResetDispatch;
@@ -1196,18 +1212,14 @@ var
   Registry: TSubcommandRegistry;
   Build: TSubcommand;
   Output: TStringOption;
-  Arguments: array of string;
   Index, RunExitCode: Integer;
 begin
   ResetDispatch;
-  SetLength(Arguments, Length(AArguments) + 1);
-  Arguments[0] := 'build';
-  for Index := 0 to High(AArguments) do
-    Arguments[Index + 1] := AArguments[Index];
   Registry := BuildHostRegistry;
   try
     Registry.StrictSingleDash := AStrictSingleDash;
-    RunExitCode := Registry.Run(HOST_PROGRAM_NAME, Arguments);
+    RunExitCode := Registry.Run(HOST_PROGRAM_NAME,
+      PrependArgument('build', AArguments));
     if DispatchCount <> 1 then
       Exit(Format('<exit %d>', [RunExitCode]));
     Build := Registry.Find('build');
@@ -1281,6 +1293,78 @@ begin
   Expect<Boolean>(Contains(Child.StandardOutput, 'command:')).ToBe(False);
 end;
 
+procedure THostDispatchSuite.TestStrictTopLevelFlagsIsOptIn;
+var
+  Registry: TSubcommandRegistry;
+  Child: TChildResult;
+begin
+  Registry := TSubcommandRegistry.Create;
+  try
+    Expect<Boolean>(Registry.StrictTopLevelFlags).ToBe(False);
+  finally
+    Registry.Free;
+  end;
+  { By default the built-in top-level help ignores what follows it, as a
+    top-level flag does. }
+  Child := RunSelf([HOST_CHILD_MODE, '--help', 'build']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host <command> [options]')).ToBe(True);
+  Expect<string>(Child.StandardError).ToBe('');
+end;
+
+{ Expects ACommandLine to be a usage error under StrictTopLevelFlags that
+  names AFlag and AExtra, with nothing on standard output: no flag output,
+  no help page there, no dispatch. }
+procedure ExpectExtraArgumentRejected(const ACommandLine: array of string;
+  const AFlag, AExtra: string);
+var
+  Child: TChildResult;
+begin
+  Child := RunSelf(PrependArgument(STRICT_TOP_LEVEL_CHILD_MODE,
+    ACommandLine));
+  Expect<Integer>(Child.ExitCode).ToBe(HOST_USAGE_EXIT_CODE);
+  Expect<string>(Child.StandardOutput).ToBe('');
+  Expect<Boolean>(StartsWith(Child.StandardError,
+    'unexpected argument after ' + AFlag + ': ' + AExtra)).ToBe(True);
+  Expect<Boolean>(Contains(Child.StandardError,
+    'usage: host <command> [options]')).ToBe(True);
+end;
+
+procedure THostDispatchSuite.TestStrictTopLevelFlagsUsageErrors;
+var
+  Child: TChildResult;
+begin
+  { Every spelling of a flag, a hidden flag, and the built-in help. }
+  ExpectExtraArgumentRejected(['--version', 'extra'], '--version', 'extra');
+  ExpectExtraArgumentRejected(['-V', 'build', '--bogus'], '-V', 'build');
+  ExpectExtraArgumentRejected(['Version', 'x'], 'Version', 'x');
+  ExpectExtraArgumentRejected(['--build-info', '--'], '--build-info', '--');
+  ExpectExtraArgumentRejected(['--help', 'build'], '--help', 'build');
+  ExpectExtraArgumentRejected(['-h', 'x'], '-h', 'x');
+  ExpectExtraArgumentRejected(['HELP', 'build'], 'HELP', 'build');
+
+  { Alone, a flag and the help still run. }
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, '--version']);
+  Expect<Integer>(Child.ExitCode).ToBe(VERSION_FLAG_EXIT_CODE);
+  Expect<Boolean>(StartsWith(Child.StandardOutput, 'host 1.2.3')).ToBe(True);
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, 'help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host <command> [options]')).ToBe(True);
+
+  { A command's line is not affected. }
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, 'build', 'main.x',
+    'help']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput,
+    'usage: host build')).ToBe(True);
+  Child := RunSelf([STRICT_TOP_LEVEL_CHILD_MODE, 'build', 'main.x']);
+  Expect<Integer>(Child.ExitCode).ToBe(0);
+  Expect<Boolean>(Contains(Child.StandardOutput, 'command: build')).ToBe(
+    True);
+end;
+
 procedure THostDispatchSuite.SetupTests;
 begin
   Test('an unconfigured registry keeps the defaults every host started with',
@@ -1329,6 +1413,10 @@ begin
     TestStrictSingleDashUsageErrors);
   Test('command help lists an option''s short name and keeps one help column',
     TestCommandHelpListsOptionShortNames);
+  Test('arguments after a top-level flag are ignored unless the host is strict',
+    TestStrictTopLevelFlagsIsOptIn);
+  Test('strict top-level flags make any argument after them a usage error',
+    TestStrictTopLevelFlagsUsageErrors);
 end;
 
 procedure TSubcommandRegistrySuite.SetupTests;
@@ -1358,13 +1446,14 @@ var
   Registry : TSubcommandRegistry;
 begin
   EchoDispatch := True;
-  if (AMode = HOST_CHILD_MODE) or (AMode = STRICT_HOST_CHILD_MODE) then
-    Registry := BuildHostRegistry
+  if AMode = UNCONFIGURED_CHILD_MODE then
+    Registry := BuildRegistry
   else
-    Registry := BuildRegistry;
+    Registry := BuildHostRegistry;
   try
     Registry.StrictSingleDash := AMode = STRICT_HOST_CHILD_MODE;
-    if (AMode = HOST_CHILD_MODE) or (AMode = STRICT_HOST_CHILD_MODE) then
+    Registry.StrictTopLevelFlags := AMode = STRICT_TOP_LEVEL_CHILD_MODE;
+    if AMode <> UNCONFIGURED_CHILD_MODE then
       Result := Registry.Run(HOST_PROGRAM_NAME, GetCommandLineArguments(2))
     else
       Result := Registry.Run(UNCONFIGURED_PROGRAM_NAME,
@@ -1377,6 +1466,7 @@ end;
 begin
   if (ParamCount >= 1) and ((ParamStr(1) = HOST_CHILD_MODE)
     or (ParamStr(1) = STRICT_HOST_CHILD_MODE)
+    or (ParamStr(1) = STRICT_TOP_LEVEL_CHILD_MODE)
     or (ParamStr(1) = UNCONFIGURED_CHILD_MODE)) then
   begin
     ExitCode := RunHostChildMode(ParamStr(1));
