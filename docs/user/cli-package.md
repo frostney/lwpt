@@ -36,11 +36,12 @@ difference: a value that a command option takes is never a help request.
 With a valued option `--output` (`-o`), `demo build -o help main.x` used to
 print the help of `build`; it now runs `build` with `help` as the value. An
 option that rejects the value, such as an integer option, now reports a usage
-error where 0.7.0 printed help.
+error where 0.7.0 printed help. `FlagGiven` is new.
 
 A host that moves from 0.6.0 to 0.7.0 without changing its code sees one
 difference: a command option with a short name is listed with it in the
 command's help and in `GenerateHelpText` (`-o, --output=<value>`).
+`HelpLabel` and `FormatHelpLabel` are new.
 
 A host that moves from 0.5.1 to 0.6.0 without changing its code sees three
 differences:
