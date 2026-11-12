@@ -505,15 +505,16 @@ begin
 
   if Length(ASub.Options) > 0 then
   begin
-    { FormatForHelp (not the bare long name) so valued options show
-      their value shape (--name=<value>, --name=<N>, --name=a|b) and
-      every surface rendered from the registry — this help text and the
-      host program's agents block — stays identical by construction. }
+    { HelpLabel (not the bare long name) so options show their short
+      name (-o, --name=<value>) and value shape (--name=<value>,
+      --name=<N>, --name=a|b), and every surface rendered from the
+      registry — this help text and the host program's agents block —
+      stays identical by construction. }
     SetLength(Names, Length(ASub.Options));
     SetLength(HelpTexts, Length(ASub.Options));
     for i := 0 to High(ASub.Options) do
     begin
-      Names[i] := ASub.Options[i].FormatForHelp;
+      Names[i] := ASub.Options[i].HelpLabel;
       HelpTexts[i] := ASub.Options[i].HelpText;
     end;
     WriteOptionRows(Output, Names, HelpTexts);

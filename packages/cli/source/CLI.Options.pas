@@ -51,6 +51,11 @@ type
 
     procedure Apply(const AValue: string); virtual; abstract;
     function FormatForHelp: string; virtual; abstract;
+    { The option as help lists it: FormatForHelp, led by `-<ShortName>, `
+      when the option has a short name (`-o, --output=<value>`), the way
+      top-level help lists a flag's short name. Every help surface built
+      from an option uses it, so they cannot drift apart. }
+    function HelpLabel: string;
     function ValidValues: string; virtual;
 
     { Mark this option as present without applying a value.
@@ -224,6 +229,13 @@ end;
 procedure TOptionBase.MarkPresent;
 begin
   FPresent := True;
+end;
+
+function TOptionBase.HelpLabel: string;
+begin
+  Result := FormatForHelp;
+  if FShortName <> '' then
+    Result := '-' + FShortName + ', ' + Result;
 end;
 
 function TOptionBase.ValidValues: string;

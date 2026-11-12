@@ -4,10 +4,15 @@ The `cli` package gives a program subcommands, options, help and usage errors
 from one registry. `lwpt` builds its own command line on it, and so can any
 other program: the registry carries no host's name, description or policy.
 
-This page describes `cli` 0.6.0. LWPT 0.8.0 and 0.8.1 ship `cli` 0.5.1, and
-earlier releases ship older versions; none of them has the host settings
+This page describes `cli` 0.7.0. LWPT 0.9.0 ships `cli` 0.6.0, which lists
+a command's options by long name only. LWPT 0.8.0 and 0.8.1 ship `cli` 0.5.1,
+and earlier releases ship older versions; none of them has the host settings
 below. The [consumer guide](consumer-guide.md) shows how to add the package
 to a project.
+
+A host that moves from 0.6.0 to 0.7.0 without changing its code sees one
+difference: a command option with a short name is listed with it in the
+command's help and in `GenerateHelpText` (`-o, --output=<value>`).
 
 A host that moves from 0.5.1 to 0.6.0 without changing its code sees three
 differences:
@@ -93,6 +98,7 @@ begin
     SetLength(RunOptions, 1);
     RunOptions[0] := TFlagOption.Create('unchecked',
       'Remove the runtime checks');
+    RunOptions[0].ShortName := 'u';
     RunCommand := TSubcommand.Create('run', 'Run a program',
       '[--unchecked] <file> [arguments]', @HandleRun, RunOptions);
     RunCommand.PassThrough := True;
@@ -157,6 +163,27 @@ defaults column says.
 Help is built in: `help`, `--help` and `-h` as the first argument print the
 top-level help, and after a command name they print that command's help.
 
+A command's help lists its options under `options:`. An option with a
+`ShortName` is listed with it, the way top-level help lists a flag's short
+name; the help texts start in one column after the widest entry:
+
+```text
+$ demo run --help
+demo run — Run a program
+
+usage: demo run [--unchecked] <file> [arguments]
+
+options:
+  -u, --unchecked   Remove the runtime checks
+
+run "demo --help" to see all commands
+```
+
+`HelpLabel` returns the label an option is listed with (`-u, --unchecked`,
+`-o, --output=<value>`, or `--release` without a short name).
+`GenerateHelpText` lists options with it too, and a host that renders its own
+command reference from the registry can use it to match the help.
+
 ## Top-level flags
 
 A top-level flag is read from the first argument only, the way `--help` is.
@@ -169,8 +196,7 @@ code. Arguments after the flag are ignored.
   letter case, the way the built-in `help` word does. `lwpt` uses it for
   `lwpt version`.
 - A flag with `HelpText` is listed under `options:` in top-level help, with
-  its short name. A flag without help text is accepted but not listed. A
-  command's own help lists its options by long name only.
+  its short name. A flag without help text is accepted but not listed.
 
 Set a flag's fields before `AddTopLevelFlag`, which checks them once.
 `AddTopLevelFlag` raises `EArgumentException`, and leaves the flag with the
