@@ -61,6 +61,9 @@ const
   TRANSACTION_LOCK_NAME = 'transaction.lock';
   TEST_BUDGET = '1';
   TEST_STALE_SECONDS = '3';
+  { A heartbeat every 400 s, beyond a utility child's 300 s deadline: the
+    quiet-wait child then has no concurrent coordinator writer. }
+  QUIET_WAIT_STALE_SECONDS = '1200';
   CAPTURE_OUTPUT_SIZE = 128 * 1024;
   CAPTURE_EXIT_CODE = 23;
   CAPTURE_STDOUT_PREFIX = 'stdout-begin:';
@@ -109,7 +112,7 @@ type
       AReleasePrefix: string; ACycles: Integer): TProcess;
     procedure RunUtility(const ASwitch, AOutputPath: string);
     procedure RunUtilityWithBudget(const ASwitch, AOutputPath,
-      ABudget: string);
+      ABudget: string; const AStaleSeconds: string = TEST_STALE_SECONDS);
     function WaitForSessionState(const ASession, AState: string;
       ATimeoutMilliseconds: Integer): Boolean;
     procedure StopChild(AProcess: TProcess);
@@ -308,7 +311,8 @@ begin
 end;
 
 procedure AddWorkerEnvironment(AProcess: TProcess;
-  const AStateRoot: string; const ABudget: string = TEST_BUDGET); forward;
+  const AStateRoot: string; const ABudget: string = TEST_BUDGET;
+  const AStaleSeconds: string = TEST_STALE_SECONDS); forward;
 
 procedure Require(const ACondition: Boolean; const AMessage: string);
 begin
@@ -660,23 +664,12 @@ var
   end;
 
   procedure BlockPublications;
-  var
-    Attempt : Integer;
   begin
-    { A heartbeat can recreate the directory between the delete and the
-      marker write; retry until the marker holds the path. }
-    for Attempt := 1 to 100 do
-    begin
-      RecursiveDelete(TmpPath);
-      try
-        WriteMarker(TmpPath, 'block atomic writes');
-      except
-        on Exception do;
-      end;
-      Blocked := FileExists(TmpPath) and not DirectoryExists(TmpPath);
-      if Blocked then Exit;
-    end;
-    Require(False, 'could not block coordinator publications');
+    { This child's heartbeat never fires within its deadline, so nothing
+      else writes the coordinator state while the block goes in. }
+    RecursiveDelete(TmpPath);
+    WriteMarker(TmpPath, 'block atomic writes');
+    Blocked := True;
   end;
 
   procedure UnblockPublications;
@@ -1588,7 +1581,8 @@ begin
 end;
 
 procedure AddWorkerEnvironment(AProcess: TProcess;
-  const AStateRoot: string; const ABudget: string);
+  const AStateRoot: string; const ABudget: string;
+  const AStaleSeconds: string);
 var
   i : Integer;
   Entry : string;
@@ -1601,7 +1595,7 @@ begin
   AProcess.Environment.Add(WORKER_STATE_DIR_ENV + '=' + AStateRoot);
   AProcess.Environment.Add(WORKER_BUDGET_ENV + '=' + ABudget);
   AProcess.Environment.Add(
-    WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS);
+    WORKER_STALE_SECONDS_ENV + '=' + AStaleSeconds);
 end;
 
 procedure TWorkerBudgetProcesses.DeleteScratch;
@@ -1694,7 +1688,7 @@ begin
 end;
 
 procedure TWorkerBudgetProcesses.RunUtilityWithBudget(const ASwitch,
-  AOutputPath, ABudget: string);
+  AOutputPath, ABudget: string; const AStaleSeconds: string);
 var
   Utility : TProcess;
   UtilityExit : Integer;
@@ -1704,7 +1698,7 @@ begin
     Utility.Executable := ExpandFileName(ParamStr(0));
     Utility.Parameters.Add(ASwitch);
     Utility.Parameters.Add(AOutputPath);
-    AddWorkerEnvironment(Utility, FScratch + '/state', ABudget);
+    AddWorkerEnvironment(Utility, FScratch + '/state', ABudget, AStaleSeconds);
     Utility.Execute;
     UtilityExit := FinishChild(Utility, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
       'worker-budget utility ' + ASwitch);
@@ -2694,7 +2688,8 @@ end;
 
 procedure TWorkerBudgetProcesses.TestWaitingLeavesStateUntouched;
 begin
-  RunUtility(QUIET_WAIT_SWITCH, FScratch + '/quiet-wait-result');
+  RunUtilityWithBudget(QUIET_WAIT_SWITCH, FScratch + '/quiet-wait-result',
+    TEST_BUDGET, QUIET_WAIT_STALE_SECONDS);
   Expect<Boolean>(FileExists(FScratch + '/quiet-wait-result')).ToBe(True);
 end;
 
