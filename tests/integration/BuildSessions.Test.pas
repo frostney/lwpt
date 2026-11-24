@@ -1417,7 +1417,8 @@ begin
       + Project + '/worker-state');
     SetProcessEnv(Holder.Environment, WORKER_BUDGET_ENV + '=1');
     { Keep the background session heartbeat outside this short observation
-      window, so HeartbeatAt advances only when the contender retries Acquire. }
+      window, so the holder's own entry stays still while it watches the
+      queue. }
     SetProcessEnv(Holder.Environment, WORKER_STALE_SECONDS_ENV + '='
       + IntToStr(TestWorkerHeartbeatStaleSeconds));
     Holder.Execute;
@@ -1707,8 +1708,9 @@ begin
         Snapshot := GetWorkerBudgetSnapshot;
         { A waiting contender keeps one ticket for its whole wait, so a
           zero-grant entry with a ticket proves that it has queued. The slot
-          stays held for two reporter intervals after that, so the queued CLI
-          reports its capacity wait. }
+          stays held for twenty reporter intervals after that, so a queued CLI
+          that is slow to be scheduled still reports its capacity wait before
+          the release. }
         for EntryIndex := 0 to High(Snapshot.Entries) do
           if (Snapshot.Entries[EntryIndex].SessionId <> HolderSessionId)
              and (Snapshot.Entries[EntryIndex].Granted = 0)
@@ -1722,7 +1724,7 @@ begin
         if ContenderWaitObserved and (QueuedAt = 0) then
           QueuedAt := GetTickCount64;
         if (QueuedAt > 0) and (GetTickCount64 - QueuedAt
-           >= TestHeartbeatIntervalMilliseconds * 2) then Break;
+           >= TestHeartbeatIntervalMilliseconds * 20) then Break;
         if GetTickCount64 - StartedAt
            >= ConcurrencyBarrierCeilingSeconds * 1000 then Exit;
         Sleep(10);

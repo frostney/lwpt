@@ -644,7 +644,40 @@ var
   HeldLease, Acquired : TLWPTWorkerLease;
   Request, Queue, TmpPath : string;
   Blocked : Boolean;
+  Ticket : Int64;
+  PollStarted : QWord;
   i : Integer;
+
+  function WaiterTicket: Int64;
+  var
+    Snapshot : TLWPTWorkerBudgetSnapshot;
+    Entry : TLWPTWorkerBudgetEntry;
+  begin
+    Result := 0;
+    Snapshot := GetWorkerBudgetSnapshot;
+    for Entry in Snapshot.Entries do
+      if Entry.SessionId = 'waiter' then Exit(Entry.WaitTicket);
+  end;
+
+  procedure BlockPublications;
+  var
+    Attempt : Integer;
+  begin
+    { A heartbeat can recreate the directory between the delete and the
+      marker write; retry until the marker holds the path. }
+    for Attempt := 1 to 100 do
+    begin
+      RecursiveDelete(TmpPath);
+      try
+        WriteMarker(TmpPath, 'block atomic writes');
+      except
+        on Exception do;
+      end;
+      Blocked := FileExists(TmpPath) and not DirectoryExists(TmpPath);
+      if Blocked then Exit;
+    end;
+    Require(False, 'could not block coordinator publications');
+  end;
 
   procedure UnblockPublications;
   begin
@@ -666,13 +699,18 @@ begin
     Waiter := TLWPTWorkerBudgetSession.Create('waiter', 1);
     HeldLease := Holder.Acquire(0);
     Require(Assigned(HeldLease), 'holder must acquire');
-    Require(Waiter.PollAcquire = nil, 'poll must return without capacity');
+    { The CLI callers wait with a timed poll from the start: it must wait for
+      its timeout and keep the ticket it took. }
+    PollStarted := GetTickCount64;
+    Require(Waiter.PollAcquire(120) = nil,
+      'timed poll must return without capacity');
+    Require(GetTickCount64 - PollStarted >= 100, 'timed poll must wait');
+    Ticket := WaiterTicket;
+    Require(Ticket > 0, 'timed poll must keep its ticket');
     { Every publication goes through the coordinator's tmp directory. With a
       file in its place, a rewrite while waiting raises instead of racing the
       heartbeat thread, whose failed writes only retry on its next interval. }
-    RecursiveDelete(TmpPath);
-    WriteMarker(TmpPath, 'block atomic writes');
-    Blocked := True;
+    BlockPublications;
     Request := ReadStateValue('waiter.request');
     Queue := ReadStateValue('queue-sequence');
     for i := 1 to POLLS do
@@ -683,6 +721,7 @@ begin
       'waiting must not rewrite the request');
     Require(ReadStateValue('queue-sequence') = Queue,
       'waiting must not take another ticket');
+    Require(WaiterTicket = Ticket, 'waiting must keep its place in the queue');
     UnblockPublications;
     FreeAndNil(HeldLease);
     Acquired := Waiter.PollAcquire;
