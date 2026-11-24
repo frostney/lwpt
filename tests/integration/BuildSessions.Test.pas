@@ -1408,6 +1408,8 @@ var
   RunResult: TLwptResult;
   Project, ReadyPath, ReleasePath: string;
   StartedAt: QWord;
+  SeenWhileQueued: Boolean;
+  HolderExit: Integer;
 begin
   Project := FScratch + '/fully-contended';
   WriteGraphProject(Project);
@@ -1445,12 +1447,14 @@ begin
       + IntToStr(TestWorkerHeartbeatStaleSeconds);
     Sleep(TestDelayedContenderStartMilliseconds);
     RunResult := Default(TLwptResult);
+    RunResult.ExitCode := -1;
+    HolderExit := -1;
     Contender := StartBuildWithArgs(Project, ['build', '--no-cache', 'alpha'],
       Environment, [poUsePipes]);
     try
       { The holder keeps the only slot until the queued CLI's capacity-wait
-        heartbeat reaches its output, so the assertion below depends on that
-        event rather than on how the CLI is scheduled. }
+        heartbeat reaches its output, so the heartbeat is proven visible
+        while the build is still blocked, whatever the CLI's scheduling. }
       StartedAt := GetTickCount64;
       while Contender.Running and (Pos(QueuedHeartbeat, RunResult.Stdout) = 0)
         and (GetTickCount64 - StartedAt
@@ -1459,17 +1463,27 @@ begin
         DrainChildPipes(Contender, RunResult.Stdout, RunResult.Stderr);
         Sleep(10);
       end;
-      WriteTextFile(ReleasePath, 'release');
-      RunResult.ExitCode := FinishChild(Contender, RunResult.Stdout,
-        RunResult.Stderr, BuildExitCeilingMilliseconds,
-        'contended: queued build');
+      SeenWhileQueued := Pos(QueuedHeartbeat, RunResult.Stdout) > 0;
+      if SeenWhileQueued then
+      begin
+        WriteTextFile(ReleasePath, 'release');
+        RunResult.ExitCode := FinishChild(Contender, RunResult.Stdout,
+          RunResult.Stderr, BuildExitCeilingMilliseconds,
+          'contended: queued build');
+        HolderExit := FinishChild(Holder, BuildExitCeilingMilliseconds,
+          'worker holder');
+      end
+      else
+        TerminateChildProcess(Contender, RunResult.Stdout, RunResult.Stderr);
     finally
+      if Contender.Running then TerminateChildProcess(Contender);
       Contender.Free;
     end;
 
     DumpRunFailure('contended: queued build', RunResult, 0);
+    Expect<Boolean>(SeenWhileQueued).ToBe(True);
+    Expect<Integer>(HolderExit).ToBe(0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
-    Expect<Boolean>(Pos(QueuedHeartbeat, RunResult.Stdout) > 0).ToBe(True);
     Expect<Boolean>(Pos('HEARTBEAT build elapsed ', RunResult.Stdout) = 0)
       .ToBe(True);
   finally
