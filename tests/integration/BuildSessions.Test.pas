@@ -36,6 +36,8 @@ const
   TestWorkerHolderEnvironment = PROJECT_NAME + '_TEST_WORKER_HOLDER';
   TestWorkerHolderReadyEnvironment = PROJECT_NAME
     + '_TEST_WORKER_HOLDER_READY';
+  TestWorkerHolderReleaseEnvironment = PROJECT_NAME
+    + '_TEST_WORKER_HOLDER_RELEASE';
   TestHeartbeatIntervalMilliseconds = 75;
   TestHeartbeatJobDurationMilliseconds =
     TestHeartbeatIntervalMilliseconds * 4;
@@ -75,7 +77,8 @@ type
     function StartBuildWithEnv(const AProject, AEntry: string;
       const AExtraEnv: array of string): TProcess;
     function StartBuildWithArgs(const AProject: string;
-      const AArgs, AExtraEnv: array of string): TProcess;
+      const AArgs, AExtraEnv: array of string;
+      const AOptions: TProcessOptions = []): TProcess;
     function RunLwptWithWorkerEnv(const AArgs: array of string;
       const AProject: string;
       const AExtraEnv: array of string): TLwptResult;
@@ -514,7 +517,8 @@ begin
 end;
 
 function TBuildSessions.StartBuildWithArgs(const AProject: string;
-  const AArgs, AExtraEnv: array of string): TProcess;
+  const AArgs, AExtraEnv: array of string;
+  const AOptions: TProcessOptions): TProcess;
 var
   i: Integer;
 begin
@@ -522,7 +526,7 @@ begin
   Result.Executable := LwptBinaryPath;
   for i := 0 to High(AArgs) do Result.Parameters.Add(AArgs[i]);
   Result.CurrentDirectory := AProject;
-  Result.Options := [];
+  Result.Options := AOptions;
   for i := 1 to GetEnvironmentVariableCount do
     if not IsWorkerEnvironment(GetEnvironmentString(i))
        and not EnvOverridden(GetEnvironmentString(i), AExtraEnv) then
@@ -1396,16 +1400,21 @@ begin
 end;
 
 procedure TBuildSessions.TestFullyContendedBuildEmitsHeartbeat;
+const
+  QueuedHeartbeat = 'HEARTBEAT build; active: alpha (queued)';
 var
-  Holder: TProcess;
+  Holder, Contender: TProcess;
   Environment: array of string;
   RunResult: TLwptResult;
-  Project, ReadyPath: string;
+  Project, ReadyPath, ReleasePath: string;
   StartedAt: QWord;
+  SeenWhileQueued: Boolean;
+  HolderExit: Integer;
 begin
   Project := FScratch + '/fully-contended';
   WriteGraphProject(Project);
   ReadyPath := Project + '/control/holder-ready';
+  ReleasePath := Project + '/control/holder-release';
   Holder := TProcess.Create(nil);
   try
     Holder.Executable := ExpandFileName(ParamStr(0));
@@ -1413,11 +1422,13 @@ begin
     SetProcessEnv(Holder.Environment, TestWorkerHolderEnvironment + '=1');
     SetProcessEnv(Holder.Environment, TestWorkerHolderReadyEnvironment + '='
       + ReadyPath);
+    SetProcessEnv(Holder.Environment, TestWorkerHolderReleaseEnvironment + '='
+      + ReleasePath);
     SetProcessEnv(Holder.Environment, WORKER_STATE_DIR_ENV + '='
       + Project + '/worker-state');
     SetProcessEnv(Holder.Environment, WORKER_BUDGET_ENV + '=1');
-    { Keep the background session heartbeat outside this short observation
-      window, so HeartbeatAt advances only when the contender retries Acquire. }
+    { Keep the holder's background heartbeat outside this short window, so
+      its entry stays unchanged while the contender queues. }
     SetProcessEnv(Holder.Environment, WORKER_STALE_SECONDS_ENV + '='
       + IntToStr(TestWorkerHeartbeatStaleSeconds));
     Holder.Execute;
@@ -1435,14 +1446,44 @@ begin
     Environment[3] := WORKER_STALE_SECONDS_ENV + '='
       + IntToStr(TestWorkerHeartbeatStaleSeconds);
     Sleep(TestDelayedContenderStartMilliseconds);
-    RunResult := RunLwpt(['build', '--no-cache', 'alpha'], Project,
-      Environment);
+    RunResult := Default(TLwptResult);
+    RunResult.ExitCode := -1;
+    HolderExit := -1;
+    Contender := StartBuildWithArgs(Project, ['build', '--no-cache', 'alpha'],
+      Environment, [poUsePipes]);
+    try
+      { The holder keeps the only slot until the queued CLI's capacity-wait
+        heartbeat reaches its output, so the heartbeat is proven visible
+        while the build is still blocked, whatever the CLI's scheduling. }
+      StartedAt := GetTickCount64;
+      while Contender.Running and (Pos(QueuedHeartbeat, RunResult.Stdout) = 0)
+        and (GetTickCount64 - StartedAt
+          < ConcurrencyBarrierCeilingSeconds * 1000) do
+      begin
+        DrainChildPipes(Contender, RunResult.Stdout, RunResult.Stderr);
+        Sleep(10);
+      end;
+      SeenWhileQueued := Pos(QueuedHeartbeat, RunResult.Stdout) > 0;
+      if SeenWhileQueued then
+      begin
+        WriteTextFile(ReleasePath, 'release');
+        RunResult.ExitCode := FinishChild(Contender, RunResult.Stdout,
+          RunResult.Stderr, BuildExitCeilingMilliseconds,
+          'contended: queued build');
+        HolderExit := FinishChild(Holder, BuildExitCeilingMilliseconds,
+          'worker holder');
+      end
+      else
+        TerminateChildProcess(Contender, RunResult.Stdout, RunResult.Stderr);
+    finally
+      if Contender.Running then TerminateChildProcess(Contender);
+      Contender.Free;
+    end;
 
     DumpRunFailure('contended: queued build', RunResult, 0);
+    Expect<Boolean>(SeenWhileQueued).ToBe(True);
+    Expect<Integer>(HolderExit).ToBe(0);
     Expect<Integer>(RunResult.ExitCode).ToBe(0);
-    Expect<Boolean>(Pos('HEARTBEAT build; active: alpha (queued)',
-      RunResult.Stdout) > 0)
-      .ToBe(True);
     Expect<Boolean>(Pos('HEARTBEAT build elapsed ', RunResult.Stdout) = 0)
       .ToBe(True);
   finally
@@ -1683,16 +1724,11 @@ function RunWorkerHolder: Integer;
 var
   Session: TLWPTWorkerBudgetSession;
   Lease: TLWPTWorkerLease;
-  Snapshot: TLWPTWorkerBudgetSnapshot;
-  ReadyPath: string;
-  HolderSessionId: string;
+  ReadyPath, ReleasePath: string;
   StartedAt: QWord;
-  EntryIndex: Integer;
-  ContenderWaitObserved: Boolean;
 begin
   Result := 1;
-  HolderSessionId := NewWorkerSessionId;
-  Session := TLWPTWorkerBudgetSession.Create(HolderSessionId, 1);
+  Session := TLWPTWorkerBudgetSession.Create(NewWorkerSessionId, 1);
   try
     Lease := Session.Acquire(5000);
     if not Assigned(Lease) then Exit;
@@ -1700,29 +1736,16 @@ begin
       ReadyPath := GetEnvironmentVariable(TestWorkerHolderReadyEnvironment);
       if not ForceDirectories(ExtractFileDir(ReadyPath)) then Exit;
       WriteTextFile(ReadyPath, 'ready');
+      { The parent releases the slot once the contender has reported its
+        capacity wait. }
+      ReleasePath := GetEnvironmentVariable(TestWorkerHolderReleaseEnvironment);
       StartedAt := GetTickCount64;
-      repeat
-        ContenderWaitObserved := False;
-        Snapshot := GetWorkerBudgetSnapshot;
-        { Acquire(0) clears Waiting before it returns, so the durable signal is
-          a zero-grant contender whose heartbeat has advanced across repeated
-          acquisition attempts for at least two reporter intervals. }
-        for EntryIndex := 0 to High(Snapshot.Entries) do
-          if (Snapshot.Entries[EntryIndex].SessionId <> HolderSessionId)
-             and (Snapshot.Entries[EntryIndex].Granted = 0)
-             and not Snapshot.Entries[EntryIndex].Uncertain
-             and (Snapshot.Entries[EntryIndex].HeartbeatAt
-               - Snapshot.Entries[EntryIndex].StartedAt
-               >= TestHeartbeatIntervalMilliseconds * 2) then
-          begin
-            ContenderWaitObserved := True;
-            Break;
-          end;
-        if ContenderWaitObserved then Break;
+      while not FileExists(ReleasePath) do
+      begin
         if GetTickCount64 - StartedAt
            >= ConcurrencyBarrierCeilingSeconds * 1000 then Exit;
         Sleep(10);
-      until False;
+      end;
       Result := 0;
     finally
       Lease.Free;

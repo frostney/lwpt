@@ -31,6 +31,7 @@ const
   RELEASE_RETRY_SWITCH = '--worker-budget-release-retry';
   THREAD_SWITCH = '--worker-budget-threads';
   POLL_SWITCH = '--worker-budget-poll';
+  QUIET_WAIT_SWITCH = '--worker-budget-quiet-wait';
   FOREIGN_LOCK_SWITCH = '--worker-budget-foreign-lock';
   GUARDED_PUBLICATION_SWITCH = '--worker-budget-guarded-publication';
   UNREADABLE_OWN_SWITCH = '--worker-budget-unreadable-own';
@@ -60,6 +61,9 @@ const
   TRANSACTION_LOCK_NAME = 'transaction.lock';
   TEST_BUDGET = '1';
   TEST_STALE_SECONDS = '3';
+  { A heartbeat every 400 s, beyond a utility child's 300 s deadline: the
+    quiet-wait child then has no concurrent coordinator writer. }
+  QUIET_WAIT_STALE_SECONDS = '1200';
   CAPTURE_OUTPUT_SIZE = 128 * 1024;
   CAPTURE_EXIT_CODE = 23;
   CAPTURE_STDOUT_PREFIX = 'stdout-begin:';
@@ -108,7 +112,7 @@ type
       AReleasePrefix: string; ACycles: Integer): TProcess;
     procedure RunUtility(const ASwitch, AOutputPath: string);
     procedure RunUtilityWithBudget(const ASwitch, AOutputPath,
-      ABudget: string);
+      ABudget: string; const AStaleSeconds: string = TEST_STALE_SECONDS);
     function WaitForSessionState(const ASession, AState: string;
       ATimeoutMilliseconds: Integer): Boolean;
     procedure StopChild(AProcess: TProcess);
@@ -119,6 +123,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestPersistentPolling;
+    procedure TestWaitingLeavesStateUntouched;
     {$IFDEF UNIX}
     procedure TestForeignLocksAreTolerated;
     procedure TestStatePublicationKeepsChildrenOut;
@@ -306,7 +311,8 @@ begin
 end;
 
 procedure AddWorkerEnvironment(AProcess: TProcess;
-  const AStateRoot: string; const ABudget: string = TEST_BUDGET); forward;
+  const AStateRoot: string; const ABudget: string = TEST_BUDGET;
+  const AStaleSeconds: string = TEST_STALE_SECONDS); forward;
 
 procedure Require(const ACondition: Boolean; const AMessage: string);
 begin
@@ -630,6 +636,98 @@ begin
   end;
 end;
 
+{ A session waiting for capacity publishes its request when its queue state
+  changes, not on every poll. The heartbeat thread keeps the heartbeat fresh,
+  so a waiting poll that changes nothing rewrites nothing: no request file,
+  no queue sequence, no temporary file. }
+procedure CheckWaitingLeavesStateUntouched;
+const
+  POLLS = 20;
+var
+  Holder, Waiter : TLWPTWorkerBudgetSession;
+  HeldLease, Acquired : TLWPTWorkerLease;
+  Request, Queue, TmpPath : string;
+  Blocked : Boolean;
+  Ticket : Int64;
+  PollStarted : QWord;
+  i : Integer;
+
+  function WaiterTicket: Int64;
+  var
+    Snapshot : TLWPTWorkerBudgetSnapshot;
+    Entry : TLWPTWorkerBudgetEntry;
+  begin
+    Result := 0;
+    Snapshot := GetWorkerBudgetSnapshot;
+    for Entry in Snapshot.Entries do
+      if Entry.SessionId = 'waiter' then Exit(Entry.WaitTicket);
+  end;
+
+  procedure BlockPublications;
+  begin
+    { This child's heartbeat never fires within its deadline, so nothing
+      else writes the coordinator state while the block goes in. }
+    RecursiveDelete(TmpPath);
+    WriteMarker(TmpPath, 'block atomic writes');
+    Blocked := True;
+  end;
+
+  procedure UnblockPublications;
+  begin
+    if not Blocked then Exit;
+    DeleteFile(TmpPath);
+    ForceDirectories(TmpPath);
+    Blocked := False;
+  end;
+
+begin
+  Holder := nil;
+  Waiter := nil;
+  HeldLease := nil;
+  Acquired := nil;
+  TmpPath := WorkerStateRoot + '/tmp';
+  Blocked := False;
+  try
+    Holder := TLWPTWorkerBudgetSession.Create('holder', 1);
+    Waiter := TLWPTWorkerBudgetSession.Create('waiter', 1);
+    HeldLease := Holder.Acquire(0);
+    Require(Assigned(HeldLease), 'holder must acquire');
+    { The CLI callers wait with a timed poll from the start: it must wait for
+      its timeout and keep the ticket it took. }
+    PollStarted := GetTickCount64;
+    Require(Waiter.PollAcquire(120) = nil,
+      'timed poll must return without capacity');
+    Require(GetTickCount64 - PollStarted >= 100, 'timed poll must wait');
+    Ticket := WaiterTicket;
+    Require(Ticket > 0, 'timed poll must keep its ticket');
+    { Every publication goes through the coordinator's tmp directory. With a
+      file in its place, a rewrite while waiting raises instead of racing the
+      heartbeat thread, whose failed writes only retry on its next interval. }
+    BlockPublications;
+    Request := ReadStateValue('waiter.request');
+    Queue := ReadStateValue('queue-sequence');
+    for i := 1 to POLLS do
+      Require(Waiter.PollAcquire = nil, 'repeated poll must return');
+    Require(Waiter.PollAcquire(120) = nil, 'waiting poll must return');
+    Require(Waiter.Acquire(120) = nil, 'finite wait must return');
+    Require(ReadStateValue('waiter.request') = Request,
+      'waiting must not rewrite the request');
+    Require(ReadStateValue('queue-sequence') = Queue,
+      'waiting must not take another ticket');
+    Require(WaiterTicket = Ticket, 'waiting must keep its place in the queue');
+    UnblockPublications;
+    FreeAndNil(HeldLease);
+    Acquired := Waiter.PollAcquire;
+    Require(Assigned(Acquired), 'waiter must be granted once capacity frees');
+  finally
+    UnblockPublications;
+    Acquired.Free;
+    HeldLease.Free;
+    Waiter.Free;
+    Holder.Free;
+  end;
+end;
+
 function RunChildMode: Boolean;
 var
   i, GrantedTotal, Cycles : Integer;
@@ -652,6 +750,13 @@ begin
   if (ParamCount = 2) and (ParamStr(1) = POLL_SWITCH) then
   begin
     CheckPersistentPolling;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
+  if (ParamCount = 2) and (ParamStr(1) = QUIET_WAIT_SWITCH) then
+  begin
+    CheckWaitingLeavesStateUntouched;
     WriteTextFile(ParamStr(2), 'passed');
     ExitCode := 0;
     Exit(True);
@@ -1476,7 +1581,8 @@ begin
 end;
 
 procedure AddWorkerEnvironment(AProcess: TProcess;
-  const AStateRoot: string; const ABudget: string);
+  const AStateRoot: string; const ABudget: string;
+  const AStaleSeconds: string);
 var
   i : Integer;
   Entry : string;
@@ -1489,7 +1595,7 @@ begin
   AProcess.Environment.Add(WORKER_STATE_DIR_ENV + '=' + AStateRoot);
   AProcess.Environment.Add(WORKER_BUDGET_ENV + '=' + ABudget);
   AProcess.Environment.Add(
-    WORKER_STALE_SECONDS_ENV + '=' + TEST_STALE_SECONDS);
+    WORKER_STALE_SECONDS_ENV + '=' + AStaleSeconds);
 end;
 
 procedure TWorkerBudgetProcesses.DeleteScratch;
@@ -1582,7 +1688,7 @@ begin
 end;
 
 procedure TWorkerBudgetProcesses.RunUtilityWithBudget(const ASwitch,
-  AOutputPath, ABudget: string);
+  AOutputPath, ABudget: string; const AStaleSeconds: string);
 var
   Utility : TProcess;
   UtilityExit : Integer;
@@ -1592,7 +1698,7 @@ begin
     Utility.Executable := ExpandFileName(ParamStr(0));
     Utility.Parameters.Add(ASwitch);
     Utility.Parameters.Add(AOutputPath);
-    AddWorkerEnvironment(Utility, FScratch + '/state', ABudget);
+    AddWorkerEnvironment(Utility, FScratch + '/state', ABudget, AStaleSeconds);
     Utility.Execute;
     UtilityExit := FinishChild(Utility, CHILD_COMPLETION_TIMEOUT_MILLISECONDS,
       'worker-budget utility ' + ASwitch);
@@ -2580,6 +2686,13 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/poll-result')).ToBe(True);
 end;
 
+procedure TWorkerBudgetProcesses.TestWaitingLeavesStateUntouched;
+begin
+  RunUtilityWithBudget(QUIET_WAIT_SWITCH, FScratch + '/quiet-wait-result',
+    TEST_BUDGET, QUIET_WAIT_STALE_SECONDS);
+  Expect<Boolean>(FileExists(FScratch + '/quiet-wait-result')).ToBe(True);
+end;
+
 {$IFDEF UNIX}
 procedure TWorkerBudgetProcesses.TestForeignLocksAreTolerated;
 begin
@@ -2608,6 +2721,8 @@ procedure TWorkerBudgetProcesses.SetupTests;
 begin
   Test('persistent polls retain FIFO position and withdraw abandoned demand',
     TestPersistentPolling);
+  Test('waiting for capacity leaves the request and queue state untouched',
+    TestWaitingLeavesStateUntouched);
   {$IFDEF UNIX}
   Test('foreign locks on request, budget and queue state are tolerated',
     TestForeignLocksAreTolerated);

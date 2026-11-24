@@ -485,11 +485,15 @@ end;
 function TTestScheduler.AcquireLease: TLWPTWorkerLease;
 begin
   Result := nil;
+  { One ticket holds the scheduler's place for the whole wait. A finite
+    Acquire withdraws its ticket on timeout, so looping on it would re-queue
+    at the back on every pass. }
   while not IsCancelled do
   begin
-    Result := FBudgetSession.Acquire(100);
+    Result := FBudgetSession.PollAcquire(100);
     if Result <> nil then Exit;
   end;
+  FBudgetSession.CancelPendingAcquire;
 end;
 
 function TTestScheduler.StartProcess(const AIndex: Integer;
