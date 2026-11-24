@@ -111,9 +111,10 @@ type
     constructor Create(const ASessionId: string; ARequestedWorkers: Integer);
     destructor Destroy; override;
     function Acquire(ATimeoutMilliseconds: Integer = -1): TLWPTWorkerLease;
-    { Poll without losing FIFO position. A successful acquisition consumes the
-      pending request; otherwise cancel it when the scheduler has no demand. }
-    function PollAcquire: TLWPTWorkerLease;
+    { Poll without losing FIFO position, waiting up to ATimeoutMilliseconds.
+      A successful acquisition consumes the pending request; otherwise cancel
+      it when the scheduler has no demand. }
+    function PollAcquire(ATimeoutMilliseconds: Integer = 0): TLWPTWorkerLease;
     procedure CancelPendingAcquire;
     property SessionId: string read FSessionId;
     property RequestedWorkers: Integer read FRequested;
@@ -1720,9 +1721,10 @@ begin
   Result := AcquireInternal(ATimeoutMilliseconds, False);
 end;
 
-function TLWPTWorkerBudgetSession.PollAcquire: TLWPTWorkerLease;
+function TLWPTWorkerBudgetSession.PollAcquire(
+  ATimeoutMilliseconds: Integer): TLWPTWorkerLease;
 begin
-  Result := AcquireInternal(0, True);
+  Result := AcquireInternal(ATimeoutMilliseconds, True);
 end;
 
 procedure TLWPTWorkerBudgetSession.CancelPendingAcquire;
@@ -1761,7 +1763,7 @@ var
   Transaction : TLWPTWorkerStateTransaction;
   Entries : TLWPTWorkerBudgetEntryArray;
   Index, Candidate, Active : Integer;
-  Granted : Boolean;
+  Granted, StartedWaiting : Boolean;
   LeaseToken : string;
 begin
   Result := nil;
@@ -1813,13 +1815,18 @@ begin
           raise ELWPTWorkerBudgetError.CreateFmt(
             'worker session "%s" disappeared from coordinator state',
             [FSessionId]);
-        Entries[Index].HeartbeatAt := NowMilliseconds;
-        if not Entries[Index].Waiting then
+        { Publish the request only when it starts waiting. A poll that keeps
+          an existing ticket changes nothing others read, and the heartbeat
+          thread keeps the entry fresh, so rewriting it on every pass would
+          only churn the state directory. }
+        StartedWaiting := not Entries[Index].Waiting;
+        if StartedWaiting then
         begin
           Entries[Index].Waiting := True;
           Entries[Index].WaitTicket := NextWaitTicket(Entries);
+          Entries[Index].HeartbeatAt := NowMilliseconds;
+          WriteEntry(Entries[Index]);
         end;
-        WriteEntry(Entries[Index]);
 
         if AKeepWaiting then FPersistentWait := True;
         Active := ActiveWorkerCount(Entries);

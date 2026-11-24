@@ -1430,7 +1430,8 @@ var
     LastWaitReport := WaitStartedAt;
     while Result = nil do
     begin
-      Result := WorkerSession.Acquire(100);
+      { Keep one ticket for the whole wait, as the build scheduler's polls do. }
+      Result := WorkerSession.PollAcquire(100);
       if Assigned(Result) then Break;
       WaitTick := GetTickCount64;
       if WaitTick - LastWaitReport >=

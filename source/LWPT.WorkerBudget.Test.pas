@@ -31,6 +31,7 @@ const
   RELEASE_RETRY_SWITCH = '--worker-budget-release-retry';
   THREAD_SWITCH = '--worker-budget-threads';
   POLL_SWITCH = '--worker-budget-poll';
+  QUIET_WAIT_SWITCH = '--worker-budget-quiet-wait';
   FOREIGN_LOCK_SWITCH = '--worker-budget-foreign-lock';
   GUARDED_PUBLICATION_SWITCH = '--worker-budget-guarded-publication';
   UNREADABLE_OWN_SWITCH = '--worker-budget-unreadable-own';
@@ -119,6 +120,7 @@ type
   public
     procedure SetupTests; override;
     procedure TestPersistentPolling;
+    procedure TestWaitingLeavesStateUntouched;
     {$IFDEF UNIX}
     procedure TestForeignLocksAreTolerated;
     procedure TestStatePublicationKeepsChildrenOut;
@@ -630,6 +632,55 @@ begin
   end;
 end;
 
+{ A session waiting for capacity publishes its request when its queue state
+  changes, not on every poll. The heartbeat thread keeps the heartbeat fresh,
+  so a waiting poll that changes nothing rewrites nothing: no request file,
+  no queue sequence, no temporary file. }
+procedure CheckWaitingLeavesStateUntouched;
+const
+  POLLS = 20;
+var
+  Holder, Waiter : TLWPTWorkerBudgetSession;
+  HeldLease, Acquired : TLWPTWorkerLease;
+  Request, Queue : string;
+  i : Integer;
+begin
+  Holder := nil;
+  Waiter := nil;
+  HeldLease := nil;
+  Acquired := nil;
+  try
+    Holder := TLWPTWorkerBudgetSession.Create('holder', 1);
+    Waiter := TLWPTWorkerBudgetSession.Create('waiter', 1);
+    HeldLease := Holder.Acquire(0);
+    Require(Assigned(HeldLease), 'holder must acquire');
+    Require(Waiter.PollAcquire = nil, 'poll must return without capacity');
+    Request := ReadStateValue('waiter.request');
+    Queue := ReadStateValue('queue-sequence');
+    for i := 1 to POLLS do
+    begin
+      { Each poll lands in a later millisecond, so a rewrite would carry a
+        different heartbeat. }
+      Sleep(5);
+      Require(Waiter.PollAcquire = nil, 'repeated poll must return');
+    end;
+    Require(Waiter.PollAcquire(120) = nil, 'waiting poll must return');
+    Require(Waiter.Acquire(120) = nil, 'finite wait must return');
+    Require(ReadStateValue('waiter.request') = Request,
+      'waiting must not rewrite the request');
+    Require(ReadStateValue('queue-sequence') = Queue,
+      'waiting must not take another ticket');
+    FreeAndNil(HeldLease);
+    Acquired := Waiter.PollAcquire;
+    Require(Assigned(Acquired), 'waiter must be granted once capacity frees');
+  finally
+    Acquired.Free;
+    HeldLease.Free;
+    Waiter.Free;
+    Holder.Free;
+  end;
+end;
+
 function RunChildMode: Boolean;
 var
   i, GrantedTotal, Cycles : Integer;
@@ -652,6 +703,13 @@ begin
   if (ParamCount = 2) and (ParamStr(1) = POLL_SWITCH) then
   begin
     CheckPersistentPolling;
+    WriteTextFile(ParamStr(2), 'passed');
+    ExitCode := 0;
+    Exit(True);
+  end;
+  if (ParamCount = 2) and (ParamStr(1) = QUIET_WAIT_SWITCH) then
+  begin
+    CheckWaitingLeavesStateUntouched;
     WriteTextFile(ParamStr(2), 'passed');
     ExitCode := 0;
     Exit(True);
@@ -2580,6 +2638,12 @@ begin
   Expect<Boolean>(FileExists(FScratch + '/poll-result')).ToBe(True);
 end;
 
+procedure TWorkerBudgetProcesses.TestWaitingLeavesStateUntouched;
+begin
+  RunUtility(QUIET_WAIT_SWITCH, FScratch + '/quiet-wait-result');
+  Expect<Boolean>(FileExists(FScratch + '/quiet-wait-result')).ToBe(True);
+end;
+
 {$IFDEF UNIX}
 procedure TWorkerBudgetProcesses.TestForeignLocksAreTolerated;
 begin
@@ -2608,6 +2672,8 @@ procedure TWorkerBudgetProcesses.SetupTests;
 begin
   Test('persistent polls retain FIFO position and withdraw abandoned demand',
     TestPersistentPolling);
+  Test('waiting for capacity leaves the request and queue state untouched',
+    TestWaitingLeavesStateUntouched);
   {$IFDEF UNIX}
   Test('foreign locks on request, budget and queue state are tolerated',
     TestForeignLocksAreTolerated);
