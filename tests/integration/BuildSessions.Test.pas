@@ -1686,7 +1686,7 @@ var
   Snapshot: TLWPTWorkerBudgetSnapshot;
   ReadyPath: string;
   HolderSessionId: string;
-  StartedAt: QWord;
+  StartedAt, QueuedAt: QWord;
   EntryIndex: Integer;
   ContenderWaitObserved: Boolean;
 begin
@@ -1701,24 +1701,28 @@ begin
       if not ForceDirectories(ExtractFileDir(ReadyPath)) then Exit;
       WriteTextFile(ReadyPath, 'ready');
       StartedAt := GetTickCount64;
+      QueuedAt := 0;
       repeat
         ContenderWaitObserved := False;
         Snapshot := GetWorkerBudgetSnapshot;
-        { Acquire(0) clears Waiting before it returns, so the durable signal is
-          a zero-grant contender whose heartbeat has advanced across repeated
-          acquisition attempts for at least two reporter intervals. }
+        { A waiting contender keeps one ticket for its whole wait, so a
+          zero-grant entry with a ticket proves that it has queued. The slot
+          stays held for two reporter intervals after that, so the queued CLI
+          reports its capacity wait. }
         for EntryIndex := 0 to High(Snapshot.Entries) do
           if (Snapshot.Entries[EntryIndex].SessionId <> HolderSessionId)
              and (Snapshot.Entries[EntryIndex].Granted = 0)
              and not Snapshot.Entries[EntryIndex].Uncertain
-             and (Snapshot.Entries[EntryIndex].HeartbeatAt
-               - Snapshot.Entries[EntryIndex].StartedAt
-               >= TestHeartbeatIntervalMilliseconds * 2) then
+             and Snapshot.Entries[EntryIndex].Waiting
+             and (Snapshot.Entries[EntryIndex].WaitTicket > 0) then
           begin
             ContenderWaitObserved := True;
             Break;
           end;
-        if ContenderWaitObserved then Break;
+        if ContenderWaitObserved and (QueuedAt = 0) then
+          QueuedAt := GetTickCount64;
+        if (QueuedAt > 0) and (GetTickCount64 - QueuedAt
+           >= TestHeartbeatIntervalMilliseconds * 2) then Break;
         if GetTickCount64 - StartedAt
            >= ConcurrencyBarrierCeilingSeconds * 1000 then Exit;
         Sleep(10);

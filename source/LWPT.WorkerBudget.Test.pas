@@ -642,38 +642,53 @@ const
 var
   Holder, Waiter : TLWPTWorkerBudgetSession;
   HeldLease, Acquired : TLWPTWorkerLease;
-  Request, Queue : string;
+  Request, Queue, TmpPath : string;
+  Blocked : Boolean;
   i : Integer;
+
+  procedure UnblockPublications;
+  begin
+    if not Blocked then Exit;
+    DeleteFile(TmpPath);
+    ForceDirectories(TmpPath);
+    Blocked := False;
+  end;
+
 begin
   Holder := nil;
   Waiter := nil;
   HeldLease := nil;
   Acquired := nil;
+  TmpPath := WorkerStateRoot + '/tmp';
+  Blocked := False;
   try
     Holder := TLWPTWorkerBudgetSession.Create('holder', 1);
     Waiter := TLWPTWorkerBudgetSession.Create('waiter', 1);
     HeldLease := Holder.Acquire(0);
     Require(Assigned(HeldLease), 'holder must acquire');
     Require(Waiter.PollAcquire = nil, 'poll must return without capacity');
+    { Every publication goes through the coordinator's tmp directory. With a
+      file in its place, a rewrite while waiting raises instead of racing the
+      heartbeat thread, whose failed writes only retry on its next interval. }
+    RecursiveDelete(TmpPath);
+    WriteMarker(TmpPath, 'block atomic writes');
+    Blocked := True;
     Request := ReadStateValue('waiter.request');
     Queue := ReadStateValue('queue-sequence');
     for i := 1 to POLLS do
-    begin
-      { Each poll lands in a later millisecond, so a rewrite would carry a
-        different heartbeat. }
-      Sleep(5);
       Require(Waiter.PollAcquire = nil, 'repeated poll must return');
-    end;
     Require(Waiter.PollAcquire(120) = nil, 'waiting poll must return');
     Require(Waiter.Acquire(120) = nil, 'finite wait must return');
     Require(ReadStateValue('waiter.request') = Request,
       'waiting must not rewrite the request');
     Require(ReadStateValue('queue-sequence') = Queue,
       'waiting must not take another ticket');
+    UnblockPublications;
     FreeAndNil(HeldLease);
     Acquired := Waiter.PollAcquire;
     Require(Assigned(Acquired), 'waiter must be granted once capacity frees');
   finally
+    UnblockPublications;
     Acquired.Free;
     HeldLease.Free;
     Waiter.Free;

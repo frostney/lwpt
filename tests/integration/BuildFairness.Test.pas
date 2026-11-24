@@ -172,13 +172,13 @@ begin
                 Mark(ARoot, 'contender-queued');
             end
             else if (Entry.Granted = 0) and not Entry.Uncertain
-              and (Entry.HeartbeatAt - Entry.StartedAt >= 100) then
+              and Entry.Waiting and (Entry.WaitTicket > 0) then
             begin
               { Before the contender starts, the real build is the only other
-                session. Its background heartbeat interval is 100 seconds,
-                beyond this child's entire lifetime. An advanced heartbeat
-                therefore proves that the build has tried to acquire capacity;
-                merely observing process startup would not establish order. }
+                session. Its scheduler keeps one ticket for its whole wait, so
+                a queued entry proves that the build has tried to acquire
+                capacity; merely observing process startup would not establish
+                order. }
               Mark(ARoot, 'build-attempted');
             end;
           end;
