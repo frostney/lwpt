@@ -105,9 +105,11 @@ development machine a healthy `-iV -iTO -iTP` probe exceeded 30 seconds, and
 the build failed before it compiled anything, while the compile itself would
 have had 30 minutes. Every driver's probe process now gets the compile's
 per-process deadline: 30 minutes by default, or `LWPT_COMPILER_TIMEOUT_MS`
-when set. The deadline still limits each process separately: a probe that
-outlives it fails the build, as an over-long compile does, and the FPC driver
-can run a bare probe and then a dispatched probe under its probe lock, each
-with the full deadline. A timeout still terminates and reaps the isolated
+when set. The deadline still limits each process separately. A timed-out
+probe counts as a failed probe with the consequences any failed probe has: a
+default-target or dispatched probe fails the request, while a bare probe for an
+explicit target falls through to the dispatched probe. The FPC driver can
+therefore run a bare probe and then a dispatched probe under its probe lock,
+each with the full deadline. A timeout still terminates and reaps the isolated
 process tree, so a wedged compiler holds that lock for a bounded time: at
 most two deadlines plus cleanup, where it used to be 30 seconds each.
