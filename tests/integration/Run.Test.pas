@@ -261,11 +261,11 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Integer>(RunCount).ToBe(1);
 
-  { An input edit a millisecond after the marker, inside the same
+  { An input touched a millisecond after the marker, inside the same
     FileAge tick, makes the task stale: newer where the filesystem keeps
-    sub-second times, and equal, which also runs, where it does not. }
-  WriteTextFile(FScratch + '/scripts/fresh.pas',
-    ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10);
+    sub-second times, and equal, which also runs, where it does not. Only
+    the time changes, so the time rule alone must catch it: the content
+    still matches the recorded run. }
   SetFileModificationTime(FScratch + '/scripts/fresh.pas', StampBaseSeconds,
     EditStampNanoseconds);
   R := RunLwpt(['run', 'fresh'], FScratch);

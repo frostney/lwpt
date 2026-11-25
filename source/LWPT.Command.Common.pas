@@ -66,6 +66,9 @@ procedure RunHooksWithEnvironment(const APhase: string;
 implementation
 
 uses
+  {$IFDEF UNIX}
+  BaseUnix,
+  {$ENDIF}
   LWPT.BuildSession,
   LWPT.CompilerDriver.FPC,
   LWPT.OutputRenderer,
@@ -439,18 +442,45 @@ var
 begin
   Fields := TStringList.Create;
   try
-    Fields.Add('command=' + AHook.Runnable.Command);
+    Fields.Add('command=' + IntToStr(Length(AHook.Runnable.Command)) + ':'
+      + AHook.Runnable.Command);
     for i := 0 to High(AHook.Runnable.Args) do
       Fields.Add('arg=' + IntToStr(Length(AHook.Runnable.Args[i])) + ':'
         + AHook.Runnable.Args[i]);
     for i := 0 to High(AHook.Inputs) do
       Fields.Add('input=' + IntToStr(Length(AHook.Inputs[i])) + ':'
         + AHook.Inputs[i]);
-    Fields.Add('output=' + AHook.Output);
+    Fields.Add('output=' + IntToStr(Length(AHook.Output)) + ':'
+      + AHook.Output);
     Fields.LineBreak := #10;
     Result := HookTextDigest(Fields.Text);
   finally
     Fields.Free;
+  end;
+end;
+
+{ SHA-256 of a regular file's content, or '' when it is not a regular file
+  or cannot be read: missing, unreadable, sharing-denied, or replaced since
+  it was matched. '' always means stale, so an unreadable input runs the
+  command, and an unreadable output after a run only skips the record. A
+  FIFO or device is never opened, so a matched pipe cannot block the gate. }
+function HookFileDigest(const APath: string): string;
+{$IFDEF UNIX}
+var
+  Info: Stat;
+{$ENDIF}
+begin
+  Result := '';
+  {$IFDEF UNIX}
+  if (FpStat(APath, Info) <> 0) or not FpS_ISREG(Info.st_mode) then Exit;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  if DirectoryExists(APath) then Exit;
+  {$ENDIF}
+  try
+    Result := SHA256File(APath);
+  except
+    on E: Exception do Result := '';
   end;
 end;
 
@@ -469,7 +499,7 @@ begin
   try
     for i := 0 to AFiles.Count - 1 do
     begin
-      Content := SHA256File(AFiles[i]);
+      Content := HookFileDigest(AFiles[i]);
       if Content = '' then Exit;
       Relative := StringReplace(ExtractRelativePath(
         IncludeTrailingPathDelimiter(AProjectRoot), AFiles[i]), '\', '/',
@@ -543,6 +573,9 @@ begin
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0) then Exit(True);
   Files := TStringList.Create;
   try
+    { Case-sensitive, so Foo.pas and foo.pas on a case-sensitive filesystem
+      are two inputs rather than one. }
+    Files.CaseSensitive := True;
     Files.Sorted := True;
     Files.Duplicates := dupIgnore;
     for i := 0 to High(AHook.Inputs) do
@@ -561,7 +594,7 @@ begin
       Exit(True);
     Result := (RecordedDefinition <> HookDefinitionDigest(AHook))
       or (RecordedInputs <> AInputDigest)
-      or (RecordedOutput <> SHA256File(OutputPath));
+      or (RecordedOutput <> HookFileDigest(OutputPath));
   finally
     Files.Free;
   end;
@@ -583,6 +616,9 @@ var
 begin
   Files := TStringList.Create;
   try
+    { Case-sensitive, so Foo.pas and foo.pas on a case-sensitive filesystem
+      are two inputs rather than one. }
+    Files.CaseSensitive := True;
     Files.Sorted := True;
     Files.Duplicates := dupIgnore;
     try
@@ -605,7 +641,8 @@ var
 begin
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
     or (AInputDigest = '') or AHook.SessionPrivateOutput then Exit;
-  OutputDigest := SHA256File(ResolveProjectPath(AProjectRoot, AHook.Output));
+  OutputDigest := HookFileDigest(
+    ResolveProjectPath(AProjectRoot, AHook.Output));
   if OutputDigest = '' then Exit;
   { An input edited while the command ran may or may not have reached the
     output. Recording neither digest keeps the next invocation stale. }
@@ -619,7 +656,11 @@ begin
     Lines.Add(OutputDigest);
     Lines.LineBreak := #10;
     try
-      AtomicWriteText(RecordPath, ExtractFileDir(RecordPath), Lines);
+      { Staged in the project temporary root, like every multi-step write
+        to toolkit state, so an interrupted write leaves nothing that
+        repair would not sweep. }
+      AtomicWriteText(RecordPath, ResolveProjectPath(AProjectRoot, TMP_DIR),
+        Lines);
     except
       { The record only lets a later invocation skip the command. Without
         it the command runs again, which is always safe, so a write
@@ -629,6 +670,21 @@ begin
   finally
     Lines.Free;
   end;
+end;
+
+{ Serialises everything that reads or writes one gated output: the gate,
+  the command and the record. Without it, two invocations generating the
+  same output from different inputs could interleave so that one records
+  its inputs beside the other's output, and later invocations would skip on
+  that record. nil for a hook with no gate or a session-private output. }
+function AcquireHookLock(const AHook: THook;
+  const AProjectRoot: string): TObject;
+begin
+  Result := nil;
+  if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
+    or AHook.SessionPrivateOutput then Exit;
+  Result := AcquireHookOutputLock(
+    ChangeFileExt(HookRunRecordPath(AHook, AProjectRoot), '.lock'));
 end;
 
 function RunRunnableWithEnvironment(const AHook: THook;
@@ -737,32 +793,37 @@ var
   i, Code: Integer;
   H: THook;
   InputDigest, RunnableError: string;
+  Lock: TObject;
 begin
   if Length(AHooks) = 0 then Exit;
   for i := 0 to High(AHooks) do
   begin
     H := AHooks[i];
+    Lock := AcquireHookLock(H, AProjectRoot);
+    try
+      if not HookIsStale(H, AProjectRoot, InputDigest) then
+      begin
+        WriteLn('  [', APhase, '] ', H.Name, ' (skipped — output fresh)');
+        Continue;
+      end;
 
-    if not HookIsStale(H, AProjectRoot, InputDigest) then
-    begin
-      WriteLn('  [', APhase, '] ', H.Name, ' (skipped — output fresh)');
-      Continue;
+      WriteLn('  [', APhase, '] ', H.Name);
+
+      Code := RunRunnableWithEnvironment(H, RunnableError, AProjectRoot,
+        AEnvironment);
+      if RunnableError <> '' then
+        raise ELWPTError.CreateFmt(
+          '[%s] %s: %s while running %s',
+          [APhase, H.Name, RunnableError, H.Runnable.Command]);
+
+      if Code <> 0 then
+        raise ELWPTError.CreateFmt(
+          '[%s] %s: command exited %d while running %s',
+          [APhase, H.Name, Code, H.Runnable.Command]);
+      RecordHookRun(H, AProjectRoot, InputDigest);
+    finally
+      Lock.Free;
     end;
-
-    WriteLn('  [', APhase, '] ', H.Name);
-
-    Code := RunRunnableWithEnvironment(H, RunnableError, AProjectRoot,
-      AEnvironment);
-    if RunnableError <> '' then
-      raise ELWPTError.CreateFmt(
-        '[%s] %s: %s while running %s',
-        [APhase, H.Name, RunnableError, H.Runnable.Command]);
-
-    if Code <> 0 then
-      raise ELWPTError.CreateFmt(
-        '[%s] %s: command exited %d while running %s',
-        [APhase, H.Name, Code, H.Runnable.Command]);
-    RecordHookRun(H, AProjectRoot, InputDigest);
   end;
 end;
 
@@ -775,11 +836,17 @@ end;
 function RunUserTask(const ATask: THook; const AProjectRoot: string): Integer;
 var
   InputDigest, TaskError: string;
+  Lock: TObject;
 begin
-  if not HookIsStale(ATask, AProjectRoot, InputDigest) then Exit(0);
-  Result := RunRunnableWithEnvironment(ATask, TaskError, AProjectRoot, []);
-  if (Result = 0) and (TaskError = '') then
-    RecordHookRun(ATask, AProjectRoot, InputDigest);
+  Lock := AcquireHookLock(ATask, AProjectRoot);
+  try
+    if not HookIsStale(ATask, AProjectRoot, InputDigest) then Exit(0);
+    Result := RunRunnableWithEnvironment(ATask, TaskError, AProjectRoot, []);
+    if (Result = 0) and (TaskError = '') then
+      RecordHookRun(ATask, AProjectRoot, InputDigest);
+  finally
+    Lock.Free;
+  end;
   if TaskError <> '' then
   begin
     WriteLn(ErrOutput, PROGRAM_NAME, ' run: ', TaskError, '.');

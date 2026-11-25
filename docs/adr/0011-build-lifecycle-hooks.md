@@ -146,11 +146,17 @@ ordering is unchanged.
 rule. A merge-conflict resolution that checked out one side of a generated
 include wrote an output from another generation after the merged inputs.
 The time gate therefore skipped the generator, and the build embedded the
-wrong module. After each successful run of a gated hook or run task, LWPT
+wrong module. After a successful run of a gated hook or run task, LWPT
 records the declaration (command, arguments, input expressions and output),
 the SHA-256 of every matched input and the SHA-256 of the output, below
-`.lwpt/sessions/hook-runs/`, one record per output. The command runs when the
-time gate says so, when no record exists, or when the declaration, an input's
-content or the output's content differs from the record. The time comparison
-stays, so `touch` on an input still forces a run. A missing record costs one
-run, as after a fresh clone or an upgrade.
+`.lwpt/sessions/hook-runs/`, one record per output, staged through
+`.lwpt/tmp/`. The command runs when the time gate says so, when no record
+exists, or when the declaration, an input's content or the output's content
+differs from the record. The time comparison stays, so `touch` on an input
+still forces a run. No record is kept for an output retargeted to a session's
+private candidate (per-entry and whole-build postbuild), for a run during which
+an input changed, or when the output or an input cannot be read; those runs
+stay stale. An exclusive per-output lock spans the gate, the command and the
+record, so concurrent invocations in one checkout cannot pair one run's
+inputs with another's output. It waits as long as the holding command runs,
+since hook commands have no deadline of their own.

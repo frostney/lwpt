@@ -107,6 +107,11 @@ function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
   and relocated session roots, for a short project-wide critical section.
   Free the result to release it. }
 function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
+{ An exclusive per-output lock for a staleness-gated hook or run task, held
+  across its gate, command and record. It waits as long as the holder's
+  command runs: the command itself has no deadline, so a shorter wait would
+  only fail a build behind a slow generator. Free the result to release. }
+function AcquireHookOutputLock(const APath: string): TObject;
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
@@ -179,7 +184,9 @@ type
     FHandle: THandle;
     {$ENDIF}
   public
-    constructor Create(const APath: string);
+    { AWaitMilliseconds 0 waits until the lock is free. }
+    constructor Create(const APath: string;
+      const AWaitMilliseconds: QWord = PUBLICATION_LOCK_WAIT_MILLISECONDS);
     destructor Destroy; override;
   end;
 
@@ -937,7 +944,8 @@ begin
 end;
 {$ENDIF}
 
-constructor TLWPTPublicationLock.Create(const APath: string);
+constructor TLWPTPublicationLock.Create(const APath: string;
+  const AWaitMilliseconds: QWord);
 var
   Started: TDateTime;
   PIDLine: AnsiString;
@@ -986,8 +994,8 @@ begin
       Acquired := FpFcntl(FDescriptor, F_SetLk, LockSpec) = 0;
       if Acquired then Break;
       Sleep(10);
-    until MilliSecondsBetween(Now, Started) >=
-      PUBLICATION_LOCK_WAIT_MILLISECONDS;
+    until (AWaitMilliseconds > 0)
+      and (MilliSecondsBetween(Now, Started) >= Int64(AWaitMilliseconds));
     if not Acquired then
       raise EConcurrencyError.CreateFmt(
         'timed out waiting for build publication lock %s', [FPath]);
@@ -1011,8 +1019,8 @@ begin
         0, 1, 0, Overlapped);
       if Acquired then Break;
       Sleep(10);
-    until MilliSecondsBetween(Now, Started) >=
-      PUBLICATION_LOCK_WAIT_MILLISECONDS;
+    until (AWaitMilliseconds > 0)
+      and (MilliSecondsBetween(Now, Started) >= Int64(AWaitMilliseconds));
     if not Acquired then
       raise EConcurrencyError.CreateFmt(
         'timed out waiting for build publication lock %s', [FPath]);
@@ -1115,6 +1123,11 @@ function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
 begin
   Result := TLWPTPublicationLock.Create(
     BuildSessionLedgerLockPath(AProjectRoot));
+end;
+
+function AcquireHookOutputLock(const APath: string): TObject;
+begin
+  Result := TLWPTPublicationLock.Create(APath, 0);
 end;
 
 function BuildSessionsProjectRoot(const AProjectRoot,

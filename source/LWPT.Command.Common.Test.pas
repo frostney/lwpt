@@ -16,6 +16,7 @@ program LWPT.Command.Common.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -48,6 +49,7 @@ type
       const ASeconds: Int64; const ANanoseconds: LongInt); overload;
     function StampOf(const ARelativePath: string): TLWPTModificationStamp;
     procedure RecordRun(const AHook: THook);
+    procedure RecordFreshBaseline(const AHook: THook);
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -67,6 +69,11 @@ type
     procedure TestRecordedRunStaysFreshAcrossChecks;
     procedure TestInputEditedDuringRunIsNotRecorded;
     procedure TestSessionPrivateOutputKeepsNoRecord;
+    procedure TestUnreadableOutputSkipsRecord;
+    {$IFDEF UNIX}
+    procedure TestFifoInputIsStaleWithoutBlocking;
+    {$ENDIF}
+    procedure TestCaseDistinctInputsAreBothHashed;
   end;
 
 procedure THookStalenessTests.BeforeEach;
@@ -123,10 +130,21 @@ begin
   RecordHookRun(AHook, FRoot, InputDigest);
 end;
 
+{ The time-rule cases start from a recorded, fresh run and then change
+  only an input's time, never its content, so the record cannot be what
+  makes them stale. }
+procedure THookStalenessTests.RecordFreshBaseline(const AHook: THook);
+begin
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  RecordRun(AHook);
+  Expect<Boolean>(HookIsStale(AHook, FRoot)).ToBe(False);
+end;
+
 { Registered where the filesystem keeps sub-second times. }
 procedure THookStalenessTests.TestInputNewerWithinOneSecondIsStale;
 begin
-  WriteStamped(OutputName, OutputNanoseconds);
+  RecordFreshBaseline(GatedHook(['lwpt.toml']));
   WriteStamped('lwpt.toml', NewerNanoseconds);
   { The tick the old whole-second comparison could not see past. }
   Expect<Integer>(FileAge(IncludeTrailingPathDelimiter(FRoot) + 'lwpt.toml'))
@@ -140,7 +158,7 @@ end;
   reads as the output's own time, and the equality fallback runs it. }
 procedure THookStalenessTests.TestInputInOutputTickIsStaleOnCoarseFilesystem;
 begin
-  WriteStamped(OutputName, OutputNanoseconds);
+  RecordFreshBaseline(GatedHook(['lwpt.toml']));
   WriteStamped('lwpt.toml', NewerNanoseconds);
   Expect<Integer>(CompareModificationStamps(StampOf('lwpt.toml'),
     StampOf(OutputName))).ToBe(0);
@@ -151,7 +169,7 @@ end;
   overflows, is still newer than a 2023 output. }
 procedure THookStalenessTests.TestFarFutureInputIsStale;
 begin
-  WriteStamped(OutputName, OutputNanoseconds);
+  RecordFreshBaseline(GatedHook(['lwpt.toml']));
   WriteStamped('lwpt.toml', FarFutureUnixSeconds, 0);
   Expect<Boolean>(HookIsStale(GatedHook(['lwpt.toml']), FRoot)).ToBe(True);
 end;
@@ -162,7 +180,7 @@ begin
     output the output's own time. Equal is therefore stale, so an edit is
     never missed; the command re-runs until its output is strictly newer
     than every input. }
-  WriteStamped(OutputName, OutputNanoseconds);
+  RecordFreshBaseline(GatedHook(['lwpt.toml']));
   WriteStamped('lwpt.toml', OutputNanoseconds);
   Expect<Boolean>(HookIsStale(GatedHook(['lwpt.toml']), FRoot)).ToBe(True);
 end;
@@ -253,11 +271,20 @@ begin
   Hook := GatedHook(['lwpt.toml']);
   WriteStamped(OutputName, OutputNanoseconds);
   WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  Hook.Runnable.Command := './gen';
+  SetLength(Hook.Runnable.Args, 1);
+  Hook.Runnable.Args[0] := 'x';
   RecordRun(Hook);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
-  Hook.Runnable.Command := 'generate';
-  SetLength(Hook.Runnable.Args, 1);
-  Hook.Runnable.Args[0] := '--other';
+  Hook.Runnable.Command := './other';
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  Hook.Runnable.Command := './gen';
+  Hook.Runnable.Args[0] := 'y';
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  { A command that embeds what used to be the argument field must not read
+    as the same declaration. }
+  Hook.Runnable.Command := './gen'#10'arg=1:x';
+  SetLength(Hook.Runnable.Args, 0);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
 end;
 
@@ -315,6 +342,74 @@ begin
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
 end;
 
+{ An output that cannot be read after the run leaves no record and does
+  not fail the command that succeeded. }
+procedure THookStalenessTests.TestUnreadableOutputSkipsRecord;
+var
+  Hook: THook;
+  InputDigest: string;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  HookIsStale(Hook, FRoot, InputDigest);
+  ForceDirectories(IncludeTrailingPathDelimiter(FRoot) + OutputName);
+  RecordHookRun(Hook, FRoot, InputDigest);
+  Expect<Boolean>(DirectoryExists(IncludeTrailingPathDelimiter(FRoot)
+    + '.lwpt/sessions/hook-runs')).ToBe(False);
+end;
+
+{$IFDEF UNIX}
+{ A matched FIFO is never opened: opening it would block the gate until a
+  writer appeared. It cannot be hashed, so the hook is stale. }
+procedure THookStalenessTests.TestFifoInputIsStaleWithoutBlocking;
+var
+  Hook: THook;
+begin
+  Hook := GatedHook(['lwpt.toml', 'pipes/*']);
+  RecordFreshBaseline(GatedHook(['lwpt.toml']));
+  ForceDirectories(IncludeTrailingPathDelimiter(FRoot) + 'pipes');
+  Expect<Integer>(FpMkfifo(IncludeTrailingPathDelimiter(FRoot)
+    + 'pipes/input.fifo', &600)).ToBe(0);
+  SetFileModificationTime(IncludeTrailingPathDelimiter(FRoot)
+    + 'pipes/input.fifo', OlderSeconds, OlderNanoseconds);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+{$ENDIF}
+
+{ Registered where the filesystem tells Foo.pas from foo.pas. Both are
+  inputs, and an edit to either one is seen. }
+procedure THookStalenessTests.TestCaseDistinctInputsAreBothHashed;
+var
+  Hook: THook;
+  InputPath: string;
+begin
+  Hook := GatedHook(['src/*.pas']);
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('src/Foo.pas', OlderSeconds, OlderNanoseconds);
+  WriteStamped('src/foo.pas', OlderSeconds, OlderNanoseconds);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  InputPath := IncludeTrailingPathDelimiter(FRoot) + 'src/foo.pas';
+  WriteTextFile(InputPath, 'edited lower-case twin');
+  SetFileModificationTime(InputPath, OlderSeconds, OlderNanoseconds);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
+function FilesystemIsCaseSensitive: Boolean;
+var
+  Root: string;
+begin
+  Root := CreateScratchRoot('hook-staleness-case');
+  try
+    WriteTextFile(IncludeTrailingPathDelimiter(Root) + 'Probe', 'upper');
+    WriteTextFile(IncludeTrailingPathDelimiter(Root) + 'probe', 'lower');
+    Result := ReadBinaryFile(IncludeTrailingPathDelimiter(Root) + 'Probe')
+      = 'upper';
+  finally
+    RecursiveDelete(Root);
+  end;
+end;
+
 procedure THookStalenessTests.SetupTests;
 var
   Support: TTimestampSupport;
@@ -346,6 +441,19 @@ begin
     TestInputEditedDuringRunIsNotRecorded);
   Test('a session-private output keeps no record',
     TestSessionPrivateOutputKeepsNoRecord);
+  Test('an output that cannot be read after the run leaves no record',
+    TestUnreadableOutputSkipsRecord);
+  {$IFDEF UNIX}
+  Test('a matched FIFO is stale and never opened',
+    TestFifoInputIsStaleWithoutBlocking);
+  {$ENDIF}
+  if FilesystemIsCaseSensitive then
+    Test('inputs that differ only in case are both hashed',
+      TestCaseDistinctInputsAreBothHashed)
+  else
+    Skip('inputs that differ only in case are both hashed',
+      TestCaseDistinctInputsAreBothHashed,
+      'the filesystem does not tell Foo.pas from foo.pas');
   if Support.WideDates then
     Test('an input dated 2300 is newer than a 2023 output',
       TestFarFutureInputIsStale)
