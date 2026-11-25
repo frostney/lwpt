@@ -150,9 +150,21 @@ Without `--clean` or `--no-cache`, LWPT first captures a versioned neutral
 cache fingerprint. It covers source and resource content, resolved lockfile and
 module state, workspace inputs, the compiler driver identity, executable and
 live version, the target tuple, effective translated arguments, hooks, and
-compiler-relevant environment. A verified hit is copied into the invocation's
-private session and follows the same postbuild, live-probe, fingerprint
-revalidation, and atomic-publication path as a newly compiled artifact.
+compiler-relevant environment. It also covers the content of every search
+directory the compile receives: the manifest's units and includes, and the
+unit, include, object, and library directories (`-Fu`, `-Fi`, `-Fo`, `-Fl`,
+`-I`) that the cfg file, `[build]` or `[test]` flags, and the selected compiler
+profile's `args` name, together with any response file (`@file`) among those
+arguments and the files it reads with `#INCLUDE`, whose lines count as
+arguments. These options and files are read as FPC 3.2 reads them, the same way the test run's input record below reads them, so a
+`$` macro or `*` wildcard entry covers its fixed leading directory. Every input
+is read without blocking, and only a regular file is hashed: a file of another
+kind, such as a FIFO, is recorded by its type and mode, so it can neither hang
+the fingerprint nor make it change from run to run. An input that cannot be
+read makes the cache step aside for that compile. A verified hit is copied into
+the invocation's private session and follows the same postbuild, live-probe,
+fingerprint revalidation, and atomic-publication path as a newly compiled
+artifact.
 
 Successful, current builds publish an immutable artifact object and result
 manifest only after public-output publication succeeds. Failed, cancelled,
@@ -296,7 +308,8 @@ v2 adds the `extra_arguments` array. The canonical TOML serialization is
 embedded in a separate publication fingerprint. That fingerprint also covers
 the selected compiler command, configured prefix arguments, and live version,
 the previous public-output content, the implicit source directory, declared
-unit/include/resource inputs,
+unit/include/resource inputs, the search directories and response files that
+the compile's arguments name (as the cache fingerprint above reads them),
 manifest, cfg, lockfile, and installed module contents. After compilation it
 reacquires machine-wide worker capacity and retains it through per-entry
 postbuild, live compiler refresh, fingerprint revalidation, and atomic
@@ -576,11 +589,11 @@ still. Before any program compiles or reuses a cached executable, `lwpt test`
 records the content of a fixed set of compiler inputs: the paths the test
 cache fingerprint covers (manifest, cfg, lockfile, installed modules, unit,
 include, and workspace paths, `LWPT_FPC_UNIT_PATHS`, project-root files, and
-each selected program's source file and directory), plus the unit, include,
-object, and library directories that the cfg file, `[test]` flags, or the
-selected compiler profile's `args` name. Those options are read as FPC 3.2
-reads them: entries split at `;`, and outside Windows also at `:`; Pascal
-quotes removed; and a leading `=` read against an empty sysroot, except in
+each selected program's source file and directory), including the unit,
+include, object, and library directories and the response files that the cfg
+file, `[test]` flags, or the selected compiler profile's `args` name. Those
+options are read as FPC 3.2 reads them: entries split at `;`, and outside
+Windows also at `:`; Pascal quotes removed; and a leading `=` read against an empty sysroot, except in
 `-Fl`, whose `=` entries are watched below every `-XR` sysroot those options
 set and below none. An entry with a `*` wildcard or a `$` macro is watched
 through its fixed leading directory. A file a program reads

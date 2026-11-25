@@ -15,8 +15,8 @@ uses
 
 const
   BUILD_SESSION_SCHEMA_VERSION = 1;
-  BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 1;
-  BUILD_CACHE_FINGERPRINT_SCHEMA_VERSION = 2;
+  BUILD_PUBLICATION_FINGERPRINT_SCHEMA_VERSION = 2;
+  BUILD_CACHE_FINGERPRINT_SCHEMA_VERSION = 3;
   BUILD_CACHE_OPERATION_BUILD_ENTRY = 'build-entry';
   BUILD_CACHE_OPERATION_TEST_PROGRAM = 'test-program';
   BUILD_SESSIONS_DIR = LWPT_DIR + '/sessions';
@@ -141,6 +141,30 @@ procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
   var ADirs: TStringArray);
 procedure AppendUnitDirsFromCfg(const ACfgPath: string;
   var ADirs: TStringArray);
+{ Appends the directories that the unit, include, object and library search
+  options among AOptions (-Fu, -Fi, -Fo, -Fl, -I) can make the compiler
+  read, resolved as FPC 3.2 resolves them. An option lists entries separated
+  by ";", and outside Windows also by ":". An entry may be Pascal-quoted. A
+  leading "=" names a path below the sysroot, which -XR sets for -Fl and
+  which is empty for every other option. "*" wildcards and "$" macros expand
+  when the compiler runs, so such an entry adds its fixed leading directory,
+  which holds every directory it can resolve to. An "=" entry of -Fl adds one
+  directory per -XR value in AOptions and one without a sysroot, because the
+  sysroot that applies depends on option order. An empty entry names the
+  current directory, which this adds nothing for. }
+procedure AppendCompilerSearchDirectories(const AOptions: array of string;
+  var ADirectories: TStringArray);
+{ Appends what AArguments make the compiler read through its options: each
+  response file that an "@file" argument names, each file those include,
+  and the directories that AppendCompilerSearchDirectories finds among the
+  options, those of the files included. Files are read as FPC 3.2 reads
+  them: one option per line, spaces, tabs and commas around it removed; ";"
+  lines are comments; "#INCLUDE <file>" reads another file; and the lines
+  of every #IFDEF branch count, since any of them may apply. Relative paths
+  resolve against AProjectRoot. A file is read without blocking, once, and
+  one that is not a regular file or cannot be read names nothing more. }
+procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
+  const AArguments: array of string; var APaths: TStringArray);
 function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
   const AEntrySource: string): Integer;
 procedure EnsureCompilerPathBudget(const AUnitDirectory,
@@ -345,6 +369,125 @@ begin
   end;
 end;
 
+procedure AppendCompilerSearchDirectories(const AOptions: array of string;
+  var ADirectories: TStringArray);
+const
+  SEARCH_OPTIONS: array[0..4] of string = ('-Fu', '-Fi', '-Fo', '-Fl', '-I');
+  SYSROOT_OPTION = '-XR';
+var
+  Sysroots: TStringArray;
+
+  procedure AddDirectory(APath: string);
+  var
+    Count, Position: Integer;
+  begin
+    for Position := 1 to Length(APath) do
+      if APath[Position] in ['*', '?', '$'] then
+      begin
+        APath := Copy(APath, 1, Position - 1);
+        while (APath <> '') and not (APath[Length(APath)] in ['/', '\']) do
+          Delete(APath, Length(APath), 1);
+        if APath = '' then APath := '.';
+        Break;
+      end;
+    if APath = '' then Exit;
+    Count := Length(ADirectories);
+    SetLength(ADirectories, Count + 1);
+    ADirectories[Count] := APath;
+  end;
+
+  { FPC's DePascalQuote: a leading ' starts a quoted entry in which ''
+    stands for one quote; without its closing quote the entry stays as
+    written. }
+  function PascalUnquoted(const AEntry: string): string;
+  var
+    Position: Integer;
+  begin
+    Result := '';
+    Position := 2;
+    while Position <= Length(AEntry) do
+    begin
+      if AEntry[Position] = '''' then
+      begin
+        if (Position < Length(AEntry)) and (AEntry[Position + 1] = '''') then
+          Inc(Position)
+        else
+          Exit;
+      end;
+      Result := Result + AEntry[Position];
+      Inc(Position);
+    end;
+    Result := AEntry;
+  end;
+
+  procedure AddEntry(AEntry: string; const ALibrary: Boolean);
+  var
+    Bare: string;
+    i: Integer;
+  begin
+    AEntry := Trim(AEntry);
+    { A double-quoted entry reaches FPC as written, since no shell or
+      response-file reader removes the quotes: watch both spellings. }
+    if (Length(AEntry) >= 2) and (AEntry[1] = '"')
+       and (AEntry[Length(AEntry)] = '"') then
+      AddEntry(Copy(AEntry, 2, Length(AEntry) - 2), ALibrary)
+    else if (AEntry <> '') and (AEntry[1] = '''') then
+      AEntry := PascalUnquoted(AEntry);
+    if (AEntry = '') or (AEntry[1] <> '=') then
+    begin
+      AddDirectory(AEntry);
+      Exit;
+    end;
+    Bare := Copy(AEntry, 2, MaxInt);
+    if ALibrary then
+      for i := 0 to High(Sysroots) do AddDirectory(Sysroots[i] + Bare);
+    AddDirectory(Bare);
+  end;
+
+  procedure AddOption(const AOption: string);
+  var
+    Entries, Option: string;
+    i, Position, StartAt: Integer;
+  begin
+    Option := Trim(AOption);
+    for i := 0 to High(SEARCH_OPTIONS) do
+      if (Length(Option) > Length(SEARCH_OPTIONS[i]))
+         and (Copy(Option, 1, Length(SEARCH_OPTIONS[i]))
+           = SEARCH_OPTIONS[i]) then
+      begin
+        Entries := Copy(Option, Length(SEARCH_OPTIONS[i]) + 1, MaxInt);
+        StartAt := 1;
+        for Position := 1 to Length(Entries) + 1 do
+          if (Position > Length(Entries)) or (Entries[Position] = ';')
+             {$IFNDEF MSWINDOWS}or (Entries[Position] = ':'){$ENDIF} then
+          begin
+            AddEntry(Copy(Entries, StartAt, Position - StartAt),
+              SEARCH_OPTIONS[i] = '-Fl');
+            StartAt := Position + 1;
+          end;
+        Exit;
+      end;
+  end;
+
+var
+  Count, i: Integer;
+  Option: string;
+begin
+  SetLength(Sysroots, 0);
+  for i := 0 to High(AOptions) do
+  begin
+    Option := Trim(AOptions[i]);
+    if (Length(Option) > Length(SYSROOT_OPTION))
+       and (Copy(Option, 1, Length(SYSROOT_OPTION)) = SYSROOT_OPTION) then
+    begin
+      Count := Length(Sysroots);
+      SetLength(Sysroots, Count + 1);
+      Sysroots[Count] := Copy(Option, Length(SYSROOT_OPTION) + 1, MaxInt);
+    end;
+  end;
+  for i := 0 to High(AOptions) do AddOption(AOptions[i]);
+end;
+
 function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
   const AEntrySource: string): Integer;
 var
@@ -461,11 +604,11 @@ end;
 { A file's content hash. The build cache lets an unreadable file fail its
   fingerprint (the cache then steps aside); a run-level input snapshot must
   not fail, so ASnapshot records such a file by its metadata. The compiler
-  cannot read that file either, and a change to it still shows. A snapshot
-  opens without blocking and hashes only a regular file through the
-  descriptor it classified, so a FIFO (even one swapped in after a check)
-  never blocks it. ADigests reuses a file already hashed in this scan
-  through an overlapping path. }
+  cannot read that file either, and a change to it still shows. Both open
+  without blocking and hash only a regular file through the descriptor they
+  classified, so a FIFO (even one swapped in after a check) never blocks
+  them: another kind of file is recorded by its type and mode. ADigests
+  reuses a file already hashed in this scan through an overlapping path. }
 function InputFileContent(const APath: string; const ASnapshot: Boolean;
   const ADigests: TFPStringHashTable): string;
 
@@ -486,12 +629,11 @@ function InputFileContent(const APath: string; const ASnapshot: Boolean;
 var
   Known: THTStringNode;
   {$IFDEF UNIX}
-  Descriptor: LongInt;
+  Descriptor, ErrorNumber: LongInt;
   Status: BaseUnix.Stat;
   Stream: TLWPTProtectedFileStream;
   {$ENDIF}
 begin
-  if not ASnapshot then Exit(SHA256File(APath));
   if ADigests <> nil then
   begin
     Known := THTStringNode(ADigests.Find(APath));
@@ -500,7 +642,16 @@ begin
   {$IFDEF UNIX}
   Descriptor := OpenProtectedDescriptor(APath, O_RDONLY or O_NONBLOCK, 0);
   if Descriptor < 0 then
-    Result := Metadata
+  begin
+    ErrorNumber := FpGetErrNo;
+    { The cache records a file removed since it was listed as SHA256File
+      does, and fails on any other file it cannot open. }
+    if ASnapshot then Result := Metadata
+    else if ErrorNumber = ESysENOENT then Result := ''
+    else
+      raise ELWPTError.Create('cannot read ' + APath + ': '
+        + SysErrorMessage(ErrorNumber));
+  end
   else if (FpFStat(Descriptor, Status) = 0)
      and not fpS_ISREG(Status.st_mode) then
   begin
@@ -511,21 +662,27 @@ begin
   begin
     Stream := TLWPTProtectedFileStream.Create(THandle(Descriptor));
     try
-      try
-        Result := SHA256Stream(Stream);
-      except
-        on E: Exception do Result := Metadata;
-      end;
+      if not ASnapshot then
+        Result := SHA256Stream(Stream)
+      else
+        try
+          Result := SHA256Stream(Stream);
+        except
+          on E: Exception do Result := Metadata;
+        end;
     finally
       Stream.Free;
     end;
   end;
   {$ELSE}
-  try
-    Result := SHA256File(APath);
-  except
-    on E: Exception do Result := Metadata;
-  end;
+  if not ASnapshot then
+    Result := SHA256File(APath)
+  else
+    try
+      Result := SHA256File(APath);
+    except
+      on E: Exception do Result := Metadata;
+    end;
   {$ENDIF}
   if ADigests <> nil then ADigests.Add(APath, Result);
 end;
@@ -652,10 +809,13 @@ begin
   Result := 'missing';
 end;
 
+{ A path's content as the cache hashes it. ADigests reuses a file already
+  hashed in the same fingerprint through another path. }
 function PathFingerprint(const AProjectRoot, APath: string;
-  const AExcludedPaths: TStringArray): string;
+  const AExcludedPaths: TStringArray;
+  const ADigests: TFPStringHashTable): string;
 begin
-  Result := PathState(AProjectRoot, APath, AExcludedPaths, False, nil);
+  Result := PathState(AProjectRoot, APath, AExcludedPaths, False, ADigests);
 end;
 
 { The first file whose entry differs between two directory listings, as a
@@ -850,7 +1010,8 @@ begin
 end;
 
 procedure AddPathArray(AFields: TStrings; const AProjectRoot, AName: string;
-  const APaths, AExcludedPaths: TStringArray);
+  const APaths, AExcludedPaths: TStringArray;
+  const ADigests: TFPStringHashTable);
 var
   i: Integer;
 begin
@@ -859,7 +1020,158 @@ begin
   begin
     AddField(AFields, AName + '.' + IntToStr(i) + '.path', APaths[i]);
     AddField(AFields, AName + '.' + IntToStr(i) + '.content',
-      PathFingerprint(AProjectRoot, APaths[i], AExcludedPaths));
+      PathFingerprint(AProjectRoot, APaths[i], AExcludedPaths, ADigests));
+  end;
+end;
+
+procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
+  const AArguments: array of string; var APaths: TStringArray);
+var
+  Options, ReadFiles: TStringArray;
+
+  { FPC's RemoveSep: spaces, tabs and commas around a line are not part of
+    it. }
+  function WithoutSeparators(const ALine: string): string;
+  var
+    First, Last: Integer;
+  begin
+    First := 1;
+    while (First <= Length(ALine)) and (ALine[First] in [',', ' ', #9]) do
+      Inc(First);
+    Last := Length(ALine);
+    while (Last >= First) and (ALine[Last] in [',', ' ', #9]) do Dec(Last);
+    Result := Copy(ALine, First, Last - First + 1);
+  end;
+
+  procedure AddOption(const AOption: string);
+  begin
+    SetLength(Options, Length(Options) + 1);
+    Options[High(Options)] := AOption;
+  end;
+
+  { FPC's Interpret_file. Directives other than #INCLUDE only select which
+    lines apply, so every line counts: that names every directory any of
+    them could select. }
+  procedure ReadFile(const APath: string);
+  var
+    Content, Directive, Line: string;
+    Lines: TStringList;
+    i, Position: Integer;
+  begin
+    if APath = '' then Exit;
+    { Reading each file once ends a file that includes itself. }
+    for i := 0 to High(ReadFiles) do
+      if SamePath(RootedPath(AProjectRoot, ReadFiles[i]),
+           RootedPath(AProjectRoot, APath)) then Exit;
+    SetLength(ReadFiles, Length(ReadFiles) + 1);
+    ReadFiles[High(ReadFiles)] := APath;
+    SetLength(APaths, Length(APaths) + 1);
+    APaths[High(APaths)] := APath;
+    { A file that cannot be read, or is not a regular file, names nothing
+      more; the path appended above stands for its state. }
+    try
+      CaptureInputFile(AProjectRoot, APath, Content);
+    except
+      on E: ELWPTError do Content := '';
+    end;
+    Lines := TStringList.Create;
+    try
+      Lines.Text := Content;
+      for i := 0 to Lines.Count - 1 do
+      begin
+        Line := WithoutSeparators(Lines[i]);
+        if Line = '' then Continue;
+        if Line[1] = '-' then AddOption(Line)
+        else if Line[1] = '#' then
+        begin
+          Position := 2;
+          while (Position <= Length(Line))
+                and (Line[Position] in ['a'..'z', 'A'..'Z', '0'..'9', '_',
+                  '-']) do
+            Inc(Position);
+          Directive := UpperCase(Copy(Line, 2, Position - 2));
+          if Directive = 'INCLUDE' then
+            ReadFile(Trim(Copy(Line, Position + 1, MaxInt)));
+        end;
+        { ";" starts a comment, and FPC refuses a nested "@file". }
+      end;
+    finally
+      Lines.Free;
+    end;
+  end;
+
+var
+  i: Integer;
+begin
+  SetLength(Options, 0);
+  SetLength(ReadFiles, 0);
+  for i := 0 to High(AArguments) do
+    if (Length(AArguments[i]) > 1) and (AArguments[i][1] = '@') then
+      ReadFile(Copy(AArguments[i], 2, MaxInt))
+    else
+      AddOption(AArguments[i]);
+  AppendCompilerSearchDirectories(Options, APaths);
+end;
+
+{ What the compile's arguments make the compiler read beyond the request's
+  unit and include paths, which the fingerprints hash already: the inputs
+  AppendCompilerArgumentInputs finds in the compiler arguments, which carry
+  the cfg (expanded or as "@file") and the compiler profile's arguments, and
+  in the request's extra arguments ([build] or [test] flags), which a driver
+  may pass outside its argument list. Each path appears once, in the order
+  the arguments name it. }
+function CompilerArgumentInputs(const AProjectRoot: string;
+  const ARequest: TLWPTBuildPublicationRequest): TStringArray;
+var
+  Arguments, Found: TStringArray;
+  Known: TStringList;
+  i: Integer;
+
+  function Remember(const APath: string): Boolean;
+  var
+    Key: string;
+  begin
+    Key := ExcludeTrailingPathDelimiter(RootedPath(AProjectRoot, APath));
+    Result := (Key <> '') and (Known.IndexOf(Key) < 0);
+    if Result then Known.Add(Key);
+  end;
+
+begin
+  SetLength(Result, 0);
+  SetLength(Arguments, 0);
+  for i := 0 to High(ARequest.CompilerArguments) do
+  begin
+    SetLength(Arguments, Length(Arguments) + 1);
+    Arguments[High(Arguments)] := ARequest.CompilerArguments[i];
+  end;
+  for i := 0 to High(ARequest.BuildRequest.Inputs.ExtraArguments) do
+  begin
+    SetLength(Arguments, Length(Arguments) + 1);
+    Arguments[High(Arguments)] :=
+      ARequest.BuildRequest.Inputs.ExtraArguments[i];
+  end;
+  SetLength(Found, 0);
+  AppendCompilerArgumentInputs(AProjectRoot, Arguments, Found);
+  Known := TStringList.Create;
+  try
+    {$IFDEF MSWINDOWS}
+    Known.CaseSensitive := False;
+    {$ELSE}
+    Known.CaseSensitive := True;
+    {$ENDIF}
+    Known.Sorted := True;
+    for i := 0 to High(ARequest.BuildRequest.Inputs.UnitPaths) do
+      Remember(ARequest.BuildRequest.Inputs.UnitPaths[i]);
+    for i := 0 to High(ARequest.BuildRequest.Inputs.IncludePaths) do
+      Remember(ARequest.BuildRequest.Inputs.IncludePaths[i]);
+    for i := 0 to High(Found) do
+      if Remember(Found[i]) then
+      begin
+        SetLength(Result, Length(Result) + 1);
+        Result[High(Result)] := Found[i];
+      end;
+  finally
+    Known.Free;
   end;
 end;
 
@@ -878,11 +1190,13 @@ function CaptureBuildPublicationFingerprint(
   AModulesPath: string;
   const ARequest: TLWPTBuildPublicationRequest): string;
 var
+  Digests: TFPStringHashTable;
   Fields: TStringList;
   EmptyPaths: TStringArray;
   ManifestFingerprint, SourceDirectory: string;
 begin
   SetLength(EmptyPaths, 0);
+  Digests := TFPStringHashTable.Create;
   Fields := TStringList.Create;
   try
     AddField(Fields, 'schema',
@@ -894,49 +1208,57 @@ begin
     AddStringArray(Fields, 'compiler.arguments', ARequest.CompilerArguments);
     AddField(Fields, 'manifest.parsed-hash', ARequest.ManifestContentHash);
     AddPathArray(Fields, AProjectRoot, 'sources',
-      ARequest.BuildRequest.Inputs.Sources, EmptyPaths);
+      ARequest.BuildRequest.Inputs.Sources, EmptyPaths, Digests);
     SourceDirectory := ExtractFileDir(
       RootedPath(AProjectRoot, ARequest.BuildRequest.Inputs.EntryPoint));
     AddField(Fields, 'source-directory', SourceDirectory);
     AddField(Fields, 'source-directory.content',
       PathFingerprint(AProjectRoot, SourceDirectory,
-        ARequest.ExcludedPaths));
+        ARequest.ExcludedPaths, Digests));
     AddField(Fields, 'output', ARequest.PublicOutput);
     AddField(Fields, 'output.previous',
-      PathFingerprint(AProjectRoot, ARequest.PublicOutput, EmptyPaths));
+      PathFingerprint(AProjectRoot, ARequest.PublicOutput, EmptyPaths,
+        Digests));
     AddStringArray(Fields, 'environment', ARequest.Environment);
     AddStringArray(Fields, 'excluded-paths', ARequest.ExcludedPaths);
     AddPathArray(Fields, AProjectRoot, 'unit-paths',
-      ARequest.BuildRequest.Inputs.UnitPaths, ARequest.ExcludedPaths);
+      ARequest.BuildRequest.Inputs.UnitPaths, ARequest.ExcludedPaths,
+      Digests);
     AddPathArray(Fields, AProjectRoot, 'include-paths',
-      ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths);
+      ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths,
+      Digests);
+    AddPathArray(Fields, AProjectRoot, 'compiler-search-inputs',
+      CompilerArgumentInputs(AProjectRoot, ARequest), ARequest.ExcludedPaths,
+      Digests);
     AddPathArray(Fields, AProjectRoot, 'workspace-paths',
-      ARequest.WorkspacePaths, ARequest.ExcludedPaths);
+      ARequest.WorkspacePaths, ARequest.ExcludedPaths, Digests);
     AddPathArray(Fields, AProjectRoot, 'prerequisite-outputs',
-      ARequest.PrerequisiteOutputs, EmptyPaths);
+      ARequest.PrerequisiteOutputs, EmptyPaths, Digests);
     AddPathArray(Fields, AProjectRoot, 'resources',
-      ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths);
+      ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths,
+      Digests);
     AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);
     AddPathArray(Fields, AProjectRoot, 'hook-inputs',
-      ARequest.HookInputs, ARequest.ExcludedPaths);
+      ARequest.HookInputs, ARequest.ExcludedPaths, Digests);
     ManifestFingerprint := PathFingerprint(
-      AProjectRoot, AManifestPath, EmptyPaths);
+      AProjectRoot, AManifestPath, EmptyPaths, Digests);
     if ManifestFingerprint <> 'file:' + ARequest.ManifestContentHash then
       raise ELWPTParsedManifestChanged.Create(
         'manifest changed after it was parsed');
     AddField(Fields, 'manifest', ManifestFingerprint);
     AddField(Fields, 'cfg',
-      PathFingerprint(AProjectRoot, ACfgPath, EmptyPaths));
+      PathFingerprint(AProjectRoot, ACfgPath, EmptyPaths, Digests));
     AddField(Fields, 'lock',
-      PathFingerprint(AProjectRoot, ALockPath, EmptyPaths));
+      PathFingerprint(AProjectRoot, ALockPath, EmptyPaths, Digests));
     AddField(Fields, 'modules', PathFingerprint(AProjectRoot, AModulesPath,
-      ARequest.ExcludedPaths));
+      ARequest.ExcludedPaths, Digests));
     { Same invariant as InputDirectoryListing: the fold separator is
       pinned, never inherited from the platform. }
     Fields.LineBreak := #10;
     Result := TextHash(Fields.Text);
   finally
     Fields.Free;
+    Digests.Free;
   end;
 end;
 
@@ -963,8 +1285,10 @@ var
   Fields: TStringList;
   ManifestFingerprint, SourceDirectory: string;
   NeutralRequest: TLWPTBuildRequest;
+  Digests: TFPStringHashTable;
 begin
   SetLength(EmptyPaths, 0);
+  Digests := TFPStringHashTable.Create;
   Fields := TStringList.Create;
   try
     if AOperation = '' then
@@ -980,9 +1304,9 @@ begin
     AddStringArray(Fields, 'compiler.arguments', ARequest.CompilerArguments);
     AddField(Fields, 'manifest.parsed-hash', ARequest.ManifestContentHash);
     AddPathArray(Fields, AProjectRoot, 'sources',
-      ARequest.BuildRequest.Inputs.Sources, EmptyPaths);
+      ARequest.BuildRequest.Inputs.Sources, EmptyPaths, Digests);
     AddPathArray(Fields, AProjectRoot, 'compiler-implicit-inputs',
-      ARequest.CompilerImplicitInputs, ARequest.ExcludedPaths);
+      ARequest.CompilerImplicitInputs, ARequest.ExcludedPaths, Digests);
     { Cache identity must survive an equivalent checkout at another absolute
       path. Content is still read relative to the concrete project root. }
     SourceDirectory := ExtractFileDir(
@@ -990,38 +1314,45 @@ begin
     AddField(Fields, 'source-directory', SourceDirectory);
     AddField(Fields, 'source-directory.content',
       PathFingerprint(AProjectRoot, SourceDirectory,
-        ARequest.ExcludedPaths));
+        ARequest.ExcludedPaths, Digests));
     AddField(Fields, 'output', ARequest.PublicOutput);
     AddStringArray(Fields, 'environment', ARequest.Environment);
     AddPathArray(Fields, AProjectRoot, 'unit-paths',
-      ARequest.BuildRequest.Inputs.UnitPaths, ARequest.ExcludedPaths);
+      ARequest.BuildRequest.Inputs.UnitPaths, ARequest.ExcludedPaths,
+      Digests);
     AddPathArray(Fields, AProjectRoot, 'include-paths',
-      ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths);
+      ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths,
+      Digests);
+    AddPathArray(Fields, AProjectRoot, 'compiler-search-inputs',
+      CompilerArgumentInputs(AProjectRoot, ARequest), ARequest.ExcludedPaths,
+      Digests);
     AddPathArray(Fields, AProjectRoot, 'workspace-paths',
-      ARequest.WorkspacePaths, ARequest.ExcludedPaths);
+      ARequest.WorkspacePaths, ARequest.ExcludedPaths, Digests);
     AddPathArray(Fields, AProjectRoot, 'prerequisite-outputs',
-      ARequest.PrerequisiteOutputs, EmptyPaths);
+      ARequest.PrerequisiteOutputs, EmptyPaths, Digests);
     AddPathArray(Fields, AProjectRoot, 'resources',
-      ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths);
+      ARequest.BuildRequest.Inputs.Resources, ARequest.ExcludedPaths,
+      Digests);
     AddStringArray(Fields, 'hook-definition', ARequest.HookDefinition);
     AddPathArray(Fields, AProjectRoot, 'hook-inputs',
-      ARequest.HookInputs, ARequest.ExcludedPaths);
+      ARequest.HookInputs, ARequest.ExcludedPaths, Digests);
     ManifestFingerprint := PathFingerprint(
-      AProjectRoot, AManifestPath, EmptyPaths);
+      AProjectRoot, AManifestPath, EmptyPaths, Digests);
     if ManifestFingerprint <> 'file:' + ARequest.ManifestContentHash then
       raise ELWPTParsedManifestChanged.Create(
         'manifest changed after it was parsed');
     AddField(Fields, 'manifest', ManifestFingerprint);
     AddField(Fields, 'cfg',
-      PathFingerprint(AProjectRoot, ACfgPath, EmptyPaths));
+      PathFingerprint(AProjectRoot, ACfgPath, EmptyPaths, Digests));
     AddField(Fields, 'lock',
-      PathFingerprint(AProjectRoot, ALockPath, EmptyPaths));
+      PathFingerprint(AProjectRoot, ALockPath, EmptyPaths, Digests));
     AddField(Fields, 'modules', PathFingerprint(AProjectRoot, AModulesPath,
-      ARequest.ExcludedPaths));
+      ARequest.ExcludedPaths, Digests));
     Fields.LineBreak := #10;
     Result := TextHash(Fields.Text);
   finally
     Fields.Free;
+    Digests.Free;
   end;
 end;
 

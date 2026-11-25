@@ -595,7 +595,7 @@ begin
       FCacheContext.ConfigurationPath, ConfigurationContent);
     CollectOptions(ConfigurationContent);
     SetLength(Directories, 0);
-    AppendCompilerSearchDirectories(Options, Directories);
+    AppendCompilerArgumentInputs(FProjectRoot, Options, Directories);
     SetLength(Paths, 0);
     AddPath(FCacheContext.ManifestPath);
     AddPath(FCacheContext.ConfigurationPath);

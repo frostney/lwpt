@@ -56,6 +56,7 @@ type
     procedure TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment;
     procedure TestCacheFingerprintCoversPrerequisiteOutputs;
     procedure TestCacheFingerprintSeparatesOperationIdentity;
+    procedure TestFingerprintsCoverArgumentSearchInputs;
     procedure TestPublicationLockUsesSessionsRoot;
     procedure TestInputSnapshotNamesChangedFiles;
     procedure TestCaptureInputFileMatchesSnapshot;
@@ -63,6 +64,7 @@ type
     procedure TestCaptureInputFileRefusesSpecialFiles;
     procedure TestInputSnapshotRecordsUnreadableFiles;
     procedure TestInputSnapshotNeverOpensSpecialFiles;
+    procedure TestFingerprintsNeverOpenSpecialFiles;
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
     procedure TestDirectoryAliasesHaveDeterministicFingerprint;
     procedure TestPublicationLockUsesFilesystemIdentity;
@@ -93,19 +95,36 @@ type
     {$ENDIF}
   end;
 
+type
+  { AppendCompilerSearchDirectories against FPC 3.2's own search-path
+    resolution (TSearchPathList.AddLibraryPath in compiler/cfileutl.pas). }
+  TCompilerSearchDirectoryTests = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestEachSearchOptionNamesItsDirectories;
+    procedure TestEqualsPrefixIsRelativeToEmptySysroot;
+    procedure TestLibraryEqualsPrefixFollowsEverySysroot;
+    procedure TestQuotedWildcardAndMacroEntries;
+    procedure TestPathSeparatorSplitsEntries;
+  end;
+
+
 const
   HOLD_SESSION_SWITCH = '--hold-build-session';
   HOLD_SESSION_PROGRAM = 'held-program';
   HOLD_WAIT_MILLISECONDS = 60000;
   { Runs one input scan in a child process (see RunScanHelper):
-    "snapshot <root> <path>..." takes a snapshot and rechecks it, and
-    "capture <root> <path>" reads one file through CaptureInputFile. }
+    "snapshot <root> <path>..." takes a snapshot and rechecks it,
+    "capture <root> <path>" reads one file through CaptureInputFile, and
+    "fingerprint <root> <argument>..." takes the cache and publication
+    fingerprints of source/app.pas with those compiler arguments twice. }
   SCAN_HELPER_ARGUMENT = '--input-scan-helper';
 
 procedure RunScanHelperMode;
 var
   Content, Outcome: string;
   Paths: TStringArray;
+  Request: TLWPTBuildPublicationRequest;
   Snapshot: TLWPTInputSnapshot;
   i: Integer;
 begin
@@ -116,6 +135,38 @@ begin
     begin
       Outcome := CaptureInputFile(ParamStr(3), ParamStr(4), Content);
       WriteLn('state=', Outcome);
+    end
+    else if ParamStr(2) = 'fingerprint' then
+    begin
+      Request := Default(TLWPTBuildPublicationRequest);
+      Request.BuildRequest := DefaultBuildRequest;
+      Request.BuildRequest.Compiler.ID := 'test-compiler';
+      Request.BuildRequest.Compiler.VersionIdentity := '1.0.0';
+      Request.BuildRequest.Target.OS := 'test-os';
+      Request.BuildRequest.Target.Architecture := 'test-arch';
+      Request.BuildRequest.Inputs.EntryPoint := 'source/app.pas';
+      SetLength(Request.BuildRequest.Inputs.Sources, 1);
+      Request.BuildRequest.Inputs.Sources[0] := 'source/app.pas';
+      Request.BuildRequest.OutputKind := BUILD_OUTPUT_EXECUTABLE;
+      Request.BuildRequest.Mode := BUILD_MODE_DEV;
+      Request.BuildRequest.Outputs.Artifact := 'candidate/app';
+      Request.ManifestContentHash := SHA256File(
+        IncludeTrailingPathDelimiter(ParamStr(3)) + MANIFEST_FILE);
+      Request.PublicOutput := 'build/app';
+      SetLength(Request.CompilerArguments, ParamCount - 3);
+      for i := 4 to ParamCount do
+        Request.CompilerArguments[i - 4] := ParamStr(i);
+      Outcome := CaptureBuildCacheFingerprint(ParamStr(3), MANIFEST_FILE,
+        CFG_FILE, LOCKFILE, MODULES_DIR, Request)
+        + CaptureBuildPublicationFingerprint(ParamStr(3), MANIFEST_FILE,
+          CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+      if Outcome = CaptureBuildCacheFingerprint(ParamStr(3), MANIFEST_FILE,
+           CFG_FILE, LOCKFILE, MODULES_DIR, Request)
+         + CaptureBuildPublicationFingerprint(ParamStr(3), MANIFEST_FILE,
+           CFG_FILE, LOCKFILE, MODULES_DIR, Request) then
+        WriteLn('fingerprint=stable')
+      else
+        WriteLn('fingerprint=unstable');
     end
     else
     begin
@@ -514,6 +565,31 @@ begin
     .ToBe(ExpandFileName(FScratch + '/source') + PathDelim + 'app.pas');
 end;
 
+procedure TLWPTBuildSessionTests.TestFingerprintsNeverOpenSpecialFiles;
+var
+  Output: string;
+  TimedOut: Boolean;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  { FIFOs with no writer where the fingerprints read: in the source
+    directory, as the cfg file, as a response file and in a search
+    directory that a response file names. A blocking open would hang, so
+    the fingerprints are taken in a helper process that the deadline
+    kills; they record each FIFO by type, the same way every time. }
+  Expect<Integer>(FpMkfifo(FScratch + '/source/pipe', &600)).ToBe(0);
+  Expect<Integer>(FpMkfifo(FScratch + '/' + CFG_FILE, &600)).ToBe(0);
+  Expect<Integer>(FpMkfifo(FScratch + '/pipe.rsp', &600)).ToBe(0);
+  WriteText(FScratch + '/named.rsp', '-Fiincs'#10);
+  ForceDirectories(FScratch + '/incs');
+  Expect<Integer>(FpMkfifo(FScratch + '/incs/Value.inc', &600)).ToBe(0);
+  Output := RunScanHelper(['fingerprint', FScratch, '@pipe.rsp',
+    '@named.rsp'], TimedOut);
+  if TimedOut then Fail('a fingerprint blocked opening a FIFO');
+  Expect<string>(Output).ToBe('fingerprint=stable');
+end;
+
 procedure TLWPTBuildSessionTests.TestCaptureInputFileRefusesSpecialFiles;
 var
   Output: string;
@@ -546,6 +622,81 @@ begin
     BUILD_CACHE_OPERATION_TEST_PROGRAM);
 
   Expect<Boolean>(TestFingerprint <> BuildFingerprint).ToBe(True);
+end;
+
+procedure TLWPTBuildSessionTests.TestFingerprintsCoverArgumentSearchInputs;
+
+  procedure ExpectChanged(const ABaseline: array of string; const AChanged: Boolean;
+    const AWhat: string; const ARequest: TLWPTBuildPublicationRequest);
+  var
+    Cache, Publication: string;
+  begin
+    Cache := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE, CFG_FILE,
+      LOCKFILE, MODULES_DIR, ARequest);
+    Publication := CaptureBuildPublicationFingerprint(FScratch,
+      MANIFEST_FILE, CFG_FILE, LOCKFILE, MODULES_DIR, ARequest);
+    if (Cache <> ABaseline[0]) <> AChanged then
+      Fail('cache fingerprint after ' + AWhat + ': changed = '
+        + BoolToStr(Cache <> ABaseline[0], True));
+    if (Publication <> ABaseline[1]) <> AChanged then
+      Fail('publication fingerprint after ' + AWhat + ': changed = '
+        + BoolToStr(Publication <> ABaseline[1], True));
+    Expect<Boolean>(Cache <> ABaseline[0]).ToBe(AChanged);
+    Expect<Boolean>(Publication <> ABaseline[1]).ToBe(AChanged);
+  end;
+
+var
+  Baseline: array[0..1] of string;
+  Request: TLWPTBuildPublicationRequest;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  WriteText(FScratch + '/extra/Extra.pas', 'unit Extra; const V = 1;');
+  WriteText(FScratch + '/incs/Value.inc', 'const W = 1;');
+  WriteText(FScratch + '/libs/libvalue.a', 'first');
+  WriteText(FScratch + '/objs/value.o', 'first');
+  WriteText(FScratch + '/rsp/more.cfg', '; included file'#10'-Foobjs'#10);
+  WriteText(FScratch + '/compile.cfg', '; options file'#10'  -Fllibs,'#10
+    + '#INCLUDE rsp/more.cfg'#10);
+  Request := BasicRequest;
+  { Arguments as a driver passes them: an expanded cfg line, a profile
+    argument and a response file. The extra argument is a [build] or
+    [test] flag, which a driver may pass outside its argument list. }
+  SetLength(Request.CompilerArguments, 3);
+  Request.CompilerArguments[0] := '-Fusource';
+  Request.CompilerArguments[1] := '-Fiincs';
+  Request.CompilerArguments[2] := '@compile.cfg';
+  SetLength(Request.BuildRequest.Inputs.ExtraArguments, 1);
+  Request.BuildRequest.Inputs.ExtraArguments[0] := '-Fumissing;extra';
+  Baseline[0] := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Baseline[1] := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  ExpectChanged(Baseline, False, 'no change', Request);
+
+  WriteText(FScratch + '/extra/Extra.pas', 'unit Extra; const V = 2;');
+  ExpectChanged(Baseline, True, 'an extra-argument unit edit', Request);
+  WriteText(FScratch + '/extra/Extra.pas', 'unit Extra; const V = 1;');
+  ExpectChanged(Baseline, False, 'restoring the unit', Request);
+
+  WriteText(FScratch + '/incs/Value.inc', 'const W = 2;');
+  ExpectChanged(Baseline, True, 'an argument include edit', Request);
+  WriteText(FScratch + '/incs/Value.inc', 'const W = 1;');
+
+  WriteText(FScratch + '/libs/libvalue.a', 'second');
+  ExpectChanged(Baseline, True, 'a response-file library edit', Request);
+  WriteText(FScratch + '/libs/libvalue.a', 'first');
+
+  WriteText(FScratch + '/objs/value.o', 'second');
+  ExpectChanged(Baseline, True, 'an included file''s object edit', Request);
+  WriteText(FScratch + '/objs/value.o', 'first');
+
+  WriteText(FScratch + '/rsp/more.cfg', '; included file'#10'-Foobjs'#10
+    + '-dLATER'#10);
+  ExpectChanged(Baseline, True, 'an included file edit', Request);
+  WriteText(FScratch + '/rsp/more.cfg', '; included file'#10'-Foobjs'#10);
+  ExpectChanged(Baseline, False, 'restoring every file', Request);
 end;
 
 procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
@@ -1832,6 +1983,8 @@ begin
     TestCacheFingerprintCoversCompilerTargetInputsAndEnvironment);
   Test('cache fingerprints cover prerequisite outputs',
     TestCacheFingerprintCoversPrerequisiteOutputs);
+  Test('fingerprints cover search inputs that compiler arguments name',
+    TestFingerprintsCoverArgumentSearchInputs);
   Test('cache fingerprints separate build and test operations',
     TestCacheFingerprintSeparatesOperationIdentity);
   Test('publication locks use the resolved sessions root',
@@ -1847,6 +2000,8 @@ begin
     TestInputSnapshotRecordsUnreadableFiles);
   Test('input snapshots never open special files',
     TestInputSnapshotNeverOpensSpecialFiles);
+  Test('fingerprints never open special files',
+    TestFingerprintsNeverOpenSpecialFiles);
   Test('symlinked search roots detect changes and terminate cycles',
     TestSymlinkedSearchRootChangeRefusesPublication);
   Test('directory aliases produce deterministic fingerprints',
@@ -1886,6 +2041,85 @@ begin
   {$ENDIF}
 end;
 
+{ The directories AOptions name, joined by "|". }
+function SearchDirectories(const AOptions: array of string): string;
+var
+  Directories: TStringArray;
+  i: Integer;
+begin
+  SetLength(Directories, 0);
+  AppendCompilerSearchDirectories(AOptions, Directories);
+  Result := '';
+  for i := 0 to High(Directories) do
+  begin
+    if i > 0 then Result := Result + '|';
+    Result := Result + Directories[i];
+  end;
+end;
+
+procedure TCompilerSearchDirectoryTests.TestEachSearchOptionNamesItsDirectories;
+begin
+  Expect<string>(SearchDirectories(['-Fuunits', '-Fiincs', '-Foobjs',
+    '-Fllibs', '-Iinc2', '-FEout', '-FUunitout', '-dDEBUG', '-Fu', '# -Fux']))
+    .ToBe('units|incs|objs|libs|inc2');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestEqualsPrefixIsRelativeToEmptySysroot;
+begin
+  { FPC passes an empty sysroot for every option but -Fl, so "=incs" is
+    "incs" and "=/abs" is "/abs", whatever -XR says. }
+  Expect<string>(SearchDirectories(['-XR/fpc-sysroot', '-Fi=incs',
+    '-Fu=/abs/units', '-I=inc2', '-Fo=objs']))
+    .ToBe('incs|/abs/units|inc2|objs');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestLibraryEqualsPrefixFollowsEverySysroot;
+begin
+  { -Fl prefixes the sysroot that the last -XR before it set; option order
+    across the cfg file, flags and profile arguments decides which one, so
+    every candidate is watched, the empty sysroot included. }
+  Expect<string>(SearchDirectories(['-Fl=/fn-lib', '-XR/fpc-sysroot',
+    '-XR/other-root', '-Flplain']))
+    .ToBe('/fpc-sysroot/fn-lib|/other-root/fn-lib|/fn-lib|plain');
+  Expect<string>(SearchDirectories(['-Fl=/fn-lib'])).ToBe('/fn-lib');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestQuotedWildcardAndMacroEntries;
+begin
+  { FPC removes Pascal quotes before it looks for "=", so a quoted entry
+    after "=" keeps its quotes. }
+  Expect<string>(SearchDirectories(['-Fi''quoted dir''', '-Fu"double"',
+    '-Fuextra/*/units', '-Fiextra/$FPCTARGET', '-Fu$FPCDIR/units',
+    '-Fi=''eq''', '-Fi''unterminated']))
+    .ToBe('quoted dir|double|"double"|extra/|extra/|.|''eq''|''unterminated');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestPathSeparatorSplitsEntries;
+begin
+  {$IFDEF MSWINDOWS}
+  Expect<string>(SearchDirectories(['-Fumissing;C:\units', '-Fi;incs']))
+    .ToBe('missing|C:\units|incs');
+  {$ELSE}
+  { FPC turns the platform path separator into ";" before it splits. }
+  Expect<string>(SearchDirectories(['-Fumissing;units:=incs', '-Fi;:incs']))
+    .ToBe('missing|units|incs|incs');
+  {$ENDIF}
+end;
+
+procedure TCompilerSearchDirectoryTests.SetupTests;
+begin
+  Test('each search option names its directories',
+    TestEachSearchOptionNamesItsDirectories);
+  Test('a leading "=" is relative to an empty sysroot outside -Fl',
+    TestEqualsPrefixIsRelativeToEmptySysroot);
+  Test('a leading "=" in -Fl follows every -XR sysroot',
+    TestLibraryEqualsPrefixFollowsEverySysroot);
+  Test('quoted, wildcard and macro entries name their fixed directory',
+    TestQuotedWildcardAndMacroEntries);
+  Test('the platform path separator splits entries',
+    TestPathSeparatorSplitsEntries);
+end;
+
 begin
   if (ParamCount >= 3) and (ParamStr(1) = SCAN_HELPER_ARGUMENT) then
     RunScanHelperMode;
@@ -1896,6 +2130,8 @@ begin
   end;
   TestRunnerProgram.AddSuite(TLWPTBuildSessionTests.Create(
     'build sessions and publication'));
+  TestRunnerProgram.AddSuite(TCompilerSearchDirectoryTests.Create(
+    'AppendCompilerSearchDirectories'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
