@@ -474,68 +474,157 @@ begin
   end;
 end;
 
+{ A regular file opened for reading, validated through the opened handle:
+  a FIFO, device or directory, even one swapped in after the path was
+  matched, is refused before any read. On Unix the descriptor is opened
+  without blocking and close-on-exec (through the spawn guard), so neither
+  a FIFO nor a concurrently started compiler can hold it. Reads keep errors
+  apart from end of file, which TStream.Read does not. }
+{$IFDEF MSWINDOWS}
+{ Declared here rather than through the Windows unit, whose names would
+  shadow SysUtils routines this unit calls. }
+function HookGetFileType(AHandle: THandle): LongWord; stdcall;
+  external 'kernel32' name 'GetFileType';
+
+const
+  HOOK_FILE_TYPE_DISK = 1;
+{$ENDIF}
+
+type
+  THookRegularFile = record
+    {$IFDEF UNIX}
+    Descriptor: LongInt;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    Stream: TLWPTProtectedFileStream;
+    {$ENDIF}
+  end;
+
+function OpenHookRegularFile(const APath: string;
+  out AFile: THookRegularFile): Boolean;
+{$IFDEF UNIX}
+var
+  Info: Stat;
+{$ENDIF}
+begin
+  Result := False;
+  {$IFDEF UNIX}
+  AFile.Descriptor := OpenProtectedDescriptor(APath, O_RDONLY or O_NONBLOCK,
+    0);
+  if AFile.Descriptor < 0 then Exit;
+  if (FpFStat(AFile.Descriptor, Info) <> 0)
+    or not FpS_ISREG(Info.st_mode) then
+  begin
+    FpClose(AFile.Descriptor);
+    Exit;
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  try
+    AFile.Stream := OpenProtectedFileStream(APath,
+      fmOpenRead or fmShareDenyNone);
+  except
+    on E: Exception do Exit;
+  end;
+  if HookGetFileType(AFile.Stream.Handle) <> HOOK_FILE_TYPE_DISK then
+  begin
+    FreeAndNil(AFile.Stream);
+    Exit;
+  end;
+  {$ENDIF}
+  Result := True;
+end;
+
+{ Bytes read, 0 at end of file, or -1 on a read error. }
+function ReadHookRegularFile(var AFile: THookRegularFile; var ABuffer;
+  const ACount: LongInt): LongInt;
+begin
+  {$IFDEF UNIX}
+  repeat
+    Result := FpRead(AFile.Descriptor, ABuffer, ACount);
+  until (Result >= 0) or (FpGetErrNo <> ESysEINTR);
+  if Result < 0 then Result := -1;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Result := FileRead(AFile.Stream.Handle, ABuffer, ACount);
+  if Result < 0 then Result := -1;
+  {$ENDIF}
+end;
+
+procedure CloseHookRegularFile(var AFile: THookRegularFile);
+begin
+  {$IFDEF UNIX}
+  FpClose(AFile.Descriptor);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  FreeAndNil(AFile.Stream);
+  {$ENDIF}
+end;
+
 { SHA-256 of a regular file's content, or '' when it is not a regular file
-  or any read fails: missing, unreadable, sharing-denied, or replaced since
-  it was matched. '' always means stale, so an unreadable input runs the
-  command and an unreadable output after a run only skips the record. On
-  Unix the file is opened without blocking and checked through the opened
-  descriptor, so a FIFO, even one swapped in after matching, cannot block
-  the gate. Read errors are kept distinct from end of file throughout,
-  which TStream.Read does not do. }
+  or any open or read fails. '' always means stale, so an unreadable input
+  runs the command and an unreadable output after a run only skips the
+  record. }
 function HookFileDigest(const APath: string): string;
 var
   Buffer: array[0..HOOK_DIGEST_BUFFER_BYTES - 1] of Byte;
   Context: TSHA256Context;
   Digest: TSHA256Digest;
-  Count: Int64;
-  {$IFDEF UNIX}
-  Descriptor: CInt;
-  Info: Stat;
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Stream: TLWPTProtectedFileStream;
-  {$ENDIF}
+  Count: LongInt;
+  HookFile: THookRegularFile;
 begin
   Result := '';
-  SHA256Init(Context);
-  {$IFDEF UNIX}
-  Descriptor := FpOpen(PChar(APath), O_RDONLY or O_NONBLOCK);
-  if Descriptor < 0 then Exit;
+  if not OpenHookRegularFile(APath, HookFile) then Exit;
   try
-    if (FpFStat(Descriptor, Info) <> 0)
-      or not FpS_ISREG(Info.st_mode) then Exit;
+    SHA256Init(Context);
     repeat
-      Count := FpRead(Descriptor, Buffer[0], SizeOf(Buffer));
-      if Count < 0 then
-      begin
-        if FpGetErrNo = ESysEINTR then Continue;
-        Exit;
-      end;
-      if Count > 0 then SHA256Update(Context, Buffer[0], Count);
-    until Count = 0;
-  finally
-    FpClose(Descriptor);
-  end;
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  if DirectoryExists(APath) then Exit;
-  try
-    Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
-  except
-    on E: Exception do Exit;
-  end;
-  try
-    repeat
-      Count := FileRead(Stream.Handle, Buffer[0], SizeOf(Buffer));
+      Count := ReadHookRegularFile(HookFile, Buffer[0], SizeOf(Buffer));
       if Count < 0 then Exit;
       if Count > 0 then SHA256Update(Context, Buffer[0], Count);
     until Count = 0;
+    SHA256Final(Context, Digest);
+    Result := SHA256DigestHex(Digest);
   finally
-    Stream.Free;
+    CloseHookRegularFile(HookFile);
   end;
-  {$ENDIF}
-  SHA256Final(Context, Digest);
-  Result := SHA256DigestHex(Digest);
+end;
+
+{ A regular file's whole content, for the small run records. }
+function ReadHookRegularText(const APath: string; out AText: string): Boolean;
+var
+  Buffer: array[0..HOOK_DIGEST_BUFFER_BYTES - 1] of Byte;
+  Count: LongInt;
+  HookFile: THookRegularFile;
+begin
+  Result := False;
+  AText := '';
+  if not OpenHookRegularFile(APath, HookFile) then Exit;
+  try
+    repeat
+      Count := ReadHookRegularFile(HookFile, Buffer[0], SizeOf(Buffer));
+      if Count < 0 then Exit;
+      if Count > 0 then AppendRawBytes(AText, Buffer[0], Count);
+    until Count = 0;
+    Result := True;
+  finally
+    CloseHookRegularFile(HookFile);
+  end;
+end;
+
+{ A collected input's path relative to the project root, in the record's
+  spelling. Collected paths start with the root, so on Unix the prefix is
+  stripped without reparsing the rest, where a backslash is an ordinary
+  filename character that ExtractRelativePath would treat as a separator. }
+function HookRelativeInputPath(const AProjectRoot, APath: string): string;
+var
+  Prefix: string;
+begin
+  Prefix := IncludeTrailingPathDelimiter(AProjectRoot);
+  if Copy(APath, 1, Length(Prefix)) = Prefix then
+    Result := Copy(APath, Length(Prefix) + 1, MaxInt)
+  else
+    Result := ExtractRelativePath(Prefix, APath);
+  Result := HookRecordPath(Result);
 end;
 
 { The files AHook's input expressions match, sorted and case-sensitive,
@@ -578,8 +667,7 @@ begin
     begin
       Content := HookFileDigest(AFiles[i]);
       if Content = '' then Exit;
-      Relative := HookRecordPath(ExtractRelativePath(
-        IncludeTrailingPathDelimiter(AProjectRoot), AFiles[i]));
+      Relative := HookRelativeInputPath(AProjectRoot, AFiles[i]);
       Fields.Add(IntToStr(Length(Relative)) + ':' + Relative + '=' + Content);
     end;
     Fields.LineBreak := #10;
@@ -593,25 +681,16 @@ function ReadHookRunRecord(const APath: string; out ADefinition, AInputs,
   AOutput: string): Boolean;
 var
   Lines: TStringList;
-  {$IFDEF UNIX}
-  Info: Stat;
-  {$ENDIF}
+  Text: string;
 begin
   Result := False;
   ADefinition := '';
   AInputs := '';
   AOutput := '';
-  {$IFDEF UNIX}
-  if (FpStat(APath, Info) <> 0) or not FpS_ISREG(Info.st_mode) then Exit;
-  {$ENDIF}
-  if not LongPathFileExists(APath) then Exit;
+  if not ReadHookRegularText(APath, Text) then Exit;
   Lines := TStringList.Create;
   try
-    try
-      LoadProtectedStrings(Lines, APath);
-    except
-      on E: Exception do Exit;
-    end;
+    Lines.Text := Text;
     if (Lines.Count <> 4) or (Lines[0] <> HOOK_RUN_RECORD_SCHEMA) then Exit;
     ADefinition := Lines[1];
     AInputs := Lines[2];

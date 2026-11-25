@@ -25,6 +25,7 @@ uses
   LWPT.Core,
   LWPT.Manifest,
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.Scratch;
 
 const
@@ -359,74 +360,55 @@ begin
 end;
 
 {$IFDEF UNIX}
-type
-  { Runs the gate off the test's thread, so a gate that blocked on a FIFO
-    fails the test instead of hanging the suite. }
-  TStaleCheckThread = class(TThread)
-  private
-    FHook: THook;
-    FRoot: string;
-  public
-    Stale: Boolean;
-    constructor Create(const AHook: THook; const ARoot: string);
-    procedure Execute; override;
-  end;
+const
+  FifoGateChildOption = '--hook-staleness-fifo-gate-child';
 
-constructor TStaleCheckThread.Create(const AHook: THook; const ARoot: string);
+function FifoGateHook: THook;
 begin
-  FHook := AHook;
-  FRoot := ARoot;
-  Stale := False;
-  inherited Create(False);
+  Result := Default(THook);
+  Result.Name := 'gen';
+  SetLength(Result.Inputs, 2);
+  Result.Inputs[0] := 'lwpt.toml';
+  Result.Inputs[1] := 'pipes/*';
+  Result.Output := OutputName;
 end;
 
-procedure TStaleCheckThread.Execute;
+{ The gate run in a child: exit 0 when it reports stale with no input
+  digest, 2 otherwise. A gate that blocked on the FIFO never exits, and the
+  parent's deadline ends it. }
+function RunFifoGateChild(const ARoot: string): Integer;
+var
+  InputDigest: string;
 begin
-  Stale := HookIsStale(FHook, FRoot);
+  if HookIsStale(FifoGateHook, ARoot, InputDigest)
+    and (InputDigest = '') then
+    Result := 0
+  else
+    Result := 2;
 end;
 
-{ A matched FIFO is never opened for reading in a way that blocks, so it
-  cannot stall the gate; it cannot be hashed, so the hook is stale. The run
-  is recorded fresh with the same declaration first, so only the FIFO can
-  make it stale. }
+{ A matched FIFO cannot block the gate and cannot be hashed: the gate
+  reports stale with no input digest. The digest check catches a gate
+  that read the FIFO as an empty file, and the child's deadline catches
+  one that blocked. }
 procedure THookStalenessTests.TestFifoInputIsStaleWithoutBlocking;
 const
-  GateDeadlineMilliseconds = 10000;
+  GateDeadlineMilliseconds = 15000;
 var
-  Checker: TStaleCheckThread;
-  FifoPath: string;
-  StartedAt: QWord;
-  Unblock: CInt;
-  Hook: THook;
+  ExitCode: Integer;
+  FifoPath, Output: string;
 begin
-  Hook := GatedHook(['lwpt.toml', 'pipes/*']);
   WriteStamped(OutputName, OutputNanoseconds);
   WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
-  WriteStamped('pipes/plain.txt', OlderSeconds, OlderNanoseconds);
-  RecordRun(Hook);
-  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  ForceDirectories(IncludeTrailingPathDelimiter(FRoot) + 'pipes');
   FifoPath := IncludeTrailingPathDelimiter(FRoot) + 'pipes/input.fifo';
   Expect<Integer>(FpMkfifo(FifoPath, &600)).ToBe(0);
   SetFileModificationTime(FifoPath, OlderSeconds, OlderNanoseconds);
-  Checker := TStaleCheckThread.Create(Hook, FRoot);
-  try
-    StartedAt := GetTickCount64;
-    while not Checker.Finished
-      and (GetTickCount64 - StartedAt < GateDeadlineMilliseconds) do
-      Sleep(10);
-    if not Checker.Finished then
-    begin
-      { Release a reader blocked in open so the thread can finish. }
-      Unblock := FpOpen(PChar(FifoPath), O_WRONLY or O_NONBLOCK);
-      if Unblock >= 0 then FpClose(Unblock);
-    end;
-    Expect<Boolean>(Checker.Finished).ToBe(True);
-    Checker.WaitFor;
-    Expect<Boolean>(Checker.Stale).ToBe(True);
-  finally
-    Checker.Free;
-  end;
+  ExitCode := RunChildCommand(FRoot, ExpandFileName(ParamStr(0)),
+    [FifoGateChildOption, FRoot], Output, GateDeadlineMilliseconds);
+  Expect<Integer>(ExitCode).ToBe(0);
 end;
+
 {$ENDIF}
 
 { Registered where the filesystem tells Foo.pas from foo.pas. Both are
@@ -504,7 +486,7 @@ begin
   Test('an output that cannot be read after the run leaves no record',
     TestUnreadableOutputSkipsRecord);
   {$IFDEF UNIX}
-  Test('a matched FIFO is stale and never opened',
+  Test('a matched FIFO is stale, unhashed and never blocks the gate',
     TestFifoInputIsStaleWithoutBlocking);
   {$ENDIF}
   if FilesystemIsCaseSensitive then
@@ -523,6 +505,10 @@ begin
 end;
 
 begin
+  {$IFDEF UNIX}
+  if (ParamCount >= 2) and (ParamStr(1) = FifoGateChildOption) then
+    Halt(RunFifoGateChild(ParamStr(2)));
+  {$ENDIF}
   TestRunnerProgram.AddSuite(THookStalenessTests.Create('HookIsStale'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
