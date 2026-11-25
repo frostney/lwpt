@@ -548,24 +548,33 @@ records the content of every path a selected program's compile can read: the
 paths the test cache fingerprint covers (manifest, cfg, lockfile, installed
 modules, unit, include, and workspace paths, `LWPT_FPC_UNIT_PATHS`,
 project-root files, and each selected program's source file and directory),
-plus the unit, include, object, and library directories that `[test]` flags
-name, with session staging and declared build outputs excluded, each hashed
-once. A file that appears at the project root also counts as a change.
+plus the unit, include, object, and library directories that the cfg file or
+`[test]` flags name. A search path that lists several directories is split at
+`;`, and a wildcard entry is watched through its fixed leading directory.
+Session staging and declared build outputs, including outputs at the project
+root, are excluded, and each path is hashed once. A file that appears at the
+project root also counts as a change.
+
 Every program checks that record again after its executable exists, compiled
-or reused, and before it runs, and also when its compile fails. If anything
-changed, that program is reported as `VOID` with the first changed file, every
-other program still running or not yet started is cancelled, and the command
-exits 1 with `run void: compiler inputs changed after it started (<path>)` in
-its summary. One invocation therefore never reports results from two source
-states, and a compile that read a half-edited file is reported as void rather
-than as a compile failure. Content decides, not timestamps: rewriting a file
-with identical bytes does not void the run, and a file LWPT cannot read is
-recorded by its size and modification time. Nothing that runs during the
-invocation may write into those inputs: not a test program (into its own
-source directory, for example), and not the compiler or an external profile's
-driver (into a project-root file, for example). Write scratch and state files
-to a temporary directory or a subdirectory that is not an input. `lwpt build` has no such check,
-because its prebuild hooks may generate inputs between entries.
+or reused, and before it runs, and also when its compile or compile
+preparation fails. If anything changed, that program is reported as `VOID`
+with the first changed file, every other program still running or not yet
+started is cancelled, and the command exits 1 with
+`run void: compiler inputs changed after it started (<path>)` in its summary.
+A compile that read a half-edited file is therefore reported as void rather
+than as a compile failure, and no run reports programs compiled from
+different contents that were visible at the checks. Content decides, not
+timestamps: rewriting a file with identical bytes does not void the run, and
+an edit that is undone before the next check is not seen. A file LWPT cannot
+read is recorded by its size and modification time, and a file that is not a
+regular file, such as a FIFO, is recorded by its type without being opened.
+
+Nothing that runs during the invocation may write into those inputs: not a
+test program (into its own source directory, for example), and not the
+compiler or an external profile's driver (into a project-root file, for
+example). Write scratch and state files to a temporary directory or a
+subdirectory that is not an input. `lwpt build` has no such check, because
+its prebuild hooks may generate inputs between entries.
 
 LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](../adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`, and a `[pretest]` `lwpt-testing` hook that runs `./build/lwpt build lwpt-testing` so the test-flavoured binary is current before any test program spawns it ([ADR-0044](../adr/0044-test-seams-only-in-test-builds.md)).
 

@@ -44,6 +44,8 @@ type
     procedure TestNewProjectRootFileVoidsRun;
     procedure TestRootLevelProgramDoesNotWatchWholeProject;
     procedure TestFlagSearchDirectoryEditVoidsRun;
+    procedure TestConfigurationIncludeDirectoryEditVoidsRun;
+    procedure TestDeclaredRootOutputsDoNotVoidRun;
   end;
 
 function PascalString(const AValue: string): string;
@@ -103,7 +105,6 @@ begin
     + 'begin'#10
     + '  Lines := TStringList.Create;'#10
     + '  try'#10
-    + '    Lines.LineBreak := #10;'#10
     + '    Lines.Text := ' + PascalString(AEditedShared) + ';'#10
     + '    Lines.SaveToFile('
     + PascalString(AProjectRoot + '/' + AEditedPath) + ');'#10
@@ -287,25 +288,116 @@ var
   Run: TLwptResult;
 begin
   ProjectRoot := FScratch + '/flag-search-directory';
-  { A unit directory that only a [test] flag names is a compiler input. }
+  { A unit directory that only a [test] flag names is a compiler input, also
+    when the flag lists several directories and uses a wildcard. }
   WriteProject(ProjectRoot, SHARED_ONE,
     'unit Extra; interface const W = 2; implementation end.',
-    'extra/Extra.pas');
-  WriteTextFile(ProjectRoot + '/extra/Extra.pas',
+    'extra/one/Extra.pas');
+  WriteTextFile(ProjectRoot + '/extra/one/Extra.pas',
     'unit Extra; interface const W = 1; implementation end.'#10);
+  WriteTextFile(ProjectRoot + '/tests/B.Test.pas',
+      'program B;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, Extra;'#10
+    + 'begin'#10
+    + '  WriteLn(''B W='', W);'#10
+    + MarkerStatements(MarkerPath(ProjectRoot, 'b-ran'))
+    + 'end.'#10);
   WriteTextFile(ProjectRoot + '/lwpt.toml',
       '[package]'#10
     + 'name = "test-input-change-fixture"'#10
     + 'version = "0.0.0"'#10
     + 'units = ["source"]'#10
     + '[test]'#10
-    + 'flags = ["-Fuextra"]'#10);
+    + 'flags = ["-Fumissing;extra/*"]'#10);
   Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
     Environment(FScratch + '/flag-search-directory-cache'));
   RequireExit('flag search directory run', Run, 1);
   Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
-    + 'changed after this test run started (extra/Extra.pas)', Run.Stdout))
+    + 'changed after this test run started (extra/one/Extra.pas)',
+    Run.Stdout)).ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'b-ran'))).ToBe(False);
+end;
+
+procedure TTestInputChange.TestConfigurationIncludeDirectoryEditVoidsRun;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/cfg-include-directory';
+  { An include directory that only the compiler configuration file names
+    is a compiler input. }
+  WriteProject(ProjectRoot, SHARED_ONE, 'const W = 2;', 'incs/Value.inc');
+  WriteTextFile(ProjectRoot + '/incs/Value.inc', 'const W = 1;'#10);
+  WriteTextFile(ProjectRoot + '/custom.cfg', '-Fiincs'#10);
+  WriteTextFile(ProjectRoot + '/tests/B.Test.pas',
+      'program B;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes;'#10
+    + '{$I Value.inc}'#10
+    + 'begin'#10
+    + '  WriteLn(''B W='', W);'#10
+    + MarkerStatements(MarkerPath(ProjectRoot, 'b-ran'))
+    + 'end.'#10);
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "test-input-change-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + '[lwpt]'#10
+    + 'cfg-file = "custom.cfg"'#10);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/cfg-include-directory-cache'));
+  RequireExit('configuration include directory run', Run, 1);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
+    + 'changed after this test run started (incs/Value.inc)', Run.Stdout))
     .ToBe(True);
+end;
+
+procedure TTestInputChange.TestDeclaredRootOutputsDoNotVoidRun;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/declared-root-outputs';
+  { Declared build outputs at the project root are published by builds,
+    not read by compiles: replacing one or creating another mid-run keeps
+    the run valid. }
+  WriteProject(ProjectRoot, SHARED_ONE, SHARED_ONE);
+  WriteTextFile(ProjectRoot + '/source/app.pas', 'program app; begin end.'#10);
+  WriteTextFile(ProjectRoot + '/source/tool.pas',
+    'program tool; begin end.'#10);
+  WriteTextFile(ProjectRoot + '/app.bin', 'first');
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "test-input-change-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + '[build]'#10
+    + 'app = { source = "source/app.pas", output = "app.bin" }'#10
+    + 'tool = { source = "source/tool.pas", output = "tool.bin" }'#10);
+  WriteTextFile(ProjectRoot + '/tests/A.Test.pas',
+      'program A;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try'#10
+    + '    Lines.Text := ''second'';'#10
+    + '    Lines.SaveToFile('
+    + PascalString(ProjectRoot + '/app.bin') + ');'#10
+    + '    Lines.SaveToFile('
+    + PascalString(ProjectRoot + '/tool.bin') + ');'#10
+    + '  finally'#10
+    + '    Lines.Free;'#10
+    + '  end;'#10
+    + 'end.'#10);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/declared-root-outputs-cache'));
+  RequireExit('declared root outputs run', Run, 0);
+  Expect<Boolean>(Contains('summary: 3 passed, 0 failed, 0 did not compile, '
+    + '0 cancelled; elapsed ', Run.Stdout)).ToBe(True);
 end;
 
 procedure TTestInputChange.SetupTests;
@@ -324,6 +416,10 @@ begin
     TestRootLevelProgramDoesNotWatchWholeProject);
   Test('a search directory named by a test flag is watched',
     TestFlagSearchDirectoryEditVoidsRun);
+  Test('an include directory named by the compiler configuration is watched',
+    TestConfigurationIncludeDirectoryEditVoidsRun);
+  Test('declared build outputs at the project root do not void the run',
+    TestDeclaredRootOutputsDoNotVoidRun);
 end;
 
 begin

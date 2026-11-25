@@ -56,6 +56,7 @@ type
     procedure TestInputSnapshotNamesChangedFiles;
     {$IFDEF UNIX}
     procedure TestInputSnapshotRecordsUnreadableFiles;
+    procedure TestInputSnapshotNeverOpensSpecialFiles;
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
     procedure TestDirectoryAliasesHaveDeterministicFingerprint;
     procedure TestPublicationLockUsesFilesystemIdentity;
@@ -330,6 +331,27 @@ begin
   finally
     FpChmod(FScratch + '/source/Unused.pas', &600);
   end;
+end;
+
+procedure TLWPTBuildSessionTests.TestInputSnapshotNeverOpensSpecialFiles;
+var
+  Paths: TStringArray;
+  Snapshot: TLWPTInputSnapshot;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  { Opening a FIFO with no writer blocks; a snapshot that opened it would
+    hang this test instead of finishing. }
+  Expect<Integer>(FpMkfifo(FScratch + '/source/pipe', &600)).ToBe(0);
+  SetLength(Paths, 2);
+  Paths[0] := 'source';
+  Paths[1] := 'source/pipe';
+  Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
+  Expect<Integer>(Length(Snapshot.Paths)).ToBe(2);
+  Expect<string>(FirstChangedInput(FScratch, Snapshot, nil)).ToBe('');
+  WriteText(FScratch + '/source/app.pas', 'begin WriteLn; end.');
+  Expect<string>(FirstChangedInput(FScratch, Snapshot, nil))
+    .ToBe(ExpandFileName(FScratch + '/source') + PathDelim + 'app.pas');
 end;
 {$ENDIF}
 
@@ -1191,6 +1213,8 @@ begin
   {$IFDEF UNIX}
   Test('input snapshots record unreadable files without failing',
     TestInputSnapshotRecordsUnreadableFiles);
+  Test('input snapshots never open special files',
+    TestInputSnapshotNeverOpensSpecialFiles);
   Test('symlinked search roots detect changes and terminate cycles',
     TestSymlinkedSearchRootChangeRefusesPublication);
   Test('directory aliases produce deterministic fingerprints',

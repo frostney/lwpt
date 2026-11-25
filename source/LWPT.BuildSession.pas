@@ -148,6 +148,7 @@ uses
   {$IFDEF MSWINDOWS}
   Windows,
   {$ENDIF}
+  contnrs,
   DateUtils;
 
 const
@@ -417,14 +418,31 @@ end;
 
 { A file's content hash. The build cache lets an unreadable file fail its
   fingerprint (the cache then steps aside); a run-level input snapshot must
-  not fail, so ATolerateUnreadable records such a file by its metadata. The
-  compiler cannot read that file either, and a change to it still shows. }
-function InputFileContent(const APath: string;
-  const ATolerateUnreadable: Boolean): string;
+  not fail, so ASnapshot records such a file by its metadata. The compiler
+  cannot read that file either, and a change to it still shows. A snapshot
+  also never opens a file that is not regular, because opening a FIFO with
+  no writer blocks, and reuses ADigests for a file it already hashed through
+  an overlapping path. }
+function InputFileContent(const APath: string; const ASnapshot: Boolean;
+  const ADigests: TFPStringHashTable): string;
 var
   Info: TSearchRec;
+  Known: THTStringNode;
+  {$IFDEF UNIX}
+  Status: BaseUnix.Stat;
+  {$ENDIF}
 begin
-  if not ATolerateUnreadable then Exit(SHA256File(APath));
+  if not ASnapshot then Exit(SHA256File(APath));
+  if ADigests <> nil then
+  begin
+    Known := THTStringNode(ADigests.Find(APath));
+    if Known <> nil then Exit(Known.Data);
+  end;
+  {$IFDEF UNIX}
+  if (FpStat(APath, Status) = 0) and not fpS_ISREG(Status.st_mode) then
+    Result := 'special:' + IntToStr(Status.st_mode)
+  else
+  {$ENDIF}
   try
     Result := SHA256File(APath);
   except
@@ -440,14 +458,15 @@ begin
       end;
     end;
   end;
+  if ADigests <> nil then ADigests.Add(APath, Result);
 end;
 
 { The sorted "<length>:<relative path>=<content>" entries of every file below
   ARoot, joined by LF. The cache hashes this text; an input snapshot keeps it
   so a change can be named by file. }
 function InputDirectoryListing(const AProjectRoot, ARoot: string;
-  const AExcludedPaths: TStringArray;
-  const ATolerateUnreadable: Boolean): string;
+  const AExcludedPaths: TStringArray; const ASnapshot: Boolean;
+  const ADigests: TFPStringHashTable): string;
 var
   Files, VisitedDirectories: TStringList;
   SessionsRoot: string;
@@ -503,7 +522,7 @@ var
             Collect(Full, Relative + '/')
           else if FileExists(Full) then
             Files.Add(IntToStr(Length(Relative)) + ':' + Relative + '='
-              + InputFileContent(Full, ATolerateUnreadable));
+              + InputFileContent(Full, ASnapshot, ADigests));
         end
         else if (Attr and faDirectory) <> 0 then
         begin
@@ -512,7 +531,7 @@ var
         end
         else
           Files.Add(IntToStr(Length(Relative)) + ':' + Relative + '='
-            + InputFileContent(Full, ATolerateUnreadable));
+            + InputFileContent(Full, ASnapshot, ADigests));
       end;
     finally
       Entries.Free;
@@ -538,17 +557,11 @@ begin
   end;
 end;
 
-function InputDirectoryFingerprint(const AProjectRoot, ARoot: string;
-  const AExcludedPaths: TStringArray): string;
-begin
-  Result := TextHash(InputDirectoryListing(AProjectRoot, ARoot,
-    AExcludedPaths, False));
-end;
-
 { A path's content as the cache sees it. ASnapshot keeps a directory's full
   listing instead of its hash and records unreadable files by metadata. }
 function PathState(const AProjectRoot, APath: string;
-  const AExcludedPaths: TStringArray; const ASnapshot: Boolean): string;
+  const AExcludedPaths: TStringArray; const ASnapshot: Boolean;
+  const ADigests: TFPStringHashTable): string;
 var
   Full, Listing: string;
 begin
@@ -557,12 +570,13 @@ begin
   { Explicit files remain inputs even when they are also declared outputs.
     Exclusions apply to broad tree walks so unrelated published artifacts do
     not invalidate another target. }
-  if FileExists(Full) then Exit('file:' + InputFileContent(Full, ASnapshot));
+  if FileExists(Full) then
+    Exit('file:' + InputFileContent(Full, ASnapshot, ADigests));
   if PathIsExcluded(AProjectRoot, Full, AExcludedPaths) then Exit('<excluded>');
   if DirectoryExists(Full) then
   begin
     Listing := InputDirectoryListing(AProjectRoot, Full, AExcludedPaths,
-      ASnapshot);
+      ASnapshot, ADigests);
     if ASnapshot then Exit('tree:' + Listing);
     Exit('tree:' + TextHash(Listing));
   end;
@@ -572,7 +586,7 @@ end;
 function PathFingerprint(const AProjectRoot, APath: string;
   const AExcludedPaths: TStringArray): string;
 begin
-  Result := PathState(AProjectRoot, APath, AExcludedPaths, False);
+  Result := PathState(AProjectRoot, APath, AExcludedPaths, False, nil);
 end;
 
 { The first file whose entry differs between two directory listings, as a
@@ -622,10 +636,12 @@ end;
 function CaptureInputSnapshot(const AProjectRoot: string;
   const APaths, AExcludedPaths: TStringArray): TLWPTInputSnapshot;
 var
+  Digests: TFPStringHashTable;
   Unique: TStringList;
   Full: string;
   i: Integer;
 begin
+  Digests := TFPStringHashTable.Create;
   Unique := TStringList.Create;
   try
     {$IFDEF MSWINDOWS}
@@ -646,10 +662,11 @@ begin
     begin
       Result.Paths[i] := Unique[i];
       Result.Contents[i] := PathState(AProjectRoot, Unique[i],
-        AExcludedPaths, True);
+        AExcludedPaths, True, Digests);
     end;
   finally
     Unique.Free;
+    Digests.Free;
   end;
 end;
 
@@ -658,25 +675,33 @@ function FirstChangedInput(const AProjectRoot: string;
   const AExcludedPaths: TStringArray): string;
 var
   Current, Entry: string;
+  Digests: TFPStringHashTable;
   i: Integer;
 begin
-  for i := 0 to High(ASnapshot.Paths) do
-  begin
-    Current := PathState(AProjectRoot, ASnapshot.Paths[i], AExcludedPaths,
-      True);
-    if Current = ASnapshot.Contents[i] then Continue;
-    Result := ASnapshot.Paths[i];
-    if (Copy(Current, 1, 5) = 'tree:')
-       and (Copy(ASnapshot.Contents[i], 1, 5) = 'tree:') then
-    begin
-      Entry := FirstChangedListingEntry(Copy(ASnapshot.Contents[i], 6, MaxInt),
-        Copy(Current, 6, MaxInt));
-      if Entry <> '' then
-        Result := IncludeTrailingPathDelimiter(Result) + Entry;
-    end;
-    Exit;
-  end;
   Result := '';
+  { One digest table per scan: a file reached through two overlapping
+    paths is hashed once, and a later scan reads it again. }
+  Digests := TFPStringHashTable.Create;
+  try
+    for i := 0 to High(ASnapshot.Paths) do
+    begin
+      Current := PathState(AProjectRoot, ASnapshot.Paths[i], AExcludedPaths,
+        True, Digests);
+      if Current = ASnapshot.Contents[i] then Continue;
+      Result := ASnapshot.Paths[i];
+      if (Copy(Current, 1, 5) = 'tree:')
+         and (Copy(ASnapshot.Contents[i], 1, 5) = 'tree:') then
+      begin
+        Entry := FirstChangedListingEntry(
+          Copy(ASnapshot.Contents[i], 6, MaxInt), Copy(Current, 6, MaxInt));
+        if Entry <> '' then
+          Result := IncludeTrailingPathDelimiter(Result) + Entry;
+      end;
+      Exit;
+    end;
+  finally
+    Digests.Free;
+  end;
 end;
 
 procedure AddField(AFields: TStrings; const AName, AValue: string);
@@ -766,7 +791,7 @@ begin
       PathFingerprint(AProjectRoot, ALockPath, EmptyPaths));
     AddField(Fields, 'modules', PathFingerprint(AProjectRoot, AModulesPath,
       ARequest.ExcludedPaths));
-    { Same invariant as InputDirectoryFingerprint: the fold separator is
+    { Same invariant as InputDirectoryListing: the fold separator is
       pinned, never inherited from the platform. }
     Fields.LineBreak := #10;
     Result := TextHash(Fields.Text);
