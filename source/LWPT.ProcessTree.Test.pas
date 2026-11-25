@@ -92,9 +92,11 @@ const
   PipeChildLifetimeMilliseconds = 60000;
   StdinEndMilliseconds = 15000;
   PipePollMilliseconds = 10;
-  { Far beyond any pipe buffer, so the writer still owns its copy of the
-    reader's stdin when the sibling starts. }
-  WriterPayloadBytes = 1024 * 1024;
+  { Sixteen times the largest default pipe capacity (16 pages of 64 KiB on
+    Linux), so the writer still owns its copy of the reader's stdin when the
+    sibling starts. The reader's queued-byte report proves it on every run. }
+  WriterPayloadBytes = 16 * 1024 * 1024;
+  StdinReaderQueuedPrefix = 'queued ';
   PipeProtectionFailurePrefix = 'could not protect child process pipes';
   {$IFDEF UNIX}
   { POSIX fixes FD_CLOEXEC at 1; Linux FPC's BaseUnix does not declare it. }
@@ -400,7 +402,7 @@ begin
   Result := IncludeTrailingPathDelimiter(GetTempDir(False)) + PROGRAM_NAME
     + '-pipe-inheritance-' + IntToStr(GetProcessID) + '-'
     + IntToStr(PipeSignalSequence) + '.' + AKind;
-  if FileExists(Result) then DeleteFile(Result);
+  if FileExists(Result) then SysUtils.DeleteFile(Result);
 end;
 
 procedure CreateSignalFile(const APath: string);
@@ -422,22 +424,31 @@ begin
   Result := True;
 end;
 
-{ Child mode: announce, wait for the trigger, then count standard input to
-  end-of-file. Without the trigger it exits with a distinct code. }
+{ Child mode: announce, wait for the trigger, report the bytes already
+  queued on standard input, then count it to end-of-file. Nothing is read
+  before the trigger, so the queued count is everything the parent wrote
+  until then. Without the trigger it exits with a distinct code. }
 procedure RunStdinReader(const ATrigger: string);
 var
   Buffer: array[0..4095] of Byte;
   Count: LongInt;
+  StandardInput: TInputPipeStream;
   Total: Int64;
 begin
   WriteLn(StdinReaderReadyLine);
   Flush(Output);
   if not WaitForSignalFile(ATrigger) then Halt(StdinReaderTriggerExitCode);
-  Total := 0;
-  repeat
-    Count := FileRead(StdInputHandle, Buffer[0], SizeOf(Buffer));
-    if Count > 0 then Inc(Total, Count);
-  until Count <= 0;
+  StandardInput := TInputPipeStream.Create(StdInputHandle);
+  try
+    WriteLn(StdinReaderQueuedPrefix, StandardInput.NumBytesAvailable);
+    Total := 0;
+    repeat
+      Count := StandardInput.Read(Buffer[0], SizeOf(Buffer));
+      if Count > 0 then Inc(Total, Count);
+    until Count <= 0;
+  finally
+    StandardInput.Free;
+  end;
   WriteLn(Total);
 end;
 
@@ -478,7 +489,7 @@ begin
     ReapChild(ASibling, PipeChildLifetimeMilliseconds);
     FreeAndNil(ASibling);
   end;
-  if FileExists(AStop) then DeleteFile(AStop);
+  if FileExists(AStop) then SysUtils.DeleteFile(AStop);
 end;
 
 function OutputHasLine(const AOutput, ALine: string): Boolean;
@@ -489,6 +500,26 @@ begin
   try
     Lines.Text := AOutput;
     Result := Lines.IndexOf(ALine) >= 0;
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ The byte count the reader found queued on its stdin at the trigger, or -1
+  when it did not report one. }
+function ReaderQueuedBytes(const AOutput: string): Int64;
+var
+  Index: Integer;
+  Lines: TStringList;
+begin
+  Result := -1;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AOutput;
+    for Index := 0 to Lines.Count - 1 do
+      if Pos(StdinReaderQueuedPrefix, Lines[Index]) = 1 then
+        Exit(StrToInt64Def(Copy(Lines[Index],
+          Length(StdinReaderQueuedPrefix) + 1, MaxInt), -1));
   finally
     Lines.Free;
   end;
@@ -570,7 +601,7 @@ begin
   finally
     StopLingeringSibling(Sibling, Stop);
     Reader.Free;
-    DeleteFile(Trigger);
+    SysUtils.DeleteFile(Trigger);
   end;
 end;
 
@@ -609,14 +640,15 @@ begin
     end;
   finally
     Reader.Free;
-    DeleteFile(Trigger);
+    SysUtils.DeleteFile(Trigger);
   end;
 end;
 
 { Starts the sibling once the reader has announced itself. By then the
   runner has closed the original stdin handle and its writer thread owns the
   only write end: a duplicate, blocked because the payload exceeds the pipe
-  buffer and the reader does not read before the trigger. }
+  capacity and the reader does not read before the trigger. The case checks
+  that precondition from the reader's queued-byte report. }
 procedure StartSiblingOnReaderOutput(const AData: RawByteString;
   const AStandardError: Boolean);
 begin
@@ -642,7 +674,7 @@ var
 begin
   WriterSiblingTrigger := NewPipeSignalPath('trigger');
   Stop := WriterSiblingTrigger + '.stop';
-  if FileExists(Stop) then DeleteFile(Stop);
+  if FileExists(Stop) then SysUtils.DeleteFile(Stop);
   WriterSibling := nil;
   WriterSiblingStarted := False;
   WriterSiblingError := '';
@@ -669,6 +701,12 @@ begin
       Expect<Integer>(ReaderExitCode).ToBe(0);
       Expect<Boolean>(OutputHasLine(ReaderStdout, IntToStr(WriterPayloadBytes)))
         .ToBe(True);
+      { Precondition, proven rather than assumed from a pipe size: less than
+        the payload was queued at the trigger, so the writer had not finished
+        and still held its copy when the sibling started before it. }
+      Expect<Boolean>(ReaderQueuedBytes(ReaderStdout) >= 0).ToBe(True);
+      Expect<Boolean>(ReaderQueuedBytes(ReaderStdout) < WriterPayloadBytes)
+        .ToBe(True);
       Expect<Boolean>(Assigned(WriterSibling) and WriterSibling.Running)
         .ToBe(True);
     finally
@@ -677,7 +715,7 @@ begin
   finally
     StopLingeringSibling(WriterSibling, Stop);
     Reader.Free;
-    DeleteFile(WriterSiblingTrigger);
+    SysUtils.DeleteFile(WriterSiblingTrigger);
   end;
 end;
 

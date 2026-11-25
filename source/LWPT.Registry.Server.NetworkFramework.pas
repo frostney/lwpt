@@ -1205,7 +1205,9 @@ begin
     ExecuteUnmanagedProcess(Child);
     if not Child.WaitOnExit(RecoveryChildExitMilliseconds) then
     begin
-      Child.Terminate(1);
+      { TProcess.Terminate ends in an unbounded wait; kill and reap within
+        the same bound instead. }
+      FpKill(Child.ProcessID, SIGKILL);
       Child.WaitOnExit(RecoveryChildExitMilliseconds);
       Exit;
     end;
