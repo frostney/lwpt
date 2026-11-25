@@ -106,10 +106,12 @@ the build failed before it compiled anything, while the compile itself would
 have had 30 minutes. Every driver's probe process now gets the compile's
 per-process deadline: 30 minutes by default, or `LWPT_COMPILER_TIMEOUT_MS`
 when set. The deadline still limits each process separately. A timed-out
-probe counts as a failed probe with the consequences any failed probe has: a
-default-target or dispatched probe fails the request, while a bare probe for an
-explicit target falls through to the dispatched probe. The FPC driver can
-therefore run a bare probe and then a dispatched probe under its probe lock,
-each with the full deadline. A timeout still terminates and reaps the isolated
-process tree, so a wedged compiler holds that lock for a bounded time: at
-most two deadlines plus cleanup, where it used to be 30 seconds each.
+probe counts as a failed probe with the consequences any failed probe has.
+Default-target discovery and a dispatched probe fail the request. A bare
+probe that validates a concrete target, whether requested or the default
+target refreshed before compiling or publishing, falls through to the
+dispatched probe. The probe work timed under the driver's probe lock is
+therefore at most two deadlines; terminating and reaping the timed-out process
+tree, and draining its pipe, come on top. Because a probe can now run far
+longer, its retained output is capped at the shared 16 MiB capture budget, and
+output past it fails the probe.

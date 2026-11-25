@@ -40,6 +40,9 @@ const
   ProbeTimeoutGrandchildOption = '--' + PROGRAM_NAME
     + '-probe-timeout-grandchild';
   ProbeTimeoutProxyOption = '--' + PROGRAM_NAME + '-probe-timeout-proxy';
+  ProbeFloodProxyOption = '--' + PROGRAM_NAME + '-probe-flood-proxy';
+  { Past the 16 MiB probe capture budget. }
+  ProbeFloodBytes = 17 * 1024 * 1024;
   ProbeTimeoutSleepMilliseconds = 30000;
   TestProbeTimeoutMilliseconds = 1000;
   TestProbeCompletionTimeoutSeconds = 10;
@@ -80,6 +83,14 @@ type
       write FGrandchildPIDPath;
   end;
 
+  { Runs this test program as a probe that writes more than the capture
+    budget and then exits successfully. }
+  TFloodFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
+  protected
+    function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
+      out AOutput: string): Integer; override;
+  end;
+
   TLWPTFPCCompilerDriverTests = class(TTestSuite)
   private
     function FixtureRequest(const ASource, AArtifact: string):
@@ -109,6 +120,7 @@ type
     procedure TestProbeFailureNamesCompilerAndTargetRequirement;
     procedure TestProbeTimeoutTerminatesProcessTree;
     procedure TestProbeDeadlineIsTheCompileDeadline;
+    procedure TestProbeOutputPastBudgetFails;
     procedure AssertProbeDeadlineIsTheCompileDeadline(
       const AExpected: QWord);
     procedure TestProbeRejectsUnexpectedTargetTuple;
@@ -155,6 +167,23 @@ begin
   {$ENDIF}
   PublishReadablePayload(ParamStr(2), IntToStr(GetProcessID));
   Sleep(ProbeTimeoutSleepMilliseconds);
+  Result := 0;
+end;
+
+function RunProbeFloodProxy: Integer;
+var
+  Chunk: string;
+  Written: Int64;
+begin
+  Chunk := StringOfChar('x', 65535) + #10;
+  Written := 0;
+  while Written < ProbeFloodBytes do
+  begin
+    Write(Chunk);
+    Inc(Written, Length(Chunk));
+  end;
+  WriteLn('3.2.2 linux x86_64');
+  Flush(Output);
   Result := 0;
 end;
 
@@ -248,6 +277,19 @@ end;
 function TTimeoutFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
 begin
   Result := TestProbeTimeoutMilliseconds;
+end;
+
+function TFloodFPCCompilerDriver.ExecuteProbe(
+  const AArguments: LWPT.Core.TStringArray; out AOutput: string): Integer;
+var
+  Arguments: LWPT.Core.TStringArray;
+  I: Integer;
+begin
+  SetLength(Arguments, Length(AArguments) + 1);
+  Arguments[0] := ProbeFloodProxyOption;
+  for I := 0 to High(AArguments) do
+    Arguments[I + 1] := AArguments[I];
+  Result := inherited ExecuteProbe(Arguments, AOutput);
 end;
 
 function TLWPTFPCCompilerDriverTests.ArgumentsContain(
@@ -620,6 +662,29 @@ begin
     Driver.Free;
     TerminateTestProcess(GrandchildPID);
     RecursiveDelete(Scratch);
+  end;
+end;
+
+{ A probe sees the compile's long deadline, so its output is bounded by
+  the shared capture budget instead: a flood past it fails the probe with
+  an explicit reason even when the process exits successfully. }
+procedure TLWPTFPCCompilerDriverTests.TestProbeOutputPastBudgetFails;
+var
+  Driver: TFloodFPCCompilerDriver;
+  ErrorMessage: string;
+begin
+  Driver := TFloodFPCCompilerDriver.Create(ExpandFileName(ParamStr(0)));
+  try
+    ErrorMessage := '';
+    try
+      Driver.DefaultTarget;
+    except
+      on E: ELWPTCompilerDriverError do ErrorMessage := E.Message;
+    end;
+    Expect<Boolean>(Pos('probe output exceeded 16777216 bytes',
+      ErrorMessage) > 0).ToBe(True);
+  finally
+    Driver.Free;
   end;
 end;
 
@@ -1272,6 +1337,8 @@ begin
     TestProbeTimeoutTerminatesProcessTree);
   Test('probe deadline is the compile deadline and its override',
     TestProbeDeadlineIsTheCompileDeadline);
+  Test('probe output past the capture budget fails the probe',
+    TestProbeOutputPastBudgetFails);
   Test('probe rejects a successful response for the wrong target tuple',
     TestProbeRejectsUnexpectedTargetTuple);
   Test('capabilities are defensive and do not advertise unit outputs',
@@ -1345,6 +1412,8 @@ begin
   if (ParamCount >= 2)
      and (ParamStr(1) = ProbeTimeoutGrandchildOption) then
     Halt(RunProbeTimeoutGrandchild);
+  if (ParamCount >= 1) and (ParamStr(1) = ProbeFloodProxyOption) then
+    Halt(RunProbeFloodProxy);
   if (ParamCount >= 2) and (ParamStr(1) = ProbeTimeoutProxyOption) then
     Halt(RunProbeTimeoutProxy(ParamStr(2)));
   TestRunnerProgram.AddSuite(TLWPTFPCCompilerDriverTests.Create(

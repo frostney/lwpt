@@ -67,6 +67,7 @@ uses
   StrUtils,
   SysUtils,
 
+  LWPT.ProcessRunner,
   LWPT.ProcessTree;
 
 const
@@ -627,9 +628,24 @@ var
   ProcessTree: TLWPTProcessTree;
   StartedAt, TimeoutMilliseconds: QWord;
   TerminationThread: TLWPTFPCProbeTerminationThread;
-  TimedOut: Boolean;
+  OutputOverflowed, TimedOut: Boolean;
+
+  { Probe output is a single short line. Retain at most the shared capture
+    budget and keep draining past it, so a stalled wrapper that floods the
+    pipe for the whole deadline cannot exhaust memory. }
+  procedure RetainOutput(const ACount: Integer);
+  var
+    Room: Int64;
+  begin
+    Room := Int64(PROCESS_RUNNER_DEFAULT_CAPTURE_BYTES) - Length(AOutput);
+    if ACount > Room then OutputOverflowed := True;
+    if Room <= 0 then Exit;
+    if ACount < Room then Room := ACount;
+    AppendRawBytes(AOutput, Buffer[0], Integer(Room));
+  end;
 begin
   AOutput := '';
+  OutputOverflowed := False;
   CompilerProcess := TProcess.Create(nil);
   ProcessTree := nil;
   TerminationThread := nil;
@@ -652,7 +668,7 @@ begin
       begin
         BytesRead := CompilerProcess.Output.Read(Buffer[0], SizeOf(Buffer));
         if BytesRead > 0 then
-          AppendRawBytes(AOutput, Buffer[0], BytesRead);
+          RetainOutput(BytesRead);
       end;
       if not CompilerProcess.Running then Break;
       if GetTickCount64 - StartedAt >= TimeoutMilliseconds then
@@ -675,7 +691,7 @@ begin
             BytesRead := CompilerProcess.Output.Read(Buffer[0],
               SizeOf(Buffer));
             if BytesRead > 0 then
-              AppendRawBytes(AOutput, Buffer[0], BytesRead);
+              RetainOutput(BytesRead);
           end;
           if BytesRead = 0 then Sleep(FPC_PROBE_POLL_MILLISECONDS);
         end;
@@ -692,7 +708,7 @@ begin
     begin
       BytesRead := CompilerProcess.Output.Read(Buffer[0], SizeOf(Buffer));
       if BytesRead <= 0 then Break;
-      AppendRawBytes(AOutput, Buffer[0], BytesRead);
+      RetainOutput(BytesRead);
     end;
     if not TimedOut then CompilerProcess.WaitOnExit;
     if TimedOut then
@@ -708,6 +724,15 @@ begin
       Result := CompilerProcess.ExitCode;
       if (Result = 0) and (CompilerProcess.ExitStatus <> 0) then
         Result := CompilerProcess.ExitStatus;
+      if OutputOverflowed then
+      begin
+        { The failure message names the first output line; lead with the
+          reason so it is the line reported. }
+        AOutput := 'probe output exceeded '
+          + IntToStr(PROCESS_RUNNER_DEFAULT_CAPTURE_BYTES) + ' bytes'
+          + LineEnding + AOutput;
+        if Result = 0 then Result := 1;
+      end;
     end;
   finally
     TerminationThread.Free;
