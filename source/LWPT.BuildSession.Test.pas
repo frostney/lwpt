@@ -69,6 +69,16 @@ type
     procedure TestFinishPrunesSupersededJobsFromInactiveSessions;
     procedure TestFinishPrunesSupersededBuildCandidates;
     procedure TestFinishNeverPrunesLiveSessions;
+    procedure TestFailedFinishReleasesGuardUnderCoordinationLock;
+    procedure TestFinishKeepsSameProcessLiveSessions;
+    {$IFDEF UNIX}
+    procedure TestFinishNeverPrunesThroughLinkedDefaultRoot;
+    {$ENDIF}
+    function StartHeldSession(const AReadyPath,
+      AReleasePath: string): TProcess;
+    function WaitForHeldSession(AHolder: TProcess;
+      const AReadyPath: string): string;
+    function ReadSessionStateLine(const ASessionRoot: string): string;
   end;
 
 const
@@ -1118,30 +1128,58 @@ begin
   Expect<Boolean>(FileExists(NewJob + '/bin/app')).ToBe(True);
 end;
 
+function TLWPTBuildSessionTests.StartHeldSession(const AReadyPath,
+  AReleasePath: string): TProcess;
+begin
+  Result := TProcess.Create(nil);
+  Result.Executable := ExpandFileName(ParamStr(0));
+  Result.Parameters.Add(HOLD_SESSION_SWITCH);
+  Result.Parameters.Add(FScratch);
+  Result.Parameters.Add(AReadyPath);
+  Result.Parameters.Add(AReleasePath);
+  ExecuteOwnedChild(Result);
+end;
+
+function TLWPTBuildSessionTests.WaitForHeldSession(AHolder: TProcess;
+  const AReadyPath: string): string;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while (not PayloadIsReadable(AReadyPath))
+    and (not WaitForChildExit(AHolder, 20))
+    and (GetTickCount64 - StartedAt < HOLD_WAIT_MILLISECONDS) do;
+  Expect<Boolean>(PayloadIsReadable(AReadyPath)).ToBe(True);
+  Result := Trim(ReadPayloadText(AReadyPath));
+end;
+
+function TLWPTBuildSessionTests.ReadSessionStateLine(
+  const ASessionRoot: string): string;
+var
+  Lines: TStringList;
+begin
+  Result := '';
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ASessionRoot + '/session.state');
+    if Lines.Count > 1 then Result := Trim(Lines[1]);
+  finally
+    Lines.Free;
+  end;
+end;
+
 procedure TLWPTBuildSessionTests.TestFinishNeverPrunesLiveSessions;
 var
   Holder: TProcess;
   Session: TLWPTBuildSession;
   ReadyPath, ReleasePath, HeldRoot, HeldProgram: string;
-  StartedAt: QWord;
 begin
   ResetScratch;
   ReadyPath := FScratch + '/held.ready';
   ReleasePath := FScratch + '/held.release';
-  Holder := TProcess.Create(nil);
+  Holder := StartHeldSession(ReadyPath, ReleasePath);
   try
-    Holder.Executable := ExpandFileName(ParamStr(0));
-    Holder.Parameters.Add(HOLD_SESSION_SWITCH);
-    Holder.Parameters.Add(FScratch);
-    Holder.Parameters.Add(ReadyPath);
-    Holder.Parameters.Add(ReleasePath);
-    ExecuteOwnedChild(Holder);
-    StartedAt := GetTickCount64;
-    while (not PayloadIsReadable(ReadyPath))
-      and (not WaitForChildExit(Holder, 20))
-      and (GetTickCount64 - StartedAt < HOLD_WAIT_MILLISECONDS) do;
-    Expect<Boolean>(PayloadIsReadable(ReadyPath)).ToBe(True);
-    HeldRoot := Trim(ReadPayloadText(ReadyPath));
+    HeldRoot := WaitForHeldSession(Holder, ReadyPath);
     HeldProgram := HeldRoot + '/jobs/' + BuildSessionPathKey('tests') + '/'
       + HOLD_SESSION_PROGRAM;
     Expect<Boolean>(DirectoryExists(HeldProgram)).ToBe(True);
@@ -1175,6 +1213,117 @@ begin
   Expect<Boolean>(DirectoryExists(HeldProgram)).ToBe(False);
   Expect<Boolean>(FileExists(HeldRoot + '/session.state')).ToBe(True);
 end;
+
+procedure TLWPTBuildSessionTests.
+  TestFailedFinishReleasesGuardUnderCoordinationLock;
+var
+  Holder: TProcess;
+  CoordinationLock: TObject;
+  ReadyPath, ReleasePath, HeldRoot: string;
+begin
+  ResetScratch;
+  ReadyPath := FScratch + '/held.ready';
+  ReleasePath := FScratch + '/held.release';
+  CoordinationLock := nil;
+  Holder := StartHeldSession(ReadyPath, ReleasePath);
+  try
+    HeldRoot := WaitForHeldSession(Holder, ReadyPath);
+    { While another session sweeps under the coordination lock, a failing
+      session must not record its terminal state or drop its owner guard;
+      otherwise the sweep could skip it as live and its superseded
+      executable would outlive both. }
+    CoordinationLock := AcquireBuildCoordinationLock(FScratch);
+    PublishReadablePayload(ReleasePath, 'release');
+    Expect<Boolean>(WaitForChildExit(Holder, 1000)).ToBe(False);
+    Expect<string>(ReadSessionStateLine(HeldRoot)).ToBe('active');
+    FreeAndNil(CoordinationLock);
+    Expect<Integer>(FinishChild(Holder, HOLD_WAIT_MILLISECONDS,
+      'held build session')).ToBe(0);
+    Expect<string>(ReadSessionStateLine(HeldRoot)).ToBe('failed');
+  finally
+    CoordinationLock.Free;
+    if not PayloadIsReadable(ReleasePath) then
+      PublishReadablePayload(ReleasePath, 'release');
+    ReapChild(Holder, HOLD_WAIT_MILLISECONDS);
+    Holder.Free;
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestFinishKeepsSameProcessLiveSessions;
+var
+  LiveSession, Session: TLWPTBuildSession;
+  LiveProgram: string;
+  Removed, Retained: Integer;
+begin
+  ResetScratch;
+  LiveSession := TLWPTBuildSession.Create(FScratch);
+  try
+    LiveProgram := LiveSession.ProgramJobsRoot('tests') + '/A.Test-key';
+    WriteText(LiveProgram + '/A.Test', 'live build');
+    { Only the owner guard says "live". A Unix record-lock probe from this
+      same process would succeed and, on close, drop that guard. }
+    WriteText(LiveSession.SessionRoot + '/session.state',
+      '1'#10'failed'#10'1');
+
+    Session := TLWPTBuildSession.Create(FScratch);
+    WriteText(Session.ProgramJobsRoot('tests') + '/A.Test-key/A.Test',
+      'newer build');
+    Session.Finish(True);
+    Session.Free;
+    Expect<Boolean>(FileExists(LiveProgram + '/A.Test')).ToBe(True);
+
+    RepairBuildSessions(IncludeTrailingPathDelimiter(FScratch), Removed,
+      Retained);
+    Expect<Integer>(Removed).ToBe(0);
+    Expect<Integer>(Retained).ToBe(1);
+    Expect<Boolean>(FileExists(LiveProgram + '/A.Test')).ToBe(True);
+  finally
+    LiveSession.Finish(True);
+    LiveSession.Free;
+  end;
+end;
+
+{$IFDEF UNIX}
+procedure TLWPTBuildSessionTests.TestFinishNeverPrunesThroughLinkedDefaultRoot;
+var
+  OtherProject, OtherJob, Project: string;
+  OtherSession, Session: TLWPTBuildSession;
+  Variant: Integer;
+begin
+  for Variant := 0 to 1 do
+  begin
+    ResetScratch;
+    OtherProject := FScratch + '/other';
+    ForceDirectories(OtherProject);
+    OtherSession := TLWPTBuildSession.Create(OtherProject);
+    OtherJob := OtherSession.JobRoot('app-dev');
+    WriteText(OtherJob + '/bin/app', 'other project candidate');
+    OtherSession.Finish(False, 'other project failed');
+    OtherSession.Free;
+
+    { Variant 0 links .lwpt, variant 1 links .lwpt/sessions, into the other
+      project. }
+    Project := FScratch + '/project';
+    ForceDirectories(Project);
+    if Variant = 0 then
+      Expect<Integer>(FpSymlink(PAnsiChar(OtherProject + '/' + LWPT_DIR),
+        PAnsiChar(Project + '/' + LWPT_DIR))).ToBe(0)
+    else
+    begin
+      ForceDirectories(Project + '/' + LWPT_DIR);
+      Expect<Integer>(FpSymlink(
+        PAnsiChar(OtherProject + '/' + BUILD_SESSIONS_DIR),
+        PAnsiChar(Project + '/' + BUILD_SESSIONS_DIR))).ToBe(0);
+    end;
+
+    Session := TLWPTBuildSession.Create(Project);
+    WriteText(Session.JobRoot('app-dev') + '/bin/app', 'this project');
+    Session.Finish(True);
+    Session.Free;
+    Expect<Boolean>(FileExists(OtherJob + '/bin/app')).ToBe(True);
+  end;
+end;
+{$ENDIF}
 
 { Child mode for TestFinishNeverPrunesLiveSessions: hold a live session with
   staged job output until the parent releases it. }
@@ -1278,6 +1427,14 @@ begin
     TestFinishPrunesSupersededBuildCandidates);
   Test('finishing sessions never prune live sessions',
     TestFinishNeverPrunesLiveSessions);
+  Test('failed sessions release their guard under the coordination lock',
+    TestFailedFinishReleasesGuardUnderCoordinationLock);
+  Test('finishing sessions keep same-process live sessions',
+    TestFinishKeepsSameProcessLiveSessions);
+  {$IFDEF UNIX}
+  Test('finishing sessions never prune through a linked default root',
+    TestFinishNeverPrunesThroughLinkedDefaultRoot);
+  {$ENDIF}
 end;
 
 begin
