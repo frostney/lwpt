@@ -47,6 +47,8 @@ type
     procedure TestCleanWithoutBuildDirSucceeds;
     procedure TestNoCacheBypassesReusableBuildResult;
     procedure TestPrerequisiteOutputChangeInvalidatesDependentResult;
+    procedure TestFlagSearchDirectoryInvalidatesResult;
+    procedure TestUnboundedSearchEntryBuildsWithoutReuse;
     {$IFDEF UNIX}
     procedure TestCleanDoesNotFollowSymlinkedDirs;
     {$ENDIF}
@@ -239,6 +241,75 @@ begin
   Expect<Boolean>(Pos('cache hit:', Changed.Stdout) = 0).ToBe(True);
 end;
 
+{ A project in its own directory with one build entry, app, whose [build]
+  flags are AFlags and whose include Value.inc lives in incs/. }
+function WriteFlagProject(const ARoot, AFlags: string): string;
+begin
+  RecursiveDelete(ARoot);
+  WriteTextFile(ARoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "buildflagsearch"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["src"]'#10
+    + #10
+    + '[build]'#10
+    + 'app = { source = "src/app.pas", output = "build/app", flags = ['
+    + AFlags + '] }'#10);
+  WriteTextFile(ARoot + '/src/app.pas',
+    'program app;'#10'{$I Value.inc}'#10'begin WriteLn(V); end.'#10);
+  WriteTextFile(ARoot + '/incs/Value.inc', 'const V = 1;'#10);
+  Result := ARoot;
+end;
+
+procedure TBuildClean.TestFlagSearchDirectoryInvalidatesResult;
+var
+  Environment: array of string;
+  ProjectRoot: string;
+  First, Hit, Changed: TLwptResult;
+begin
+  { An include directory that only the entry's flags name is a reusable-
+    result input. }
+  ProjectRoot := WriteFlagProject(FScratch + '/flag-search',
+    '"-Fiincs"');
+  RecursiveDelete(FScratch + '/flag-search-cache');
+  SetLength(Environment, 1);
+  Environment[0] := CACHE_DIR_ENV + '=' + FScratch + '/flag-search-cache';
+  First := RunLwpt(['build', '--verbose'], ProjectRoot, Environment);
+  Expect<Integer>(First.ExitCode).ToBe(0);
+  Hit := RunLwpt(['build', '--verbose'], ProjectRoot, Environment);
+  Expect<Integer>(Hit.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache hit:', Hit.Stdout) > 0).ToBe(True);
+  WriteTextFile(ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10);
+  Changed := RunLwpt(['build', '--verbose'], ProjectRoot, Environment);
+  Expect<Integer>(Changed.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('cache hit:', Changed.Stdout) = 0).ToBe(True);
+end;
+
+procedure TBuildClean.TestUnboundedSearchEntryBuildsWithoutReuse;
+var
+  Environment: array of string;
+  ProjectRoot: string;
+  Run: TLwptResult;
+  Attempt: Integer;
+begin
+  { No fixed directory is known to hold "incs/$FPCTARGET/../../incs", so the
+    entry builds every time and its result is never stored. }
+  ProjectRoot := WriteFlagProject(FScratch + '/unbounded-search',
+    '"-Fiincs/$FPCTARGET/../../incs"');
+  RecursiveDelete(FScratch + '/unbounded-search-cache');
+  SetLength(Environment, 1);
+  Environment[0] := CACHE_DIR_ENV + '=' + FScratch
+    + '/unbounded-search-cache';
+  for Attempt := 1 to 2 do
+  begin
+    Run := RunLwpt(['build', '--verbose'], ProjectRoot, Environment);
+    Expect<Integer>(Run.ExitCode).ToBe(0);
+    Expect<Boolean>(Pos('cache miss: unbounded-inputs', Run.Stdout) > 0)
+      .ToBe(True);
+    Expect<Boolean>(Pos('cache stored:', Run.Stdout) = 0).ToBe(True);
+  end;
+end;
+
 { Clean must not traverse build/ at all, including through a symlink.
   Unix only because Windows symlink creation needs privileges. Compiled
   out rather than an empty body: the test runner counts a test that runs
@@ -278,6 +349,10 @@ begin
   {$ENDIF}
   Test('prerequisite output changes invalidate dependent results',
     TestPrerequisiteOutputChangeInvalidatesDependentResult);
+  Test('an include directory named by build flags invalidates the result',
+    TestFlagSearchDirectoryInvalidatesResult);
+  Test('a search entry no fixed directory holds builds without reuse',
+    TestUnboundedSearchEntryBuildsWithoutReuse);
 end;
 
 begin

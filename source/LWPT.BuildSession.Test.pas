@@ -57,8 +57,10 @@ type
     procedure TestCacheFingerprintCoversPrerequisiteOutputs;
     procedure TestCacheFingerprintSeparatesOperationIdentity;
     procedure TestFingerprintsCoverArgumentSearchInputs;
+    procedure TestOptionFileLookupCoversEveryCandidate;
     {$IFDEF OBJECTSTORE_TESTING}
     procedure TestOptionFileChangedAfterReadIsRefused;
+    procedure TestShadowingCandidateAfterReadIsSeen;
     {$ENDIF}
     procedure TestPublicationLockUsesSessionsRoot;
     procedure TestInputSnapshotNamesChangedFiles;
@@ -110,6 +112,7 @@ type
     procedure TestQuotedWildcardAndMacroEntries;
     procedure TestPathSeparatorSplitsEntries;
     procedure TestMacrosExpandAsFPCExpandsThem;
+    procedure TestUnboundedEntriesAreNamed;
   end;
 
 
@@ -725,9 +728,84 @@ begin
   ExpectChanged(Baseline, True, 'a #CFGDIR file''s unit edit', Request);
 end;
 
+procedure TLWPTBuildSessionTests.TestOptionFileLookupCoversEveryCandidate;
+var
+  Files, Paths, States: TStringArray;
+  Joined, Unbounded: string;
+  i: Integer;
+  Request: TLWPTBuildPublicationRequest;
+  CacheRefused, PublicationRefused: Boolean;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  { FPC skips the #CFGDIR inside the inactive branch and reads the
+    fallback; the reader does not evaluate branches, so it reads both. }
+  WriteText(FScratch + '/opts.cfg', '#IFDEF NEVER_DEFINED'#10
+    + '#CFGDIR disabled'#10'#ENDIF'#10'#INCLUDE paths.cfg'#10);
+  WriteText(FScratch + '/disabled/paths.cfg', '-Fuchosen-if-defined'#10);
+  WriteText(FScratch + '/paths.cfg', '-Fuchosen-otherwise'#10);
+  SetLength(Paths, 0);
+  SetLength(Files, 0);
+  SetLength(States, 0);
+  Unbounded := '';
+  AppendCompilerArgumentInputs(FScratch, ['@' + FScratch + '/opts.cfg'],
+    Paths, Files, States, Unbounded);
+  Joined := '|';
+  for i := 0 to High(Paths) do Joined := Joined + Paths[i] + '|';
+  if (Pos('|chosen-if-defined|', Joined) = 0)
+     or (Pos('|chosen-otherwise|', Joined) = 0) then
+    Fail('inputs: ' + Joined);
+  Expect<Boolean>(Pos('|chosen-if-defined|', Joined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('|chosen-otherwise|', Joined) > 0).ToBe(True);
+  Expect<string>(Unbounded).ToBe('');
+
+  { An option file named through an $FPC* macro, or a #CFGDIR wildcard,
+    names files only the compiler can pick: the cache fingerprint refuses,
+    and publication still hashes what it can. }
+  WriteText(FScratch + '/opts.cfg', '#INCLUDE cfgs/$FPCTARGET.cfg'#10);
+  Unbounded := '';
+  SetLength(Paths, 0);
+  SetLength(Files, 0);
+  SetLength(States, 0);
+  AppendCompilerArgumentInputs(FScratch, ['@' + FScratch + '/opts.cfg'],
+    Paths, Files, States, Unbounded);
+  Expect<Boolean>(Pos('#INCLUDE cfgs/$FPCTARGET.cfg', Unbounded) > 0)
+    .ToBe(True);
+  WriteText(FScratch + '/opts.cfg', '#CFGDIR cfgs/*'#10'#INCLUDE a.cfg'#10);
+  Unbounded := '';
+  SetLength(Paths, 0);
+  SetLength(Files, 0);
+  SetLength(States, 0);
+  AppendCompilerArgumentInputs(FScratch, ['@' + FScratch + '/opts.cfg'],
+    Paths, Files, States, Unbounded);
+  Expect<Boolean>(Pos('#CFGDIR cfgs/*', Unbounded) > 0).ToBe(True);
+  Request := BasicRequest;
+  SetLength(Request.CompilerArguments, 1);
+  Request.CompilerArguments[0] := '@' + FScratch + '/opts.cfg';
+  CacheRefused := False;
+  try
+    CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE, CFG_FILE,
+      LOCKFILE, MODULES_DIR, Request);
+  except
+    on E: ELWPTUnboundedCompilerInputs do CacheRefused := True;
+  end;
+  Expect<Boolean>(CacheRefused).ToBe(True);
+  PublicationRefused := False;
+  try
+    CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE, CFG_FILE,
+      LOCKFILE, MODULES_DIR, Request);
+  except
+    on E: Exception do PublicationRefused := True;
+  end;
+  Expect<Boolean>(PublicationRefused).ToBe(False);
+end;
+
 {$IFDEF OBJECTSTORE_TESTING}
 var
   RewrittenOptionFile: string;
+  { The project root that relative option-file paths resolve against. }
+  HookProjectRoot: string;
 
 { Rewrites the option file it is handed, once, right after the read. }
 procedure RewriteOptionFileOnce(const APath: string);
@@ -816,6 +894,61 @@ begin
   Expect<Boolean>(InputStateMatchesCapture(States[0], 'missing'))
     .ToBe(False);
 end;
+
+{ Creates a higher-priority #CFGDIR candidate right after the fallback is
+  read, once. }
+procedure CreateShadowingCandidateOnce(const APath: string);
+var
+  Stream: TFileStream;
+  Content, Shadow: string;
+begin
+  if RewrittenOptionFile <> '' then Exit;
+  if APath <> 'paths.cfg' then Exit;
+  RewrittenOptionFile := APath;
+  Shadow := HookProjectRoot + '/cfgs/paths.cfg';
+  Content := '-Fushadow'#10;
+  Stream := TFileStream.Create(Shadow, fmCreate);
+  try
+    Stream.WriteBuffer(Content[1], Length(Content));
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestShadowingCandidateAfterReadIsSeen;
+var
+  Files, Paths, States: TStringArray;
+  Snapshot: TLWPTInputSnapshot;
+  Coherent: Boolean;
+  i: Integer;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/opts.cfg', '#CFGDIR ' + FScratch + '/cfgs'#10
+    + '#INCLUDE paths.cfg'#10);
+  WriteText(FScratch + '/cfgs/readme.txt', 'no paths.cfg yet');
+  WriteText(FScratch + '/paths.cfg', '-Fufallback'#10);
+  { The cfgs/ candidate is absent when it is looked up and appears before
+    the capture: its recorded absence no longer holds. }
+  RewrittenOptionFile := '';
+  HookProjectRoot := FScratch;
+  OptionFileReadTestHook := CreateShadowingCandidateOnce;
+  try
+    SetLength(Paths, 0);
+    SetLength(Files, 0);
+    SetLength(States, 0);
+    AppendCompilerArgumentInputs(FScratch, ['@' + FScratch + '/opts.cfg'],
+      Paths, Files, States);
+  finally
+    OptionFileReadTestHook := nil;
+  end;
+  Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
+  Coherent := True;
+  for i := 0 to High(Files) do
+    if not InputStateMatchesCapture(InputSnapshotState(FScratch, Snapshot,
+         Files[i]), States[i]) then Coherent := False;
+  Expect<Boolean>(Coherent).ToBe(False);
+end;
+
 {$ENDIF}
 
 procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
@@ -2104,9 +2237,13 @@ begin
     TestCacheFingerprintCoversPrerequisiteOutputs);
   Test('fingerprints cover search inputs that compiler arguments name',
     TestFingerprintsCoverArgumentSearchInputs);
+  Test('option-file lookup reads every candidate and names unbounded ones',
+    TestOptionFileLookupCoversEveryCandidate);
   {$IFDEF OBJECTSTORE_TESTING}
   Test('an option file changed after its read is refused',
     TestOptionFileChangedAfterReadIsRefused);
+  Test('a candidate that appears after the lookup is seen',
+    TestShadowingCandidateAfterReadIsSeen);
   {$ENDIF}
   Test('cache fingerprints separate build and test operations',
     TestCacheFingerprintSeparatesOperationIdentity);
@@ -2255,6 +2392,27 @@ begin
     .ToBe('inc/');
 end;
 
+procedure TCompilerSearchDirectoryTests.TestUnboundedEntriesAreNamed;
+var
+  Directories: TStringArray;
+  Unbounded: string;
+begin
+  { A ".." after a wildcard or an $FPC* macro can climb out of the fixed
+    leading directory, so that entry is named as unbounded; an entry whose
+    macro is last stays bounded. }
+  SetLength(Directories, 0);
+  Unbounded := '';
+  AppendCompilerSearchDirectories(['-Fuextra/$FPCTARGET/units',
+    '-Fi/fixture/$FPCVERSION/../../outside', '-Fo*/../objs'], Directories,
+    Unbounded);
+  Expect<string>(Unbounded)
+    .ToBe('option "-Fi/fixture/$FPCVERSION/../../outside"');
+  Unbounded := '';
+  AppendCompilerSearchDirectories(['-Fuextra/$FPCTARGET/units',
+    '-Fi../incs/*'], Directories, Unbounded);
+  Expect<string>(Unbounded).ToBe('');
+end;
+
 procedure TCompilerSearchDirectoryTests.SetupTests;
 begin
   Test('each search option names its directories',
@@ -2269,6 +2427,8 @@ begin
     TestPathSeparatorSplitsEntries);
   Test('macros expand as FPC expands them',
     TestMacrosExpandAsFPCExpandsThem);
+  Test('entries that can climb out of their fixed directory are named',
+    TestUnboundedEntriesAreNamed);
 end;
 
 begin

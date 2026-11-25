@@ -50,6 +50,11 @@ type
 
   TLWPTBuildPublicationResult = (bprPublished, bprStale);
 
+  { Raised by CaptureBuildCacheFingerprint when the compile's arguments may
+    make the compiler read inputs that no fixed path holds, so a reusable
+    result cannot be addressed. }
+  ELWPTUnboundedCompilerInputs = class(ELWPTError);
+
   { Compiler-input content at one moment: each distinct path once, with the
     content the build cache fingerprint would hash for it. Contents[i]
     belongs to Paths[i]. }
@@ -146,14 +151,21 @@ procedure AppendUnitDirsFromCfg(const ACfgPath: string;
   read, resolved as FPC 3.2 resolves them. An option lists entries separated
   by ";", and outside Windows also by ":". An entry may be Pascal-quoted. A
   leading "=" names a path below the sysroot, which -XR sets for -Fl and
-  which is empty for every other option. "*" wildcards and "$" macros expand
-  when the compiler runs, so such an entry adds its fixed leading directory,
-  which holds every directory it can resolve to. An "=" entry of -Fl adds one
+  which is empty for every other option. Macros are replaced first, as
+  ExpandSearchMacros describes. A "*" wildcard, and an $FPC* macro whose
+  value only the compiler knows, make an entry add its fixed leading
+  directory, which holds every directory it can resolve to unless a ".."
+  follows. An "=" entry of -Fl adds one
   directory per -XR value in AOptions and one without a sysroot, because the
   sysroot that applies depends on option order. An empty entry names the
   current directory, which this adds nothing for. }
 procedure AppendCompilerSearchDirectories(const AOptions: array of string;
-  var ADirectories: TStringArray);
+  var ADirectories: TStringArray); overload;
+{ The same, also naming in AUnbounded (when it is '') the first option with
+  an entry whose fixed leading directory may not hold what it resolves to:
+  a ".." after a wildcard or an $FPC* macro. }
+procedure AppendCompilerSearchDirectories(const AOptions: array of string;
+  var ADirectories: TStringArray; var AUnbounded: string); overload;
 { Appends what AArguments make the compiler read through its options: each
   option file that an "@file" argument names and each file those include,
   and the directories that AppendCompilerSearchDirectories finds among the
@@ -163,10 +175,11 @@ procedure AppendCompilerSearchDirectories(const AOptions: array of string;
   file and "#CFGDIR <dirs>" adds directories to look for such files in
   first, both after macro expansion; and the lines of every #IFDEF branch
   count, since any of them may apply. A file FPC looks for in #CFGDIR
-  directories appends every place it may be found. Relative paths resolve
-  against AProjectRoot. A file is read without blocking, once, and one that
-  is not a regular file or cannot be read names nothing more. A wildcard in
-  a #CFGDIR entry is searched at its fixed leading directory only. }
+  directories appends every place it may be found and reads each one that
+  exists, since the branches decide which #CFGDIR lines applied. Relative
+  paths resolve against AProjectRoot. A file is read without blocking,
+  once, and one that is not a regular file or cannot be read names nothing
+  more. }
 procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
   const AArguments: array of string; var APaths: TStringArray); overload;
 { The same, also appending each option file it read to AReadFiles and the
@@ -175,6 +188,14 @@ procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
 procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
   const AArguments: array of string;
   var APaths, AReadFiles, AReadStates: TStringArray); overload;
+{ The same, also naming in AUnbounded (when it is '') the first argument,
+  option or directive that may make the compiler read beyond APaths: a
+  ".." after a wildcard or an $FPC* macro, an option file named through an
+  $FPC* macro, or a #CFGDIR entry with a wildcard or such a macro. }
+procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
+  const AArguments: array of string;
+  var APaths, AReadFiles, AReadStates: TStringArray;
+  var AUnbounded: string); overload;
 { True when ARecorded, the state an input snapshot or fingerprint recorded
   for a file, still describes ACaptured, the state CaptureInputFile gave it
   ('' when that read failed). }
@@ -426,7 +447,7 @@ end;
   model: each becomes UNKNOWN_SEARCH_SEGMENT, a relative part of the path.
   On Windows its special-folder macros become those folders, and on OpenBSD
   its base macros become their directories. Then each "$NAME$" whose
-  environment variable is set and not empty becomes its value, from the
+  environment variable is set, even to nothing, becomes its value, from the
   left, until a name is not set; the compiler inherits this environment. }
 function ExpandSearchMacros(const AValue: string): string;
 const
@@ -465,6 +486,31 @@ const
   end;
   {$ENDIF}
 
+  { FPC's GetEnvPChar: a variable that is set, empty or not, has a value;
+    on Windows its name is compared without case. }
+  function EnvironmentValue(const AName: string; out AFound: string): Boolean;
+  var
+    Entry: string;
+    Index: Integer;
+  begin
+    AFound := '';
+    Result := False;
+    if AName = '' then Exit;
+    for Index := 1 to GetEnvironmentVariableCount do
+    begin
+      Entry := GetEnvironmentString(Index);
+      {$IFDEF MSWINDOWS}
+      if SameText(Copy(Entry, 1, Length(AName) + 1), AName + '=') then
+      {$ELSE}
+      if Copy(Entry, 1, Length(AName) + 1) = AName + '=' then
+      {$ENDIF}
+      begin
+        AFound := Copy(Entry, Length(AName) + 2, MaxInt);
+        Exit(True);
+      end;
+    end;
+  end;
+
 var
   Expansions, i, Position: Integer;
   Name, Value: string;
@@ -491,9 +537,7 @@ begin
     Name := Copy(Result, Position + 1, MaxInt);
     if Pos('$', Name) = 0 then Break;
     Name := Copy(Name, 1, Pos('$', Name) - 1);
-    Value := '';
-    if Name <> '' then Value := GetEnvironmentVariable(Name);
-    if Value = '' then Break;
+    if not EnvironmentValue(Name, Value) then Break;
     ReplaceSearchMacro(Result, '$' + Name + '$', Value);
     Inc(Expansions);
     Position := Pos('$', Result);
@@ -501,18 +545,29 @@ begin
 end;
 
 { Appends the directories that one search option's value AEntries names,
-  its macros already expanded. }
+  its macros already expanded. An entry with a wildcard or an unknown
+  segment adds its fixed leading directory, which holds what it resolves
+  to unless a ".." follows; then, or for any such entry when AExactOnly,
+  AUnbounded becomes True instead, and with AExactOnly nothing is added. }
 procedure AppendSearchEntries(const AEntries: string;
-  const ALibrary: Boolean; const ASysroots: TStringArray;
-  var ADirectories: TStringArray);
+  const ALibrary, AExactOnly: Boolean; const ASysroots: TStringArray;
+  var ADirectories: TStringArray; var AUnbounded: Boolean);
 
   procedure AddDirectory(APath: string);
   var
     Count, Position: Integer;
+    Rest: string;
   begin
     for Position := 1 to Length(APath) do
       if APath[Position] in ['*', '?', '$', UNKNOWN_SEARCH_SEGMENT] then
       begin
+        Rest := '/' + StringReplace(Copy(APath, Position, MaxInt), '', '/',
+          [rfReplaceAll]) + '/';
+        if AExactOnly or (Pos('/../', Rest) > 0) then
+        begin
+          AUnbounded := True;
+          if AExactOnly then Exit;
+        end;
         APath := Copy(APath, 1, Position - 1);
         while (APath <> '') and not (APath[Length(APath)] in ['/', '\']) do
           Delete(APath, Length(APath), 1);
@@ -587,7 +642,7 @@ begin
 end;
 
 procedure AppendCompilerSearchDirectories(const AOptions: array of string;
-  var ADirectories: TStringArray);
+  var ADirectories: TStringArray; var AUnbounded: string);
 const
   SEARCH_OPTIONS: array[0..4] of string = ('-Fu', '-Fi', '-Fo', '-Fl', '-I');
   SYSROOT_OPTION = '-XR';
@@ -595,6 +650,7 @@ var
   Sysroots: TStringArray;
   Count, i, j: Integer;
   Option: string;
+  Unbounded: Boolean;
 begin
   SetLength(Sysroots, 0);
   for i := 0 to High(AOptions) do
@@ -617,12 +673,25 @@ begin
          and (Copy(Option, 1, Length(SEARCH_OPTIONS[j]))
            = SEARCH_OPTIONS[j]) then
       begin
+        Unbounded := False;
         AppendSearchEntries(ExpandSearchMacros(Copy(Option,
           Length(SEARCH_OPTIONS[j]) + 1, MaxInt)),
-          SEARCH_OPTIONS[j] = '-Fl', Sysroots, ADirectories);
+          SEARCH_OPTIONS[j] = '-Fl', False, Sysroots, ADirectories,
+          Unbounded);
+        if Unbounded and (AUnbounded = '') then
+          AUnbounded := 'option "' + Option + '"';
         Break;
       end;
   end;
+end;
+
+procedure AppendCompilerSearchDirectories(const AOptions: array of string;
+  var ADirectories: TStringArray);
+var
+  Unbounded: string;
+begin
+  Unbounded := '';
+  AppendCompilerSearchDirectories(AOptions, ADirectories, Unbounded);
 end;
 
 function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
@@ -1176,7 +1245,8 @@ end;
 
 procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
   const AArguments: array of string;
-  var APaths, AReadFiles, AReadStates: TStringArray);
+  var APaths, AReadFiles, AReadStates: TStringArray;
+  var AUnbounded: string);
 var
   ConfigurationDirectories, Options: TStringArray;
 
@@ -1184,6 +1254,11 @@ var
   begin
     SetLength(AList, Length(AList) + 1);
     AList[High(AList)] := AValue;
+  end;
+
+  procedure MarkUnbounded(const AReason: string);
+  begin
+    if AUnbounded = '' then AUnbounded := AReason;
   end;
 
   function IsAbsolute(const APath: string): Boolean;
@@ -1207,39 +1282,56 @@ var
     Result := Copy(ALine, First, Last - First + 1);
   end;
 
-  { FPC's Interpret_file. Its other directives only select which lines
-    apply, so every line counts: that names every directory any of them
-    could select. }
-  procedure ReadFile(const AName: string);
+  function AlreadyRead(const APath: string): Boolean;
   var
-    Chosen, Content, Directive, Line, Operand, State: string;
-    Lines: TStringList;
-    i, Position: Integer;
+    i: Integer;
   begin
-    if AName = '' then Exit;
-    { FPC opens a relative name from the first #CFGDIR directory that has
-      it, and otherwise as named. Every candidate is an input, so a file
-      that appears earlier in that order is seen too. }
-    Chosen := '';
-    if not IsAbsolute(AName) then
-      for i := 0 to High(ConfigurationDirectories) do
-      begin
-        Line := IncludeTrailingPathDelimiter(ConfigurationDirectories[i])
-          + AName;
-        Append(APaths, Line);
-        if (Chosen = '') and FileExists(RootedPath(AProjectRoot, Line)) then
-          Chosen := Line;
-      end;
-    Append(APaths, AName);
-    if Chosen = '' then Chosen := AName;
-    { Reading each file once ends a file that includes itself. }
     for i := 0 to High(AReadFiles) do
       if SamePath(RootedPath(AProjectRoot, AReadFiles[i]),
-           RootedPath(AProjectRoot, Chosen)) then Exit;
+           RootedPath(AProjectRoot, APath)) then Exit(True);
+    Result := False;
+  end;
+
+  procedure ReadCandidate(const APath, ADescription: string); forward;
+
+  { FPC's Interpret_file for AName. A relative name opens from the first
+    #CFGDIR directory that has it, and otherwise as named. Which #CFGDIR
+    lines applied depends on #IFDEF branches this does not evaluate, and
+    what is there may change, so every candidate is an input and every one
+    that exists is read: that names every directory any of them could. }
+  procedure ReadFile(const AName, ADescription: string);
+  var
+    i: Integer;
+  begin
+    if AName = '' then Exit;
+    if Pos(UNKNOWN_SEARCH_SEGMENT, AName) > 0 then
+    begin
+      { Only the compiler knows which file an $FPC* macro names. }
+      MarkUnbounded(ADescription);
+      Exit;
+    end;
+    if not IsAbsolute(AName) then
+      for i := 0 to High(ConfigurationDirectories) do
+        ReadCandidate(IncludeTrailingPathDelimiter(
+          ConfigurationDirectories[i]) + AName, ADescription);
+    ReadCandidate(AName, ADescription);
+  end;
+
+  procedure ReadCandidate(const APath, ADescription: string);
+  var
+    Content, Directive, Line, Operand, State: string;
+    Lines: TStringList;
+    Unbounded: Boolean;
+    i, Position: Integer;
+  begin
+    Append(APaths, APath);
+    { Reading each file once ends a file that includes itself. }
+    if AlreadyRead(APath) then Exit;
     { A file that cannot be read, or is not a regular file, names nothing
-      more; its recorded state stays a candidate's input. }
+      more. Its state, 'missing' included, is held to the snapshot or
+      fingerprint, so a file that appears or changes since is seen. }
     try
-      State := CaptureInputFile(AProjectRoot, Chosen, Content);
+      State := CaptureInputFile(AProjectRoot, APath, Content);
     except
       on E: ELWPTError do
       begin
@@ -1247,10 +1339,10 @@ var
         Content := '';
       end;
     end;
-    Append(AReadFiles, Chosen);
+    Append(AReadFiles, APath);
     Append(AReadStates, State);
     {$IFDEF OBJECTSTORE_TESTING}
-    if Assigned(OptionFileReadTestHook) then OptionFileReadTestHook(Chosen);
+    if Assigned(OptionFileReadTestHook) then OptionFileReadTestHook(APath);
     {$ENDIF}
     Lines := TStringList.Create;
     try
@@ -1270,10 +1362,18 @@ var
           Directive := UpperCase(Copy(Line, 2, Position - 2));
           Operand := ExpandSearchMacros(Trim(Copy(Line, Position + 1,
             MaxInt)));
-          if Directive = 'INCLUDE' then ReadFile(Operand)
+          if Directive = 'INCLUDE' then
+            ReadFile(Operand, 'directive "' + Line + '" in ' + APath)
           else if Directive = 'CFGDIR' then
-            AppendSearchEntries(Operand, False, nil,
-              ConfigurationDirectories);
+          begin
+            { FPC expands a wildcard here into the directories that
+              exist, which this does not follow. }
+            Unbounded := False;
+            AppendSearchEntries(Operand, False, True, nil,
+              ConfigurationDirectories, Unbounded);
+            if Unbounded then
+              MarkUnbounded('directive "' + Line + '" in ' + APath);
+          end;
         end;
         { ";" starts a comment, and FPC refuses a nested "@file". }
       end;
@@ -1289,10 +1389,22 @@ begin
   SetLength(Options, 0);
   for i := 0 to High(AArguments) do
     if (Length(AArguments[i]) > 1) and (AArguments[i][1] = '@') then
-      ReadFile(Copy(AArguments[i], 2, MaxInt))
+      ReadFile(Copy(AArguments[i], 2, MaxInt),
+        'argument "' + AArguments[i] + '"')
     else
       Append(Options, AArguments[i]);
-  AppendCompilerSearchDirectories(Options, APaths);
+  AppendCompilerSearchDirectories(Options, APaths, AUnbounded);
+end;
+
+procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
+  const AArguments: array of string;
+  var APaths, AReadFiles, AReadStates: TStringArray);
+var
+  Unbounded: string;
+begin
+  Unbounded := '';
+  AppendCompilerArgumentInputs(AProjectRoot, AArguments, APaths, AReadFiles,
+    AReadStates, Unbounded);
 end;
 
 procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
@@ -1313,10 +1425,12 @@ end;
   in the request's extra arguments ([build] or [test] flags), which a driver
   may pass outside its argument list. Each path appears once, in the order
   the arguments name it. AReadFiles and AReadStates are the option files
-  read and the states they were read in. }
+  read and the states they were read in, and AUnbounded names what may make
+  the compiler read beyond these paths ('' when nothing does). }
 function CompilerArgumentInputs(const AProjectRoot: string;
   const ARequest: TLWPTBuildPublicationRequest;
-  out AReadFiles, AReadStates: TStringArray): TStringArray;
+  out AReadFiles, AReadStates: TStringArray;
+  out AUnbounded: string): TStringArray;
 var
   Arguments, Found: TStringArray;
   Known: TStringList;
@@ -1348,8 +1462,9 @@ begin
   SetLength(Found, 0);
   SetLength(AReadFiles, 0);
   SetLength(AReadStates, 0);
+  AUnbounded := '';
   AppendCompilerArgumentInputs(AProjectRoot, Arguments, Found, AReadFiles,
-    AReadStates);
+    AReadStates, AUnbounded);
   Known := TStringList.Create;
   try
     {$IFDEF MSWINDOWS}
@@ -1408,7 +1523,7 @@ var
   Digests: TFPStringHashTable;
   Fields: TStringList;
   EmptyPaths, ReadFiles, ReadStates: TStringArray;
-  ManifestFingerprint, SourceDirectory: string;
+  ManifestFingerprint, SourceDirectory, Unbounded: string;
 begin
   SetLength(EmptyPaths, 0);
   Digests := TFPStringHashTable.Create;
@@ -1442,9 +1557,11 @@ begin
     AddPathArray(Fields, AProjectRoot, 'include-paths',
       ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths,
       Digests);
+    { Publication hashes what it can bound; only a reusable result needs
+      every input. }
     AddPathArray(Fields, AProjectRoot, 'compiler-search-inputs',
-      CompilerArgumentInputs(AProjectRoot, ARequest, ReadFiles, ReadStates),
-      ARequest.ExcludedPaths, Digests);
+      CompilerArgumentInputs(AProjectRoot, ARequest, ReadFiles, ReadStates,
+        Unbounded), ARequest.ExcludedPaths, Digests);
     RequireOptionFilesUnchanged(AProjectRoot, ReadFiles, ReadStates,
       Digests);
     AddPathArray(Fields, AProjectRoot, 'workspace-paths',
@@ -1498,9 +1615,9 @@ function CaptureBuildCacheFingerprint(
   const ARequest: TLWPTBuildPublicationRequest;
   const AOperation: string): string;
 var
-  EmptyPaths, ReadFiles, ReadStates: TStringArray;
+  EmptyPaths, ReadFiles, ReadStates, SearchInputs: TStringArray;
   Fields: TStringList;
-  ManifestFingerprint, SourceDirectory: string;
+  ManifestFingerprint, SourceDirectory, Unbounded: string;
   NeutralRequest: TLWPTBuildRequest;
   Digests: TFPStringHashTable;
 begin
@@ -1540,9 +1657,14 @@ begin
     AddPathArray(Fields, AProjectRoot, 'include-paths',
       ARequest.BuildRequest.Inputs.IncludePaths, ARequest.ExcludedPaths,
       Digests);
+    SearchInputs := CompilerArgumentInputs(AProjectRoot, ARequest,
+      ReadFiles, ReadStates, Unbounded);
+    if Unbounded <> '' then
+      raise ELWPTUnboundedCompilerInputs.Create('the compiler may read '
+        + 'inputs that ' + Unbounded + ' names and that no fixed directory '
+        + 'holds, so its result is not reused');
     AddPathArray(Fields, AProjectRoot, 'compiler-search-inputs',
-      CompilerArgumentInputs(AProjectRoot, ARequest, ReadFiles, ReadStates),
-      ARequest.ExcludedPaths, Digests);
+      SearchInputs, ARequest.ExcludedPaths, Digests);
     RequireOptionFilesUnchanged(AProjectRoot, ReadFiles, ReadStates,
       Digests);
     AddPathArray(Fields, AProjectRoot, 'workspace-paths',

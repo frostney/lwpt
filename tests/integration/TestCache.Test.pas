@@ -71,6 +71,7 @@ type
     procedure TestConfigurationIncludeDirectoryInvalidatesFingerprint;
     procedure TestEnvironmentMacroDirectoryInvalidatesFingerprint;
     procedure TestConfigurationDirectoryIncludeInvalidatesFingerprint;
+    procedure TestUnboundedSearchEntryIsNeverReused;
     {$IFDEF UNIX}
     procedure TestFifoInUnitDirectoryDoesNotHangCachedRun;
     procedure TestConfigurationSwappedForFifoDoesNotHangCachedRun;
@@ -898,16 +899,18 @@ begin
   ProjectRoot := FScratch + '/environment-macro-directory';
   External := FScratch + '/environment-macro-includes';
   { FPC replaces "$NAME$" in a search option with that environment
-    variable, so the include directory lies outside the project. }
+    variable, a set but empty one included, so the include directory lies
+    outside the project. }
   WriteSearchProject(ProjectRoot,
-    '[test]'#10'flags = ["-Fi$LWPT_FIXTURE_INCLUDES$"]'#10,
+    '[test]'#10
+    + 'flags = ["-Fi$LWPT_FIXTURE_EMPTY$$LWPT_FIXTURE_INCLUDES$"]'#10,
     '{$I Value.inc}'#10, 'source/Unused.pas',
     'unit Unused; interface implementation end.'#10);
   RecursiveDelete(External);
   WriteTextFile(External + '/Value.inc', 'const V = 1;'#10);
   RequireEditRecompiles('environment-macro-directory', ProjectRoot,
     External + '/Value.inc', 'const V = 2;'#10,
-    ['LWPT_FIXTURE_INCLUDES=' + External]);
+    ['LWPT_FIXTURE_EMPTY=', 'LWPT_FIXTURE_INCLUDES=' + External]);
 end;
 
 procedure TTestCache.TestConfigurationDirectoryIncludeInvalidatesFingerprint;
@@ -930,6 +933,40 @@ begin
   WriteTextFile(ProjectRoot + '/cfgs/paths.cfg', '-Fiincs'#10);
   RequireEditRecompiles('cfgdir-include', ProjectRoot,
     ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10, []);
+end;
+
+procedure TTestCache.TestUnboundedSearchEntryIsNeverReused;
+var
+  Environment: TStringArray;
+  ProjectRoot: string;
+  Run: TLwptResult;
+  Attempt: Integer;
+begin
+  ProjectRoot := FScratch + '/unbounded-search-entry';
+  { "incs/$FPCTARGET/../../incs" resolves to incs/ only once the compiler
+    names its target; no fixed directory is known to hold it, so the
+    program compiles every time, and sees each edit. }
+  WriteSearchProject(ProjectRoot,
+    '[test]'#10'flags = ["-Fiincs/$FPCTARGET/../../incs"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  RecursiveDelete(FScratch + '/unbounded-search-entry-cache');
+  Environment := CacheEnvironment(FScratch + '/unbounded-search-entry-cache',
+    FScratch + '/unbounded-search-entry-marker');
+  for Attempt := 1 to 3 do
+  begin
+    if Attempt = 3 then
+      WriteTextFile(ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10);
+    Run := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
+      Environment);
+    RequireSuccess('unbounded search entry run ' + IntToStr(Attempt), Run);
+    Expect<Boolean>(Pos('cache bypass: unavailable '
+      + '(ELWPTUnboundedCompilerInputs', Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('cache hit:', Run.Stdout) = 0).ToBe(True);
+    if Attempt = 3 then
+      Expect<Boolean>(Pos('SEARCH V=2', Run.Stdout) > 0).ToBe(True)
+    else
+      Expect<Boolean>(Pos('SEARCH V=1', Run.Stdout) > 0).ToBe(True);
+  end;
 end;
 
 {$IFDEF UNIX}
@@ -1034,6 +1071,8 @@ begin
     + 'fingerprint', TestEnvironmentMacroDirectoryInvalidatesFingerprint);
   Test('an include directory named by a #CFGDIR-found file invalidates the '
     + 'fingerprint', TestConfigurationDirectoryIncludeInvalidatesFingerprint);
+  Test('a search entry no fixed directory holds is never reused',
+    TestUnboundedSearchEntryIsNeverReused);
   {$IFDEF UNIX}
   Test('a FIFO in a unit directory neither hangs nor defeats the cache',
     TestFifoInUnitDirectoryDoesNotHangCachedRun);

@@ -799,11 +799,18 @@ begin
     LongestCompiledBaseNameLength(ScanDirs, T.Source));
   Fingerprint := CaptureBuildPublicationFingerprint(ProjectRoot,
     AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
-  CacheFingerprint := CaptureBuildCacheFingerprint(ProjectRoot,
-    AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
+  { A compile whose inputs no fixed path holds has no reusable address: it
+    compiles, and its result is not stored. }
+  try
+    CacheFingerprint := CaptureBuildCacheFingerprint(ProjectRoot,
+      AManifestPath, CfgPath, LOCKFILE, ModulesPath, Request);
+  except
+    on E: ELWPTUnboundedCompilerInputs do CacheFingerprint := '';
+  end;
 
   if not AUseCache then CacheReason := 'disabled'
   else if AClean then CacheReason := 'clean'
+  else if CacheFingerprint = '' then CacheReason := 'unbounded-inputs'
   else if AUseCache and Assigned(ACache) then
     try
       if ACache.Materialize(CacheFingerprint, CandidateBin,
@@ -954,7 +961,8 @@ begin
     CacheSnapshot := JobRoot + '/cache-artifact/'
       + ExtractFileName(CandidateBin);
     ForceDirectories(ExtractFileDir(CacheSnapshot));
-    if CopyFileContent(CandidateBin, CacheSnapshot) then
+    if (CacheFingerprint <> '')
+       and CopyFileContent(CandidateBin, CacheSnapshot) then
       ACompiled.CacheSnapshot := CacheSnapshot;
     ACompiled.ProjectRoot := ProjectRoot;
     ACompiled.CfgPath := CfgPath;
