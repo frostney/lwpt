@@ -940,10 +940,10 @@ begin
     low-water mark forces a quarter of the objects out.
 
     This counts the work instead of timing it. A hit at 2000 objects
-    takes a few milliseconds, so on a loaded host it usually runs inside
-    one scheduler slice, while the hit at 20 000 objects is preempted and
-    waits for a processor; their wall-clock ratio then measures the host's
-    load as much as the code (#444). }
+    takes a few milliseconds of processor time, so on a loaded host it
+    often finishes without waiting, while the hit at 20 000 objects is
+    preempted and waits for a processor; their wall-clock ratio then
+    measures the host's load as much as the code (#444). }
   Measure(SmallObjects, SmallHit, SmallAdmission);
   Measure(LargeObjects, LargeHit, LargeAdmission);
   { The hit leaves its index entry the same length, so it judges room
