@@ -40,6 +40,18 @@ const
   OutputName = 'generated.out';
 
 type
+  { AppendCompilerSearchDirectories against FPC 3.2's own search-path
+    resolution (TSearchPathList.AddLibraryPath in compiler/cfileutl.pas). }
+  TCompilerSearchDirectoryTests = class(TTestSuite)
+  public
+    procedure SetupTests; override;
+    procedure TestEachSearchOptionNamesItsDirectories;
+    procedure TestEqualsPrefixIsRelativeToEmptySysroot;
+    procedure TestLibraryEqualsPrefixFollowsEverySysroot;
+    procedure TestQuotedWildcardAndMacroEntries;
+    procedure TestPathSeparatorSplitsEntries;
+  end;
+
   THookStalenessTests = class(TTestSuite)
   private
     FRoot: string;
@@ -217,6 +229,85 @@ begin
     at sub-second precision, equal (so also stale) on a coarse filesystem. }
   WriteStamped('proto/v1/deep/two.proto', NewerNanoseconds);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
+{ The directories AOptions name, joined by "|". }
+function SearchDirectories(const AOptions: array of string): string;
+var
+  Directories: TStringArray;
+  i: Integer;
+begin
+  SetLength(Directories, 0);
+  AppendCompilerSearchDirectories(AOptions, Directories);
+  Result := '';
+  for i := 0 to High(Directories) do
+  begin
+    if i > 0 then Result := Result + '|';
+    Result := Result + Directories[i];
+  end;
+end;
+
+procedure TCompilerSearchDirectoryTests.TestEachSearchOptionNamesItsDirectories;
+begin
+  Expect<string>(SearchDirectories(['-Fuunits', '-Fiincs', '-Foobjs',
+    '-Fllibs', '-Iinc2', '-FEout', '-FUunitout', '-dDEBUG', '-Fu', '# -Fux']))
+    .ToBe('units|incs|objs|libs|inc2');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestEqualsPrefixIsRelativeToEmptySysroot;
+begin
+  { FPC passes an empty sysroot for every option but -Fl, so "=incs" is
+    "incs" and "=/abs" is "/abs", whatever -XR says. }
+  Expect<string>(SearchDirectories(['-XR/fpc-sysroot', '-Fi=incs',
+    '-Fu=/abs/units', '-I=inc2', '-Fo=objs']))
+    .ToBe('incs|/abs/units|inc2|objs');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestLibraryEqualsPrefixFollowsEverySysroot;
+begin
+  { -Fl prefixes the sysroot that the last -XR before it set; option order
+    across the cfg file, flags and profile arguments decides which one, so
+    every candidate is watched, the empty sysroot included. }
+  Expect<string>(SearchDirectories(['-Fl=/fn-lib', '-XR/fpc-sysroot',
+    '-XR/other-root', '-Flplain']))
+    .ToBe('/fpc-sysroot/fn-lib|/other-root/fn-lib|/fn-lib|plain');
+  Expect<string>(SearchDirectories(['-Fl=/fn-lib'])).ToBe('/fn-lib');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestQuotedWildcardAndMacroEntries;
+begin
+  { FPC removes Pascal quotes before it looks for "=", so a quoted entry
+    after "=" keeps its quotes. }
+  Expect<string>(SearchDirectories(['-Fi''quoted dir''', '-Fu"double"',
+    '-Fuextra/*/units', '-Fiextra/$FPCTARGET', '-Fu$FPCDIR/units',
+    '-Fi=''eq''', '-Fi''unterminated']))
+    .ToBe('quoted dir|double|"double"|extra/|extra/|.|''eq''|''unterminated');
+end;
+
+procedure TCompilerSearchDirectoryTests.TestPathSeparatorSplitsEntries;
+begin
+  {$IFDEF MSWINDOWS}
+  Expect<string>(SearchDirectories(['-Fumissing;C:\units', '-Fi;incs']))
+    .ToBe('missing|C:\units|incs');
+  {$ELSE}
+  { FPC turns the platform path separator into ";" before it splits. }
+  Expect<string>(SearchDirectories(['-Fumissing;units:=incs', '-Fi;:incs']))
+    .ToBe('missing|units|incs|incs');
+  {$ENDIF}
+end;
+
+procedure TCompilerSearchDirectoryTests.SetupTests;
+begin
+  Test('each search option names its directories',
+    TestEachSearchOptionNamesItsDirectories);
+  Test('a leading "=" is relative to an empty sysroot outside -Fl',
+    TestEqualsPrefixIsRelativeToEmptySysroot);
+  Test('a leading "=" in -Fl follows every -XR sysroot',
+    TestLibraryEqualsPrefixFollowsEverySysroot);
+  Test('quoted, wildcard and macro entries name their fixed directory',
+    TestQuotedWildcardAndMacroEntries);
+  Test('the platform path separator splits entries',
+    TestPathSeparatorSplitsEntries);
 end;
 
 { An output that no successful run recorded, such as the committed output
@@ -510,6 +601,8 @@ begin
     Halt(RunFifoGateChild(ParamStr(2)));
   {$ENDIF}
   TestRunnerProgram.AddSuite(THookStalenessTests.Create('HookIsStale'));
+  TestRunnerProgram.AddSuite(TCompilerSearchDirectoryTests.Create(
+    'AppendCompilerSearchDirectories'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.

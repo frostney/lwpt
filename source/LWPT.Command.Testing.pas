@@ -96,9 +96,11 @@ type
     ExcludedPaths: TStringArray;
   end;
 
+  { tjsVoided: the job found that compiler inputs changed after the run
+    started, so the run's results no longer describe one source state. }
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
     tjsCompileFailed, tjsRunFailed, tjsCancelled,
-    tjsWorkerError);
+    tjsWorkerError, tjsVoided);
 
   TTestJob = record
     Source: string;
@@ -125,6 +127,7 @@ type
     ExitCode: Integer;
     Status: TTestJobStatus;
     StartedAt: QWord;
+    RunVoided: Boolean;
   end;
 
   TTestScheduler = class;
@@ -163,6 +166,16 @@ type
     FCacheContext: TLWPTTestCacheContext;
     FStartedReported: array of Boolean;
     FTerminalReported: array of Boolean;
+    FRunInputs: TLWPTInputSnapshot;
+    FVoidedInput: string;
+    { The run's own copy of the compiler configuration file as the input
+      snapshot recorded it, or '' when the project has none. Jobs read this
+      copy, never the live file. }
+    FRunConfigurationPath: string;
+    procedure CaptureRunInputs;
+    function ChangedRunInput: string;
+    function VoidRun(const AIndex: Integer; const AChanged: string): Boolean;
+    function VoidIfInputsChanged(const AIndex: Integer): Boolean;
     function ClaimJob(out AIndex: Integer): Boolean;
     function AcquireLease: TLWPTWorkerLease;
     function StartProcess(const AIndex: Integer;
@@ -206,10 +219,12 @@ type
     destructor Destroy; override;
     procedure Run;
     procedure PrintResults(const AProjectRoot: string; out APassed,
-      AFailed, ACompileFailed, ACancelled: Integer);
+      AFailed, ACompileFailed, ACancelled, AVoided: Integer);
     function InventoryJSON(const AProjectRoot: string): string;
     procedure ValidateInventory(const AProjectRoot: string);
     property InternalError: string read FInternalError;
+    { The project-relative input that voided the run, or ''. }
+    property VoidedInput: string read FVoidedInput;
     function EffectiveWorkerCount: Integer;
   end;
 
@@ -350,6 +365,8 @@ end;
 
 function TestDisplayPath(const AProjectRoot, ASource: string): string;
   forward;
+procedure CaptureProjectRootCompilerInputs(const AProjectRoot: string;
+  var APaths: TStringArray); forward;
 
 constructor TTestWorker.Create(const AScheduler: TTestScheduler);
 begin
@@ -456,6 +473,243 @@ begin
   FBudgetSession.Free;
   DoneCriticalSection(FCriticalSection);
   inherited Destroy;
+end;
+
+function InputDisplayPath(const AProjectRoot, APath: string): string;
+begin
+  if PathContains(AProjectRoot, APath) then
+    Result := CanonicalPathGlob(ExtractRelativePath(
+      IncludeTrailingPathDelimiter(AProjectRoot), APath))
+  else
+    Result := APath;
+end;
+
+{ A project-root file that is a declared build output: another invocation
+  may publish it at any time, and no compile reads it. }
+function RootFileIsExcluded(const AProjectRoot, AName: string;
+  const AExcludedPaths: TStringArray): Boolean;
+var
+  Excluded, Full: string;
+  i: Integer;
+begin
+  Full := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot) + AName);
+  for i := 0 to High(AExcludedPaths) do
+  begin
+    Excluded := AExcludedPaths[i];
+    if Excluded = '' then Continue;
+    if not IsAbsoluteFilesystemPath(Excluded) then
+      Excluded := IncludeTrailingPathDelimiter(AProjectRoot) + Excluded;
+    if SameFileName(Full, ExpandFileName(Excluded)) then Exit(True);
+  end;
+  Result := False;
+end;
+
+{ One fingerprint of everything any selected job's compile can read, taken
+  after pretest and before any job compiles or reuses a cached result: the
+  union of the per-program cache fingerprint's paths plus every directory
+  the compiler's search options can name, each hashed once. }
+procedure TTestScheduler.CaptureRunInputs;
+var
+  Options, Paths: TStringArray;
+
+  procedure AddPath(const APath: string);
+  begin
+    SetLength(Paths, Length(Paths) + 1);
+    Paths[High(Paths)] := APath;
+  end;
+
+  procedure AddOption(const AOption: string);
+  begin
+    SetLength(Options, Length(Options) + 1);
+    Options[High(Options)] := AOption;
+  end;
+
+  { Every option that can reach the compiler: the configuration file's
+    lines, the request's unit and include paths (the manifest's units, its
+    modules and LWPT_FPC_UNIT_PATHS), [test] flags and the selected
+    profile's own arguments. }
+  procedure CollectOptions(const AConfiguration: string);
+  var
+    IncludeSearchPaths, ProfileArguments, UnitSearchPaths: TStringArray;
+    Lines: TStringList;
+    i: Integer;
+  begin
+    SetLength(Options, 0);
+    Lines := TStringList.Create;
+    try
+      Lines.Text := AConfiguration;
+      for i := 0 to Lines.Count - 1 do AddOption(Lines[i]);
+    finally
+      Lines.Free;
+    end;
+    UnitSearchPaths := Copy(FUnitPaths, 0, Length(FUnitPaths));
+    IncludeSearchPaths := Copy(FUnitPaths, 0, Length(FUnitPaths));
+    AppendCompilerEnvironmentSearchPaths(UnitSearchPaths, IncludeSearchPaths);
+    for i := 0 to High(UnitSearchPaths) do
+      AddOption('-Fu' + UnitSearchPaths[i]);
+    for i := 0 to High(IncludeSearchPaths) do
+      AddOption('-Fi' + IncludeSearchPaths[i]);
+    for i := 0 to High(FCompilerArguments) do
+      AddOption(FCompilerArguments[i]);
+    ProfileArguments := FCompilerDriver.InvocationArguments(nil);
+    for i := 0 to High(ProfileArguments) do AddOption(ProfileArguments[i]);
+  end;
+
+  { The run's copy of the configuration bytes the snapshot recorded. }
+  procedure PublishRunConfiguration(const AState, AContent: string);
+  var
+    Stream: TLWPTProtectedFileStream;
+  begin
+    if AState = 'missing' then
+    begin
+      FRunConfigurationPath := '';
+      Exit;
+    end;
+    ForceDirectories(FBuildRoot);
+    FRunConfigurationPath := IncludeTrailingPathDelimiter(FBuildRoot)
+      + 'run-configuration.cfg';
+    Stream := OpenProtectedFileStream(FRunConfigurationPath, fmCreate);
+    try
+      if AContent <> '' then Stream.WriteBuffer(AContent[1], Length(AContent));
+    finally
+      Stream.Free;
+    end;
+  end;
+
+const
+  CONFIGURATION_CAPTURE_ATTEMPTS = 3;
+var
+  ConfigurationContent, ConfigurationState, Recorded, SourceDirectory: string;
+  Directories: TStringArray;
+  Attempt, i: Integer;
+begin
+  { One read of the configuration file gives the bytes its search options
+    come from and the state they hash to; the capture holds only when the
+    snapshot recorded that same state, so the watched directories and the
+    recorded file always describe one version of it. Jobs then compile from
+    the run's copy of those bytes and never read the live file, which the
+    snapshot keeps watching. }
+  for Attempt := 1 to CONFIGURATION_CAPTURE_ATTEMPTS do
+  begin
+    ConfigurationState := CaptureInputFile(FProjectRoot,
+      FCacheContext.ConfigurationPath, ConfigurationContent);
+    CollectOptions(ConfigurationContent);
+    SetLength(Directories, 0);
+    AppendCompilerSearchDirectories(Options, Directories);
+    SetLength(Paths, 0);
+    AddPath(FCacheContext.ManifestPath);
+    AddPath(FCacheContext.ConfigurationPath);
+    AddPath(LOCKFILE);
+    AddPath(FCacheContext.ModulesPath);
+    for i := 0 to High(FCacheContext.CompilerImplicitInputs) do
+      AddPath(FCacheContext.CompilerImplicitInputs[i]);
+    for i := 0 to High(FCacheContext.WorkspacePaths) do
+      AddPath(FCacheContext.WorkspacePaths[i]);
+    for i := 0 to High(Directories) do AddPath(Directories[i]);
+    for i := 0 to High(FJobs) do
+    begin
+      AddPath(FJobs[i].Source);
+      { The source directory as the cache fingerprint derives it: from the
+        project-relative path, so a program at the project root adds no
+        directory rather than the whole project. }
+      SourceDirectory := ExtractFileDir(TestRelativePath(FProjectRoot,
+        FJobs[i].Source));
+      if SourceDirectory <> '' then AddPath(SourceDirectory);
+    end;
+    FRunInputs := CaptureInputSnapshot(FProjectRoot, Paths,
+      FCacheContext.ExcludedPaths);
+    Recorded := InputSnapshotState(FProjectRoot, FRunInputs,
+      FCacheContext.ConfigurationPath);
+    { A missing file is recorded as missing, or as excluded or a directory,
+      none of which a compile reads as its configuration. }
+    if (Recorded = ConfigurationState)
+       or ((ConfigurationState = 'missing')
+         and (Copy(Recorded, 1, 5) <> 'file:')) then
+    begin
+      PublishRunConfiguration(ConfigurationState, ConfigurationContent);
+      Exit;
+    end;
+  end;
+  raise ELWPTError.Create('the compiler configuration file kept changing '
+    + 'while this test run started; rerun ' + PROGRAM_NAME + ' test');
+end;
+
+{ The first run input that differs from the snapshot, as a display path,
+  or ''. The snapshot sees a recorded file change or disappear; a file that
+  appears at the project root is a new implicit compiler input. }
+function TTestScheduler.ChangedRunInput: string;
+var
+  RootFiles: TStringArray;
+  i, j: Integer;
+  Recorded: Boolean;
+begin
+  Result := FirstChangedInput(FProjectRoot, FRunInputs,
+    FCacheContext.ExcludedPaths);
+  if Result = '' then
+  begin
+    SetLength(RootFiles, 0);
+    CaptureProjectRootCompilerInputs(FProjectRoot, RootFiles);
+    for i := 0 to High(RootFiles) do
+    begin
+      if RootFileIsExcluded(FProjectRoot, RootFiles[i],
+           FCacheContext.ExcludedPaths) then Continue;
+      Recorded := False;
+      for j := 0 to High(FCacheContext.CompilerImplicitInputs) do
+        if RootFiles[i] = FCacheContext.CompilerImplicitInputs[j] then
+        begin
+          Recorded := True;
+          Break;
+        end;
+      if not Recorded then
+      begin
+        Result := IncludeTrailingPathDelimiter(FProjectRoot) + RootFiles[i];
+        Break;
+      end;
+    end;
+  end;
+  if Result <> '' then Result := InputDisplayPath(FProjectRoot, Result);
+end;
+
+{ Voids the run because of AChanged: results from before and after a change
+  must not be reported together. The first detector is VOID; a sibling that
+  detects the same change afterwards is one of the programs the void
+  cancelled. Always True, so callers can exit on it. }
+function TTestScheduler.VoidRun(const AIndex: Integer;
+  const AChanged: string): Boolean;
+begin
+  Result := True;
+  EnterCriticalSection(FCriticalSection);
+  try
+    if FVoidedInput <> '' then
+    begin
+      if FJobs[AIndex].Status <> tjsWorkerError then
+        FJobs[AIndex].Status := tjsCancelled;
+      Exit;
+    end;
+    if FJobs[AIndex].Status <> tjsWorkerError then
+    begin
+      FJobs[AIndex].Status := tjsVoided;
+      FJobs[AIndex].ExitCode := 1;
+      FJobs[AIndex].ErrorMessage := 'compiler inputs changed after this '
+        + 'test run started (' + AChanged + '); its results are void; rerun '
+        + PROGRAM_NAME + ' test';
+    end;
+    FVoidedInput := AChanged;
+    if not FCancelled then CancelPendingAndActiveLocked;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
+end;
+
+{ Called by every job once its executable exists (compiled or reused) and
+  before it runs, and when its compile or compile preparation fails. }
+function TTestScheduler.VoidIfInputsChanged(const AIndex: Integer): Boolean;
+var
+  Changed: string;
+begin
+  Changed := ChangedRunInput;
+  Result := Changed <> '';
+  if Result then VoidRun(AIndex, Changed);
 end;
 
 function TTestScheduler.ClaimJob(out AIndex: Integer): Boolean;
@@ -932,6 +1186,20 @@ var
       BUILD_CACHE_OPERATION_TEST_PROGRAM);
   end;
 
+  { The cache fingerprint taken when this job started no longer matches,
+    so its compile read inputs that moved, even if they have moved back and
+    the run check no longer sees it. }
+  procedure VoidForMovedInputs;
+  var
+    Changed: string;
+  begin
+    Changed := ChangedRunInput;
+    if Changed = '' then
+      Changed := 'an input of ' + RelativeSource + ' changed while it '
+        + 'compiled';
+    VoidRun(AIndex, Changed);
+  end;
+
   function ReacquireWorkerLease: Boolean;
   begin
     Result := False;
@@ -978,37 +1246,49 @@ var
 begin
   ProducerLease := nil;
   ReleasingWorkerForWait := False;
+  CompilerProcess := nil;
+  RelativeSource := TestRelativePath(FProjectRoot, FJobs[AIndex].Source);
   try
   try
     CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
       FUnitPaths, FCompilerArguments, Binary, BuildRequest, FBuildRoot,
-      FCompilerDriver, FCacheContext.ConfigurationPath);
+      FCompilerDriver, FRunConfigurationPath);
+    NeutralRequest := BuildRequest;
+    NeutralRequest.Inputs.EntryPoint := RelativeSource;
+    SetLength(NeutralRequest.Inputs.Sources, 1);
+    NeutralRequest.Inputs.Sources[0] := RelativeSource;
+    NeutralRequest := NeutralBuildCacheRequest(NeutralRequest,
+      'test-programs/' + RelativeSource);
+    PublicationRequest := Default(TLWPTBuildPublicationRequest);
+    PublicationRequest.BuildRequest := NeutralRequest;
+    PublicationRequest.CompilerExecutable := FCompilerDriver.ExecutableName;
+    PublicationRequest.CompilerArguments :=
+      FCompilerDriver.InvocationArguments(FCompilerDriver.BuildArguments(
+        NeutralRequest, PascalSourceCompilerInvocationOptions(
+          FRunConfigurationPath)));
   except
     { A staging path over the compiler's budget fails this one test with
       the explanatory message instead of aborting the whole scheduler. }
-    on E: ELWPTError do
+    on E: Exception do
     begin
+      FreeAndNil(CompilerProcess);
+      { Preparation reads the search directories, so a changed input
+        explains its failure, whatever it raised. Otherwise a staging-path
+        budget error fails this one test, and anything else stays a
+        scheduler error. }
+      if VoidIfInputsChanged(AIndex) then
+      begin
+        SetJobOutput(AIndex, True, E.Message);
+        Exit;
+      end;
+      if not (E is ELWPTError) then raise;
       SetJobOutput(AIndex, True, E.Message);
       FailJob(AIndex, tjsCompileFailed, 1, E.Message);
       Exit;
     end;
   end;
 
-  RelativeSource := TestRelativePath(FProjectRoot, FJobs[AIndex].Source);
   ArtifactSetPath := ExtractFileDir(Binary) + '/cache-tmp/artifact-set';
-  NeutralRequest := BuildRequest;
-  NeutralRequest.Inputs.EntryPoint := RelativeSource;
-  SetLength(NeutralRequest.Inputs.Sources, 1);
-  NeutralRequest.Inputs.Sources[0] := RelativeSource;
-  NeutralRequest := NeutralBuildCacheRequest(NeutralRequest,
-    'test-programs/' + RelativeSource);
-  PublicationRequest := Default(TLWPTBuildPublicationRequest);
-  PublicationRequest.BuildRequest := NeutralRequest;
-  PublicationRequest.CompilerExecutable := FCompilerDriver.ExecutableName;
-  PublicationRequest.CompilerArguments := FCompilerDriver.InvocationArguments(
-    FCompilerDriver.BuildArguments(NeutralRequest,
-      PascalSourceCompilerInvocationOptions(
-        FCacheContext.ConfigurationPath)));
   PublicationRequest.ManifestContentHash :=
     FCacheContext.ManifestContentHash;
   PublicationRequest.PublicOutput := 'test-programs/' + RelativeSource;
@@ -1076,8 +1356,7 @@ begin
               if CaptureFingerprint <> CacheFingerprint then
               begin
                 CompilerProcess.Free;
-                FailJob(AIndex, tjsCompileFailed, 1,
-                  'inputs changed while waiting for cached test program');
+                VoidForMovedInputs;
                 Exit;
               end;
               if AcceptCachedResult('cache wait hit') then
@@ -1102,8 +1381,7 @@ begin
               begin
                 CompilerProcess.Free;
                 FreeAndNil(ProducerLease);
-                FailJob(AIndex, tjsCompileFailed, 1,
-                  'inputs changed while waiting for cached test program');
+                VoidForMovedInputs;
                 Exit;
               end;
               if FCacheContext.Cache.Materialize(CacheFingerprint,
@@ -1168,6 +1446,14 @@ begin
     Output := CacheDiagnostic
       + FCompilerDriver.DisplayOutput(StandardOutput, StandardError);
     SetJobOutput(AIndex, True, Output);
+    { A compiler the run terminated left no result to interpret: whatever it
+      printed, or failed to print, says nothing about the program. }
+    if IsCancelled then
+    begin
+      FreeAndNil(ProducerLease);
+      CompleteJob(AIndex, tjsCancelled);
+      Exit;
+    end;
     BuildResult := FCompilerDriver.NormalizeExecutionResult(BuildRequest, Code,
       StandardOutput, StandardError);
     ValidateReportedArtifacts(FCompilerDriver.CompilerID, BuildRequest,
@@ -1177,7 +1463,9 @@ begin
     begin
       FreeAndNil(ProducerLease);
       SetJobOutput(AIndex, True, E.Message);
-      FailJob(AIndex, tjsCompileFailed, 1, E.Message);
+      if IsCancelled then CompleteJob(AIndex, tjsCancelled)
+      else if not VoidIfInputsChanged(AIndex) then
+        FailJob(AIndex, tjsCompileFailed, 1, E.Message);
       Exit;
     end;
   end;
@@ -1185,6 +1473,13 @@ begin
   begin
     FreeAndNil(ProducerLease);
     CompleteJob(AIndex, tjsCancelled);
+    Exit;
+  end;
+  { The executable now exists, compiled or reused, and nothing has run it.
+    A compile that failed on a half-edited file is void, not a failure. }
+  if VoidIfInputsChanged(AIndex) then
+  begin
+    FreeAndNil(ProducerLease);
     Exit;
   end;
   if not BuildResult.Success then
@@ -1199,9 +1494,16 @@ begin
   begin
     try
       if CaptureFingerprint <> CacheFingerprint then
+      begin
         SetJobOutput(AIndex, True, Output
           + 'cache store skipped: inputs changed during compilation'
-          + LineEnding)
+          + LineEnding);
+        { This program's inputs moved while it compiled, so its executable
+          may mix states even if they have moved back since the check. }
+        VoidForMovedInputs;
+        FreeAndNil(ProducerLease);
+        Exit;
+      end
       else
       begin
         WriteTestArtifactSet(ExtractFileDir(Binary), ArtifactSetPath,
@@ -1299,7 +1601,7 @@ end;
 function IsTerminalTestStatus(const AStatus: TTestJobStatus): Boolean; inline;
 begin
   Result := AStatus in [tjsPassed, tjsCompileFailed, tjsRunFailed,
-    tjsCancelled, tjsWorkerError];
+    tjsCancelled, tjsWorkerError, tjsVoided];
 end;
 
 function TTestScheduler.AllJobsTerminal: Boolean;
@@ -1348,6 +1650,7 @@ begin
         AEvent.ExitCode := FJobs[i].ExitCode;
         AEvent.Status := FJobs[i].Status;
         AEvent.StartedAt := FJobs[i].StartedAt;
+        AEvent.RunVoided := FVoidedInput <> '';
         Exit(True);
       end;
     Result := False;
@@ -1359,10 +1662,12 @@ end;
 procedure TTestScheduler.PrintProgressEvent(
   const AEvent: TTestProgressEvent);
 var
-  Detail, LogOutput, LogReference: string;
+  CancelReason, Detail, LogOutput, LogReference: string;
   JobEvent: TLWPTJobEvent;
   JobState: TLWPTJobState;
 begin
+  if AEvent.RunVoided then CancelReason := 'run void: inputs changed'
+  else CancelReason := 'bail threshold reached';
   LogReference := FSession.JobLogReference(
     ObservabilityTestIdentityNamespace + AEvent.Source);
   if AEvent.Kind = tpkStart then
@@ -1382,7 +1687,7 @@ begin
     JobEvent := TLWPTJobEvent.Create(
       ObservabilityTestIdentityNamespace + AEvent.Source,
       FSession.SessionID, ojsSkipped, 0, 0,
-      'bail threshold reached before start', '');
+      CancelReason + ' before start', '');
     try
       FReporter.ReportJob(JobEvent, '', '', FVerbose);
     finally
@@ -1410,12 +1715,17 @@ begin
     tjsCancelled:
       begin
         JobState := ojsSkipped;
-        Detail := 'bail threshold reached';
+        Detail := CancelReason;
       end;
     tjsWorkerError:
       begin
         JobState := ojsFailed;
         Detail := 'scheduler error';
+      end;
+    tjsVoided:
+      begin
+        JobState := ojsFailed;
+        Detail := 'inputs changed';
       end;
   end;
   JobEvent := TLWPTJobEvent.Create(
@@ -1441,6 +1751,7 @@ var
   InvocationStartedAt, NowTick: QWord;
   HeartbeatEvent: TLWPTHeartbeatEvent;
 begin
+  CaptureRunInputs;
   InvocationStartedAt := GetTickCount64;
   FReporter.StartHeartbeatClock(InvocationStartedAt, InvocationStartedAt);
   Started := 0;
@@ -1496,15 +1807,18 @@ begin
 end;
 
 procedure TTestScheduler.PrintResults(const AProjectRoot: string;
-  out APassed, AFailed, ACompileFailed, ACancelled: Integer);
+  out APassed, AFailed, ACompileFailed, ACancelled, AVoided: Integer);
 var
   i: Integer;
-  DisplayPath: string;
+  CancelReason, DisplayPath: string;
 begin
   APassed := 0;
   AFailed := 0;
   ACompileFailed := 0;
   ACancelled := 0;
+  AVoided := 0;
+  if FVoidedInput <> '' then CancelReason := 'run void: inputs changed'
+  else CancelReason := 'bail threshold reached';
   for i := 0 to High(FJobs) do
   begin
     DisplayPath := ExtractRelativePath(
@@ -1528,13 +1842,18 @@ begin
         end;
       tjsCancelled:
         begin
-          WriteLn('cancelled (bail threshold reached)');
+          WriteLn('cancelled (', CancelReason, ')');
           Inc(ACancelled);
         end;
       tjsWorkerError:
         begin
           WriteLn('ERROR (', FJobs[i].ErrorMessage, ')');
           Inc(AFailed);
+        end;
+      tjsVoided:
+        begin
+          WriteLn('VOID (', FJobs[i].ErrorMessage, ')');
+          Inc(AVoided);
         end;
     else
       begin
@@ -1597,7 +1916,7 @@ begin
           + IntToStr(AJob.ExitCode);
     tjsCancelled:
       Result := 'cancelled before its inventory record was read';
-    tjsWorkerError:
+    tjsWorkerError, tjsVoided:
       Result := AJob.ErrorMessage;
   else
     Result := 'did not complete';
@@ -1770,6 +2089,16 @@ begin
   end;
 end;
 
+{ The summary's void clause; empty for a run whose inputs held still, so
+  its summary line keeps the established format. }
+function RunVoidSummary(const AVoided: Integer;
+  const AVoidedInput: string): string;
+begin
+  if AVoidedInput = '' then Exit('');
+  Result := ', ' + IntToStr(AVoided) + ' void; run void: compiler inputs '
+    + 'changed after it started (' + AVoidedInput + ')';
+end;
+
 function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings; const AUseCache: Boolean): Integer;
@@ -1787,10 +2116,10 @@ const
 var
   Man: TManifest;
   DiscoveredTests, Tests: TStringList;
-  UnitPaths: TStringArray;
+  RootFiles, UnitPaths: TStringArray;
   ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond,
-    InventoryPath, ManifestContentHash: string;
-  i, n, Passed, Failed, CompileFailed, Cancelled,
+    InventoryPath, ManifestContentHash, VoidedInput: string;
+  i, n, Passed, Failed, CompileFailed, Cancelled, Voided,
     EffectiveBail: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
@@ -1807,6 +2136,8 @@ begin
   Failed := 0;
   CompileFailed := 0;
   Cancelled := 0;
+  Voided := 0;
+  VoidedInput := '';
   CompilerSelection := nil;
   DiscoveredTests := nil;
   Tests := nil;
@@ -1931,16 +2262,27 @@ begin
       CacheContext.ManifestContentHash := ManifestContentHash;
       CacheContext.ConfigurationPath := ResolveCfgFile(Man);
       CacheContext.ModulesPath := ModulesRoot;
-      CaptureProjectRootCompilerInputs(ProjectRoot,
-        CacheContext.CompilerImplicitInputs);
-      SetLength(CacheContext.WorkspacePaths, Length(Man.Workspaces));
-      for i := 0 to High(Man.Workspaces) do
-        CacheContext.WorkspacePaths[i] := NeutralProjectPath(ProjectRoot,
-          Man.Workspaces[i].Path);
       AddTestCacheExcludedOutputs(Man, CacheContext.ExcludedPaths);
       n := Length(CacheContext.ExcludedPaths);
       SetLength(CacheContext.ExcludedPaths, n + 1);
       CacheContext.ExcludedPaths[n] := Session.SessionsRoot;
+      { A declared output at the project root is published by builds, not
+        read by compiles, so neither the cache fingerprint nor the run's
+        input check treats it as an implicit input. }
+      CaptureProjectRootCompilerInputs(ProjectRoot, RootFiles);
+      SetLength(CacheContext.CompilerImplicitInputs, 0);
+      for i := 0 to High(RootFiles) do
+        if not RootFileIsExcluded(ProjectRoot, RootFiles[i],
+             CacheContext.ExcludedPaths) then
+        begin
+          n := Length(CacheContext.CompilerImplicitInputs);
+          SetLength(CacheContext.CompilerImplicitInputs, n + 1);
+          CacheContext.CompilerImplicitInputs[n] := RootFiles[i];
+        end;
+      SetLength(CacheContext.WorkspacePaths, Length(Man.Workspaces));
+      for i := 0 to High(Man.Workspaces) do
+        CacheContext.WorkspacePaths[i] := NeutralProjectPath(ProjectRoot,
+          Man.Workspaces[i].Path);
       if AUseCache then
         try
           Cache := TLWPTBuildCache.CreateDefault;
@@ -1967,6 +2309,11 @@ begin
         if not AInventory then
           WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
         Scheduler.Run;
+        VoidedInput := Scheduler.VoidedInput;
+        if VoidedInput <> '' then
+          WriteLn(ErrOutput, PROGRAM_NAME, ' test: compiler inputs changed ',
+            'after this test run started (', VoidedInput, '); its results ',
+            'are void; rerun ', PROGRAM_NAME, ' test');
         Scheduler.ValidateInventory(ProjectRoot);
         if AInventory then
         begin
@@ -1975,7 +2322,7 @@ begin
         end
         else
           Scheduler.PrintResults(ProjectRoot, Passed, Failed, CompileFailed,
-            Cancelled);
+            Cancelled, Voided);
         if Scheduler.InternalError <> '' then
           WriteLn(ErrOutput, PROGRAM_NAME, ' test: scheduler error: ',
             Scheduler.InternalError);
@@ -1983,14 +2330,16 @@ begin
         Scheduler.Free;
       end;
 
-      if (Failed = 0) and (CompileFailed = 0) and (Cancelled = 0) then
+      if (Failed = 0) and (CompileFailed = 0) and (Cancelled = 0)
+         and (Voided = 0) and (VoidedInput = '') then
         Result := 0
       else
         Result := 1;
     if not AInventory then RunHooks('posttest', Man.PostTest, ProjectRoot, ResolveTmpDir(Man));
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
-      + IntToStr(Cancelled) + ' cancelled');
+      + IntToStr(Cancelled) + ' cancelled' + RunVoidSummary(Voided,
+        VoidedInput));
     for i := 0 to Session.CleanupWarnings.Count - 1 do
       WriteLn(ErrOutput, PROGRAM_NAME, ' test: warning: ',
         Session.CleanupWarnings[i]);
@@ -2011,7 +2360,8 @@ begin
     CompilerSelection.Free;
     if not AInventory then
       WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
-        CompileFailed, ' did not compile, ', Cancelled, ' cancelled; elapsed ',
+        CompileFailed, ' did not compile, ', Cancelled, ' cancelled',
+        RunVoidSummary(Voided, VoidedInput), '; elapsed ',
         FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
   end;
 end;
