@@ -5,6 +5,7 @@ program LWPT.BuildSession.Test;
 
 uses
   {$IFDEF UNIX}
+  cthreads,
   BaseUnix,
   {$ENDIF}
   Classes,
@@ -18,6 +19,22 @@ uses
   LWPT.Core;
 
 type
+  { Runs one snapshot and recheck off the test thread, so a snapshot that
+    blocks can be detected and released instead of hanging the program. }
+  TSnapshotThread = class(TThread)
+  private
+    FRoot: string;
+    FPaths: TStringArray;
+    FChanged: string;
+    FError: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ARoot: string; const APaths: TStringArray);
+    property Changed: string read FChanged;
+    property Error: string read FError;
+  end;
+
   TLWPTBuildSessionTests = class(TTestSuite)
   private
     FScratch: string;
@@ -67,6 +84,27 @@ type
     procedure TestRepairRemovesInterruptedSessionCreation;
     procedure TestRepairUsesHistoricalRelocatedRootsOnly;
   end;
+
+constructor TSnapshotThread.Create(const ARoot: string;
+  const APaths: TStringArray);
+begin
+  FRoot := ARoot;
+  FPaths := Copy(APaths, 0, Length(APaths));
+  FreeOnTerminate := False;
+  inherited Create(False);
+end;
+
+procedure TSnapshotThread.Execute;
+var
+  Snapshot: TLWPTInputSnapshot;
+begin
+  try
+    Snapshot := CaptureInputSnapshot(FRoot, FPaths, nil);
+    FChanged := FirstChangedInput(FRoot, Snapshot, nil);
+  except
+    on E: Exception do FError := E.ClassName + ': ' + E.Message;
+  end;
+end;
 
 procedure TLWPTBuildSessionTests.ResetScratch;
 begin
@@ -334,21 +372,45 @@ begin
 end;
 
 procedure TLWPTBuildSessionTests.TestInputSnapshotNeverOpensSpecialFiles;
+const
+  SNAPSHOT_DEADLINE_MILLISECONDS = 30000;
 var
   Paths: TStringArray;
   Snapshot: TLWPTInputSnapshot;
+  StartedAt: QWord;
+  Worker: TSnapshotThread;
+  Writer: LongInt;
 begin
   ResetScratch;
   WriteText(FScratch + '/source/app.pas', 'begin end.');
-  { Opening a FIFO with no writer blocks; a snapshot that opened it would
-    hang this test instead of finishing. }
+  { Opening a FIFO with no writer blocks. The snapshot runs in a thread with
+    a deadline; if it blocks, opening the FIFO for writing releases it so
+    the test fails instead of hanging. }
   Expect<Integer>(FpMkfifo(FScratch + '/source/pipe', &600)).ToBe(0);
   SetLength(Paths, 2);
   Paths[0] := 'source';
   Paths[1] := 'source/pipe';
+  Worker := TSnapshotThread.Create(FScratch, Paths);
+  try
+    StartedAt := GetTickCount64;
+    while not Worker.Finished
+          and (GetTickCount64 - StartedAt < SNAPSHOT_DEADLINE_MILLISECONDS) do
+      Sleep(10);
+    if not Worker.Finished then
+    begin
+      Writer := FpOpen(FScratch + '/source/pipe', O_WRONLY or O_NONBLOCK);
+      if Writer >= 0 then FpClose(Writer);
+      Worker.WaitFor;
+      Fail('input snapshot blocked opening a FIFO');
+    end;
+    Worker.WaitFor;
+    Expect<string>(Worker.Error).ToBe('');
+    Expect<string>(Worker.Changed).ToBe('');
+  finally
+    Worker.Free;
+  end;
   Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
   Expect<Integer>(Length(Snapshot.Paths)).ToBe(2);
-  Expect<string>(FirstChangedInput(FScratch, Snapshot, nil)).ToBe('');
   WriteText(FScratch + '/source/app.pas', 'begin WriteLn; end.');
   Expect<string>(FirstChangedInput(FScratch, Snapshot, nil))
     .ToBe(ExpandFileName(FScratch + '/source') + PathDelim + 'app.pas');

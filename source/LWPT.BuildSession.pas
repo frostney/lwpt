@@ -420,16 +420,33 @@ end;
   fingerprint (the cache then steps aside); a run-level input snapshot must
   not fail, so ASnapshot records such a file by its metadata. The compiler
   cannot read that file either, and a change to it still shows. A snapshot
-  also never opens a file that is not regular, because opening a FIFO with
-  no writer blocks, and reuses ADigests for a file it already hashed through
-  an overlapping path. }
+  opens without blocking and hashes only a regular file through the
+  descriptor it classified, so a FIFO (even one swapped in after a check)
+  never blocks it. ADigests reuses a file already hashed in this scan
+  through an overlapping path. }
 function InputFileContent(const APath: string; const ASnapshot: Boolean;
   const ADigests: TFPStringHashTable): string;
+
+  function Metadata: string;
+  var
+    Info: TSearchRec;
+  begin
+    Result := 'unreadable';
+    if SysUtils.FindFirst(APath, faAnyFile or faSymLink, Info) = 0 then
+    try
+      Result := Result + ':' + IntToStr(Info.Size) + ':'
+        + IntToStr(Info.Time) + ':' + IntToStr(Info.Attr);
+    finally
+      SysUtils.FindClose(Info);
+    end;
+  end;
+
 var
-  Info: TSearchRec;
   Known: THTStringNode;
   {$IFDEF UNIX}
+  Descriptor: LongInt;
   Status: BaseUnix.Stat;
+  Stream: TLWPTProtectedFileStream;
   {$ENDIF}
 begin
   if not ASnapshot then Exit(SHA256File(APath));
@@ -439,25 +456,35 @@ begin
     if Known <> nil then Exit(Known.Data);
   end;
   {$IFDEF UNIX}
-  if (FpStat(APath, Status) = 0) and not fpS_ISREG(Status.st_mode) then
-    Result := 'special:' + IntToStr(Status.st_mode)
+  Descriptor := OpenProtectedDescriptor(APath, O_RDONLY or O_NONBLOCK, 0);
+  if Descriptor < 0 then
+    Result := Metadata
+  else if (FpFStat(Descriptor, Status) = 0)
+     and not fpS_ISREG(Status.st_mode) then
+  begin
+    FpClose(Descriptor);
+    Result := 'special:' + IntToStr(Status.st_mode);
+  end
   else
-  {$ENDIF}
+  begin
+    Stream := TLWPTProtectedFileStream.Create(THandle(Descriptor));
+    try
+      try
+        Result := SHA256Stream(Stream);
+      except
+        on E: Exception do Result := Metadata;
+      end;
+    finally
+      Stream.Free;
+    end;
+  end;
+  {$ELSE}
   try
     Result := SHA256File(APath);
   except
-    on E: Exception do
-    begin
-      Result := 'unreadable';
-      if SysUtils.FindFirst(APath, faAnyFile or faSymLink, Info) = 0 then
-      try
-        Result := Result + ':' + IntToStr(Info.Size) + ':'
-          + IntToStr(Info.Time) + ':' + IntToStr(Info.Attr);
-      finally
-        SysUtils.FindClose(Info);
-      end;
-    end;
+    on E: Exception do Result := Metadata;
   end;
+  {$ENDIF}
   if ADigests <> nil then ADigests.Add(APath, Result);
 end;
 

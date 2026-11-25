@@ -169,7 +169,8 @@ type
     FRunInputs: TLWPTInputSnapshot;
     FVoidedInput: string;
     procedure CaptureRunInputs;
-    function IsExcludedRootFile(const AName: string): Boolean;
+    function ChangedRunInput: string;
+    function VoidRun(const AIndex: Integer; const AChanged: string): Boolean;
     function VoidIfInputsChanged(const AIndex: Integer): Boolean;
     function ClaimJob(out AIndex: Integer): Boolean;
     function AcquireLease: TLWPTWorkerLease;
@@ -479,6 +480,38 @@ begin
     Result := APath;
 end;
 
+{ A project-root file that is a declared build output: another invocation
+  may publish it at any time, and no compile reads it. }
+function RootFileIsExcluded(const AProjectRoot, AName: string;
+  const AExcludedPaths: TStringArray): Boolean;
+var
+  Excluded, Full: string;
+  i: Integer;
+begin
+  Full := ExpandFileName(IncludeTrailingPathDelimiter(AProjectRoot) + AName);
+  for i := 0 to High(AExcludedPaths) do
+  begin
+    Excluded := AExcludedPaths[i];
+    if Excluded = '' then Continue;
+    if not IsAbsoluteFilesystemPath(Excluded) then
+      Excluded := IncludeTrailingPathDelimiter(AProjectRoot) + Excluded;
+    if SameFileName(Full, ExpandFileName(Excluded)) then Exit(True);
+  end;
+  Result := False;
+end;
+
+{ The compiler configuration file's content at one moment, so the run can
+  tell whether it read one version throughout its capture. }
+function ConfigurationState(const APath: string): string;
+begin
+  if (APath = '') or not FileExists(APath) then Exit('missing');
+  try
+    Result := SHA256File(APath);
+  except
+    on E: Exception do Result := 'unreadable';
+  end;
+end;
+
 { A compiler option that names directories the compiler searches: unit,
   include, object or library paths. APath is the option's argument, which
   may list several directories. }
@@ -515,14 +548,14 @@ var
   end;
 
   { A compiler search path can list directories separated by ";" and use
-    wildcards that the compiler expands. Each wildcard entry is watched
-    through its fixed leading directory, which contains every directory
-    the wildcard can match now or later. }
+    wildcards and $FPC... macros that the compiler expands. Such an entry is
+    watched through its fixed leading directory, which contains every
+    directory it can resolve to now or later. }
   procedure AddSearchPath(const APath: string);
   var
     Entries: TStringList;
     Entry: string;
-    i, Wildcard: Integer;
+    i, Position, Wildcard: Integer;
   begin
     Entries := TStringList.Create;
     try
@@ -536,10 +569,13 @@ var
            and (Entry[Length(Entry)] = '"') then
           Entry := Copy(Entry, 2, Length(Entry) - 2);
         if Entry = '' then Continue;
-        Wildcard := Pos('*', Entry);
-        if (Pos('?', Entry) > 0)
-           and ((Wildcard = 0) or (Pos('?', Entry) < Wildcard)) then
-          Wildcard := Pos('?', Entry);
+        Wildcard := 0;
+        for Position := 1 to Length(Entry) do
+          if Entry[Position] in ['*', '?', '$'] then
+          begin
+            Wildcard := Position;
+            Break;
+          end;
         if Wildcard > 0 then
         begin
           Entry := Copy(Entry, 1, Wildcard - 1);
@@ -573,7 +609,7 @@ var
       Exit;
     Lines := TStringList.Create;
     try
-      Lines.LoadFromFile(AConfigurationPath);
+      LoadProtectedStrings(Lines, AConfigurationPath);
       for i := 0 to Lines.Count - 1 do
         if CompilerFlagSearchPath(Trim(Lines[i]), FlagPath) then
           AddSearchPath(FlagPath);
@@ -582,85 +618,88 @@ var
     end;
   end;
 
-var
-  FlagPath, SourceDirectory: string;
-  i: Integer;
-begin
-  SetLength(Paths, 0);
-  AddPath(FCacheContext.ManifestPath);
-  AddPath(FCacheContext.ConfigurationPath);
-  AddPath(LOCKFILE);
-  AddPath(FCacheContext.ModulesPath);
-  for i := 0 to High(FCacheContext.CompilerImplicitInputs) do
-    if not IsExcludedRootFile(FCacheContext.CompilerImplicitInputs[i]) then
-      AddPath(FCacheContext.CompilerImplicitInputs[i]);
-  for i := 0 to High(FCacheContext.WorkspacePaths) do
-    AddPath(FCacheContext.WorkspacePaths[i]);
-  PascalSourceSearchPaths(FUnitPaths, FCacheContext.ConfigurationPath,
-    UnitSearchPaths, IncludeSearchPaths);
-  AddSearchPaths(UnitSearchPaths);
-  AddSearchPaths(IncludeSearchPaths);
-  AddConfigurationSearchPaths(FCacheContext.ConfigurationPath);
-  { Search directories that [test] flags add reach the compiler as extra
-    arguments, outside the request's search paths. }
-  for i := 0 to High(FCompilerArguments) do
-    if CompilerFlagSearchPath(FCompilerArguments[i], FlagPath) then
-      AddSearchPath(FlagPath);
-  for i := 0 to High(FJobs) do
+  { Search options that reach the compiler outside the request's search
+    paths: [test] flags and the selected profile's own arguments. }
+  procedure AddOptionSearchPaths(const AOptions: TStringArray);
+  var
+    FlagPath: string;
+    i: Integer;
   begin
-    AddPath(FJobs[i].Source);
-    { The source directory as the cache fingerprint derives it: from the
-      project-relative path, so a program at the project root adds no
-      directory rather than the whole project. }
-    SourceDirectory := ExtractFileDir(TestRelativePath(FProjectRoot,
-      FJobs[i].Source));
-    if SourceDirectory <> '' then AddPath(SourceDirectory);
+    for i := 0 to High(AOptions) do
+      if CompilerFlagSearchPath(AOptions[i], FlagPath) then
+        AddSearchPath(FlagPath);
   end;
-  FRunInputs := CaptureInputSnapshot(FProjectRoot, Paths,
-    FCacheContext.ExcludedPaths);
-end;
 
-{ A project-root file that is a declared build output: another invocation
-  may publish it at any time, and no compile reads it. }
-function TTestScheduler.IsExcludedRootFile(const AName: string): Boolean;
+const
+  CONFIGURATION_CAPTURE_ATTEMPTS = 3;
 var
-  Excluded, Full: string;
-  i: Integer;
+  ConfigurationBefore, SourceDirectory: string;
+  Attempt, i: Integer;
 begin
-  Full := ExpandFileName(IncludeTrailingPathDelimiter(FProjectRoot) + AName);
-  for i := 0 to High(FCacheContext.ExcludedPaths) do
+  { The search paths come from the cfg file and its hash from the snapshot;
+    a cfg replaced in between would pair new bytes with old directories, so
+    the capture repeats until the cfg held still across it. }
+  for Attempt := 1 to CONFIGURATION_CAPTURE_ATTEMPTS do
   begin
-    Excluded := FCacheContext.ExcludedPaths[i];
-    if Excluded = '' then Continue;
-    if not IsAbsoluteFilesystemPath(Excluded) then
-      Excluded := IncludeTrailingPathDelimiter(FProjectRoot) + Excluded;
-    if SameFileName(Full, ExpandFileName(Excluded)) then Exit(True);
+    ConfigurationBefore := ConfigurationState(FCacheContext.ConfigurationPath);
+    SetLength(Paths, 0);
+    AddPath(FCacheContext.ManifestPath);
+    AddPath(FCacheContext.ConfigurationPath);
+    AddPath(LOCKFILE);
+    AddPath(FCacheContext.ModulesPath);
+    for i := 0 to High(FCacheContext.CompilerImplicitInputs) do
+      AddPath(FCacheContext.CompilerImplicitInputs[i]);
+    for i := 0 to High(FCacheContext.WorkspacePaths) do
+      AddPath(FCacheContext.WorkspacePaths[i]);
+    PascalSourceSearchPaths(FUnitPaths, FCacheContext.ConfigurationPath,
+      UnitSearchPaths, IncludeSearchPaths);
+    AddSearchPaths(UnitSearchPaths);
+    AddSearchPaths(IncludeSearchPaths);
+    AddConfigurationSearchPaths(FCacheContext.ConfigurationPath);
+    AddOptionSearchPaths(FCompilerArguments);
+    AddOptionSearchPaths(FCompilerDriver.InvocationArguments(nil));
+    for i := 0 to High(FJobs) do
+    begin
+      AddPath(FJobs[i].Source);
+      { The source directory as the cache fingerprint derives it: from the
+        project-relative path, so a program at the project root adds no
+        directory rather than the whole project. }
+      SourceDirectory := ExtractFileDir(TestRelativePath(FProjectRoot,
+        FJobs[i].Source));
+      if SourceDirectory <> '' then AddPath(SourceDirectory);
+    end;
+    FRunInputs := CaptureInputSnapshot(FProjectRoot, Paths,
+      FCacheContext.ExcludedPaths);
+    if ConfigurationState(FCacheContext.ConfigurationPath)
+       = ConfigurationBefore then Exit;
   end;
-  Result := False;
+  raise ELWPTError.Create('the compiler configuration file kept changing '
+    + 'while this test run started; rerun ' + PROGRAM_NAME + ' test');
 end;
 
 { Called by every job once its executable exists (compiled or reused) and
   before it runs, and when a compile fails. A changed input voids the job and
   stops the run: results from before and after the change must not be
   reported together. }
-function TTestScheduler.VoidIfInputsChanged(const AIndex: Integer): Boolean;
+{ The first run input that differs from the snapshot, as a display path,
+  or ''. The snapshot sees a recorded file change or disappear; a file that
+  appears at the project root is a new implicit compiler input. }
+function TTestScheduler.ChangedRunInput: string;
 var
-  Changed: string;
   RootFiles: TStringArray;
   i, j: Integer;
   Recorded: Boolean;
 begin
-  Changed := FirstChangedInput(FProjectRoot, FRunInputs,
+  Result := FirstChangedInput(FProjectRoot, FRunInputs,
     FCacheContext.ExcludedPaths);
-  if Changed = '' then
+  if Result = '' then
   begin
-    { The snapshot sees a recorded root file change or disappear; a root
-      file that appears is a new implicit compiler input. }
     SetLength(RootFiles, 0);
     CaptureProjectRootCompilerInputs(FProjectRoot, RootFiles);
     for i := 0 to High(RootFiles) do
     begin
-      if IsExcludedRootFile(RootFiles[i]) then Continue;
+      if RootFileIsExcluded(FProjectRoot, RootFiles[i],
+           FCacheContext.ExcludedPaths) then Continue;
       Recorded := False;
       for j := 0 to High(FCacheContext.CompilerImplicitInputs) do
         if RootFiles[i] = FCacheContext.CompilerImplicitInputs[j] then
@@ -670,18 +709,24 @@ begin
         end;
       if not Recorded then
       begin
-        Changed := IncludeTrailingPathDelimiter(FProjectRoot) + RootFiles[i];
+        Result := IncludeTrailingPathDelimiter(FProjectRoot) + RootFiles[i];
         Break;
       end;
     end;
   end;
-  Result := Changed <> '';
-  if not Result then Exit;
-  Changed := InputDisplayPath(FProjectRoot, Changed);
+  if Result <> '' then Result := InputDisplayPath(FProjectRoot, Result);
+end;
+
+{ Voids the run because of AChanged: results from before and after a change
+  must not be reported together. The first detector is VOID; a sibling that
+  detects the same change afterwards is one of the programs the void
+  cancelled. Always True, so callers can exit on it. }
+function TTestScheduler.VoidRun(const AIndex: Integer;
+  const AChanged: string): Boolean;
+begin
+  Result := True;
   EnterCriticalSection(FCriticalSection);
   try
-    { The first detector voids the run; a sibling that detects the same
-      change afterwards is one of the programs the void cancelled. }
     if FVoidedInput <> '' then
     begin
       if FJobs[AIndex].Status <> tjsWorkerError then
@@ -693,14 +738,25 @@ begin
       FJobs[AIndex].Status := tjsVoided;
       FJobs[AIndex].ExitCode := 1;
       FJobs[AIndex].ErrorMessage := 'compiler inputs changed after this '
-        + 'test run started (' + Changed + '); its results are void; rerun '
+        + 'test run started (' + AChanged + '); its results are void; rerun '
         + PROGRAM_NAME + ' test';
     end;
-    FVoidedInput := Changed;
+    FVoidedInput := AChanged;
     if not FCancelled then CancelPendingAndActiveLocked;
   finally
     LeaveCriticalSection(FCriticalSection);
   end;
+end;
+
+{ Called by every job once its executable exists (compiled or reused) and
+  before it runs, and when its compile or compile preparation fails. }
+function TTestScheduler.VoidIfInputsChanged(const AIndex: Integer): Boolean;
+var
+  Changed: string;
+begin
+  Changed := ChangedRunInput;
+  Result := Changed <> '';
+  if Result then VoidRun(AIndex, Changed);
 end;
 
 function TTestScheduler.ClaimJob(out AIndex: Integer): Boolean;
@@ -1177,6 +1233,20 @@ var
       BUILD_CACHE_OPERATION_TEST_PROGRAM);
   end;
 
+  { The cache fingerprint taken when this job started no longer matches,
+    so its compile read inputs that moved, even if they have moved back and
+    the run check no longer sees it. }
+  procedure VoidForMovedInputs;
+  var
+    Changed: string;
+  begin
+    Changed := ChangedRunInput;
+    if Changed = '' then
+      Changed := 'an input of ' + RelativeSource + ' changed while it '
+        + 'compiled';
+    VoidRun(AIndex, Changed);
+  end;
+
   function ReacquireWorkerLease: Boolean;
   begin
     Result := False;
@@ -1231,13 +1301,20 @@ begin
   except
     { A staging path over the compiler's budget fails this one test with
       the explanatory message instead of aborting the whole scheduler. }
-    on E: ELWPTError do
+    on E: Exception do
     begin
+      { Preparation reads the search directories and the cfg file too, so a
+        changed input explains its failure, whatever it raised. Otherwise a
+        staging-path budget error fails this one test, and anything else
+        stays a scheduler error. }
+      if VoidIfInputsChanged(AIndex) then
+      begin
+        SetJobOutput(AIndex, True, E.Message);
+        Exit;
+      end;
+      if not (E is ELWPTError) then raise;
       SetJobOutput(AIndex, True, E.Message);
-      { A preparation check such as the staging-path budget reads the
-        search directories too, so a changed input explains its failure. }
-      if not VoidIfInputsChanged(AIndex) then
-        FailJob(AIndex, tjsCompileFailed, 1, E.Message);
+      FailJob(AIndex, tjsCompileFailed, 1, E.Message);
       Exit;
     end;
   end;
@@ -1324,9 +1401,7 @@ begin
               if CaptureFingerprint <> CacheFingerprint then
               begin
                 CompilerProcess.Free;
-                if not VoidIfInputsChanged(AIndex) then
-                  FailJob(AIndex, tjsCompileFailed, 1,
-                    'inputs changed while waiting for cached test program');
+                VoidForMovedInputs;
                 Exit;
               end;
               if AcceptCachedResult('cache wait hit') then
@@ -1351,9 +1426,7 @@ begin
               begin
                 CompilerProcess.Free;
                 FreeAndNil(ProducerLease);
-                if not VoidIfInputsChanged(AIndex) then
-                  FailJob(AIndex, tjsCompileFailed, 1,
-                    'inputs changed while waiting for cached test program');
+                VoidForMovedInputs;
                 Exit;
               end;
               if FCacheContext.Cache.Materialize(CacheFingerprint,
@@ -1461,13 +1534,11 @@ begin
         SetJobOutput(AIndex, True, Output
           + 'cache store skipped: inputs changed during compilation'
           + LineEnding);
-        { The change was seen before this executable runs, so it voids the
-          run like the check above. }
-        if VoidIfInputsChanged(AIndex) then
-        begin
-          FreeAndNil(ProducerLease);
-          Exit;
-        end;
+        { This program's inputs moved while it compiled, so its executable
+          may mix states even if they have moved back since the check. }
+        VoidForMovedInputs;
+        FreeAndNil(ProducerLease);
+        Exit;
       end
       else
       begin
@@ -2081,7 +2152,7 @@ const
 var
   Man: TManifest;
   DiscoveredTests, Tests: TStringList;
-  UnitPaths: TStringArray;
+  RootFiles, UnitPaths: TStringArray;
   ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond,
     InventoryPath, ManifestContentHash, VoidedInput: string;
   i, n, Passed, Failed, CompileFailed, Cancelled, Voided,
@@ -2227,16 +2298,27 @@ begin
       CacheContext.ManifestContentHash := ManifestContentHash;
       CacheContext.ConfigurationPath := ResolveCfgFile(Man);
       CacheContext.ModulesPath := ModulesRoot;
-      CaptureProjectRootCompilerInputs(ProjectRoot,
-        CacheContext.CompilerImplicitInputs);
-      SetLength(CacheContext.WorkspacePaths, Length(Man.Workspaces));
-      for i := 0 to High(Man.Workspaces) do
-        CacheContext.WorkspacePaths[i] := NeutralProjectPath(ProjectRoot,
-          Man.Workspaces[i].Path);
       AddTestCacheExcludedOutputs(Man, CacheContext.ExcludedPaths);
       n := Length(CacheContext.ExcludedPaths);
       SetLength(CacheContext.ExcludedPaths, n + 1);
       CacheContext.ExcludedPaths[n] := Session.SessionsRoot;
+      { A declared output at the project root is published by builds, not
+        read by compiles, so neither the cache fingerprint nor the run's
+        input check treats it as an implicit input. }
+      CaptureProjectRootCompilerInputs(ProjectRoot, RootFiles);
+      SetLength(CacheContext.CompilerImplicitInputs, 0);
+      for i := 0 to High(RootFiles) do
+        if not RootFileIsExcluded(ProjectRoot, RootFiles[i],
+             CacheContext.ExcludedPaths) then
+        begin
+          n := Length(CacheContext.CompilerImplicitInputs);
+          SetLength(CacheContext.CompilerImplicitInputs, n + 1);
+          CacheContext.CompilerImplicitInputs[n] := RootFiles[i];
+        end;
+      SetLength(CacheContext.WorkspacePaths, Length(Man.Workspaces));
+      for i := 0 to High(Man.Workspaces) do
+        CacheContext.WorkspacePaths[i] := NeutralProjectPath(ProjectRoot,
+          Man.Workspaces[i].Path);
       if AUseCache then
         try
           Cache := TLWPTBuildCache.CreateDefault;

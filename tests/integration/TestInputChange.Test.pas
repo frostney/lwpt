@@ -33,6 +33,7 @@ type
       AEditedShared: string; const AEditedPath: string = 'source/Shared.pas');
     procedure RequireExit(const ALabel: string; const ARun: TLwptResult;
       const AExpected: Integer);
+    procedure RequireStableB(const AProjectRoot, ACacheName: string);
   protected
     procedure BeforeAll; override;
   public
@@ -46,6 +47,8 @@ type
     procedure TestFlagSearchDirectoryEditVoidsRun;
     procedure TestConfigurationIncludeDirectoryEditVoidsRun;
     procedure TestDeclaredRootOutputsDoNotVoidRun;
+    procedure TestFlagMacroSearchDirectoryEditVoidsRun;
+    procedure TestProfileIncludeDirectoryEditVoidsRun;
   end;
 
 function PascalString(const AValue: string): string;
@@ -145,6 +148,24 @@ begin
 end;
 
 { Result lines print native separators; compare them in canonical form. }
+function Contains(const ANeedle, AText: string): Boolean; forward;
+
+{ Before an edit run, B alone in a stable run must compile through the
+  search path under test and print W=1, so a VOID result proves the watch
+  rather than a fixture the compiler never resolved. }
+procedure TTestInputChange.RequireStableB(const AProjectRoot,
+  ACacheName: string);
+var
+  Run: TLwptResult;
+begin
+  Run := RunLwpt(['test', 'tests/B.Test.pas', '--verbose', '--no-cache'],
+    AProjectRoot, Environment(FScratch + '/' + ACacheName));
+  RequireExit('stable B run', Run, 0);
+  Expect<Boolean>(Contains('B W=1', Run.Stdout)).ToBe(True);
+  RecursiveDelete(AProjectRoot + '-markers');
+  ForceDirectories(AProjectRoot + '-markers');
+end;
+
 function Contains(const ANeedle, AText: string): Boolean;
 begin
   Result := Pos(ANeedle, StringReplace(AText, '\', '/', [rfReplaceAll])) > 0;
@@ -310,6 +331,7 @@ begin
     + 'units = ["source"]'#10
     + '[test]'#10
     + 'flags = ["-Fumissing;extra/*"]'#10);
+  RequireStableB(ProjectRoot, 'flag-search-directory-stable-cache');
   Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
     Environment(FScratch + '/flag-search-directory-cache'));
   RequireExit('flag search directory run', Run, 1);
@@ -346,6 +368,7 @@ begin
     + 'units = ["source"]'#10
     + '[lwpt]'#10
     + 'cfg-file = "custom.cfg"'#10);
+  RequireStableB(ProjectRoot, 'cfg-include-directory-stable-cache');
   Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
     Environment(FScratch + '/cfg-include-directory-cache'));
   RequireExit('configuration include directory run', Run, 1);
@@ -400,6 +423,69 @@ begin
     + '0 cancelled; elapsed ', Run.Stdout)).ToBe(True);
 end;
 
+procedure TTestInputChange.TestFlagMacroSearchDirectoryEditVoidsRun;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/flag-macro-directory';
+  { FPC expands $FPCTARGET in a search path, so the watch covers the fixed
+    directory before the macro, whatever the macro resolves to. }
+  WriteProject(ProjectRoot, SHARED_ONE, 'const W = 2;',
+    'extra/any-target/Value.inc');
+  WriteTextFile(ProjectRoot + '/extra/any-target/Value.inc', 'const W = 1;'#10);
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "test-input-change-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + '[test]'#10
+    + 'flags = ["-Fiextra/$FPCTARGET"]'#10);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/flag-macro-directory-cache'));
+  RequireExit('flag macro directory run', Run, 1);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
+    + 'changed after this test run started (extra/any-target/Value.inc)',
+    Run.Stdout)).ToBe(True);
+end;
+
+procedure TTestInputChange.TestProfileIncludeDirectoryEditVoidsRun;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/profile-include-directory';
+  { The selected compiler profile's own arguments reach the compiler too. }
+  WriteProject(ProjectRoot, SHARED_ONE, 'const W = 2;', 'incs/Value.inc');
+  WriteTextFile(ProjectRoot + '/incs/Value.inc', 'const W = 1;'#10);
+  WriteTextFile(ProjectRoot + '/tests/B.Test.pas',
+      'program B;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes;'#10
+    + '{$I Value.inc}'#10
+    + 'begin'#10
+    + '  WriteLn(''B W='', W);'#10
+    + MarkerStatements(MarkerPath(ProjectRoot, 'b-ran'))
+    + 'end.'#10);
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "test-input-change-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + '[compiler]'#10
+    + 'default = "pinned"'#10
+    + '[compiler.profiles.pinned]'#10
+    + 'driver = "fpc"'#10
+    + 'args = ["-Fiincs"]'#10);
+  RequireStableB(ProjectRoot, 'profile-include-directory-stable-cache');
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/profile-include-directory-cache'));
+  RequireExit('profile include directory run', Run, 1);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
+    + 'changed after this test run started (incs/Value.inc)', Run.Stdout))
+    .ToBe(True);
+end;
+
 procedure TTestInputChange.SetupTests;
 begin
   Test('an input edited during the run voids later jobs and stops the run',
@@ -420,6 +506,10 @@ begin
     TestConfigurationIncludeDirectoryEditVoidsRun);
   Test('declared build outputs at the project root do not void the run',
     TestDeclaredRootOutputsDoNotVoidRun);
+  Test('a search directory behind a compiler macro is watched',
+    TestFlagMacroSearchDirectoryEditVoidsRun);
+  Test('an include directory named by the compiler profile is watched',
+    TestProfileIncludeDirectoryEditVoidsRun);
 end;
 
 begin

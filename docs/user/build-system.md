@@ -544,13 +544,15 @@ runs; with selectors every match runs, without path-derived groups or skips. See
 
 Once `[pretest]` has finished, the invocation's compiler inputs must hold
 still. Before any program compiles or reuses a cached executable, `lwpt test`
-records the content of every path a selected program's compile can read: the
-paths the test cache fingerprint covers (manifest, cfg, lockfile, installed
-modules, unit, include, and workspace paths, `LWPT_FPC_UNIT_PATHS`,
-project-root files, and each selected program's source file and directory),
-plus the unit, include, object, and library directories that the cfg file or
-`[test]` flags name. A search path that lists several directories is split at
-`;`, and a wildcard entry is watched through its fixed leading directory.
+records the content of a fixed set of compiler inputs: the paths the test
+cache fingerprint covers (manifest, cfg, lockfile, installed modules, unit,
+include, and workspace paths, `LWPT_FPC_UNIT_PATHS`, project-root files, and
+each selected program's source file and directory), plus the unit, include,
+object, and library directories that the cfg file, `[test]` flags, or the
+selected compiler profile's `args` name. A search path that lists several
+directories is split at `;`, and an entry with a wildcard or a `$FPC...`
+macro is watched through its fixed leading directory. A file a program reads
+from outside this set, such as `{$I ../elsewhere/Value.inc}`, is not watched.
 Session staging and declared build outputs, including outputs at the project
 root, are excluded, and each path is hashed once. A file that appears at the
 project root also counts as a change.
@@ -561,9 +563,11 @@ preparation fails. If anything changed, that program is reported as `VOID`
 with the first changed file, every other program still running or not yet
 started is cancelled, and the command exits 1 with
 `run void: compiler inputs changed after it started (<path>)` in its summary.
-A compile that read a half-edited file is therefore reported as void rather
+A program whose cached-compile fingerprint moved while it compiled voids the
+run in the same way, even if the inputs moved back before the check. A
+compile that read a half-edited file is therefore reported as void rather
 than as a compile failure, and no run reports programs compiled from
-different contents that were visible at the checks. Content decides, not
+different contents of the watched inputs that were visible at the checks. Content decides, not
 timestamps: rewriting a file with identical bytes does not void the run, and
 an edit that is undone before the next check is not seen. A file LWPT cannot
 read is recorded by its size and modification time, and a file that is not a
