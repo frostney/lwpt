@@ -42,11 +42,20 @@ function  CreatePascalCompilerProcess(const ASrcFile: string;
 procedure AppendCompilerEnvironmentSearchPaths(
   var AUnitPaths, AIncludePaths: TStringArray);
 { True when AHook must run: it declares no staleness gate (inputs plus
-  output), its output is missing, or an input is not older than the output.
-  Times are compared at full filesystem resolution; see HookIsStale in the
-  implementation for why an input as new as the output counts as stale. }
+  output), its output is missing, an input is not older than the output,
+  or the inputs or output differ in content from the last successful run's
+  record. Times are compared at full filesystem resolution; see HookIsStale
+  in the implementation for why an input as new as the output counts as
+  stale, and why times alone are not enough. AInputDigest receives the
+  digest of the resolved inputs for RecordHookRun ('' when ungated). }
 function  HookIsStale(const AHook: THook;
-  const AProjectRoot: string): Boolean;
+  const AProjectRoot: string): Boolean; overload;
+function  HookIsStale(const AHook: THook; const AProjectRoot: string;
+  out AInputDigest: string): Boolean; overload;
+{ Records that AHook just succeeded on inputs with AInputDigest (taken
+  before it ran), together with the content of the output it left. }
+procedure RecordHookRun(const AHook: THook;
+  const AProjectRoot, AInputDigest: string);
 function  RunUserTask(const ATask: THook; const AProjectRoot: string): Integer;
 procedure RunHooks(const APhase: string; const AHooks: THookArray;
   const AProjectRoot: string);
@@ -392,26 +401,144 @@ begin
   end;
 end;
 
-{ The gate compares full-resolution modification times (#367). FileAge
-  rounds to whole seconds on Unix and to 2-second DOS time on Windows, so
-  an input edited in the same tick as the output's last write looked as
-  old as the output and the edit was skipped. An input exactly as new as
-  the output is stale: equal times are rare at full resolution but common
-  on filesystems that keep coarse ones (FAT, some network filesystems,
-  HFS+ at one second), where an edit can carry the output's own time.
-  The command therefore re-runs until its output is strictly newer than
-  every input: usually once, but again on each invocation while the
-  equality persists, as when several invocations land in one coarse tick
-  or a generator leaves an unchanged output's time alone. An input that
-  vanishes before it is read is stale too. }
-function HookIsStale(const AHook: THook;
-  const AProjectRoot: string): Boolean;
+const
+  HOOK_RUN_RECORD_DIR = BUILD_SESSIONS_DIR + '/hook-runs';
+  HOOK_RUN_RECORD_SCHEMA = 'lwpt-hook-run-v1';
+
+function HookTextDigest(const AText: string): string;
+var
+  Bytes: TBytes;
+begin
+  SetLength(Bytes, Length(AText));
+  if Length(AText) > 0 then Move(AText[1], Bytes[0], Length(AText));
+  Result := SHA256BytesPrefixed(Bytes);
+end;
+
+{ The record belongs to the output path: one hook writes one output, so
+  the number of records stays bounded by the number of gated outputs. It
+  lives below the default sessions directory, which every LWPT project
+  already ignores and which repair never sweeps (repair reclaims only
+  session directories). A lost record only makes the hook run once more. }
+function HookRunRecordPath(const AHook: THook;
+  const AProjectRoot: string): string;
+var
+  Key: string;
+begin
+  Key := HookTextDigest(StringReplace(AHook.Output, '\', '/',
+    [rfReplaceAll]));
+  Result := ResolveProjectPath(AProjectRoot, HOOK_RUN_RECORD_DIR) + '/'
+    + Copy(Key, Length('sha256:') + 1, 32) + '.record';
+end;
+
+{ The declaration the record was made for. A changed command, argument,
+  input expression or output makes an older record inapplicable. }
+function HookDefinitionDigest(const AHook: THook): string;
+var
+  Fields: TStringList;
+  i: Integer;
+begin
+  Fields := TStringList.Create;
+  try
+    Fields.Add('command=' + AHook.Runnable.Command);
+    for i := 0 to High(AHook.Runnable.Args) do
+      Fields.Add('arg=' + IntToStr(Length(AHook.Runnable.Args[i])) + ':'
+        + AHook.Runnable.Args[i]);
+    for i := 0 to High(AHook.Inputs) do
+      Fields.Add('input=' + IntToStr(Length(AHook.Inputs[i])) + ':'
+        + AHook.Inputs[i]);
+    Fields.Add('output=' + AHook.Output);
+    Fields.LineBreak := #10;
+    Result := HookTextDigest(Fields.Text);
+  finally
+    Fields.Free;
+  end;
+end;
+
+{ Content digest of the resolved input set: each file's project-relative
+  path and SHA-256, in the sorted order the resolver returns. A file that
+  vanishes before it is read gives '' so the hook counts as stale. }
+function HookInputsDigest(const AProjectRoot: string;
+  const AFiles: TStringList): string;
+var
+  Fields: TStringList;
+  i: Integer;
+  Content, Relative: string;
+begin
+  Result := '';
+  Fields := TStringList.Create;
+  try
+    for i := 0 to AFiles.Count - 1 do
+    begin
+      Content := SHA256File(AFiles[i]);
+      if Content = '' then Exit;
+      Relative := StringReplace(ExtractRelativePath(
+        IncludeTrailingPathDelimiter(AProjectRoot), AFiles[i]), '\', '/',
+        [rfReplaceAll]);
+      Fields.Add(IntToStr(Length(Relative)) + ':' + Relative + '=' + Content);
+    end;
+    Fields.LineBreak := #10;
+    Result := HookTextDigest(Fields.Text);
+  finally
+    Fields.Free;
+  end;
+end;
+
+function ReadHookRunRecord(const APath: string; out ADefinition, AInputs,
+  AOutput: string): Boolean;
+var
+  Lines: TStringList;
+begin
+  Result := False;
+  ADefinition := '';
+  AInputs := '';
+  AOutput := '';
+  if not LongPathFileExists(APath) then Exit;
+  Lines := TStringList.Create;
+  try
+    try
+      LoadProtectedStrings(Lines, APath);
+    except
+      on E: Exception do Exit;
+    end;
+    if (Lines.Count <> 4) or (Lines[0] <> HOOK_RUN_RECORD_SCHEMA) then Exit;
+    ADefinition := Lines[1];
+    AInputs := Lines[2];
+    AOutput := Lines[3];
+    Result := (ADefinition <> '') and (AInputs <> '') and (AOutput <> '');
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ Modification times alone cannot say whether an output was generated from
+  the inputs present now. A version-control checkout, merge resolution or
+  copy can write an output from another generation after the inputs, so it
+  is newer than every input and yet stale. The gate therefore also compares
+  content with the record of the last successful run: the declaration, the
+  digest of the resolved inputs, and the digest of the output it left. A
+  missing or unreadable record, or any difference, runs the command.
+
+  The time comparison stays, at full resolution (#367), so that making an
+  input newer (touch) still forces a run. FileAge rounds to whole seconds on
+  Unix and to 2-second DOS time on Windows, so an input edited in the same
+  tick as the output's last write looked as old as the output and the edit
+  was skipped. An input exactly as new as the output is stale: equal times
+  are rare at full resolution but common on filesystems that keep coarse
+  ones (FAT, some network filesystems, HFS+ at one second), where an edit
+  can carry the output's own time. The command therefore re-runs until its
+  output is strictly newer than every input: usually once, but again on
+  each invocation while the equality persists, as when several invocations
+  land in one coarse tick or a generator leaves an unchanged output's time
+  alone. An input that vanishes before it is read is stale too. }
+function HookIsStale(const AHook: THook; const AProjectRoot: string;
+  out AInputDigest: string): Boolean;
 var
   OutputStamp, InputStamp: TLWPTModificationStamp;
   i: Integer;
   Files: TStringList;
-  OutputPath: string;
+  OutputPath, RecordedDefinition, RecordedInputs, RecordedOutput: string;
 begin
+  AInputDigest := '';
   { Always-run hooks (no inputs/output declared) never short-circuit. }
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0) then Exit(True);
   Files := TStringList.Create;
@@ -420,6 +547,7 @@ begin
     Files.Duplicates := dupIgnore;
     for i := 0 to High(AHook.Inputs) do
       ResolveInputExpression(AHook, AProjectRoot, AHook.Inputs[i], Files);
+    AInputDigest := HookInputsDigest(AProjectRoot, Files);
     OutputPath := ResolveProjectPath(AProjectRoot, AHook.Output);
     if not LongPathModificationStamp(OutputPath, OutputStamp) then
       Exit(True);
@@ -427,9 +555,54 @@ begin
       if not LongPathModificationStamp(Files[i], InputStamp)
         or (CompareModificationStamps(InputStamp, OutputStamp) >= 0) then
         Exit(True);
-    Result := False;
+    if AInputDigest = '' then Exit(True);
+    if not ReadHookRunRecord(HookRunRecordPath(AHook, AProjectRoot),
+      RecordedDefinition, RecordedInputs, RecordedOutput) then
+      Exit(True);
+    Result := (RecordedDefinition <> HookDefinitionDigest(AHook))
+      or (RecordedInputs <> AInputDigest)
+      or (RecordedOutput <> SHA256File(OutputPath));
   finally
     Files.Free;
+  end;
+end;
+
+function HookIsStale(const AHook: THook;
+  const AProjectRoot: string): Boolean;
+var
+  InputDigest: string;
+begin
+  Result := HookIsStale(AHook, AProjectRoot, InputDigest);
+end;
+
+procedure RecordHookRun(const AHook: THook;
+  const AProjectRoot, AInputDigest: string);
+var
+  Lines: TStringList;
+  OutputDigest, RecordPath: string;
+begin
+  if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
+    or (AInputDigest = '') then Exit;
+  OutputDigest := SHA256File(ResolveProjectPath(AProjectRoot, AHook.Output));
+  if OutputDigest = '' then Exit;
+  RecordPath := HookRunRecordPath(AHook, AProjectRoot);
+  Lines := TStringList.Create;
+  try
+    Lines.Add(HOOK_RUN_RECORD_SCHEMA);
+    Lines.Add(HookDefinitionDigest(AHook));
+    Lines.Add(AInputDigest);
+    Lines.Add(OutputDigest);
+    Lines.LineBreak := #10;
+    try
+      AtomicWriteText(RecordPath, ExtractFileDir(RecordPath), Lines);
+    except
+      { The record only lets a later invocation skip the command. Without
+        it the command runs again, which is always safe, so a write
+        failure must not fail the command that just succeeded. }
+      on E: Exception do;
+    end;
+  finally
+    Lines.Free;
   end;
 end;
 
@@ -538,14 +711,14 @@ procedure RunHooksWithEnvironment(const APhase: string;
 var
   i, Code: Integer;
   H: THook;
-  RunnableError: string;
+  InputDigest, RunnableError: string;
 begin
   if Length(AHooks) = 0 then Exit;
   for i := 0 to High(AHooks) do
   begin
     H := AHooks[i];
 
-    if not HookIsStale(H, AProjectRoot) then
+    if not HookIsStale(H, AProjectRoot, InputDigest) then
     begin
       WriteLn('  [', APhase, '] ', H.Name, ' (skipped — output fresh)');
       Continue;
@@ -564,6 +737,7 @@ begin
       raise ELWPTError.CreateFmt(
         '[%s] %s: command exited %d while running %s',
         [APhase, H.Name, Code, H.Runnable.Command]);
+    RecordHookRun(H, AProjectRoot, InputDigest);
   end;
 end;
 
@@ -575,10 +749,12 @@ end;
 
 function RunUserTask(const ATask: THook; const AProjectRoot: string): Integer;
 var
-  TaskError: string;
+  InputDigest, TaskError: string;
 begin
-  if not HookIsStale(ATask, AProjectRoot) then Exit(0);
+  if not HookIsStale(ATask, AProjectRoot, InputDigest) then Exit(0);
   Result := RunRunnableWithEnvironment(ATask, TaskError, AProjectRoot, []);
+  if (Result = 0) and (TaskError = '') then
+    RecordHookRun(ATask, AProjectRoot, InputDigest);
   if TaskError <> '' then
   begin
     WriteLn(ErrOutput, PROGRAM_NAME, ' run: ', TaskError, '.');

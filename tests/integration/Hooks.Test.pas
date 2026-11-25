@@ -1,10 +1,14 @@
 { Hooks.Test — pins lifecycle-hook execution semantics (ADR-0011).
 
-  Eleven assertions:
+  Twelve assertions:
     1. [prebuild] hook (bare-string shorthand) runs before `lwpt build`.
     2. A bare `.pas` command receives no implicit InstantFPC treatment.
     3. [prebuild] hook with inputs/output (the staleness gate) skips
        on the second invocation when the output is fresher than every
+       input.
+    3a. A staleness-gated [prebuild] hook whose output was replaced
+       after its last run (a checkout of the other side of a merge
+       conflict) regenerates, though the output is newer than every
        input.
     4. The whole-build [postbuild] hook sees staged outputs before
        publication.
@@ -53,6 +57,7 @@ type
     procedure TestPrebuildCommandRuns;
     procedure TestBareStringDoesNotSelectInstantFPC;
     procedure TestPrebuildStalenessGateSkipsSecondRun;
+    procedure TestPrebuildRegeneratesReplacedOutput;
     procedure TestPostbuildRunsAfterBuild;
     procedure TestEntryPostbuildUsesPrivateCandidate;
     procedure TestEntryPostbuildKeepsRelatedPath;
@@ -177,6 +182,51 @@ begin
   { Staleness gate: input (gen.pas) is older than output (sentinel),
     so the hook must skip. Output mtime unchanged. }
   Expect<Integer>(SecondMtime).ToBe(FirstMtime);
+end;
+
+procedure THooksE2E.TestPrebuildRegeneratesReplacedOutput;
+var
+  R: TLwptResult;
+  GeneratedPath, InputPath: string;
+begin
+  SetupScratchProject(
+    '[prebuild]'#10 +
+    'embed = { command = "instantfpc", args = ["scripts/embed.pas"], '
+    + 'inputs = ["stdlib/*.txt"], output = "generated.txt" }'#10);
+  WriteTextFile(FScratch + '/scripts/embed.pas',
+      'program Embed;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try'#10
+    + '    Lines.LoadFromFile(''stdlib/module.txt'');'#10
+    + '    Lines.SaveToFile(''generated.txt'');'#10
+    + '  finally'#10
+    + '    Lines.Free;'#10
+    + '  end;'#10
+    + 'end.'#10);
+  InputPath := FScratch + '/stdlib/module.txt';
+  GeneratedPath := FScratch + '/generated.txt';
+  WriteTextFile(InputPath, 'main'#10);
+  SetFileModificationTime(InputPath, 1700000000, 0);
+
+  R := RunLwpt(['build'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(Trim(ReadBinaryFile(GeneratedPath))).ToBe('main');
+
+  { Merge: the merged input is written first, then the conflict in the
+    generated file is resolved by taking main's side, which leaves the
+    output newer than every input but generated from the old input. }
+  WriteTextFile(InputPath, 'merged'#10);
+  SetFileModificationTime(InputPath, 1700000100, 0);
+  WriteTextFile(GeneratedPath, 'main'#10);
+  SetFileModificationTime(GeneratedPath, 1700000200, 0);
+
+  R := RunLwpt(['build'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(Trim(ReadBinaryFile(GeneratedPath))).ToBe('merged');
 end;
 
 procedure THooksE2E.TestPostbuildRunsAfterBuild;
@@ -401,6 +451,8 @@ begin
     TestBareStringDoesNotSelectInstantFPC);
   Test('[prebuild] staleness gate skips the second run when output is fresh',
     TestPrebuildStalenessGateSkipsSecondRun);
+  Test('[prebuild] regenerates an output replaced after its last run',
+    TestPrebuildRegeneratesReplacedOutput);
   Test('[postbuild] sees staged outputs before publication',
     TestPostbuildRunsAfterBuild);
   Test('entry postbuild receives the private candidate before publication',

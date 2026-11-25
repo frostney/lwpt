@@ -1,5 +1,6 @@
 { LWPT.Command.Common.Test — the staleness gate of hooks and run tasks
-  (#367). Every modification time is set explicitly, so no test sleeps to
+  (#367): modification times, plus the content recorded by the last
+  successful run. Every modification time is set explicitly, so no test sleeps to
   cross a timestamp tick. The base second is even, which puts both stamps
   of a sub-second pair inside one SysUtils.FileAge tick on every platform:
   a whole second on Unix and a 2-second DOS tick on Windows. Fresh inputs
@@ -46,6 +47,7 @@ type
     procedure WriteStamped(const ARelativePath: string;
       const ASeconds: Int64; const ANanoseconds: LongInt); overload;
     function StampOf(const ARelativePath: string): TLWPTModificationStamp;
+    procedure RecordRun(const AHook: THook);
   protected
     procedure BeforeEach; override;
     procedure AfterEach; override;
@@ -58,6 +60,11 @@ type
     procedure TestOlderInputsAreFresh;
     procedure TestMissingOutputIsStale;
     procedure TestNewerInputInAnyGlobIsStale;
+    procedure TestUnrecordedRunIsStale;
+    procedure TestReplacedOutputNewerThanInputsIsStale;
+    procedure TestChangedInputContentWithOlderTimeIsStale;
+    procedure TestChangedDeclarationIsStale;
+    procedure TestRecordedRunStaysFreshAcrossChecks;
   end;
 
 procedure THookStalenessTests.BeforeEach;
@@ -101,6 +108,17 @@ function THookStalenessTests.StampOf(
 begin
   Expect<Boolean>(LongPathModificationStamp(
     IncludeTrailingPathDelimiter(FRoot) + ARelativePath, Result)).ToBe(True);
+end;
+
+{ What RunHooks and RunUserTask do after the command succeeds: digest the
+  inputs as the gate saw them, then record them with the output's content. }
+procedure THookStalenessTests.RecordRun(const AHook: THook);
+var
+  InputDigest: string;
+begin
+  HookIsStale(AHook, FRoot, InputDigest);
+  Expect<Boolean>(InputDigest <> '').ToBe(True);
+  RecordHookRun(AHook, FRoot, InputDigest);
 end;
 
 { Registered where the filesystem keeps sub-second times. }
@@ -152,6 +170,7 @@ begin
   WriteStamped(OutputName, OutputNanoseconds);
   WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
   WriteStamped('src/a.pas', OlderSeconds, OlderNanoseconds);
+  RecordRun(GatedHook(['lwpt.toml', 'src/*.pas']));
   Expect<Boolean>(HookIsStale(GatedHook(['lwpt.toml', 'src/*.pas']), FRoot))
     .ToBe(False);
 end;
@@ -171,11 +190,87 @@ begin
   WriteStamped('src/b.pas', OlderSeconds, OlderNanoseconds);
   WriteStamped('proto/v1/one.proto', OlderSeconds, OlderNanoseconds);
   WriteStamped('proto/v1/deep/two.proto', OlderSeconds, OlderNanoseconds);
+  RecordRun(Hook);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
   { One file of the second glob, edited a millisecond after the output: newer
     at sub-second precision, equal (so also stale) on a coarse filesystem. }
   WriteStamped('proto/v1/deep/two.proto', NewerNanoseconds);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
+{ An output that no successful run recorded, such as the committed output
+  of a fresh clone, runs once even when every input is older. }
+procedure THookStalenessTests.TestUnrecordedRunIsStale;
+begin
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  Expect<Boolean>(HookIsStale(GatedHook(['lwpt.toml']), FRoot)).ToBe(True);
+end;
+
+{ The reported trap: resolving a merge conflict by checking out one side
+  of the generated file writes an output from another generation after
+  the merged inputs, so it is newer than every input and still stale. }
+procedure THookStalenessTests.TestReplacedOutputNewerThanInputsIsStale;
+var
+  Hook: THook;
+  OutputPath: string;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped(OutputName, OlderSeconds, OlderNanoseconds + 1000000);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  RecordRun(Hook);
+  OutputPath := IncludeTrailingPathDelimiter(FRoot) + OutputName;
+  WriteTextFile(OutputPath, 'the other branch''s generation');
+  SetFileModificationTime(OutputPath, BaseSeconds, OutputNanoseconds);
+  Expect<Integer>(CompareModificationStamps(StampOf(OutputName),
+    StampOf('lwpt.toml'))).ToBe(1);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
+{ An input rewritten with an older time, as a checkout or an archive
+  extraction can leave it, is stale by its content. }
+procedure THookStalenessTests.TestChangedInputContentWithOlderTimeIsStale;
+var
+  Hook: THook;
+  InputPath: string;
+begin
+  Hook := GatedHook(['src/*.pas']);
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('src/a.pas', OlderSeconds, OlderNanoseconds);
+  RecordRun(Hook);
+  InputPath := IncludeTrailingPathDelimiter(FRoot) + 'src/a.pas';
+  WriteTextFile(InputPath, 'merged content');
+  SetFileModificationTime(InputPath, OlderSeconds, OlderNanoseconds);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
+procedure THookStalenessTests.TestChangedDeclarationIsStale;
+var
+  Hook: THook;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  Hook.Runnable.Command := 'generate';
+  SetLength(Hook.Runnable.Args, 1);
+  Hook.Runnable.Args[0] := '--other';
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
+{ Checking does not consume the record: unchanged inputs and output skip
+  on every later invocation. }
+procedure THookStalenessTests.TestRecordedRunStaysFreshAcrossChecks;
+var
+  Hook: THook;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
 end;
 
 procedure THookStalenessTests.SetupTests;
@@ -196,6 +291,15 @@ begin
   Test('a missing output is stale', TestMissingOutputIsStale);
   Test('a newer file matched by any of several input globs is stale',
     TestNewerInputInAnyGlobIsStale);
+  Test('an output no successful run recorded is stale',
+    TestUnrecordedRunIsStale);
+  Test('an output replaced after the run is stale though newer than every input',
+    TestReplacedOutputNewerThanInputsIsStale);
+  Test('an input whose content changed is stale though older than the output',
+    TestChangedInputContentWithOlderTimeIsStale);
+  Test('a changed command or argument is stale', TestChangedDeclarationIsStale);
+  Test('a recorded run stays fresh across checks',
+    TestRecordedRunStaysFreshAcrossChecks);
   if Support.WideDates then
     Test('an input dated 2300 is newer than a 2023 output',
       TestFarFutureInputIsStale)
