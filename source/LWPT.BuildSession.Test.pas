@@ -57,6 +57,9 @@ type
     procedure TestCacheFingerprintCoversPrerequisiteOutputs;
     procedure TestCacheFingerprintSeparatesOperationIdentity;
     procedure TestFingerprintsCoverArgumentSearchInputs;
+    {$IFDEF OBJECTSTORE_TESTING}
+    procedure TestOptionFileChangedAfterReadIsRefused;
+    {$ENDIF}
     procedure TestPublicationLockUsesSessionsRoot;
     procedure TestInputSnapshotNamesChangedFiles;
     procedure TestCaptureInputFileMatchesSnapshot;
@@ -106,6 +109,7 @@ type
     procedure TestLibraryEqualsPrefixFollowsEverySysroot;
     procedure TestQuotedWildcardAndMacroEntries;
     procedure TestPathSeparatorSplitsEntries;
+    procedure TestMacrosExpandAsFPCExpandsThem;
   end;
 
 
@@ -658,7 +662,12 @@ begin
   WriteText(FScratch + '/objs/value.o', 'first');
   WriteText(FScratch + '/rsp/more.cfg', '; included file'#10'-Foobjs'#10);
   WriteText(FScratch + '/compile.cfg', '; options file'#10'  -Fllibs,'#10
-    + '#INCLUDE rsp/more.cfg'#10);
+    + '#INCLUDE rsp/more.cfg'#10'#CFGDIR cfgs'#10'#INCLUDE paths.cfg'#10);
+  { FPC looks for paths.cfg in cfgs/ first, then as named. }
+  WriteText(FScratch + '/paths.cfg', '-Fuone'#10);
+  WriteText(FScratch + '/one/One.pas', 'unit One;');
+  WriteText(FScratch + '/cfgs/readme.txt', 'no paths.cfg here yet');
+  WriteText(FScratch + '/two/Two.pas', 'unit Two;');
   Request := BasicRequest;
   { Arguments as a driver passes them: an expanded cfg line, a profile
     argument and a response file. The extra argument is a [build] or
@@ -697,7 +706,117 @@ begin
   ExpectChanged(Baseline, True, 'an included file edit', Request);
   WriteText(FScratch + '/rsp/more.cfg', '; included file'#10'-Foobjs'#10);
   ExpectChanged(Baseline, False, 'restoring every file', Request);
+
+  WriteText(FScratch + '/one/One.pas', 'unit One; { edited }');
+  ExpectChanged(Baseline, True, 'a fallback include''s unit edit', Request);
+  WriteText(FScratch + '/one/One.pas', 'unit One;');
+  WriteText(FScratch + '/two/Two.pas', 'unit Two; { edited }');
+  ExpectChanged(Baseline, False, 'an edit no file names yet', Request);
+  WriteText(FScratch + '/two/Two.pas', 'unit Two;');
+
+  { A file that appears in a #CFGDIR directory now shadows the fallback. }
+  WriteText(FScratch + '/cfgs/paths.cfg', '-Futwo'#10);
+  ExpectChanged(Baseline, True, 'a #CFGDIR file appearing', Request);
+  Baseline[0] := CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  Baseline[1] := CaptureBuildPublicationFingerprint(FScratch, MANIFEST_FILE,
+    CFG_FILE, LOCKFILE, MODULES_DIR, Request);
+  WriteText(FScratch + '/two/Two.pas', 'unit Two; { edited }');
+  ExpectChanged(Baseline, True, 'a #CFGDIR file''s unit edit', Request);
 end;
+
+{$IFDEF OBJECTSTORE_TESTING}
+var
+  RewrittenOptionFile: string;
+
+{ Rewrites the option file it is handed, once, right after the read. }
+procedure RewriteOptionFileOnce(const APath: string);
+var
+  Stream: TFileStream;
+  Content: string;
+begin
+  if RewrittenOptionFile <> '' then Exit;
+  RewrittenOptionFile := APath;
+  Content := '-Fiother'#10;
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    Stream.WriteBuffer(Content[1], Length(Content));
+  finally
+    Stream.Free;
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestOptionFileChangedAfterReadIsRefused;
+var
+  Files, Paths, States: TStringArray;
+  Refusal: string;
+  Request: TLWPTBuildPublicationRequest;
+  Snapshot: TLWPTInputSnapshot;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  WriteText(FScratch + '/opts.cfg', '-Fiincs');
+  Request := BasicRequest;
+  SetLength(Request.CompilerArguments, 1);
+  Request.CompilerArguments[0] := '@' + FScratch + '/opts.cfg';
+  { The option file changes between the read that names its directories
+    and the hash: the fingerprint must not pair one version's directories
+    with the other's bytes, so the cache steps aside. }
+  RewrittenOptionFile := '';
+  OptionFileReadTestHook := RewriteOptionFileOnce;
+  try
+    Refusal := '';
+    try
+      CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE, CFG_FILE,
+        LOCKFILE, MODULES_DIR, Request);
+    except
+      on E: ELWPTError do Refusal := E.Message;
+    end;
+  finally
+    OptionFileReadTestHook := nil;
+  end;
+  Expect<Boolean>(Pos('changed while it was fingerprinted', Refusal) > 0)
+    .ToBe(True);
+
+  { The run snapshot holds a read to the state it recorded the same way. }
+  WriteText(FScratch + '/opts.cfg', '-Fiincs');
+  RewrittenOptionFile := '';
+  OptionFileReadTestHook := RewriteOptionFileOnce;
+  try
+    SetLength(Paths, 0);
+    SetLength(Files, 0);
+    SetLength(States, 0);
+    AppendCompilerArgumentInputs(FScratch, ['@' + FScratch + '/opts.cfg'],
+      Paths, Files, States);
+  finally
+    OptionFileReadTestHook := nil;
+  end;
+  Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
+  Expect<Integer>(Length(Files)).ToBe(1);
+  Expect<Boolean>(InputStateMatchesCapture(InputSnapshotState(FScratch,
+    Snapshot, Files[0]), States[0])).ToBe(False);
+
+  SetLength(Paths, 0);
+  SetLength(Files, 0);
+  SetLength(States, 0);
+  AppendCompilerArgumentInputs(FScratch, ['@' + FScratch + '/opts.cfg'],
+    Paths, Files, States);
+  Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
+  Expect<Boolean>(InputStateMatchesCapture(InputSnapshotState(FScratch,
+    Snapshot, Files[0]), States[0])).ToBe(True);
+  { A read that met nothing readable holds while nothing readable is
+    there; a missing file holds while it is not a file. }
+  Expect<Boolean>(InputStateMatchesCapture('file:special:4480', ''))
+    .ToBe(True);
+  Expect<Boolean>(InputStateMatchesCapture(States[0], ''))
+    .ToBe(False);
+  Expect<Boolean>(InputStateMatchesCapture('missing', 'missing'))
+    .ToBe(True);
+  Expect<Boolean>(InputStateMatchesCapture(States[0], 'missing'))
+    .ToBe(False);
+end;
+{$ENDIF}
 
 procedure TLWPTBuildSessionTests.WriteText(const APath, AText: string);
 var
@@ -1985,6 +2104,10 @@ begin
     TestCacheFingerprintCoversPrerequisiteOutputs);
   Test('fingerprints cover search inputs that compiler arguments name',
     TestFingerprintsCoverArgumentSearchInputs);
+  {$IFDEF OBJECTSTORE_TESTING}
+  Test('an option file changed after its read is refused',
+    TestOptionFileChangedAfterReadIsRefused);
+  {$ENDIF}
   Test('cache fingerprints separate build and test operations',
     TestCacheFingerprintSeparatesOperationIdentity);
   Test('publication locks use the resolved sessions root',
@@ -2106,6 +2229,32 @@ begin
   {$ENDIF}
 end;
 
+procedure TCompilerSearchDirectoryTests.TestMacrosExpandAsFPCExpandsThem;
+const
+  {$IFDEF MSWINDOWS}
+  HOME_VARIABLE = 'USERPROFILE';
+  {$ELSE}
+  HOME_VARIABLE = 'HOME';
+  {$ENDIF}
+var
+  Home: string;
+begin
+  Home := GetEnvironmentVariable(HOME_VARIABLE);
+  if Home = '' then Fail(HOME_VARIABLE + ' is not set');
+  { FPC's DefaultReplacements: "$NAME$" becomes a set environment variable,
+    also in -XR, so the directory may lie anywhere; an $FPC* macro, in any
+    case, is a relative segment only the compiler names; an unset name
+    stays as written. }
+  Expect<string>(SearchDirectories(['-Fi$' + HOME_VARIABLE + '$/incs']))
+    .ToBe(Home + '/incs');
+  Expect<string>(SearchDirectories(['-XR$' + HOME_VARIABLE + '$',
+    '-Fl=/lib'])).ToBe(Home + '/lib|/lib');
+  Expect<string>(SearchDirectories(['-Fuextra/$fpctarget/units',
+    '-Fi$FPCVERSION/incs'])).ToBe('extra/|.');
+  Expect<string>(SearchDirectories(['-Fiinc/$LWPT_UNSET_FIXTURE_NAME$/x']))
+    .ToBe('inc/');
+end;
+
 procedure TCompilerSearchDirectoryTests.SetupTests;
 begin
   Test('each search option names its directories',
@@ -2118,6 +2267,8 @@ begin
     TestQuotedWildcardAndMacroEntries);
   Test('the platform path separator splits entries',
     TestPathSeparatorSplitsEntries);
+  Test('macros expand as FPC expands them',
+    TestMacrosExpandAsFPCExpandsThem);
 end;
 
 begin

@@ -580,22 +580,27 @@ const
   CONFIGURATION_CAPTURE_ATTEMPTS = 3;
 var
   ConfigurationContent, ConfigurationState, Recorded, SourceDirectory: string;
-  Directories: TStringArray;
+  Directories, OptionFiles, OptionFileStates: TStringArray;
   Attempt, i: Integer;
+  Coherent: Boolean;
 begin
   { One read of the configuration file gives the bytes its search options
     come from and the state they hash to; the capture holds only when the
     snapshot recorded that same state, so the watched directories and the
-    recorded file always describe one version of it. Jobs then compile from
-    the run's copy of those bytes and never read the live file, which the
-    snapshot keeps watching. }
+    recorded file always describe one version of it. Option files that
+    those options name are held to the same rule. Jobs then compile from
+    the run's copy of the configuration bytes and never read the live file,
+    which the snapshot keeps watching. }
   for Attempt := 1 to CONFIGURATION_CAPTURE_ATTEMPTS do
   begin
     ConfigurationState := CaptureInputFile(FProjectRoot,
       FCacheContext.ConfigurationPath, ConfigurationContent);
     CollectOptions(ConfigurationContent);
     SetLength(Directories, 0);
-    AppendCompilerArgumentInputs(FProjectRoot, Options, Directories);
+    SetLength(OptionFiles, 0);
+    SetLength(OptionFileStates, 0);
+    AppendCompilerArgumentInputs(FProjectRoot, Options, Directories,
+      OptionFiles, OptionFileStates);
     SetLength(Paths, 0);
     AddPath(FCacheContext.ManifestPath);
     AddPath(FCacheContext.ConfigurationPath);
@@ -622,16 +627,20 @@ begin
       FCacheContext.ConfigurationPath);
     { A missing file is recorded as missing, or as excluded or a directory,
       none of which a compile reads as its configuration. }
-    if (Recorded = ConfigurationState)
-       or ((ConfigurationState = 'missing')
-         and (Copy(Recorded, 1, 5) <> 'file:')) then
+    Coherent := InputStateMatchesCapture(Recorded, ConfigurationState);
+    for i := 0 to High(OptionFiles) do
+      if not InputStateMatchesCapture(InputSnapshotState(FProjectRoot,
+           FRunInputs, OptionFiles[i]), OptionFileStates[i]) then
+        Coherent := False;
+    if Coherent then
     begin
       PublishRunConfiguration(ConfigurationState, ConfigurationContent);
       Exit;
     end;
   end;
-  raise ELWPTError.Create('the compiler configuration file kept changing '
-    + 'while this test run started; rerun ' + PROGRAM_NAME + ' test');
+  raise ELWPTError.Create('the compiler configuration or an option file it '
+    + 'names kept changing while this test run started; rerun '
+    + PROGRAM_NAME + ' test');
 end;
 
 { The first run input that differs from the snapshot, as a display path,
