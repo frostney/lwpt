@@ -1958,7 +1958,8 @@ begin
           WriteLn('discovered ', Tests.Count, ' test file(s)');
       end;
       Scheduler := TTestScheduler.Create(Tests, UnitPaths,
-        Man.TestFlags, Session.JobRoot('tests'), AJobs, EffectiveBail, Session,
+        Man.TestFlags, Session.ProgramJobsRoot('tests'), AJobs, EffectiveBail,
+        Session,
         ProjectRoot, AVerbose, AInventory,
         (ASelectors = nil) or (ASelectors.Count = 0), InventoryPath,
         CompilerDriver, CacheContext);
@@ -1990,6 +1991,9 @@ begin
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled');
+    for i := 0 to Session.CleanupWarnings.Count - 1 do
+      WriteLn(ErrOutput, PROGRAM_NAME, ' test: warning: ',
+        Session.CleanupWarnings[i]);
       finally
         Session.Free;
       end;
