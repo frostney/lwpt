@@ -34,8 +34,9 @@ type
     FHTTPS: Boolean;
     FServe: TProcess;
     procedure ReadPin;
-    function Environment: TStringArray;
   public
+    { The variables `serve` needs: the TLS password for an HTTPS origin. }
+    function Environment: TStringArray;
     { Runs `registry init`. ABasePort is advertised in the base URL (and so
       in the origin identity); AListenPort is where `serve` listens. AHost
       names the base URL host: an HTTPS origin may use `127.0.0.1`, which

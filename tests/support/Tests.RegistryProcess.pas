@@ -66,7 +66,10 @@ function RelocateRegistryPortTo(const ADataDirectory, ABaseURL: string;
   entries ("KEY=value") are added to the inherited environment, and a
   nonempty AWorkingDirectory becomes the child's current directory, and a
   nonempty AExecutable replaces LwptBinaryPath (e.g. the test build). Callers
-  that serve HTTPS, or that probe readiness themselves, use this directly. }
+  that serve HTTPS, or that probe readiness themselves, use this directly.
+  A collision is recognized only by `listen_failed:` on the child's standard
+  error. Any other failed start raises with the exit status and everything
+  the child wrote to standard error and standard output. }
 function LaunchRegistryCLI(const ADataDirectory: string; var ABaseURL: string;
   const AEnvironment: array of string; const AWorkingDirectory: string = '';
   const AAllowRelocation: Boolean = True;
@@ -326,10 +329,12 @@ begin
       Result.Execute;
       Started := GetTickCount64;
       Output := '';
+      Diagnostics := '';
       repeat
         { The child announces only after binding its own socket, so another
           process answering on the same URL can never satisfy readiness. }
         Output := Output + DrainAvailableStream(Result.Output, 4096);
+        Diagnostics := Diagnostics + DrainAvailableStream(Result.Stderr, 4096);
         if Pos(' listening at ' + ABaseURL, Output) > 0 then Exit;
         if not Result.Running then Break;
         Sleep(10);
@@ -337,7 +342,11 @@ begin
       ExitState := 'running';
       if not Result.Running then ExitState := IntToStr(Result.ExitCode)
         + ' (status=' + IntToStr(Result.ExitStatus) + ')';
-      Diagnostics := DrainAvailableStream(Result.Stderr, 4096);
+      { An exited child's pipes hold everything it wrote. }
+      Output := Output + DrainAvailableStream(Result.Output);
+      Diagnostics := Diagnostics + DrainAvailableStream(Result.Stderr);
+      { Only standard error counts: a refusal reported anywhere else is a
+        defect that this start must expose, not recover from. }
       Collided := (not Result.Running) and (Pos('listen_failed:', Diagnostics) > 0);
       { A caller that asserts readiness is refused must not be rescued by
         relocating to a free port. }
@@ -346,7 +355,7 @@ begin
         raise Exception.Create('registry CLI listener did not become ready after '
           + IntToStr(Attempt) + ' start attempt(s); exit=' + ExitState
           + '; last probe: listener has not announced its bound port; stderr: '
-          + Diagnostics);
+          + Diagnostics + '; stdout: ' + Output);
     except
       StopRegistryCLI(Result);
       raise;

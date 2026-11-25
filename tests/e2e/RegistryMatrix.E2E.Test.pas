@@ -19,7 +19,9 @@ program RegistryMatrix.E2E.Test;
   - a pointer-first backup taken while publishing, its restore, and the
     rollback hazard an older restore creates for mirrors.
   - an origin whose port is taken before it starts, which relocates while
-    publication and consumers keep its identity.
+    publication and consumers keep its identity;
+  - an HTTPS origin whose port is taken, whose refused start names the
+    collision on standard error before the start relocates it.
 
   Every child process is bound to this program, bounded, and stopped by the
   case's cleanup, including after a failure. A failing case prints its
@@ -124,6 +126,7 @@ type
       ACode: string; const ACommands: array of string);
     procedure BodyBackupAndRestore;
     procedure BodyPortCollision;
+    procedure BodyHTTPSPortCollision;
   protected
     procedure BeforeAll; override;
     procedure AfterAll; override;
@@ -137,6 +140,7 @@ type
     procedure TestSchemaVersions;
     procedure TestBackupAndRestore;
     procedure TestPortCollision;
+    procedure TestHTTPSPortCollision;
   end;
 
 { --- small helpers ------------------------------------------------------- }
@@ -1209,6 +1213,62 @@ begin
   end;
 end;
 
+procedure TRegistryMatrixE2E.TestHTTPSPortCollision;
+begin
+  Guard('i', BodyHTTPSPortCollision);
+end;
+
+{ An HTTPS origin starts on a port another process holds. The refusal must
+  reach standard error, where operators and the start helper's collision
+  recovery read it: on macOS the TLS listener's setup once moved the error
+  output to standard output, so the refusal looked like a silent exit 1 and
+  the start was never relocated. }
+procedure TRegistryMatrixE2E.BodyHTTPSPortCollision;
+var
+  Origin: TPublishOrigin;
+  Occupier: TRegistryTestServer;
+  Collided, Discovery, BaseURL, Refusal: string;
+  Run: TLwptResult;
+  Serve: TProcess;
+begin
+  Origin := NewOrigin('t', True);
+  Occupier := TRegistryTestServer.Create(nil, True);
+  try
+    Origin.MoveToPort(Occupier.Port);
+    Collided := Origin.Base;
+    Run := RunLwpt(['registry', 'serve', '--data-dir', Origin.DataDirectory],
+      FCase + '/w', Origin.Environment, SERVE_REFUSAL_TIMEOUT_MILLISECONDS);
+    Log('serve on a taken port', Run);
+    Expect<Boolean>(Run.TimedOut).ToBe(False);
+    Expect<Integer>(Run.ExitCode).ToBe(1);
+    Expect<Boolean>(Contains(Run.Stderr, 'registry: listen_failed: ')).ToBe(True);
+    Expect<string>(Run.Stdout).ToBe('');
+    { A start that may not relocate shows the child's own reason. }
+    BaseURL := Origin.Base;
+    Refusal := '';
+    try
+      Serve := LaunchRegistryCLI(Origin.DataDirectory, BaseURL,
+        Origin.Environment, FCase + '/w', False);
+      StopRegistryCLI(Serve);
+    except
+      on E: Exception do Refusal := E.Message;
+    end;
+    FLog.Add('refused start: ' + Refusal);
+    Expect<Boolean>(Contains(Refusal, 'after 1 start attempt(s); exit=1 '))
+      .ToBe(True);
+    Expect<Boolean>(Contains(Refusal, 'stderr: ' + RegistryProgramName
+      + ' registry: listen_failed: ')).ToBe(True);
+    Origin.Start;
+    FLog.Add('origin relocated from ' + Collided + ' to ' + Origin.Base);
+    Expect<Boolean>(Origin.Base <> Collided).ToBe(True);
+    Discovery := OriginText(Origin, '/.well-known/' + RegistryProgramName
+      + '-registry');
+    Expect<string>(DocumentField(Discovery, 'base_url')).ToBe(Origin.Base);
+  finally
+    Occupier.Free;
+  end;
+end;
+
 procedure TRegistryMatrixE2E.SetupTests;
 begin
   Test('localhost HTTP development: init policy, live publish, reads, install, and restart',
@@ -1227,6 +1287,8 @@ begin
     TestBackupAndRestore);
   Test('an origin whose port is taken before it starts relocates and keeps its identity',
     TestPortCollision);
+  Test('an HTTPS origin whose port is taken reports it on standard error and relocates',
+    TestHTTPSPortCollision);
 end;
 
 begin

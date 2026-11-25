@@ -435,18 +435,12 @@ var
   DictionaryKeyCallbacks: Pointer;
   DictionaryValueCallbacks: Pointer;
 
-threadvar
-  FrameworkThreadInitialized: Boolean;
-
-procedure EnsureFrameworkThread;
-begin
-  if FrameworkThreadInitialized then Exit;
-  FrameworkThreadInitialized := True;
-  Assign(Output, '');
-  Rewrite(Output);
-  Assign(ErrOutput, '');
-  Rewrite(ErrOutput);
-end;
+{ The callbacks below never reopen the standard text files. The runtime
+  initializes a dispatch thread's threadvars, standard files included, on
+  that thread's first threadvar access. Network.framework also runs the TLS
+  configure block on the main thread while the listener is set up, and
+  reopening there sent the command's error output, through Rewrite of an
+  unnamed file, to standard output. }
 
 function MakeBlock(var ABlock: TRegistryBlock; AInvoke: CodePointer;
   AContext: Pointer; ADescriptor: PBlockDescriptor): Pointer;
@@ -500,7 +494,6 @@ var
   Options: Pointer;
   Server: TNetworkFrameworkRegistryServer;
 begin
-  EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
   Options := Nw_tls_copy_sec_protocol_options(AOptions);
   Sec_protocol_options_set_local_identity(Options, Server.FTLSIdentity);
@@ -518,7 +511,6 @@ procedure ListenerStateInvoke(ABlock: PRegistryBlock; AState: Int32;
 var
   Server: TNetworkFrameworkRegistryServer;
 begin
-  EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
   case AState of
     NW_LISTENER_STATE_READY, NW_LISTENER_STATE_FAILED:
@@ -538,7 +530,6 @@ procedure ConnectionStateInvoke(ABlock: PRegistryBlock; AState: Int32;
 var
   Connection: TNetworkFrameworkRegistryConnection;
 begin
-  EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
   case AState of
     NW_CONNECTION_STATE_READY: Connection.ArmReceive;
@@ -555,7 +546,6 @@ var
   Connection: TNetworkFrameworkRegistryConnection;
   Size: NativeUInt;
 begin
-  EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
   if Connection.FClosing or Connection.FResponding then Exit;
   if AContent <> nil then
@@ -576,7 +566,6 @@ procedure SendInvoke(ABlock: PRegistryBlock; AError: Pointer); cdecl;
 var
   Connection: TNetworkFrameworkRegistryConnection;
 begin
-  EnsureFrameworkThread;
   Connection := TNetworkFrameworkRegistryConnection(ABlock^.Context);
   try
     Connection.SendCompleted(AError);
@@ -614,7 +603,6 @@ var
   Connection: TNetworkFrameworkRegistryConnection;
   Server: TNetworkFrameworkRegistryServer;
 begin
-  EnsureFrameworkThread;
   Server := TNetworkFrameworkRegistryServer(ABlock^.Context);
   EnterCriticalSection(Server.FConnectionLock);
   try
