@@ -425,15 +425,29 @@ end;
 
 procedure TTestInputChange.TestFlagMacroSearchDirectoryEditVoidsRun;
 var
-  ProjectRoot: string;
+  ProjectRoot, Target: string;
   Run: TLwptResult;
 begin
   ProjectRoot := FScratch + '/flag-macro-directory';
-  { FPC expands $FPCTARGET in a search path, so the watch covers the fixed
-    directory before the macro, whatever the macro resolves to. }
+  { FPC expands $FPCTARGET to "<cpu>-<os>" of the target it compiles for,
+    the same compiler and target that compiled this program. The include
+    lives where the macro resolves, so the stable run proves FPC read it
+    there, and the watch must cover it. }
+  Target := LowerCase({$I %FPCTARGETCPU%}) + '-'
+    + LowerCase({$I %FPCTARGETOS%});
   WriteProject(ProjectRoot, SHARED_ONE, 'const W = 2;',
-    'extra/any-target/Value.inc');
-  WriteTextFile(ProjectRoot + '/extra/any-target/Value.inc', 'const W = 1;'#10);
+    'extra/' + Target + '/Value.inc');
+  WriteTextFile(ProjectRoot + '/extra/' + Target + '/Value.inc',
+    'const W = 1;'#10);
+  WriteTextFile(ProjectRoot + '/tests/B.Test.pas',
+      'program B;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes;'#10
+    + '{$I Value.inc}'#10
+    + 'begin'#10
+    + '  WriteLn(''B W='', W);'#10
+    + MarkerStatements(MarkerPath(ProjectRoot, 'b-ran'))
+    + 'end.'#10);
   WriteTextFile(ProjectRoot + '/lwpt.toml',
       '[package]'#10
     + 'name = "test-input-change-fixture"'#10
@@ -441,12 +455,13 @@ begin
     + 'units = ["source"]'#10
     + '[test]'#10
     + 'flags = ["-Fiextra/$FPCTARGET"]'#10);
+  RequireStableB(ProjectRoot, 'flag-macro-directory-stable-cache');
   Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
     Environment(FScratch + '/flag-macro-directory-cache'));
   RequireExit('flag macro directory run', Run, 1);
   Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
-    + 'changed after this test run started (extra/any-target/Value.inc)',
-    Run.Stdout)).ToBe(True);
+    + 'changed after this test run started (extra/' + Target
+    + '/Value.inc)', Run.Stdout)).ToBe(True);
 end;
 
 procedure TTestInputChange.TestProfileIncludeDirectoryEditVoidsRun;
