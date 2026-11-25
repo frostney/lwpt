@@ -1,15 +1,21 @@
 { Hooks.Test — pins lifecycle-hook execution semantics (ADR-0011).
 
-  Eleven assertions:
+  Thirteen assertions:
     1. [prebuild] hook (bare-string shorthand) runs before `lwpt build`.
     2. A bare `.pas` command receives no implicit InstantFPC treatment.
     3. [prebuild] hook with inputs/output (the staleness gate) skips
        on the second invocation when the output is fresher than every
        input.
+    3a. A staleness-gated [prebuild] hook whose output was replaced
+       after its last run (a checkout of the other side of a merge
+       conflict) regenerates, though the output is newer than every
+       input.
     4. The whole-build [postbuild] hook sees staged outputs before
        publication.
     5. A per-entry [postbuild] hook sees the private candidate before
        the public output exists.
+    5a. A staleness-gated per-entry [postbuild] hook whose output is
+       retargeted to the private candidate runs and keeps no run record.
     6. Related paths containing the output name are not retargeted.
     7. A failing per-entry [postbuild] hook leaves no public output.
     8. A failing whole-build [postbuild] hook leaves no public output.
@@ -53,8 +59,10 @@ type
     procedure TestPrebuildCommandRuns;
     procedure TestBareStringDoesNotSelectInstantFPC;
     procedure TestPrebuildStalenessGateSkipsSecondRun;
+    procedure TestPrebuildRegeneratesReplacedOutput;
     procedure TestPostbuildRunsAfterBuild;
     procedure TestEntryPostbuildUsesPrivateCandidate;
+    procedure TestGatedEntryPostbuildKeepsNoRecord;
     procedure TestEntryPostbuildKeepsRelatedPath;
     procedure TestFailingEntryPostbuildDoesNotPublish;
     procedure TestFailingWholePostbuildDoesNotPublish;
@@ -179,6 +187,51 @@ begin
   Expect<Integer>(SecondMtime).ToBe(FirstMtime);
 end;
 
+procedure THooksE2E.TestPrebuildRegeneratesReplacedOutput;
+var
+  R: TLwptResult;
+  GeneratedPath, InputPath: string;
+begin
+  SetupScratchProject(
+    '[prebuild]'#10 +
+    'embed = { command = "instantfpc", args = ["scripts/embed.pas"], '
+    + 'inputs = ["stdlib/*.txt"], output = "generated.txt" }'#10);
+  WriteTextFile(FScratch + '/scripts/embed.pas',
+      'program Embed;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try'#10
+    + '    Lines.LoadFromFile(''stdlib/module.txt'');'#10
+    + '    Lines.SaveToFile(''generated.txt'');'#10
+    + '  finally'#10
+    + '    Lines.Free;'#10
+    + '  end;'#10
+    + 'end.'#10);
+  InputPath := FScratch + '/stdlib/module.txt';
+  GeneratedPath := FScratch + '/generated.txt';
+  WriteTextFile(InputPath, 'main'#10);
+  SetFileModificationTime(InputPath, 1700000000, 0);
+
+  R := RunLwpt(['build'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(Trim(ReadBinaryFile(GeneratedPath))).ToBe('main');
+
+  { Merge: the merged input is written first, then the conflict in the
+    generated file is resolved by taking main's side, which leaves the
+    output newer than every input but generated from the old input. }
+  WriteTextFile(InputPath, 'merged'#10);
+  SetFileModificationTime(InputPath, 1700000100, 0);
+  WriteTextFile(GeneratedPath, 'main'#10);
+  SetFileModificationTime(GeneratedPath, 1700000200, 0);
+
+  R := RunLwpt(['build'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<string>(Trim(ReadBinaryFile(GeneratedPath))).ToBe('merged');
+end;
+
 procedure THooksE2E.TestPostbuildRunsAfterBuild;
 var R: TLwptResult;
 begin
@@ -240,6 +293,68 @@ begin
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/tinybin')))
     .ToBe(True);
+end;
+
+{ The gated output is the entry's output placeholder, retargeted to the
+  session's private
+  candidate, whose path changes with every build: a record kept for it
+  would leave one record per session behind. }
+procedure THooksE2E.TestGatedEntryPostbuildKeepsNoRecord;
+var
+  Entries: TStringList;
+  R: TLwptResult;
+  Search: TSearchRec;
+begin
+  SetupScratchProject('');
+  WriteTextFile(FScratch + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "hooks-e2e"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + #10
+    + '[build]'#10
+    + 'tinybin = { source = "source/tinybin.pas", '
+    + 'output = "build/tinybin", '
+    + 'postbuild = { mark = { command = "instantfpc", '
+    + 'args = ["scripts/mark-candidate.pas", "{item.output}"], '
+    + 'inputs = ["source/*.pas"], output = "{item.output}" } } }'#10);
+  WriteTextFile(FScratch + '/scripts/mark-candidate.pas',
+      'program MarkCandidate;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, SysUtils;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  if ParamStr(1) <> GetEnvironmentVariable('
+    + '''LWPT_BUILD_OUTPUT'') then Halt(3);'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try'#10
+    + '    Lines.Add(ParamStr(1));'#10
+    + '    Lines.SaveToFile(''postbuild-ran.txt'');'#10
+    + '  finally'#10
+    + '    Lines.Free;'#10
+    + '  end;'#10
+    + 'end.'#10);
+
+  R := RunLwpt(['build'], FScratch);
+
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(SentinelExists('postbuild-ran.txt')).ToBe(True);
+  Entries := TStringList.Create;
+  try
+    if FindFirst(FScratch + '/.lwpt/sessions/hook-runs/*', faAnyFile,
+      Search) = 0 then
+    try
+      repeat
+        if (Search.Name <> '.') and (Search.Name <> '..') then
+          Entries.Add(Search.Name);
+      until FindNext(Search) <> 0;
+    finally
+      FindClose(Search);
+    end;
+    Expect<Integer>(Entries.Count).ToBe(0);
+  finally
+    Entries.Free;
+  end;
 end;
 
 procedure THooksE2E.TestEntryPostbuildKeepsRelatedPath;
@@ -401,10 +516,14 @@ begin
     TestBareStringDoesNotSelectInstantFPC);
   Test('[prebuild] staleness gate skips the second run when output is fresh',
     TestPrebuildStalenessGateSkipsSecondRun);
+  Test('[prebuild] regenerates an output replaced after its last run',
+    TestPrebuildRegeneratesReplacedOutput);
   Test('[postbuild] sees staged outputs before publication',
     TestPostbuildRunsAfterBuild);
   Test('entry postbuild receives the private candidate before publication',
     TestEntryPostbuildUsesPrivateCandidate);
+  Test('gated entry postbuild on the private candidate keeps no run record',
+    TestGatedEntryPostbuildKeepsNoRecord);
   Test('entry postbuild keeps paths that only contain the output name',
     TestEntryPostbuildKeepsRelatedPath);
   Test('failing entry postbuild leaves the public output untouched',

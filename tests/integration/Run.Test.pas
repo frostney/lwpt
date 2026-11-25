@@ -34,6 +34,7 @@ type
   private
     FOrigDir, FScratch: string;
     procedure SetupScratchProject;
+    function RunCount: Integer;
   protected
     procedure BeforeAll; override;
     procedure AfterAll;  override;
@@ -201,6 +202,22 @@ begin
   Expect<Boolean>(FileExists(ExportScratch + '/export-marker.txt')).ToBe(True);
 end;
 
+{ Lines in the runs.log the staleness test's task appends to. }
+function TRunE2E.RunCount: Integer;
+var
+  Lines: TStringList;
+begin
+  Result := 0;
+  if not FileExists(FScratch + '/runs.log') then Exit;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(FScratch + '/runs.log');
+    Result := Lines.Count;
+  finally
+    Lines.Free;
+  end;
+end;
+
 procedure TRunE2E.TestRunTaskStalenessSkipsFreshOutput;
 var
   R: TLwptResult;
@@ -212,19 +229,28 @@ begin
     'args = ["scripts/fresh.pas"]'#10 +
     'inputs = ["scripts/*.pas"]'#10 +
     'output = "fresh-marker.txt"'#10);
+  { Each run writes the same marker and adds a line to runs.log, which is
+    not an output, so the log counts runs while the marker's content stays
+    what the last run recorded. }
   WriteTextFile(FScratch + '/scripts/fresh.pas',
     'program Fresh;'#10 + '{$mode delphi}{$H+}'#10 +
-    'uses Classes;'#10 + 'var L: TStringList;'#10 + 'begin'#10 +
+    'uses Classes, SysUtils;'#10 + 'var L: TStringList;'#10 + 'begin'#10 +
     '  L := TStringList.Create; try L.Add(''once'');'#10 +
     '  L.SaveToFile(''fresh-marker.txt''); finally L.Free; end;'#10 +
+    '  L := TStringList.Create; try'#10 +
+    '    if FileExists(''runs.log'') then L.LoadFromFile(''runs.log'');'#10 +
+    '    L.Add(''run''); L.SaveToFile(''runs.log'');'#10 +
+    '  finally L.Free; end;'#10 +
     'end.'#10);
   DeleteFile(FScratch + '/fresh-marker.txt');
+  DeleteFile(FScratch + '/runs.log');
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(FScratch + '/fresh-marker.txt')).ToBe(True);
+  Expect<Integer>(RunCount).ToBe(1);
   { Explicit times instead of sleeping across a timestamp tick: every
-    input is older than the marker, so the task skips. }
-  WriteTextFile(FScratch + '/fresh-marker.txt', 'fresh-preserved');
+    input is older than the marker and unchanged since the recorded run,
+    so the task skips. }
   SetFileModificationTime(FScratch + '/scripts/fresh.pas', InputStampSeconds,
     InputStampNanoseconds);
   SetFileModificationTime(FScratch + '/scripts/hello.pas', InputStampSeconds,
@@ -233,18 +259,27 @@ begin
     MarkerStampNanoseconds);
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
-  Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
-    .ToBe('fresh-preserved');
+  Expect<Integer>(RunCount).ToBe(1);
 
-  { An input edit a millisecond after the marker, inside the same
+  { An input touched a millisecond after the marker, inside the same
     FileAge tick, makes the task stale: newer where the filesystem keeps
-    sub-second times, and equal, which also runs, where it does not. }
-  WriteTextFile(FScratch + '/scripts/fresh.pas',
-    ReadBinaryFile(FScratch + '/scripts/fresh.pas') + #10);
+    sub-second times, and equal, which also runs, where it does not. Only
+    the time changes, so the time rule alone must catch it: the content
+    still matches the recorded run. }
   SetFileModificationTime(FScratch + '/scripts/fresh.pas', StampBaseSeconds,
     EditStampNanoseconds);
   R := RunLwpt(['run', 'fresh'], FScratch);
   Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Integer>(RunCount).ToBe(2);
+
+  { A marker replaced after the recorded run, with a time newer than every
+    input, is stale by its content and is regenerated. }
+  WriteTextFile(FScratch + '/fresh-marker.txt', 'from another generation');
+  SetFileModificationTime(FScratch + '/fresh-marker.txt',
+    StampBaseSeconds + 10, 0);
+  R := RunLwpt(['run', 'fresh'], FScratch);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Integer>(RunCount).ToBe(3);
   Expect<string>(Trim(ReadBinaryFile(FScratch + '/fresh-marker.txt')))
     .ToBe('once');
   SetupScratchProject;

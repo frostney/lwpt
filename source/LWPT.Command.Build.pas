@@ -495,6 +495,8 @@ begin
       APublicOutput, ACandidateOutput);
     Result[i].Output := ReplaceOutputReference(AHooks[i].Output,
       APublicOutput, ACandidateOutput);
+    Result[i].SessionPrivateOutput := AHooks[i].SessionPrivateOutput
+      or (Result[i].Output <> AHooks[i].Output);
     Result[i].Runnable.Args := Copy(AHooks[i].Runnable.Args, 0,
       Length(AHooks[i].Runnable.Args));
     for j := 0 to High(Result[i].Runnable.Args) do
@@ -1417,7 +1419,8 @@ var
     HookEnvironment[2] := BUILD_PUBLIC_OUTPUT_ENV + '='
       + Compiled[AIndex].OutBin;
     RunHooksWithEnvironment('postbuild:' + Man.BuildEntries[AIndex].Name,
-      Compiled[AIndex].PostBuild, ProjectRoot, HookEnvironment);
+      Compiled[AIndex].PostBuild, ProjectRoot, ResolveTmpDir(Man),
+      HookEnvironment);
   end;
 
   function AcquireWorkerLease: TLWPTWorkerLease;
@@ -1470,7 +1473,7 @@ var
     if Length(AHooks) = 0 then Exit;
     PostBuildLease := AcquireWorkerLease;
     try
-      RunHooks('postbuild', AHooks, ProjectRoot);
+      RunHooks('postbuild', AHooks, ProjectRoot, ResolveTmpDir(Man));
     finally
       PostBuildLease.Free;
     end;
@@ -1684,7 +1687,7 @@ begin
         Session.SessionReference, ')');
     { --clean means a forced compile in fresh private staging. It never
       deletes the last successful public output or another live session. }
-    RunHooks('prebuild', Man.PreBuild, ProjectRoot);
+    RunHooks('prebuild', Man.PreBuild, ProjectRoot, ResolveTmpDir(Man));
     GenerateVersionInclude(
       ExtractFileDir(ExpandFileName(AManifestPath)), Man);
 
@@ -1761,7 +1764,8 @@ begin
               try
                 PrintStart(i);
                 RunHooks('prebuild:' + Man.BuildEntries[i].Name,
-                  Man.BuildEntries[i].PreBuild, ProjectRoot);
+                  Man.BuildEntries[i].PreBuild, ProjectRoot,
+                  ResolveTmpDir(Man));
                 Jobs[i] := TLWPTBuildJob.Create(AManifestPath, Man,
                   ManifestContentHash, Man.BuildEntries[i], ARelease, AClean,
                   Session, WorkerSession, Lease, EntryDrivers[i], Cache,

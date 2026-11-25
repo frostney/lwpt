@@ -139,3 +139,27 @@ ADR's test-only ordering. `lwpt test` now freezes discovery and positional
 selection before `[pretest]`; the hook may prepare inputs for those programs
 but cannot add programs to the current invocation. Install and build lifecycle
 ordering is unchanged.
+
+## Amendment — 2026-11-25: staleness also compares recorded content
+
+"No re-run when output is fresher than every input" is no longer the whole
+rule. A merge-conflict resolution that checked out one side of a generated
+include wrote an output from another generation after the merged inputs.
+The time gate therefore skipped the generator, and the build embedded the
+wrong module. After a successful run of a gated hook or run task, LWPT
+records the declaration (command, arguments, input expressions and output),
+the SHA-256 of every matched input and the SHA-256 of the output, below
+`.lwpt/sessions/hook-runs/`, one record per output, staged through the
+project's temporary directory. The command runs when the time gate says so, when no record
+exists, or when the declaration, an input's content or the output's content
+differs from the record. The time comparison stays, so `touch` on an input
+still forces a run. No record is kept for an output retargeted to a session's
+private candidate (per-entry and whole-build postbuild), for a run whose input
+digest after the command differs from the one taken before it, or when the
+output or an input cannot be read; those runs stay stale. Concurrent
+invocations in one checkout that run the same generator still race on its
+output, as they did under times alone. A per-output lock across the gate, the
+command and the record was considered and rejected: hook commands have no
+deadline, so it must wait without bound. A gated hook that delegates to a
+nested LWPT command for the same output would then deadlock, and so would a
+build holding the only worker slot while it waited.
