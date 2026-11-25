@@ -112,9 +112,11 @@ begin
 
     WriteLn('package: ', Ctx.Manifest.Name, ' ', Ctx.Manifest.Version);
     WriteLn('adding ', Name, ' = "', ASpec, '"');
-    RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot);
+    RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot,
+      ResolveTmpDir(Ctx.Manifest));
     RunManifestMutationTransaction(Ctx, Lines);
-    RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot);
+    RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot,
+      ResolveTmpDir(Ctx.Manifest));
     WriteLn(Action, ' ', Name, ' in ', MANIFEST_FILE);
   finally
     Lines.Free;

@@ -127,7 +127,7 @@ var
 begin
   HookIsStale(AHook, FRoot, InputDigest);
   Expect<Boolean>(InputDigest <> '').ToBe(True);
-  RecordHookRun(AHook, FRoot, InputDigest);
+  RecordHookRun(AHook, FRoot, TMP_DIR, InputDigest);
 end;
 
 { The time-rule cases start from a recorded, fresh run and then change
@@ -318,7 +318,7 @@ begin
   WriteTextFile(InputPath, 'edited during the run');
   SetFileModificationTime(InputPath, OlderSeconds, OlderNanoseconds);
   WriteStamped(OutputName, OutputNanoseconds);
-  RecordHookRun(Hook, FRoot, InputDigest);
+  RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest);
   { Revert the input to the content the run started from. }
   WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
@@ -336,7 +336,7 @@ begin
   WriteStamped(OutputName, OutputNanoseconds);
   WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
   HookIsStale(Hook, FRoot, InputDigest);
-  RecordHookRun(Hook, FRoot, InputDigest);
+  RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest);
   Expect<Boolean>(DirectoryExists(IncludeTrailingPathDelimiter(FRoot)
     + '.lwpt/sessions/hook-runs')).ToBe(False);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
@@ -353,26 +353,79 @@ begin
   WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
   HookIsStale(Hook, FRoot, InputDigest);
   ForceDirectories(IncludeTrailingPathDelimiter(FRoot) + OutputName);
-  RecordHookRun(Hook, FRoot, InputDigest);
+  RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest);
   Expect<Boolean>(DirectoryExists(IncludeTrailingPathDelimiter(FRoot)
     + '.lwpt/sessions/hook-runs')).ToBe(False);
 end;
 
 {$IFDEF UNIX}
-{ A matched FIFO is never opened: opening it would block the gate until a
-  writer appeared. It cannot be hashed, so the hook is stale. }
+type
+  { Runs the gate off the test's thread, so a gate that blocked on a FIFO
+    fails the test instead of hanging the suite. }
+  TStaleCheckThread = class(TThread)
+  private
+    FHook: THook;
+    FRoot: string;
+  public
+    Stale: Boolean;
+    constructor Create(const AHook: THook; const ARoot: string);
+    procedure Execute; override;
+  end;
+
+constructor TStaleCheckThread.Create(const AHook: THook; const ARoot: string);
+begin
+  FHook := AHook;
+  FRoot := ARoot;
+  Stale := False;
+  inherited Create(False);
+end;
+
+procedure TStaleCheckThread.Execute;
+begin
+  Stale := HookIsStale(FHook, FRoot);
+end;
+
+{ A matched FIFO is never opened for reading in a way that blocks, so it
+  cannot stall the gate; it cannot be hashed, so the hook is stale. The run
+  is recorded fresh with the same declaration first, so only the FIFO can
+  make it stale. }
 procedure THookStalenessTests.TestFifoInputIsStaleWithoutBlocking;
+const
+  GateDeadlineMilliseconds = 10000;
 var
+  Checker: TStaleCheckThread;
+  FifoPath: string;
+  StartedAt: QWord;
+  Unblock: CInt;
   Hook: THook;
 begin
   Hook := GatedHook(['lwpt.toml', 'pipes/*']);
-  RecordFreshBaseline(GatedHook(['lwpt.toml']));
-  ForceDirectories(IncludeTrailingPathDelimiter(FRoot) + 'pipes');
-  Expect<Integer>(FpMkfifo(IncludeTrailingPathDelimiter(FRoot)
-    + 'pipes/input.fifo', &600)).ToBe(0);
-  SetFileModificationTime(IncludeTrailingPathDelimiter(FRoot)
-    + 'pipes/input.fifo', OlderSeconds, OlderNanoseconds);
-  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  WriteStamped('pipes/plain.txt', OlderSeconds, OlderNanoseconds);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  FifoPath := IncludeTrailingPathDelimiter(FRoot) + 'pipes/input.fifo';
+  Expect<Integer>(FpMkfifo(FifoPath, &600)).ToBe(0);
+  SetFileModificationTime(FifoPath, OlderSeconds, OlderNanoseconds);
+  Checker := TStaleCheckThread.Create(Hook, FRoot);
+  try
+    StartedAt := GetTickCount64;
+    while not Checker.Finished
+      and (GetTickCount64 - StartedAt < GateDeadlineMilliseconds) do
+      Sleep(10);
+    if not Checker.Finished then
+    begin
+      { Release a reader blocked in open so the thread can finish. }
+      Unblock := FpOpen(PChar(FifoPath), O_WRONLY or O_NONBLOCK);
+      if Unblock >= 0 then FpClose(Unblock);
+    end;
+    Expect<Boolean>(Checker.Finished).ToBe(True);
+    Checker.WaitFor;
+    Expect<Boolean>(Checker.Stale).ToBe(True);
+  finally
+    Checker.Free;
+  end;
 end;
 {$ENDIF}
 
@@ -388,6 +441,13 @@ begin
   WriteStamped('src/Foo.pas', OlderSeconds, OlderNanoseconds);
   WriteStamped('src/foo.pas', OlderSeconds, OlderNanoseconds);
   RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  { Each twin on its own: a collector that kept either one alone fails. }
+  InputPath := IncludeTrailingPathDelimiter(FRoot) + 'src/Foo.pas';
+  WriteTextFile(InputPath, 'edited upper-case twin');
+  SetFileModificationTime(InputPath, OlderSeconds, OlderNanoseconds);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  WriteStamped('src/Foo.pas', OlderSeconds, OlderNanoseconds);
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
   InputPath := IncludeTrailingPathDelimiter(FRoot) + 'src/foo.pas';
   WriteTextFile(InputPath, 'edited lower-case twin');

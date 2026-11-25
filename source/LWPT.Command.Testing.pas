@@ -1861,7 +1861,7 @@ begin
         begin
           WriteLn('test session: ', Session.SessionID, ' (',
             Session.SessionReference, ')');
-          RunHooks('pretest', Man.PreTest, ProjectRoot);
+          RunHooks('pretest', Man.PreTest, ProjectRoot, ResolveTmpDir(Man));
         end;
 
     ModulesRoot := ResolveModulesDir(Man);
@@ -1904,7 +1904,7 @@ begin
           WriteLn('no *.Test.pas files found');
         Result := 0;
         if not AInventory then
-          RunHooks('posttest', Man.PostTest, ProjectRoot);
+          RunHooks('posttest', Man.PostTest, ProjectRoot, ResolveTmpDir(Man));
         Session.Finish(True);
         Exit;
       end;
@@ -1921,7 +1921,7 @@ begin
         { Mirror the other exit paths: posttest cleanup/reporting hooks
           run even when the scheduler never starts. }
         if not AInventory then
-          RunHooks('posttest', Man.PostTest, ProjectRoot);
+          RunHooks('posttest', Man.PostTest, ProjectRoot, ResolveTmpDir(Man));
         Session.Finish(False, 'test staging key collision');
         Exit;
       end;
@@ -1986,7 +1986,7 @@ begin
         Result := 0
       else
         Result := 1;
-    if not AInventory then RunHooks('posttest', Man.PostTest, ProjectRoot);
+    if not AInventory then RunHooks('posttest', Man.PostTest, ProjectRoot, ResolveTmpDir(Man));
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled');

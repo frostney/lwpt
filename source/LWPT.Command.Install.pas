@@ -32,7 +32,8 @@ begin
   { A v3 lock is refused before hooks or any other change (ADR-0052). }
   RequireProjectLockfileSchema(Ctx);
   WriteLn('package: ', Ctx.Manifest.Name, ' ', Ctx.Manifest.Version);
-  RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot);
+  RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot,
+    ResolveTmpDir(Ctx.Manifest));
   if AFrozen then
     Mode := itmFrozenVerify
   else if AOffline then
@@ -40,7 +41,8 @@ begin
   else
     Mode := itmMaterialize;
   RunInstallTransaction(Ctx, Mode, AAcceptMovedTags);
-  RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot);
+  RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot,
+    ResolveTmpDir(Ctx.Manifest));
 end;
 
 end.

@@ -149,14 +149,17 @@ The time gate therefore skipped the generator, and the build embedded the
 wrong module. After a successful run of a gated hook or run task, LWPT
 records the declaration (command, arguments, input expressions and output),
 the SHA-256 of every matched input and the SHA-256 of the output, below
-`.lwpt/sessions/hook-runs/`, one record per output, staged through
-`.lwpt/tmp/`. The command runs when the time gate says so, when no record
+`.lwpt/sessions/hook-runs/`, one record per output, staged through the
+project's temporary directory. The command runs when the time gate says so, when no record
 exists, or when the declaration, an input's content or the output's content
 differs from the record. The time comparison stays, so `touch` on an input
 still forces a run. No record is kept for an output retargeted to a session's
-private candidate (per-entry and whole-build postbuild), for a run during which
-an input changed, or when the output or an input cannot be read; those runs
-stay stale. An exclusive per-output lock spans the gate, the command and the
-record, so concurrent invocations in one checkout cannot pair one run's
-inputs with another's output. It waits as long as the holding command runs,
-since hook commands have no deadline of their own.
+private candidate (per-entry and whole-build postbuild), for a run whose input
+digest after the command differs from the one taken before it, or when the
+output or an input cannot be read; those runs stay stale. Concurrent
+invocations in one checkout that run the same generator still race on its
+output, as they did under times alone. A per-output lock across the gate, the
+command and the record was considered and rejected: hook commands have no
+deadline, so it must wait without bound. A gated hook that delegates to a
+nested LWPT command for the same output would then deadlock, and so would a
+build holding the only worker slot while it waited.
