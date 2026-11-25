@@ -60,13 +60,22 @@ type
     FSessionOwnerGuardPath: string;
     FSessionOwnerGuard: TObject;
     FFinished: Boolean;
+    FProgramJobs: TStringList;
     function JobLogPath(const AName: string): string;
     procedure WriteState(const AState: string);
+    procedure PruneSupersededJobs;
   public
     constructor Create(const AProjectRoot: string); overload;
     constructor Create(const AProjectRoot, ASessionsRoot: string); overload;
     destructor Destroy; override;
+    { One build job's private staging. A later session that stages the same
+      job supersedes the whole directory. }
     function JobRoot(const AName: string): string;
+    { A job root holding one directory per program (test programs). A later
+      session supersedes each program directory on its own, so a run of
+      selected programs leaves the others' staging alone. Call it from the
+      thread that owns the session, before workers start. }
+    function ProgramJobsRoot(const AName: string): string;
     function JobLogReference(const AName: string): string;
     function SessionReference: string;
     procedure WriteJobLog(const AName, AOutput: string);
@@ -1314,6 +1323,32 @@ begin
     + 'locks/owners/' + ASessionID + '.lock';
 end;
 
+{ The one inactivity predicate for a session directory under ARoot: its owner
+  guard is not held, and its state is failed, or its owner is gone, or it has
+  outlived the partial-state grace. lwpt repair reclaims exactly these
+  sessions, and a finishing session prunes superseded job staging only from
+  these sessions. ASessionName may be a hidden '.creating-' directory. }
+function SessionIsInactive(const ARoot, ASessionName: string): Boolean;
+var
+  SessionPath, SessionID, StatePath, AgePath, State: string;
+  PID: LongInt;
+begin
+  SessionPath := IncludeTrailingPathDelimiter(ARoot) + ASessionName;
+  SessionID := ASessionName;
+  if Copy(SessionID, 1, Length('.creating-')) = '.creating-' then
+    Delete(SessionID, 1, Length('.creating-'));
+  if SessionOwnerGuardHeld(SessionOwnerGuardPath(ARoot, SessionID)) then
+    Exit(False);
+  StatePath := SessionPath + '/session.state';
+  PID := ReadPID(StatePath);
+  State := ReadSessionState(StatePath);
+  if LongPathFileExists(StatePath) then AgePath := StatePath
+  else AgePath := SessionPath;
+  Result := not ((State <> 'failed')
+    and (not IncompleteStateIsAbandoned(AgePath))
+    and ((State = '') or ProcessIsAlive(PID)));
+end;
+
 constructor TLWPTBuildSession.Create(const AProjectRoot: string);
 begin
   Create(AProjectRoot, RootedPath(AProjectRoot, BUILD_SESSIONS_DIR));
@@ -1330,6 +1365,7 @@ begin
   FProjectRoot := ExpandFileName(AProjectRoot);
   FSessionOwnerGuardPath := '';
   FSessionOwnerGuard := nil;
+  FProgramJobs := TStringList.Create;
   BaseRoot := ExpandFileName(ASessionsRoot);
   FDefaultSessionsRoot := SamePath(BaseRoot,
     RootedPath(FProjectRoot, BUILD_SESSIONS_DIR));
@@ -1395,6 +1431,7 @@ begin
         session to be retained. Repair can still reclaim the directory. }
     end;
   FSessionOwnerGuard.Free;
+  FProgramJobs.Free;
   inherited Destroy;
 end;
 
@@ -1417,6 +1454,13 @@ function TLWPTBuildSession.JobRoot(const AName: string): string;
 begin
   Result := FSessionRoot + '/jobs/' + BuildSessionPathKey(AName);
   LongPathForceDirectories(Result);
+end;
+
+function TLWPTBuildSession.ProgramJobsRoot(const AName: string): string;
+begin
+  Result := JobRoot(AName);
+  if FProgramJobs.IndexOf(BuildSessionPathKey(AName)) < 0 then
+    FProgramJobs.Add(BuildSessionPathKey(AName));
 end;
 
 function TLWPTBuildSession.JobLogPath(const AName: string): string;
@@ -1458,12 +1502,117 @@ begin
   AtomicWriteBytes(LogPath, FSessionRoot, Bytes);
 end;
 
+{ A job unit is what a later session supersedes: one build job's directory
+  (jobs/<entry>-<mode>-<key>/, with its bin/, units/ and cache staging) or
+  one program's directory below a ProgramJobsRoot
+  (jobs/tests-<key>/<program-key>/). Job and program keys are stable for the
+  same project, so the same unit in an inactive session of this sessions root
+  holds an older build of the same entry or program. A failed session keeps
+  its staging for diagnosis, and someone running that copy by hand would get
+  the superseded binary without a warning. Remove it, keeping the older
+  session's logs, failure detail and state. Live sessions (owner guard held,
+  or not yet inactive by repair's own predicate) are never touched. Pruning
+  is best effort: a failure here must not change the result of the run that
+  finished, and lwpt repair still reclaims the session. }
+procedure TLWPTBuildSession.PruneSupersededJobs;
+const
+  SESSION_PATTERNS: array[0..1] of string = ('s-*', 'session-*');
+var
+  JobsRoot, OtherRoot, OtherJobs, ProgramJob: string;
+  Jobs, Programs, Sessions: TLWPTDirectoryEntries;
+  Units: TStringList;
+  CoordinationLock: TLWPTPublicationLock;
+  JobIndex, ProgramIndex, SessionIndex, UnitIndex, PatternIndex: Integer;
+
+  function IsDirectoryEntry(const AEntry: TLWPTDirectoryEntry): Boolean;
+  begin
+    Result := ((AEntry.Attr and faDirectory) <> 0)
+      and (AEntry.Name <> '.') and (AEntry.Name <> '..');
+  end;
+
+begin
+  JobsRoot := FSessionRoot + '/jobs';
+  if not LongPathDirectoryExists(JobsRoot) then Exit;
+  Units := TStringList.Create;
+  try
+    Jobs := ListDirectoryEntries(JobsRoot, '*', faDirectory);
+    for JobIndex := 0 to High(Jobs) do
+    begin
+      if not IsDirectoryEntry(Jobs[JobIndex]) then Continue;
+      if FProgramJobs.IndexOf(Jobs[JobIndex].Name) < 0 then
+      begin
+        Units.Add(Jobs[JobIndex].Name);
+        Continue;
+      end;
+      Programs := ListDirectoryEntries(JobsRoot + '/' + Jobs[JobIndex].Name,
+        '*', faDirectory);
+      for ProgramIndex := 0 to High(Programs) do
+        if IsDirectoryEntry(Programs[ProgramIndex]) then
+          Units.Add(Jobs[JobIndex].Name + '/' + Programs[ProgramIndex].Name);
+    end;
+    if Units.Count = 0 then Exit;
+    try
+      { Repair reclaims sessions under this same lock, so the two never
+        remove one session's contents at the same time. }
+      CoordinationLock := TLWPTPublicationLock.Create(
+        BuildSessionLedgerLockPath(FProjectRoot));
+      try
+        if (not FDefaultSessionsRoot) and (not SessionRootIdentityMatches(
+          FSessionsRoot, BuildSessionProjectIdentity(FProjectRoot))) then
+          Exit;
+        for PatternIndex := Low(SESSION_PATTERNS)
+          to High(SESSION_PATTERNS) do
+        begin
+          Sessions := ListDirectoryEntries(FSessionsRoot,
+            SESSION_PATTERNS[PatternIndex], faDirectory);
+          for SessionIndex := 0 to High(Sessions) do
+          begin
+            if not IsDirectoryEntry(Sessions[SessionIndex]) then Continue;
+            if Sessions[SessionIndex].Name = FSessionID then Continue;
+            OtherRoot := FSessionsRoot + '/' + Sessions[SessionIndex].Name;
+            OtherJobs := OtherRoot + '/jobs';
+            if IsDirSymlinkOrJunction(OtherRoot)
+              or IsDirSymlinkOrJunction(OtherJobs)
+              or (not LongPathDirectoryExists(OtherJobs)) then Continue;
+            if not SessionIsInactive(FSessionsRoot,
+              Sessions[SessionIndex].Name) then Continue;
+            for UnitIndex := 0 to Units.Count - 1 do
+            begin
+              if Pos('/', Units[UnitIndex]) = 0 then
+              begin
+                { WipeDir removes a linked job directory as a link. }
+                WipeDir(OtherJobs + '/' + Units[UnitIndex]);
+                Continue;
+              end;
+              ProgramJob := OtherJobs + '/' + ExtractFileDir(Units[UnitIndex]);
+              if (not LongPathDirectoryExists(ProgramJob))
+                or IsDirSymlinkOrJunction(ProgramJob) then Continue;
+              WipeDir(OtherJobs + '/' + Units[UnitIndex]);
+              { RemoveDir refuses a job root that still holds programs this
+                session did not stage. }
+              LongPathRemoveDir(ProgramJob);
+            end;
+            LongPathRemoveDir(OtherJobs);
+          end;
+        end;
+      finally
+        CoordinationLock.Free;
+      end;
+    except
+      on Exception do;
+    end;
+  finally
+    Units.Free;
+  end;
+end;
+
 procedure TLWPTBuildSession.Finish(ASuccess: Boolean; const ADetail: string);
 var
   HasLogs: Boolean;
   Lines: TStringList;
 begin
   if FFinished then Exit;
+  PruneSupersededJobs;
   if ASuccess then
   begin
     { The guard lives beside session directories, so it remains observable
@@ -1583,10 +1732,7 @@ procedure RepairBuildSessions(const AProjectRoot, ATemporaryRoot: string;
   out ARemoved, ARetained: Integer;
   out ATemporaryRootCleaned: Boolean);
 var
-  Root, SessionPath, SessionID, StatePath, AgePath, OwnerPath: string;
-  PID: LongInt;
-  State: string;
-  OwnerHeld: Boolean;
+  Root, SessionPath, SessionID, OwnerPath: string;
   LedgerLock: TLWPTPublicationLock;
   Roots: TStringList;
   ProjectIdentity: string;
@@ -1609,17 +1755,7 @@ var
       if Copy(SessionID, 1, Length('.creating-')) = '.creating-' then
         Delete(SessionID, 1, Length('.creating-'));
       OwnerPath := SessionOwnerGuardPath(Root, SessionID);
-      StatePath := SessionPath + '/session.state';
-      PID := ReadPID(StatePath);
-      State := ReadSessionState(StatePath);
-      OwnerHeld := SessionOwnerGuardHeld(OwnerPath);
-      if LongPathFileExists(StatePath) then AgePath := StatePath
-      else AgePath := SessionPath;
-      if OwnerHeld then
-        Inc(ARetained)
-      else if (State <> 'failed')
-        and (not IncompleteStateIsAbandoned(AgePath))
-        and ((State = '') or ProcessIsAlive(PID)) then
+      if not SessionIsInactive(Root, Entries[EntryIndex].Name) then
         Inc(ARetained)
       else
       begin

@@ -1958,7 +1958,8 @@ begin
           WriteLn('discovered ', Tests.Count, ' test file(s)');
       end;
       Scheduler := TTestScheduler.Create(Tests, UnitPaths,
-        Man.TestFlags, Session.JobRoot('tests'), AJobs, EffectiveBail, Session,
+        Man.TestFlags, Session.ProgramJobsRoot('tests'), AJobs, EffectiveBail,
+        Session,
         ProjectRoot, AVerbose, AInventory,
         (ASelectors = nil) or (ASelectors.Count = 0), InventoryPath,
         CompilerDriver, CacheContext);
