@@ -72,6 +72,8 @@ type
     procedure TestEnvironmentMacroDirectoryInvalidatesFingerprint;
     procedure TestConfigurationDirectoryIncludeInvalidatesFingerprint;
     procedure TestUnboundedSearchEntryIsNeverReused;
+    procedure TestExhaustedMacroExpansionIsNeverReused;
+    procedure TestRepeatedIncludeUnderNewDirectoryInvalidates;
     {$IFDEF UNIX}
     procedure TestFifoInUnitDirectoryDoesNotHangCachedRun;
     procedure TestConfigurationSwappedForFifoDoesNotHangCachedRun;
@@ -969,6 +971,69 @@ begin
   end;
 end;
 
+procedure TTestCache.TestExhaustedMacroExpansionIsNeverReused;
+const
+  CHAIN_LENGTH = 70;
+var
+  Environment: TStringArray;
+  ProjectRoot: string;
+  Run: TLwptResult;
+  Attempt, i: Integer;
+begin
+  ProjectRoot := FScratch + '/macro-chain';
+  { FPC follows a chain of 70 "$NAME$" variables to the include directory;
+    LWPT stops expanding at its bound, so it cannot know the directory and
+    never reuses the result. }
+  WriteSearchProject(ProjectRoot,
+    '[test]'#10'flags = ["-Fi$LWPT_FIXTURE_CHAIN_0$"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  RecursiveDelete(FScratch + '/macro-chain-cache');
+  Environment := CacheEnvironment(FScratch + '/macro-chain-cache',
+    FScratch + '/macro-chain-marker');
+  for i := 0 to CHAIN_LENGTH - 1 do
+  begin
+    SetLength(Environment, Length(Environment) + 1);
+    Environment[High(Environment)] := 'LWPT_FIXTURE_CHAIN_' + IntToStr(i)
+      + '=$LWPT_FIXTURE_CHAIN_' + IntToStr(i + 1) + '$';
+  end;
+  SetLength(Environment, Length(Environment) + 1);
+  Environment[High(Environment)] := 'LWPT_FIXTURE_CHAIN_'
+    + IntToStr(CHAIN_LENGTH) + '=' + ProjectRoot + '/incs';
+  for Attempt := 1 to 2 do
+  begin
+    Run := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
+      Environment);
+    RequireSuccess('macro chain run ' + IntToStr(Attempt), Run);
+    Expect<Boolean>(Pos('SEARCH V=1', Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('cache bypass: unavailable '
+      + '(ELWPTUnboundedCompilerInputs', Run.Stdout) > 0).ToBe(True);
+  end;
+end;
+
+procedure TTestCache.TestRepeatedIncludeUnderNewDirectoryInvalidates;
+var
+  ProjectRoot: string;
+begin
+  ProjectRoot := FScratch + '/repeated-include';
+  { The profile's response file includes wrapper.cfg twice; after the
+    #CFGDIR, FPC parses it again and its #INCLUDE finds later/paths.cfg,
+    the only file that names the include directory. }
+  WriteSearchProject(ProjectRoot,
+      '[compiler]'#10
+    + 'default = "pinned"'#10
+    + '[compiler.profiles.pinned]'#10
+    + 'driver = "fpc"'#10
+    + 'args = ["@opts.rsp"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  WriteTextFile(ProjectRoot + '/opts.rsp', '#INCLUDE wrapper.cfg'#10
+    + '#CFGDIR later'#10'#INCLUDE wrapper.cfg'#10);
+  WriteTextFile(ProjectRoot + '/wrapper.cfg', '#INCLUDE paths.cfg'#10);
+  WriteTextFile(ProjectRoot + '/paths.cfg', '-Fiunused'#10);
+  WriteTextFile(ProjectRoot + '/later/paths.cfg', '-Fiincs'#10);
+  RequireEditRecompiles('repeated-include', ProjectRoot,
+    ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10, []);
+end;
+
 {$IFDEF UNIX}
 procedure TTestCache.TestFifoInUnitDirectoryDoesNotHangCachedRun;
 var
@@ -1073,6 +1138,10 @@ begin
     + 'fingerprint', TestConfigurationDirectoryIncludeInvalidatesFingerprint);
   Test('a search entry no fixed directory holds is never reused',
     TestUnboundedSearchEntryIsNeverReused);
+  Test('a macro chain past the expansion bound is never reused',
+    TestExhaustedMacroExpansionIsNeverReused);
+  Test('a file included again after #CFGDIR invalidates the fingerprint',
+    TestRepeatedIncludeUnderNewDirectoryInvalidates);
   {$IFDEF UNIX}
   Test('a FIFO in a unit directory neither hangs nor defeats the cache',
     TestFifoInUnitDirectoryDoesNotHangCachedRun);

@@ -58,6 +58,7 @@ type
     procedure TestCacheFingerprintSeparatesOperationIdentity;
     procedure TestFingerprintsCoverArgumentSearchInputs;
     procedure TestOptionFileLookupCoversEveryCandidate;
+    procedure TestOptionFileContextAndCaseFollowFPC;
     {$IFDEF OBJECTSTORE_TESTING}
     procedure TestOptionFileChangedAfterReadIsRefused;
     procedure TestShadowingCandidateAfterReadIsSeen;
@@ -113,6 +114,7 @@ type
     procedure TestPathSeparatorSplitsEntries;
     procedure TestMacrosExpandAsFPCExpandsThem;
     procedure TestUnboundedEntriesAreNamed;
+    procedure TestBackslashClimbIsUnbounded;
   end;
 
 
@@ -799,6 +801,39 @@ begin
     on E: Exception do PublicationRefused := True;
   end;
   Expect<Boolean>(PublicationRefused).ToBe(False);
+end;
+
+procedure TLWPTBuildSessionTests.TestOptionFileContextAndCaseFollowFPC;
+var
+  Files, Paths, States: TStringArray;
+  Joined, Unbounded: string;
+  i: Integer;
+begin
+  ResetScratch;
+  { FPC parses wrapper.cfg again after the #CFGDIR, and its #INCLUDE then
+    finds later/paths.cfg; on a case-sensitive system it also finds
+    cfgs/paths.cfg for "Paths.cfg" through FileExistsNonCase. }
+  WriteText(FScratch + '/opts.cfg', '#INCLUDE wrapper.cfg'#10
+    + '#CFGDIR later'#10'#INCLUDE wrapper.cfg'#10'#CFGDIR cfgs'#10
+    + '#INCLUDE Upper.cfg'#10);
+  WriteText(FScratch + '/wrapper.cfg', '#INCLUDE paths.cfg'#10);
+  WriteText(FScratch + '/paths.cfg', '-Furoot-only'#10);
+  WriteText(FScratch + '/later/paths.cfg', '-Fulater-only'#10);
+  WriteText(FScratch + '/cfgs/upper.cfg', '-Fulower-only'#10);
+  SetLength(Paths, 0);
+  SetLength(Files, 0);
+  SetLength(States, 0);
+  Unbounded := '';
+  AppendCompilerArgumentInputs(FScratch, ['@' + FScratch + '/opts.cfg'],
+    Paths, Files, States, Unbounded);
+  Joined := '|';
+  for i := 0 to High(Paths) do Joined := Joined + Paths[i] + '|';
+  if (Pos('|root-only|', Joined) = 0) or (Pos('|later-only|', Joined) = 0)
+     or (Pos('|lower-only|', Joined) = 0) then
+    Fail('inputs: ' + Joined);
+  Expect<Boolean>(Pos('|later-only|', Joined) > 0).ToBe(True);
+  Expect<Boolean>(Pos('|lower-only|', Joined) > 0).ToBe(True);
+  Expect<string>(Unbounded).ToBe('');
 end;
 
 {$IFDEF OBJECTSTORE_TESTING}
@@ -2239,6 +2274,8 @@ begin
     TestFingerprintsCoverArgumentSearchInputs);
   Test('option-file lookup reads every candidate and names unbounded ones',
     TestOptionFileLookupCoversEveryCandidate);
+  Test('option files follow FPC''s #CFGDIR context and name cases',
+    TestOptionFileContextAndCaseFollowFPC);
   {$IFDEF OBJECTSTORE_TESTING}
   Test('an option file changed after its read is refused',
     TestOptionFileChangedAfterReadIsRefused);
@@ -2413,6 +2450,21 @@ begin
   Expect<string>(Unbounded).ToBe('');
 end;
 
+procedure TCompilerSearchDirectoryTests.TestBackslashClimbIsUnbounded;
+var
+  Directories: TStringArray;
+  Unbounded: string;
+begin
+  { FPC reads "\" as a separator on every platform, so this ".." climbs
+    out of incs\ as the "/" spelling does. }
+  SetLength(Directories, 0);
+  Unbounded := '';
+  AppendCompilerSearchDirectories(['-Fiincs\$FPCTARGET\..\..\outside'],
+    Directories, Unbounded);
+  Expect<string>(Unbounded)
+    .ToBe('option "-Fiincs\$FPCTARGET\..\..\outside"');
+end;
+
 procedure TCompilerSearchDirectoryTests.SetupTests;
 begin
   Test('each search option names its directories',
@@ -2429,6 +2481,8 @@ begin
     TestMacrosExpandAsFPCExpandsThem);
   Test('entries that can climb out of their fixed directory are named',
     TestUnboundedEntriesAreNamed);
+  Test('a backslash climb is unbounded too',
+    TestBackslashClimbIsUnbounded);
 end;
 
 begin
