@@ -713,10 +713,10 @@ begin
     if not TimedOut then CompilerProcess.WaitOnExit;
     if TimedOut then
     begin
-      if (AOutput <> '') and (AOutput[Length(AOutput)] <> #10) then
-        AOutput := AOutput + LineEnding;
-      AOutput := AOutput + 'probe timed out after '
-        + IntToStr(TimeoutMilliseconds) + ' ms';
+      { Failure messages report the first output line, so the reason leads
+        whatever the probe printed before it stalled. }
+      AOutput := 'probe timed out after ' + IntToStr(TimeoutMilliseconds)
+        + ' ms' + LineEnding + AOutput;
       Result := FPC_PROBE_TIMEOUT_EXIT_CODE;
     end
     else

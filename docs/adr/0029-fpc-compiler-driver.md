@@ -114,4 +114,6 @@ dispatched probe. The probe work timed under the driver's probe lock is
 therefore at most two deadlines; terminating and reaping the timed-out process
 tree, and draining its pipe, come on top. Because a probe can now run far
 longer, its retained output is capped at the shared 16 MiB capture budget, and
-output past it fails the probe.
+output past it fails the probe. The longer deadline mitigates the stalls;
+their cause is not established and is tracked in
+[#440](https://github.com/frostney/lwpt/issues/440).

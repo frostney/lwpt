@@ -41,6 +41,7 @@ const
     + '-probe-timeout-grandchild';
   ProbeTimeoutProxyOption = '--' + PROGRAM_NAME + '-probe-timeout-proxy';
   ProbeFloodProxyOption = '--' + PROGRAM_NAME + '-probe-flood-proxy';
+  ProbeNoisyStallProxyOption = '--' + PROGRAM_NAME + '-probe-noisy-stall-proxy';
   { Past the 16 MiB probe capture budget. }
   ProbeFloodBytes = 17 * 1024 * 1024;
   ProbeTimeoutSleepMilliseconds = 30000;
@@ -91,6 +92,16 @@ type
       out AOutput: string): Integer; override;
   end;
 
+  { Runs this test program as a probe that prints a line and then stalls
+    past a short test deadline. }
+  TNoisyStallFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
+  protected
+    function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
+      out AOutput: string): Integer; override;
+  public
+    function ProbeTimeoutMilliseconds: QWord; override;
+  end;
+
   TLWPTFPCCompilerDriverTests = class(TTestSuite)
   private
     function FixtureRequest(const ASource, AArtifact: string):
@@ -121,6 +132,7 @@ type
     procedure TestProbeTimeoutTerminatesProcessTree;
     procedure TestProbeDeadlineIsTheCompileDeadline;
     procedure TestProbeOutputPastBudgetFails;
+    procedure TestTimeoutReasonLeadsProbeOutput;
     procedure AssertProbeDeadlineIsTheCompileDeadline(
       const AExpected: QWord);
     procedure TestProbeRejectsUnexpectedTargetTuple;
@@ -166,6 +178,14 @@ begin
   FpSignal(SIGTERM, SignalHandler(SIG_IGN));
   {$ENDIF}
   PublishReadablePayload(ParamStr(2), IntToStr(GetProcessID));
+  Sleep(ProbeTimeoutSleepMilliseconds);
+  Result := 0;
+end;
+
+function RunProbeNoisyStallProxy: Integer;
+begin
+  WriteLn('probe noise before the stall');
+  Flush(Output);
   Sleep(ProbeTimeoutSleepMilliseconds);
   Result := 0;
 end;
@@ -290,6 +310,24 @@ begin
   for I := 0 to High(AArguments) do
     Arguments[I + 1] := AArguments[I];
   Result := inherited ExecuteProbe(Arguments, AOutput);
+end;
+
+function TNoisyStallFPCCompilerDriver.ExecuteProbe(
+  const AArguments: LWPT.Core.TStringArray; out AOutput: string): Integer;
+var
+  Arguments: LWPT.Core.TStringArray;
+  I: Integer;
+begin
+  SetLength(Arguments, Length(AArguments) + 1);
+  Arguments[0] := ProbeNoisyStallProxyOption;
+  for I := 0 to High(AArguments) do
+    Arguments[I + 1] := AArguments[I];
+  Result := inherited ExecuteProbe(Arguments, AOutput);
+end;
+
+function TNoisyStallFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
+begin
+  Result := TestProbeTimeoutMilliseconds;
 end;
 
 function TLWPTFPCCompilerDriverTests.ArgumentsContain(
@@ -662,6 +700,30 @@ begin
     Driver.Free;
     TerminateTestProcess(GrandchildPID);
     RecursiveDelete(Scratch);
+  end;
+end;
+
+{ Failure messages show only the probe's first output line, so a probe
+  that printed something before it stalled must still report why it
+  failed. }
+procedure TLWPTFPCCompilerDriverTests.TestTimeoutReasonLeadsProbeOutput;
+var
+  Driver: TNoisyStallFPCCompilerDriver;
+  ErrorMessage: string;
+begin
+  Driver := TNoisyStallFPCCompilerDriver.Create(ExpandFileName(ParamStr(0)));
+  try
+    ErrorMessage := '';
+    try
+      Driver.DefaultTarget;
+    except
+      on E: ELWPTCompilerDriverError do ErrorMessage := E.Message;
+    end;
+    Expect<Boolean>(Pos('(exit 124): probe timed out after '
+      + IntToStr(TestProbeTimeoutMilliseconds) + ' ms', ErrorMessage) > 0)
+      .ToBe(True);
+  finally
+    Driver.Free;
   end;
 end;
 
@@ -1339,6 +1401,8 @@ begin
     TestProbeDeadlineIsTheCompileDeadline);
   Test('probe output past the capture budget fails the probe',
     TestProbeOutputPastBudgetFails);
+  Test('a timeout reason leads output the probe printed before it stalled',
+    TestTimeoutReasonLeadsProbeOutput);
   Test('probe rejects a successful response for the wrong target tuple',
     TestProbeRejectsUnexpectedTargetTuple);
   Test('capabilities are defensive and do not advertise unit outputs',
@@ -1412,6 +1476,8 @@ begin
   if (ParamCount >= 2)
      and (ParamStr(1) = ProbeTimeoutGrandchildOption) then
     Halt(RunProbeTimeoutGrandchild);
+  if (ParamCount >= 1) and (ParamStr(1) = ProbeNoisyStallProxyOption) then
+    Halt(RunProbeNoisyStallProxy);
   if (ParamCount >= 1) and (ParamStr(1) = ProbeFloodProxyOption) then
     Halt(RunProbeFloodProxy);
   if (ParamCount >= 2) and (ParamStr(1) = ProbeTimeoutProxyOption) then
