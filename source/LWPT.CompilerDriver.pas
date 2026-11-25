@@ -77,6 +77,7 @@ type
       virtual;
     function SeparateStandardError: Boolean; virtual;
     function CompilationTimeoutMilliseconds: QWord; virtual;
+    function ProbeTimeoutMilliseconds: QWord; virtual;
     function ClassifyFailure(const AExitCode: Integer;
       const ARawOutput: string): TLWPTCompilerFailure; virtual; abstract;
     function NormalizeResult(const ARequest: TLWPTBuildRequest;
@@ -217,6 +218,16 @@ begin
       '%s must be a positive integer number of milliseconds',
       [COMPILER_TIMEOUT_ENVIRONMENT]);
   Result := QWord(Configured);
+end;
+
+{ A capability probe is a compiler process like a compile, run under the
+  same machine load, so it shares the compile deadline. A shorter fixed
+  probe deadline turned a slow but healthy compiler on a loaded machine
+  into a failed build. The deadline still bounds a wedged compiler, which
+  would hang the compile that follows the probe for as long. }
+function TLWPTCompilerDriver.ProbeTimeoutMilliseconds: QWord;
+begin
+  Result := CompilationTimeoutMilliseconds;
 end;
 
 function TLWPTCompilerDriver.NormalizeExecutionResult(

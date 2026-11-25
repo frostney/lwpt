@@ -1,5 +1,9 @@
 # Route FPC compilation through a neutral compiler-driver seam
 
+> **Amended 2026-11-25:** the 30-second probe deadline below is superseded.
+> Each probe process now gets the compile's per-process deadline; see
+> [the amendment](#amendment--2026-11-25).
+
 ADR-0022 established `TLWPTBuildRequest`, compiler capabilities, and
 `TLWPTBuildResult`, but deliberately left FPC argument construction and output
 interpretation in the build and test commands. That split produced two
@@ -92,3 +96,24 @@ compilation uses the ordinary FPC driver path before the compiled script runs.
   invocation-option level: builds pass `@lwpt.cfg`, while test and Windows hook
   compilation expand it for cross-platform response-file compatibility. The
   FPC driver owns both translations.
+
+## Amendment — 2026-11-25
+
+The fixed 30-second probe deadline is withdrawn. A probe is a compiler process
+like a compile and runs under the same machine load. On a heavily loaded
+development machine a healthy `-iV -iTO -iTP` probe exceeded 30 seconds, and
+the build failed before it compiled anything, while the compile itself would
+have had 30 minutes. Every driver's probe process now gets the compile's
+per-process deadline: 30 minutes by default, or `LWPT_COMPILER_TIMEOUT_MS`
+when set. The deadline still limits each process separately. A timed-out
+probe counts as a failed probe with the consequences any failed probe has.
+Default-target discovery and a dispatched probe fail the request. A bare
+probe that validates a concrete target, whether requested or the default
+target refreshed before compiling or publishing, falls through to the
+dispatched probe. The probe work timed under the driver's probe lock is
+therefore at most two deadlines; terminating and reaping the timed-out process
+tree, and draining its pipe, come on top. Because a probe can now run far
+longer, its retained output is capped at the shared 16 MiB capture budget, and
+output past it fails the probe. The longer deadline mitigates the stalls;
+their cause is not established and is tracked in
+[#440](https://github.com/frostney/lwpt/issues/440).

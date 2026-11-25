@@ -24,7 +24,6 @@ type
   protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AStandardOutput, AStandardError: string): Integer; virtual;
-    function ProbeTimeoutMilliseconds: QWord; virtual;
   public
     constructor Create(const AExecutableName: string = '';
       const AVersionConstraint: string = '*');
@@ -69,7 +68,6 @@ const
   LAKON_VERBOSE_UNITS_FLAG = '--verbose-units';
   LAKON_NO_INLINE_FLAG = '--no-inline';
   LAKON_INLINE_STATS_FLAG = '--inline-stats';
-  LAKON_PROBE_TIMEOUT_MILLISECONDS = 30000;
   LAKON_TARGET_OS = 'wasi';
   LAKON_TARGET_ARCHITECTURE = 'wasm32';
   LAKON_TARGET_ENVIRONMENT = 'wasip1';
@@ -171,11 +169,6 @@ end;
 function TLWPTLakonCompilerDriver.VersionConstraint: string;
 begin
   Result := FVersionConstraint;
-end;
-
-function TLWPTLakonCompilerDriver.ProbeTimeoutMilliseconds: QWord;
-begin
-  Result := LAKON_PROBE_TIMEOUT_MILLISECONDS;
 end;
 
 function TLWPTLakonCompilerDriver.ExecuteProbe(
