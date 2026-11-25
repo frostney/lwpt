@@ -158,11 +158,17 @@ profile's `args` name, together with any response file (`@file`) among those
 arguments and the files it reads with `#INCLUDE`, whose lines count as
 arguments. These options and files are read as FPC 3.2 reads them, the same
 way the test run's input record below reads them. A response file's
-`#INCLUDE` looks in its `#CFGDIR` directories first, and every place it may
-be found is an input, so a file that appears earlier in that order is seen. A
-fingerprint whose option file changes between the read that names its
-directories and the hash steps aside, because those directories and the hash
-would describe different versions. Every input is read without blocking, and only a regular file is hashed: a file of another
+`#INCLUDE` looks in its `#CFGDIR` directories first; every place it may be
+found is an input, and each one there is read, so a file that appears
+earlier in that order is seen. When no fixed directory is known to hold what
+an entry resolves to (a `..` after a `*` wildcard or an `$FPC*` macro, an
+option file named through an `$FPC*` macro, or a `#CFGDIR` entry with a
+wildcard or such a macro), the compile does not use the cache: a test
+program reports `cache bypass: unavailable`, and a build entry reports
+`cache miss: unbounded-inputs` and stores nothing. A fingerprint whose option
+file changes between the read that names its directories and the hash steps
+aside the same way, because those directories and the hash would describe
+different versions. Every input is read without blocking, and only a regular file is hashed: a file of another
 kind, such as a FIFO, is recorded by its type and mode, so it can neither hang
 the fingerprint nor make it change from run to run. An input that cannot be
 read makes the cache step aside for that compile. A verified hit is copied into
@@ -600,15 +606,17 @@ options are read as FPC 3.2 reads them: entries split at `;`, and outside
 Windows also at `:`; Pascal quotes removed; and a leading `=` read against an empty sysroot, except in
 `-Fl`, whose `=` entries are watched below every `-XR` sysroot those options
 set and below none. Before that, FPC's macros are replaced: an environment
-variable written `$NAME$` that is set and not empty becomes its value, which
+variable written `$NAME$` that is set, even to nothing, becomes its value, which
 may name a directory outside the project, and on Windows `$APPDATA` and the
 other special-folder macros become those folders. An entry with a `*`
 wildcard or a `$FPC*` macro such as `$FPCTARGET`, whose value only the
-compiler knows, is watched through its fixed leading directory. Response
-files are read as FPC reads them: one option per line, `;` comments, and
-`#INCLUDE` and `#CFGDIR` followed, with every `#IFDEF` branch counted. Each
-option file must still hold the bytes its directories were read from when
-the record is taken, or the record is taken again. A file a program reads
+compiler knows, is watched through its fixed leading directory, also where
+a `..` after it can climb above that directory, which the record does not
+follow. Response files are read as FPC reads them: one option per line, `;`
+comments, and `#INCLUDE` and `#CFGDIR` followed, with every `#IFDEF` branch
+counted and every `#CFGDIR` candidate read. Each option file, and each
+candidate's absence, must still hold when the record is taken, or the record
+is taken again. A file a program reads
 from outside this set, such as `{$I ../elsewhere/Value.inc}`, is not watched.
 Session staging and declared build outputs, including outputs at the project
 root, are excluded, and each path is hashed once. A file that appears at the
