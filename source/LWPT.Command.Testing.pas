@@ -1991,6 +1991,9 @@ begin
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled');
+    for i := 0 to Session.CleanupWarnings.Count - 1 do
+      WriteLn(ErrOutput, PROGRAM_NAME, ' test: warning: ',
+        Session.CleanupWarnings[i]);
       finally
         Session.Free;
       end;

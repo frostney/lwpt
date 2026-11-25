@@ -336,14 +336,19 @@ only executable left in session staging for an entry or program is the latest
 run's, and only when that run failed; an executable copied by hand from an
 older session can no longer be a silently superseded build. A session counts as
 inactive by the same rule `lwpt repair` uses, and a session whose owner guard
-is held is never touched. Retention follows completion order: a failing
-session records its result and releases its guard under the same lock as
-this sweep, so when overlapping runs finish, the last to finish keeps its
-staging if it failed, even if it compiled earlier. LWPT never sweeps through a
-linked `.lwpt` or `.lwpt/sessions`. Staging is matched by job keys derived
-from the entry name or the program's absolute path, so staging retained from
-before a project moved or was renamed, or from development builds that used an
-older staging layout, is not matched; `lwpt repair` reclaims it. `lwpt repair` removes inactive
+is held is never touched. Each session records its project's identity, and
+only the same project's sessions are swept, even when a linked `.lwpt` or
+`.lwpt/sessions` makes several projects share one directory. Retention
+follows the order in which sessions take the build-coordination lock to
+finish: a failing session records its result and releases its guard before
+it releases that lock, so of overlapping runs, the last to take the lock keeps
+its staging if it failed, even if it compiled earlier. When the sweep cannot
+take the lock or cannot remove a superseded directory (on Windows, for
+example, an executable that is still running), the command prints a warning
+naming what remains, without changing its result. Staging is matched by job
+keys derived from the entry name or the program's absolute path, so staging
+retained from before a project moved or was renamed, or by an LWPT that did
+not record session identities, is not matched; `lwpt repair` reclaims it. `lwpt repair` removes inactive
 sessions only after their OS-held owner guard is absent; malformed state fails
 closed while its guard remains held. Reusable artifacts remain separate from
 session ownership and are admitted only after successful publication.

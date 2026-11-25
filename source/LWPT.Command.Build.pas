@@ -1917,6 +1917,9 @@ begin
     Result := Ord(Failed <> 0);
     Session.Finish(Failed = 0,
       IntToStr(Failed) + ' build entry(s) failed or became stale');
+    for i := 0 to Session.CleanupWarnings.Count - 1 do
+      WriteLn(ErrOutput, PROGRAM_NAME, ' build: warning: ',
+        Session.CleanupWarnings[i]);
   finally
     Reporter.Free;
     Session.Free;

@@ -15,6 +15,7 @@ uses
   Tests.LwptSubprocess,
   Tests.Scratch,
 
+  LWPT.BuildSession,
   LWPT.ObjectStore,
   LWPT.WorkerBudget;
 
@@ -708,9 +709,26 @@ begin
   WriteTextFile(ProjectRoot + '/tests/Unselected.Test.pas',
     ExitProgram('Unselected', 1));
   Environment := CacheEnvironment(CacheRoot, Marker);
+  { Staging must land in the project's default sessions root, which the
+    assertions below inspect. }
+  SetLength(Environment, Length(Environment) + 1);
+  Environment[High(Environment)] := BUILD_SESSION_DIR_ENV + '=';
 
   Failed := RunLwpt(['test', '--jobs=1'], ProjectRoot, Environment);
   Expect<Integer>(Failed.ExitCode).ToBe(1);
+  { Both programs compiled and failed at run time, so each left a retained
+    executable for the rerun to supersede. }
+  Rerun := TStringList.Create;
+  try
+    CollectExecutables(ProjectRoot + '/.lwpt/sessions', 'Rerun.Test', Rerun);
+    Expect<Integer>(Rerun.Count).ToBe(1);
+    Rerun.Clear;
+    CollectExecutables(ProjectRoot + '/.lwpt/sessions', 'Unselected.Test',
+      Rerun);
+    Expect<Integer>(Rerun.Count).ToBe(1);
+  finally
+    Rerun.Free;
+  end;
   WriteTextFile(ProjectRoot + '/tests/Rerun.Test.pas', ExitProgram('Rerun', 0));
   Passed := RunLwpt(['test', '--jobs=1', 'tests/Rerun.Test.pas'],
     ProjectRoot, Environment);

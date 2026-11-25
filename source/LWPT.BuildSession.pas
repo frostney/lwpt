@@ -61,6 +61,8 @@ type
     FSessionOwnerGuard: TObject;
     FFinished: Boolean;
     FProgramJobs: TStringList;
+    FProjectIdentity: string;
+    FCleanupWarnings: TStringList;
     function JobLogPath(const AName: string): string;
     procedure WriteState(const AState: string);
     procedure PruneSupersededJobs;
@@ -81,6 +83,9 @@ type
     function SessionReference: string;
     procedure WriteJobLog(const AName, AOutput: string);
     procedure Finish(ASuccess: Boolean; const ADetail: string = '');
+    { Superseded staging this session could not remove when it finished,
+      one line each, for the command to report. Empty on a clean sweep. }
+    property CleanupWarnings: TStringList read FCleanupWarnings;
     property SessionID: string read FSessionID;
     property SessionRoot: string read FSessionRoot;
     property SessionsRoot: string read FSessionsRoot;
@@ -117,6 +122,17 @@ function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
   and relocated session roots, for a short project-wide critical section.
   Free the result to release it. }
 function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
+{$IFDEF OBJECTSTORE_TESTING}
+type
+  TLWPTSessionFinishTestHook = procedure(const ASessionRoot: string);
+
+var
+  { Test-only: called by a failing Finish while it still holds the
+    build-coordination lock, after its terminal state and owner guard are
+    settled. Production code must leave it nil. }
+  SessionFinishBeforeCoordinationReleaseTestHook: TLWPTSessionFinishTestHook;
+
+{$ENDIF}
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,
   ADestinationPath, AExpectedFingerprint, AManifestPath, ACfgPath,
   ALockPath, AModulesPath: string;
@@ -1353,16 +1369,6 @@ begin
   end;
 end;
 
-function SessionLiveInProcess(const ASessionID: string): Boolean;
-begin
-  EnterCriticalSection(LiveSessionCriticalSection);
-  try
-    Result := LiveSessionIDs.IndexOf(ASessionID) >= 0;
-  finally
-    LeaveCriticalSection(LiveSessionCriticalSection);
-  end;
-end;
-
 { The one inactivity predicate for a session directory under ARoot: its owner
   guard is not held, and its state is failed, or its owner is gone, or it has
   outlived the partial-state grace. lwpt repair reclaims exactly these
@@ -1372,14 +1378,23 @@ function SessionIsInactive(const ARoot, ASessionName: string): Boolean;
 var
   SessionPath, SessionID, StatePath, AgePath, State: string;
   PID: LongInt;
+  GuardHeld: Boolean;
 begin
   SessionPath := IncludeTrailingPathDelimiter(ARoot) + ASessionName;
   SessionID := ASessionName;
   if Copy(SessionID, 1, Length('.creating-')) = '.creating-' then
     Delete(SessionID, 1, Length('.creating-'));
-  if SessionLiveInProcess(SessionID)
-    or SessionOwnerGuardHeld(SessionOwnerGuardPath(ARoot, SessionID)) then
-    Exit(False);
+  { A session registers before it takes its guard, and the lookup and probe
+    share the registry's critical section, so a probe from this process
+    never runs against a guard this process holds or is taking. }
+  EnterCriticalSection(LiveSessionCriticalSection);
+  try
+    GuardHeld := (LiveSessionIDs.IndexOf(SessionID) >= 0)
+      or SessionOwnerGuardHeld(SessionOwnerGuardPath(ARoot, SessionID));
+  finally
+    LeaveCriticalSection(LiveSessionCriticalSection);
+  end;
+  if GuardHeld then Exit(False);
   StatePath := SessionPath + '/session.state';
   PID := ReadPID(StatePath);
   State := ReadSessionState(StatePath);
@@ -1388,6 +1403,25 @@ begin
   Result := not ((State <> 'failed')
     and (not IncompleteStateIsAbandoned(AgePath))
     and ((State = '') or ProcessIsAlive(PID)));
+end;
+
+{ The project identity a session recorded in its state, or '' for a session
+  written before sessions recorded one. }
+function ReadSessionProjectIdentity(const ASessionRoot: string): string;
+var
+  Lines: TStringList;
+  StatePath: string;
+begin
+  Result := '';
+  StatePath := ASessionRoot + '/session.state';
+  if not LongPathFileExists(StatePath) then Exit;
+  Lines := TStringList.Create;
+  try
+    LoadProtectedStrings(Lines, StatePath);
+    if Lines.Count > 3 then Result := Trim(Lines[3]);
+  finally
+    Lines.Free;
+  end;
 end;
 
 constructor TLWPTBuildSession.Create(const AProjectRoot: string);
@@ -1407,6 +1441,8 @@ begin
   FSessionOwnerGuardPath := '';
   FSessionOwnerGuard := nil;
   FProgramJobs := TStringList.Create;
+  FCleanupWarnings := TStringList.Create;
+  FProjectIdentity := BuildSessionProjectIdentity(FProjectRoot);
   BaseRoot := ExpandFileName(ASessionsRoot);
   FDefaultSessionsRoot := SamePath(BaseRoot,
     RootedPath(FProjectRoot, BUILD_SESSIONS_DIR));
@@ -1442,9 +1478,9 @@ begin
   FSessionRoot := PendingRoot;
   FSessionOwnerGuardPath := SessionOwnerGuardPath(BaseRoot, FSessionID);
   try
+    RegisterLiveSession(FSessionID);
     FSessionOwnerGuard := TLWPTSessionOwnerGuard.Create(
       FSessionOwnerGuardPath);
-    RegisterLiveSession(FSessionID);
     WriteState('active');
     if not LongPathRenameFile(PendingRoot,
       IncludeTrailingPathDelimiter(BaseRoot) + FSessionID) then
@@ -1474,12 +1510,12 @@ begin
     end;
   ReleaseOwnerGuard;
   FProgramJobs.Free;
+  FCleanupWarnings.Free;
   inherited Destroy;
 end;
 
 procedure TLWPTBuildSession.ReleaseOwnerGuard;
 begin
-  if FSessionOwnerGuard = nil then Exit;
   FreeAndNil(FSessionOwnerGuard);
   UnregisterLiveSession(FSessionID);
 end;
@@ -1493,6 +1529,8 @@ begin
     Lines.Add(IntToStr(GetProcessID));
     Lines.Add(AState);
     Lines.Add(IntToStr(BUILD_SESSION_SCHEMA_VERSION));
+    { Readers before this line existed read only the first three lines. }
+    Lines.Add(FProjectIdentity);
     AtomicWriteText(FSessionRoot + '/session.state', FSessionRoot, Lines);
   finally
     Lines.Free;
@@ -1569,9 +1607,9 @@ procedure TLWPTBuildSession.PruneSupersededJobs;
 const
   SESSION_PATTERNS: array[0..1] of string = ('s-*', 'session-*');
 var
-  JobsRoot, OtherRoot, OtherJobs, ProgramJob, LinkProbe: string;
+  JobsRoot, OtherRoot, OtherJobs, ProgramJob: string;
   Jobs, Programs, Sessions: TLWPTDirectoryEntries;
-  Units, Components: TStringList;
+  Units: TStringList;
   JobIndex, ProgramIndex, SessionIndex, UnitIndex, PatternIndex: Integer;
 
   function IsDirectoryEntry(const AEntry: TLWPTDirectoryEntry): Boolean;
@@ -1581,51 +1619,41 @@ var
   end;
 
   procedure RemoveUnit(const AUnit: string);
+  var
+    Target, Reason: string;
   begin
+    Target := OtherJobs + '/' + AUnit;
+    Reason := '';
     try
-      if Pos('/', AUnit) = 0 then
+      if Pos('/', AUnit) > 0 then
       begin
-        { WipeDir removes a linked job directory as a link. }
-        WipeDir(OtherJobs + '/' + AUnit);
-        Exit;
+        ProgramJob := OtherJobs + '/' + ExtractFileDir(AUnit);
+        if (not LongPathDirectoryExists(ProgramJob))
+          or IsDirSymlinkOrJunction(ProgramJob) then Exit;
       end;
-      ProgramJob := OtherJobs + '/' + ExtractFileDir(AUnit);
-      if (not LongPathDirectoryExists(ProgramJob))
-        or IsDirSymlinkOrJunction(ProgramJob) then Exit;
-      WipeDir(OtherJobs + '/' + AUnit);
+      if not (LongPathDirectoryExists(Target)
+        or IsDirSymlinkOrJunction(Target)) then Exit;
+      { WipeDir removes a linked unit as a link. }
+      WipeDir(Target);
       { RemoveDir refuses a job root that still holds programs this session
         did not stage. }
-      LongPathRemoveDir(ProgramJob);
+      if Pos('/', AUnit) > 0 then LongPathRemoveDir(ProgramJob);
     except
-      on Exception do;
+      on E: Exception do Reason := E.Message;
+    end;
+    if LongPathDirectoryExists(Target) or IsDirSymlinkOrJunction(Target) then
+    begin
+      if Reason = '' then Reason := 'it could not be removed';
+      FCleanupWarnings.Add(Format('superseded staging %s was not removed '
+        + '(%s); run %s repair', [Target, Reason, PROGRAM_NAME]));
     end;
   end;
 
 begin
   JobsRoot := FSessionRoot + '/jobs';
   if not LongPathDirectoryExists(JobsRoot) then Exit;
-  if FDefaultSessionsRoot then
-  begin
-    { A linked .lwpt or .lwpt/sessions can lead into another checkout's
-      sessions, whose build-entry keys can match ours. Never sweep through
-      a link. }
-    Components := TStringList.Create;
-    try
-      Components.Delimiter := '/';
-      Components.StrictDelimiter := True;
-      Components.DelimitedText := BUILD_SESSIONS_DIR;
-      LinkProbe := ExcludeTrailingPathDelimiter(FProjectRoot);
-      for UnitIndex := 0 to Components.Count - 1 do
-      begin
-        LinkProbe := LinkProbe + '/' + Components[UnitIndex];
-        if IsDirSymlinkOrJunction(LinkProbe) then Exit;
-      end;
-    finally
-      Components.Free;
-    end;
-  end
-  else if not SessionRootIdentityMatches(FSessionsRoot,
-    BuildSessionProjectIdentity(FProjectRoot)) then
+  if (not FDefaultSessionsRoot) and (not SessionRootIdentityMatches(
+    FSessionsRoot, FProjectIdentity)) then
     Exit;
   Units := TStringList.Create;
   try
@@ -1655,14 +1683,25 @@ begin
         if Sessions[SessionIndex].Name = FSessionID then Continue;
         OtherRoot := FSessionsRoot + '/' + Sessions[SessionIndex].Name;
         OtherJobs := OtherRoot + '/jobs';
-        if IsDirSymlinkOrJunction(OtherRoot)
-          or IsDirSymlinkOrJunction(OtherJobs)
-          or (not LongPathDirectoryExists(OtherJobs)) then Continue;
-        if not SessionIsInactive(FSessionsRoot,
-          Sessions[SessionIndex].Name) then Continue;
-        for UnitIndex := 0 to Units.Count - 1 do
-          RemoveUnit(Units[UnitIndex]);
-        LongPathRemoveDir(OtherJobs);
+        try
+          if IsDirSymlinkOrJunction(OtherRoot)
+            or IsDirSymlinkOrJunction(OtherJobs)
+            or (not LongPathDirectoryExists(OtherJobs)) then Continue;
+          { A sessions root can be shared through a link with another
+            project, whose build-entry keys can match ours: only this
+            project's own sessions are superseded. }
+          if ReadSessionProjectIdentity(OtherRoot) <> FProjectIdentity then
+            Continue;
+          if not SessionIsInactive(FSessionsRoot,
+            Sessions[SessionIndex].Name) then Continue;
+          for UnitIndex := 0 to Units.Count - 1 do
+            RemoveUnit(Units[UnitIndex]);
+          LongPathRemoveDir(OtherJobs);
+        except
+          { An unreadable session record retains that session; the sweep
+            continues with the others. }
+          on Exception do Continue;
+        end;
       end;
     end;
   finally
@@ -1688,13 +1727,23 @@ begin
       CoordinationLock := TLWPTPublicationLock.Create(
         BuildSessionLedgerLockPath(FProjectRoot));
     except
-      on Exception do CoordinationLock := nil;
+      on E: Exception do
+      begin
+        CoordinationLock := nil;
+        if LongPathDirectoryExists(FSessionRoot + '/jobs') then
+          FCleanupWarnings.Add(Format('superseded staging in older sessions '
+            + 'was not checked (%s); run %s repair',
+            [E.Message, PROGRAM_NAME]));
+      end;
     end;
     if CoordinationLock <> nil then
       try
         PruneSupersededJobs;
       except
-        on Exception do;
+        on E: Exception do
+          FCleanupWarnings.Add(Format('superseded staging in older sessions '
+            + 'was not fully checked (%s); run %s repair',
+            [E.Message, PROGRAM_NAME]));
       end;
     if ASuccess then
     begin
@@ -1738,6 +1787,11 @@ begin
     WriteState('failed');
     ReleaseOwnerGuard;
     FFinished := True;
+    {$IFDEF OBJECTSTORE_TESTING}
+    if (CoordinationLock <> nil)
+      and Assigned(SessionFinishBeforeCoordinationReleaseTestHook) then
+      SessionFinishBeforeCoordinationReleaseTestHook(FSessionRoot);
+    {$ENDIF}
   finally
     CoordinationLock.Free;
   end;
