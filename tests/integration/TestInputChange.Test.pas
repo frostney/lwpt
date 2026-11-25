@@ -30,7 +30,7 @@ type
     function Environment(const ACacheRoot: string): TStringArray;
     function MarkerPath(const AProjectRoot, AName: string): string;
     procedure WriteProject(const AProjectRoot, AInitialShared,
-      AEditedShared: string);
+      AEditedShared: string; const AEditedPath: string = 'source/Shared.pas');
     procedure RequireExit(const ALabel: string; const ARun: TLwptResult;
       const AExpected: Integer);
   protected
@@ -41,6 +41,8 @@ type
     procedure TestHalfEditedInputIsVoidNotCompileFailure;
     procedure TestCacheHitAfterEditIsVoid;
     procedure TestUnchangedContentRunsAsBefore;
+    procedure TestNewProjectRootFileVoidsRun;
+    procedure TestRootLevelProgramDoesNotWatchWholeProject;
   end;
 
 function PascalString(const AValue: string): string;
@@ -76,12 +78,12 @@ begin
   Result := AProjectRoot + '-markers/' + AName;
 end;
 
-{ Three programs that --jobs=1 runs in source order. A rewrites the shared
-  unit with AEditedShared once it runs, so B and C always compile after the
-  edit: the regression needs no timing. B and C use the unit and leave
-  markers, which prove whether they ran. }
+{ Three programs that --jobs=1 runs in source order. A writes AEditedShared
+  to AEditedPath (the shared unit by default) once it runs, so B and C always
+  compile after the edit: the regression needs no timing. B and C use the
+  unit and leave markers, which prove whether they ran. }
 procedure TTestInputChange.WriteProject(const AProjectRoot, AInitialShared,
-  AEditedShared: string);
+  AEditedShared: string; const AEditedPath: string);
 begin
   RecursiveDelete(AProjectRoot);
   RecursiveDelete(AProjectRoot + '-markers');
@@ -103,7 +105,7 @@ begin
     + '    Lines.LineBreak := #10;'#10
     + '    Lines.Text := ' + PascalString(AEditedShared) + ';'#10
     + '    Lines.SaveToFile('
-    + PascalString(AProjectRoot + '/source/Shared.pas') + ');'#10
+    + PascalString(AProjectRoot + '/' + AEditedPath) + ');'#10
     + '  finally'#10
     + '    Lines.Free;'#10
     + '  end;'#10
@@ -238,6 +240,45 @@ begin
   Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'c-ran'))).ToBe(True);
 end;
 
+procedure TTestInputChange.TestNewProjectRootFileVoidsRun;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/new-root-file';
+  { Project-root files are implicit compiler inputs, so one that appears
+    during the run is a change even though no recorded file changed. }
+  WriteProject(ProjectRoot, SHARED_ONE, 'const RootAdded = 1;',
+    'RootAdded.inc');
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/new-root-file-cache'));
+  RequireExit('new root file run', Run, 1);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
+    + 'changed after this test run started (RootAdded.inc)', Run.Stdout))
+    .ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'b-ran'))).ToBe(False);
+end;
+
+procedure TTestInputChange.TestRootLevelProgramDoesNotWatchWholeProject;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/root-level-program';
+  { A writes into a subdirectory that no compile reads. A program at the
+    project root must not make that directory an input: like the cache
+    fingerprint, its source directory is the root's own files only. }
+  WriteProject(ProjectRoot, SHARED_ONE, 'second', 'scratch/out.txt');
+  WriteTextFile(ProjectRoot + '/scratch/out.txt', 'first');
+  WriteTextFile(ProjectRoot + '/Root.Test.pas',
+    'program Root;'#10'begin'#10'end.'#10);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/root-level-program-cache'));
+  RequireExit('root-level program run', Run, 0);
+  Expect<Boolean>(Contains('summary: 4 passed, 0 failed, 0 did not compile, '
+    + '0 cancelled; elapsed ', Run.Stdout)).ToBe(True);
+end;
+
 procedure TTestInputChange.SetupTests;
 begin
   Test('an input edited during the run voids later jobs and stops the run',
@@ -248,6 +289,10 @@ begin
     TestCacheHitAfterEditIsVoid);
   Test('rewriting identical content keeps the run unchanged',
     TestUnchangedContentRunsAsBefore);
+  Test('a file added at the project root voids the run',
+    TestNewProjectRootFileVoidsRun);
+  Test('a program at the project root does not watch the whole project',
+    TestRootLevelProgramDoesNotWatchWholeProject);
 end;
 
 begin

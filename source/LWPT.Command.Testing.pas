@@ -359,6 +359,8 @@ end;
 
 function TestDisplayPath(const AProjectRoot, ASource: string): string;
   forward;
+procedure CaptureProjectRootCompilerInputs(const AProjectRoot: string;
+  var APaths: TStringArray); forward;
 
 constructor TTestWorker.Create(const AScheduler: TTestScheduler);
 begin
@@ -497,6 +499,7 @@ var
   end;
 
 var
+  SourceDirectory: string;
   i: Integer;
 begin
   SetLength(Paths, 0);
@@ -513,7 +516,12 @@ begin
   for i := 0 to High(FJobs) do
   begin
     AddPath(FJobs[i].Source);
-    AddPath(ExtractFileDir(FJobs[i].Source));
+    { The source directory as the cache fingerprint derives it: from the
+      project-relative path, so a program at the project root adds no
+      directory rather than the whole project. }
+    SourceDirectory := ExtractFileDir(TestRelativePath(FProjectRoot,
+      FJobs[i].Source));
+    if SourceDirectory <> '' then AddPath(SourceDirectory);
   end;
   FRunInputs := CaptureInputSnapshot(FProjectRoot, Paths,
     FCacheContext.ExcludedPaths);
@@ -526,9 +534,34 @@ end;
 function TTestScheduler.VoidIfInputsChanged(const AIndex: Integer): Boolean;
 var
   Changed: string;
+  RootFiles: TStringArray;
+  i, j: Integer;
+  Recorded: Boolean;
 begin
   Changed := FirstChangedInput(FProjectRoot, FRunInputs,
     FCacheContext.ExcludedPaths);
+  if Changed = '' then
+  begin
+    { The snapshot sees a recorded root file change or disappear; a root
+      file that appears is a new implicit compiler input. }
+    SetLength(RootFiles, 0);
+    CaptureProjectRootCompilerInputs(FProjectRoot, RootFiles);
+    for i := 0 to High(RootFiles) do
+    begin
+      Recorded := False;
+      for j := 0 to High(FCacheContext.CompilerImplicitInputs) do
+        if RootFiles[i] = FCacheContext.CompilerImplicitInputs[j] then
+        begin
+          Recorded := True;
+          Break;
+        end;
+      if not Recorded then
+      begin
+        Changed := IncludeTrailingPathDelimiter(FProjectRoot) + RootFiles[i];
+        Break;
+      end;
+    end;
+  end;
   Result := Changed <> '';
   if not Result then Exit;
   Changed := InputDisplayPath(FProjectRoot, Changed);
