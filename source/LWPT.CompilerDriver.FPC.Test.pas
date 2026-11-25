@@ -34,6 +34,9 @@ const
   IsolatedDefaultTargetCase = 'default-target';
   IsolatedExplicitProcessorCase = 'explicit-processor';
   IsolatedUnitPathsCase = 'unit-paths';
+  IsolatedProbeDeadlineDefaultCase = 'probe-deadline-default';
+  IsolatedProbeDeadlineOverrideCase = 'probe-deadline-override';
+  IsolatedProbeDeadlineOverride = '1234';
   ProbeTimeoutGrandchildOption = '--' + PROGRAM_NAME
     + '-probe-timeout-grandchild';
   ProbeTimeoutProxyOption = '--' + PROGRAM_NAME + '-probe-timeout-proxy';
@@ -71,6 +74,7 @@ type
   protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; override;
+    function ProbeTimeoutMilliseconds: QWord; override;
   public
     property GrandchildPIDPath: string read FGrandchildPIDPath
       write FGrandchildPIDPath;
@@ -86,7 +90,9 @@ type
       const AExpected: string): Boolean;
     function RunCompiler(const ADriver: TLWPTCompilerDriver;
       const ARequest: TLWPTBuildRequest; out AOutput: string): Integer;
-    procedure RunIsolatedCase(const ACase: string);
+    procedure RunIsolatedCase(const ACase: string); overload;
+    procedure RunIsolatedCase(const ACase: string;
+      const AExtraEnvironment: array of string); overload;
     procedure AssertDefaultBuildRequestUsesBareProbeTarget;
     procedure AssertExplicitProcessorOverrideStillDispatches;
     procedure AssertBuildArgumentsPreserveTestCompileFlagSet;
@@ -103,6 +109,8 @@ type
     procedure TestProbeFailureNamesCompilerAndTargetRequirement;
     procedure TestProbeTimeoutTerminatesProcessTree;
     procedure TestProbeDeadlineIsTheCompileDeadline;
+    procedure AssertProbeDeadlineIsTheCompileDeadline(
+      const AExpected: QWord);
     procedure TestProbeRejectsUnexpectedTargetTuple;
     procedure TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits;
     procedure TestBuildArgumentsPreserveBuildFlagSet;
@@ -117,48 +125,6 @@ type
     procedure TestWindowsBareRunnableResolvesFromInheritedPath;
     procedure TestNilDriverBuildRequestIsRejected;
   end;
-
-{$IFDEF UNIX}
-function CSetEnvironmentVariable(AName, AValue: PAnsiChar;
-  AOverwrite: LongInt): LongInt; cdecl;
-  {$IFDEF LINUX}
-  external 'c' name 'setenv';
-  {$ELSE}
-  external name 'setenv';
-  {$ENDIF}
-function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
-  {$IFDEF LINUX}
-  external 'c' name 'unsetenv';
-  {$ELSE}
-  external name 'unsetenv';
-  {$ENDIF}
-{$ENDIF}
-
-{ Tests run one at a time on the main thread, so changing this process's
-  environment cannot race another reader. An empty value unsets it. }
-procedure SetCompilerTimeoutEnvironment(const AValue: string);
-{$IFDEF UNIX}
-var
-  Name, Value: AnsiString;
-{$ENDIF}
-{$IFDEF MSWINDOWS}
-var
-  Name, Value: UnicodeString;
-{$ENDIF}
-begin
-  {$IFDEF UNIX}
-  Name := AnsiString(COMPILER_TIMEOUT_ENVIRONMENT);
-  Value := AnsiString(AValue);
-  if AValue = '' then CUnsetEnvironmentVariable(PAnsiChar(Name))
-  else CSetEnvironmentVariable(PAnsiChar(Name), PAnsiChar(Value), 1);
-  {$ENDIF}
-  {$IFDEF MSWINDOWS}
-  Name := UnicodeString(COMPILER_TIMEOUT_ENVIRONMENT);
-  Value := UnicodeString(AValue);
-  if AValue = '' then Windows.SetEnvironmentVariableW(PWideChar(Name), nil)
-  else Windows.SetEnvironmentVariableW(PWideChar(Name), PWideChar(Value));
-  {$ENDIF}
-end;
 
 procedure TerminateTestProcess(const APID: Integer);
 {$IFDEF MSWINDOWS}
@@ -279,6 +245,11 @@ begin
   Result := inherited ExecuteProbe(Arguments, AOutput);
 end;
 
+function TTimeoutFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
+begin
+  Result := TestProbeTimeoutMilliseconds;
+end;
+
 function TLWPTFPCCompilerDriverTests.ArgumentsContain(
   const AArguments: LWPT.Core.TStringArray;
   const AExpected: string): Boolean;
@@ -349,14 +320,26 @@ begin
 end;
 
 procedure TLWPTFPCCompilerDriverTests.RunIsolatedCase(const ACase: string);
+begin
+  RunIsolatedCase(ACase, []);
+end;
+
+procedure TLWPTFPCCompilerDriverTests.RunIsolatedCase(const ACase: string;
+  const AExtraEnvironment: array of string);
 var
+  Environment: array of string;
+  i: Integer;
   Run: TLwptResult;
 begin
   SetLwptBinaryPath(ExpandFileName(ParamStr(0)));
-  Run := RunLwpt([IsolatedCompilerDriverOption, ACase], '',
-    ['FPC_TARGET_OS=', 'FPC_TARGET_CPU=',
-      PROJECT_NAME + '_FPC_UNIT_PATHS=',
-      PROJECT_NAME + '_WORKER_LEASE_TOKEN=']);
+  SetLength(Environment, 4 + Length(AExtraEnvironment));
+  Environment[0] := 'FPC_TARGET_OS=';
+  Environment[1] := 'FPC_TARGET_CPU=';
+  Environment[2] := PROJECT_NAME + '_FPC_UNIT_PATHS=';
+  Environment[3] := PROJECT_NAME + '_WORKER_LEASE_TOKEN=';
+  for i := 0 to High(AExtraEnvironment) do
+    Environment[4 + i] := AExtraEnvironment[i];
+  Run := RunLwpt([IsolatedCompilerDriverOption, ACase], '', Environment);
   if Run.ExitCode <> 0 then
   begin
     WriteLn('ISOLATED COMPILER-DRIVER TEST FAILURE: ', ACase);
@@ -591,7 +574,7 @@ var
   Driver: TTimeoutFPCCompilerDriver;
   ElapsedMilliseconds, StartedAt: QWord;
   GrandchildPID: Integer;
-  ErrorMessage, GrandchildPIDPath, PreviousTimeout, Scratch: string;
+  ErrorMessage, GrandchildPIDPath, Scratch: string;
   Raised: Boolean;
 begin
   Scratch := ExpandFileName('build/tests/tmp/compiler-driver-probe-timeout');
@@ -604,13 +587,9 @@ begin
   Driver := TTimeoutFPCCompilerDriver.Create(ExpandFileName(ParamStr(0)));
   Driver.GrandchildPIDPath := GrandchildPIDPath;
   GrandchildPID := 0;
-  PreviousTimeout := GetEnvironmentVariable(COMPILER_TIMEOUT_ENVIRONMENT);
   try
     Raised := False;
     ErrorMessage := '';
-    { The probe deadline comes from the compile deadline's setting, so the
-      environment shortens it for this test. }
-    SetCompilerTimeoutEnvironment(IntToStr(TestProbeTimeoutMilliseconds));
     StartedAt := GetTickCount64;
     try
       Driver.DefaultTarget;
@@ -638,7 +617,6 @@ begin
       Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
     end;
   finally
-    SetCompilerTimeoutEnvironment(PreviousTimeout);
     Driver.Free;
     TerminateTestProcess(GrandchildPID);
     RecursiveDelete(Scratch);
@@ -646,28 +624,29 @@ begin
 end;
 
 { A probe is a compiler process under the same machine load as the
-  compile it gates. Its deadline is the compile deadline (30 minutes by
-  default, LWPT_COMPILER_TIMEOUT_MS when set), so a loaded machine cannot
-  fail a build at the probe that the compile itself would have survived. }
+  compile it gates, so each probe process gets the compile's per-process
+  deadline: 30 minutes by default, LWPT_COMPILER_TIMEOUT_MS when set. The
+  cases run in a child started with the setting in its environment, so the
+  production lookup reads it as a real invocation would. }
 procedure TLWPTFPCCompilerDriverTests.TestProbeDeadlineIsTheCompileDeadline;
+begin
+  RunIsolatedCase(IsolatedProbeDeadlineDefaultCase,
+    [COMPILER_TIMEOUT_ENVIRONMENT + '=']);
+  RunIsolatedCase(IsolatedProbeDeadlineOverrideCase,
+    [COMPILER_TIMEOUT_ENVIRONMENT + '=' + IsolatedProbeDeadlineOverride]);
+end;
+
+procedure TLWPTFPCCompilerDriverTests.AssertProbeDeadlineIsTheCompileDeadline(
+  const AExpected: QWord);
 var
   Driver: TLWPTFPCCompilerDriver;
-  PreviousTimeout: string;
 begin
-  PreviousTimeout := GetEnvironmentVariable(COMPILER_TIMEOUT_ENVIRONMENT);
   Driver := TLWPTFPCCompilerDriver.Create;
   try
-    SetCompilerTimeoutEnvironment('');
-    Expect<QWord>(Driver.ProbeTimeoutMilliseconds)
-      .ToBe(DEFAULT_COMPILER_TIMEOUT_MILLISECONDS);
-    Expect<QWord>(Driver.ProbeTimeoutMilliseconds)
-      .ToBe(Driver.CompilationTimeoutMilliseconds);
-    SetCompilerTimeoutEnvironment('1234');
-    Expect<QWord>(Driver.ProbeTimeoutMilliseconds).ToBe(1234);
+    Expect<QWord>(Driver.ProbeTimeoutMilliseconds).ToBe(AExpected);
     Expect<QWord>(Driver.ProbeTimeoutMilliseconds)
       .ToBe(Driver.CompilationTimeoutMilliseconds);
   finally
-    SetCompilerTimeoutEnvironment(PreviousTimeout);
     Driver.Free;
   end;
 end;
@@ -1339,6 +1318,12 @@ begin
         Suite.AssertExplicitProcessorOverrideStillDispatches
       else if ACase = IsolatedUnitPathsCase then
         Suite.AssertBuildArgumentsPreserveTestCompileFlagSet
+      else if ACase = IsolatedProbeDeadlineDefaultCase then
+        Suite.AssertProbeDeadlineIsTheCompileDeadline(
+          DEFAULT_COMPILER_TIMEOUT_MILLISECONDS)
+      else if ACase = IsolatedProbeDeadlineOverrideCase then
+        Suite.AssertProbeDeadlineIsTheCompileDeadline(
+          StrToQWord(IsolatedProbeDeadlineOverride))
       else
         raise Exception.Create('unknown isolated compiler-driver case "'
           + ACase + '"');

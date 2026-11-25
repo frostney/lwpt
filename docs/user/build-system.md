@@ -35,10 +35,11 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   complete process tree, and terminates it on timeout or capture failure.
   Stdin pumping and writer cleanup remain deadline-bounded when an escaped
   descendant retains the pipe.
-  Compiles and capability probes share one deadline, 30 minutes by default;
-  `LWPT_COMPILER_TIMEOUT_MS` sets a positive millisecond override for
-  unusually short or long toolchains. A probe runs under the same machine load
-  as the compile it gates, so a loaded machine cannot fail it first.
+  Every compiler process, compile or capability probe, gets the same
+  per-process deadline: 30 minutes by default; `LWPT_COMPILER_TIMEOUT_MS` sets
+  a positive millisecond override for unusually short or long toolchains.
+  Probes have no separate, shorter deadline for a loaded machine to reach
+  before the compile's.
 - **Dependency-aware parallel builds.** Independent ready build entries run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See

@@ -1,5 +1,9 @@
 # Route FPC compilation through a neutral compiler-driver seam
 
+> **Amended 2026-11-25:** the 30-second probe deadline below is superseded.
+> Each probe process now gets the compile's per-process deadline; see
+> [the amendment](#amendment--2026-11-25).
+
 ADR-0022 established `TLWPTBuildRequest`, compiler capabilities, and
 `TLWPTBuildResult`, but deliberately left FPC argument construction and output
 interpretation in the build and test commands. That split produced two
@@ -99,8 +103,11 @@ The fixed 30-second probe deadline is withdrawn. A probe is a compiler process
 like a compile and runs under the same machine load. On a heavily loaded
 development machine a healthy `-iV -iTO -iTP` probe exceeded 30 seconds, and
 the build failed before it compiled anything, while the compile itself would
-have had 30 minutes. Every driver's probe now uses the compile deadline: 30
-minutes by default, or `LWPT_COMPILER_TIMEOUT_MS` when set. The timeout still
-terminates and reaps the isolated process tree, so a wedged compiler still
-cannot hold the shared driver lock indefinitely. It holds the lock for no
-longer than the compile that follows would hang.
+have had 30 minutes. Every driver's probe process now gets the compile's
+per-process deadline: 30 minutes by default, or `LWPT_COMPILER_TIMEOUT_MS`
+when set. The deadline still limits each process separately: a probe that
+outlives it fails the build, as an over-long compile does, and the FPC driver
+can run a bare probe and then a dispatched probe under its probe lock, each
+with the full deadline. A timeout still terminates and reaps the isolated
+process tree, so a wedged compiler holds that lock for a bounded time: at
+most two deadlines plus cleanup, where it used to be 30 seconds each.
