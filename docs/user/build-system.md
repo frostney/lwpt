@@ -548,7 +548,9 @@ records the content of every path a selected program's compile can read: the
 paths the test cache fingerprint covers (manifest, cfg, lockfile, installed
 modules, unit, include, and workspace paths, `LWPT_FPC_UNIT_PATHS`,
 project-root files, and each selected program's source file and directory),
-with session staging and declared build outputs excluded, each hashed once.
+plus the unit, include, object, and library directories that `[test]` flags
+name, with session staging and declared build outputs excluded, each hashed
+once. A file that appears at the project root also counts as a change.
 Every program checks that record again after its executable exists, compiled
 or reused, and before it runs, and also when its compile fails. If anything
 changed, that program is reported as `VOID` with the first changed file, every

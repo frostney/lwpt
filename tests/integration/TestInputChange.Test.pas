@@ -43,6 +43,7 @@ type
     procedure TestUnchangedContentRunsAsBefore;
     procedure TestNewProjectRootFileVoidsRun;
     procedure TestRootLevelProgramDoesNotWatchWholeProject;
+    procedure TestFlagSearchDirectoryEditVoidsRun;
   end;
 
 function PascalString(const AValue: string): string;
@@ -142,9 +143,10 @@ begin
   end;
 end;
 
+{ Result lines print native separators; compare them in canonical form. }
 function Contains(const ANeedle, AText: string): Boolean;
 begin
-  Result := Pos(ANeedle, AText) > 0;
+  Result := Pos(ANeedle, StringReplace(AText, '\', '/', [rfReplaceAll])) > 0;
 end;
 
 procedure TTestInputChange.TestEditDuringRunVoidsLaterJobs;
@@ -279,6 +281,33 @@ begin
     + '0 cancelled; elapsed ', Run.Stdout)).ToBe(True);
 end;
 
+procedure TTestInputChange.TestFlagSearchDirectoryEditVoidsRun;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/flag-search-directory';
+  { A unit directory that only a [test] flag names is a compiler input. }
+  WriteProject(ProjectRoot, SHARED_ONE,
+    'unit Extra; interface const W = 2; implementation end.',
+    'extra/Extra.pas');
+  WriteTextFile(ProjectRoot + '/extra/Extra.pas',
+    'unit Extra; interface const W = 1; implementation end.'#10);
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "test-input-change-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + '[test]'#10
+    + 'flags = ["-Fuextra"]'#10);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/flag-search-directory-cache'));
+  RequireExit('flag search directory run', Run, 1);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
+    + 'changed after this test run started (extra/Extra.pas)', Run.Stdout))
+    .ToBe(True);
+end;
+
 procedure TTestInputChange.SetupTests;
 begin
   Test('an input edited during the run voids later jobs and stops the run',
@@ -293,6 +322,8 @@ begin
     TestNewProjectRootFileVoidsRun);
   Test('a program at the project root does not watch the whole project',
     TestRootLevelProgramDoesNotWatchWholeProject);
+  Test('a search directory named by a test flag is watched',
+    TestFlagSearchDirectoryEditVoidsRun);
 end;
 
 begin

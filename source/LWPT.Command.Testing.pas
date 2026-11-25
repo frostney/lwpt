@@ -478,9 +478,30 @@ begin
     Result := APath;
 end;
 
+{ A [test] flag that names a directory the compiler searches: unit,
+  include, object or library paths. }
+function CompilerFlagSearchPath(const AFlag: string;
+  out APath: string): Boolean;
+const
+  PREFIXES: array[0..4] of string = ('-Fu', '-Fi', '-Fo', '-Fl', '-I');
+var
+  i: Integer;
+begin
+  for i := 0 to High(PREFIXES) do
+    if (Length(AFlag) > Length(PREFIXES[i]))
+       and (Copy(AFlag, 1, Length(PREFIXES[i])) = PREFIXES[i]) then
+    begin
+      APath := Copy(AFlag, Length(PREFIXES[i]) + 1, MaxInt);
+      Exit(True);
+    end;
+  APath := '';
+  Result := False;
+end;
+
 { One fingerprint of everything any selected job's compile can read, taken
   after pretest and before any job compiles or reuses a cached result: the
-  union of the per-program cache fingerprint's paths, each hashed once. }
+  union of the per-program cache fingerprint's paths plus the search
+  directories [test] flags name, each hashed once. }
 procedure TTestScheduler.CaptureRunInputs;
 var
   IncludeSearchPaths, Paths, UnitSearchPaths: TStringArray;
@@ -499,7 +520,7 @@ var
   end;
 
 var
-  SourceDirectory: string;
+  FlagPath, SourceDirectory: string;
   i: Integer;
 begin
   SetLength(Paths, 0);
@@ -513,6 +534,11 @@ begin
     UnitSearchPaths, IncludeSearchPaths);
   AddPaths(UnitSearchPaths);
   AddPaths(IncludeSearchPaths);
+  { Search directories that [test] flags add reach the compiler as extra
+    arguments, outside the request's search paths. }
+  for i := 0 to High(FCompilerArguments) do
+    if CompilerFlagSearchPath(FCompilerArguments[i], FlagPath) then
+      AddPath(FlagPath);
   for i := 0 to High(FJobs) do
   begin
     AddPath(FJobs[i].Source);
