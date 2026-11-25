@@ -158,12 +158,16 @@ profile's `args` name, together with any response file (`@file`) among those
 arguments and the files it reads with `#INCLUDE`, whose lines count as
 arguments. These options and files are read as FPC 3.2 reads them, the same
 way the test run's input record below reads them. A response file's
-`#INCLUDE` looks in its `#CFGDIR` directories first; every place it may be
-found is an input, and each one there is read, so a file that appears
-earlier in that order is seen. When no fixed directory is known to hold what
-an entry resolves to (a `..` after a `*` wildcard or an `$FPC*` macro, an
-option file named through an `$FPC*` macro, or a `#CFGDIR` entry with a
-wildcard or such a macro), the compile does not use the cache: a test
+`#INCLUDE` looks in its `#CFGDIR` directories first, under the name as
+written, in lower case and in upper case, as FPC does on a case-sensitive
+system; every place it may be found is an input, and each one there is
+read, so a file that appears earlier in that order is seen. A file included
+again after a `#CFGDIR` is read again under the new directories, as FPC
+reads it. When no fixed directory is known to hold what an entry resolves to
+(a `..` after a `*` wildcard or an `$FPC*` macro, an option file named
+through an `$FPC*` macro, a `#CFGDIR` entry with a wildcard or such a macro,
+a chain of more than 64 environment-variable expansions, or option files
+nested past FPC's limit of 16), the compile does not use the cache: a test
 program reports `cache bypass: unavailable`, and a build entry reports
 `cache miss: unbounded-inputs` and stores nothing. A fingerprint whose option
 file changes between the read that names its directories and the hash steps

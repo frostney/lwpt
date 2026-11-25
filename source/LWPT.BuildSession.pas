@@ -191,7 +191,9 @@ procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
 { The same, also naming in AUnbounded (when it is '') the first argument,
   option or directive that may make the compiler read beyond APaths: a
   ".." after a wildcard or an $FPC* macro, an option file named through an
-  $FPC* macro, or a #CFGDIR entry with a wildcard or such a macro. }
+  $FPC* macro, a #CFGDIR entry with a wildcard or such a macro, a macro
+  expansion that reached its bound, or option files nested past FPC's
+  limit. }
 procedure AppendCompilerArgumentInputs(const AProjectRoot: string;
   const AArguments: array of string;
   var APaths, AReadFiles, AReadStates: TStringArray;
