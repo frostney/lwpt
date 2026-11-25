@@ -35,9 +35,11 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   complete process tree, and terminates it on timeout or capture failure.
   Stdin pumping and writer cleanup remain deadline-bounded when an escaped
   descendant retains the pipe.
-  Capability probes time out after 30 seconds. Compiles
-  default to 30 minutes; `LWPT_COMPILER_TIMEOUT_MS` sets a positive
-  millisecond override for unusually short or long toolchains.
+  Every compiler process, compile or capability probe, gets the same
+  per-process deadline: 30 minutes by default; `LWPT_COMPILER_TIMEOUT_MS` sets
+  a positive millisecond override for unusually short or long toolchains.
+  Probes have no separate, shorter deadline for a loaded machine to reach
+  before the compile's.
 - **Dependency-aware parallel builds.** Independent ready build entries run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
@@ -327,7 +329,30 @@ per-entry hook. See ADR-0023.
 
 Successful sessions remove compiler jobs but retain stable
 job logs and completed state for diagnosis. Failed, stale, or interrupted
-sessions retain their private diagnostics. `lwpt repair` removes inactive
+sessions retain their private diagnostics until a later `lwpt build` or
+`lwpt test` stages the same build entry or test program: when that later
+session finishes, pass or fail, it removes that entry's or program's staging
+(executables, units and candidates) from every inactive session in its
+resolved sessions root and keeps their logs, `failure.txt` and state. So the
+only executable left in session staging for an entry or program is the latest
+run's, and only when that run failed; an executable copied by hand from an
+older session can no longer be a silently superseded build. A session counts as
+inactive by the same rule `lwpt repair` uses, and a session whose owner guard
+is held is never touched. Each session records its project's identity, and
+only the same project's sessions are swept, even when a linked `.lwpt` or
+`.lwpt/sessions` makes several projects share one directory. Retention
+follows the order in which sessions take the build-coordination lock to
+finish: a failing session records its result and releases its guard before
+it releases that lock, so of overlapping runs, the last to take the lock keeps
+its staging if it failed, even if it compiled earlier. When the sweep cannot
+take the lock, cannot remove a superseded directory (on Windows, for example,
+an executable that is still running), or finds matching staging in a session
+it cannot verify as this project's (an unreadable record, or one written by
+an LWPT that did not record session identities), it leaves that staging and
+the command prints a warning naming it, without changing its result. Staging is matched by job
+keys derived from the entry name or the program's absolute path, so staging
+retained from before a project moved or was renamed is not matched; `lwpt
+repair` reclaims it. `lwpt repair` removes inactive
 sessions only after their OS-held owner guard is absent; malformed state fails
 closed while its guard remains held. Reusable artifacts remain separate from
 session ownership and are admitted only after successful publication.

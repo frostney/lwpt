@@ -34,9 +34,16 @@ const
   IsolatedDefaultTargetCase = 'default-target';
   IsolatedExplicitProcessorCase = 'explicit-processor';
   IsolatedUnitPathsCase = 'unit-paths';
+  IsolatedProbeDeadlineDefaultCase = 'probe-deadline-default';
+  IsolatedProbeDeadlineOverrideCase = 'probe-deadline-override';
+  IsolatedProbeDeadlineOverride = '1234';
   ProbeTimeoutGrandchildOption = '--' + PROGRAM_NAME
     + '-probe-timeout-grandchild';
   ProbeTimeoutProxyOption = '--' + PROGRAM_NAME + '-probe-timeout-proxy';
+  ProbeFloodProxyOption = '--' + PROGRAM_NAME + '-probe-flood-proxy';
+  ProbeNoisyStallProxyOption = '--' + PROGRAM_NAME + '-probe-noisy-stall-proxy';
+  { Past the 16 MiB probe capture budget. }
+  ProbeFloodBytes = 17 * 1024 * 1024;
   ProbeTimeoutSleepMilliseconds = 30000;
   TestProbeTimeoutMilliseconds = 1000;
   TestProbeCompletionTimeoutSeconds = 10;
@@ -77,6 +84,24 @@ type
       write FGrandchildPIDPath;
   end;
 
+  { Runs this test program as a probe that writes more than the capture
+    budget and then exits successfully. }
+  TFloodFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
+  protected
+    function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
+      out AOutput: string): Integer; override;
+  end;
+
+  { Runs this test program as a probe that prints a line and then stalls
+    past a short test deadline. }
+  TNoisyStallFPCCompilerDriver = class(TLWPTFPCCompilerDriver)
+  protected
+    function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
+      out AOutput: string): Integer; override;
+  public
+    function ProbeTimeoutMilliseconds: QWord; override;
+  end;
+
   TLWPTFPCCompilerDriverTests = class(TTestSuite)
   private
     function FixtureRequest(const ASource, AArtifact: string):
@@ -87,7 +112,9 @@ type
       const AExpected: string): Boolean;
     function RunCompiler(const ADriver: TLWPTCompilerDriver;
       const ARequest: TLWPTBuildRequest; out AOutput: string): Integer;
-    procedure RunIsolatedCase(const ACase: string);
+    procedure RunIsolatedCase(const ACase: string); overload;
+    procedure RunIsolatedCase(const ACase: string;
+      const AExtraEnvironment: array of string); overload;
     procedure AssertDefaultBuildRequestUsesBareProbeTarget;
     procedure AssertExplicitProcessorOverrideStillDispatches;
     procedure AssertBuildArgumentsPreserveTestCompileFlagSet;
@@ -103,6 +130,11 @@ type
     procedure TestExplicitProcessorOverrideStillDispatches;
     procedure TestProbeFailureNamesCompilerAndTargetRequirement;
     procedure TestProbeTimeoutTerminatesProcessTree;
+    procedure TestProbeDeadlineIsTheCompileDeadline;
+    procedure TestProbeOutputPastBudgetFails;
+    procedure TestTimeoutReasonLeadsProbeOutput;
+    procedure AssertProbeDeadlineIsTheCompileDeadline(
+      const AExpected: QWord);
     procedure TestProbeRejectsUnexpectedTargetTuple;
     procedure TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits;
     procedure TestBuildArgumentsPreserveBuildFlagSet;
@@ -147,6 +179,31 @@ begin
   {$ENDIF}
   PublishReadablePayload(ParamStr(2), IntToStr(GetProcessID));
   Sleep(ProbeTimeoutSleepMilliseconds);
+  Result := 0;
+end;
+
+function RunProbeNoisyStallProxy: Integer;
+begin
+  WriteLn('probe noise before the stall');
+  Flush(Output);
+  Sleep(ProbeTimeoutSleepMilliseconds);
+  Result := 0;
+end;
+
+function RunProbeFloodProxy: Integer;
+var
+  Chunk: string;
+  Written: Int64;
+begin
+  Chunk := StringOfChar('x', 65535) + #10;
+  Written := 0;
+  while Written < ProbeFloodBytes do
+  begin
+    Write(Chunk);
+    Inc(Written, Length(Chunk));
+  end;
+  WriteLn('3.2.2 linux x86_64');
+  Flush(Output);
   Result := 0;
 end;
 
@@ -242,6 +299,37 @@ begin
   Result := TestProbeTimeoutMilliseconds;
 end;
 
+function TFloodFPCCompilerDriver.ExecuteProbe(
+  const AArguments: LWPT.Core.TStringArray; out AOutput: string): Integer;
+var
+  Arguments: LWPT.Core.TStringArray;
+  I: Integer;
+begin
+  SetLength(Arguments, Length(AArguments) + 1);
+  Arguments[0] := ProbeFloodProxyOption;
+  for I := 0 to High(AArguments) do
+    Arguments[I + 1] := AArguments[I];
+  Result := inherited ExecuteProbe(Arguments, AOutput);
+end;
+
+function TNoisyStallFPCCompilerDriver.ExecuteProbe(
+  const AArguments: LWPT.Core.TStringArray; out AOutput: string): Integer;
+var
+  Arguments: LWPT.Core.TStringArray;
+  I: Integer;
+begin
+  SetLength(Arguments, Length(AArguments) + 1);
+  Arguments[0] := ProbeNoisyStallProxyOption;
+  for I := 0 to High(AArguments) do
+    Arguments[I + 1] := AArguments[I];
+  Result := inherited ExecuteProbe(Arguments, AOutput);
+end;
+
+function TNoisyStallFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
+begin
+  Result := TestProbeTimeoutMilliseconds;
+end;
+
 function TLWPTFPCCompilerDriverTests.ArgumentsContain(
   const AArguments: LWPT.Core.TStringArray;
   const AExpected: string): Boolean;
@@ -312,14 +400,26 @@ begin
 end;
 
 procedure TLWPTFPCCompilerDriverTests.RunIsolatedCase(const ACase: string);
+begin
+  RunIsolatedCase(ACase, []);
+end;
+
+procedure TLWPTFPCCompilerDriverTests.RunIsolatedCase(const ACase: string;
+  const AExtraEnvironment: array of string);
 var
+  Environment: array of string;
+  i: Integer;
   Run: TLwptResult;
 begin
   SetLwptBinaryPath(ExpandFileName(ParamStr(0)));
-  Run := RunLwpt([IsolatedCompilerDriverOption, ACase], '',
-    ['FPC_TARGET_OS=', 'FPC_TARGET_CPU=',
-      PROJECT_NAME + '_FPC_UNIT_PATHS=',
-      PROJECT_NAME + '_WORKER_LEASE_TOKEN=']);
+  SetLength(Environment, 4 + Length(AExtraEnvironment));
+  Environment[0] := 'FPC_TARGET_OS=';
+  Environment[1] := 'FPC_TARGET_CPU=';
+  Environment[2] := PROJECT_NAME + '_FPC_UNIT_PATHS=';
+  Environment[3] := PROJECT_NAME + '_WORKER_LEASE_TOKEN=';
+  for i := 0 to High(AExtraEnvironment) do
+    Environment[4 + i] := AExtraEnvironment[i];
+  Run := RunLwpt([IsolatedCompilerDriverOption, ACase], '', Environment);
   if Run.ExitCode <> 0 then
   begin
     WriteLn('ISOLATED COMPILER-DRIVER TEST FAILURE: ', ACase);
@@ -600,6 +700,81 @@ begin
     Driver.Free;
     TerminateTestProcess(GrandchildPID);
     RecursiveDelete(Scratch);
+  end;
+end;
+
+{ Failure messages show only the probe's first output line, so a probe
+  that printed something before it stalled must still report why it
+  failed. }
+procedure TLWPTFPCCompilerDriverTests.TestTimeoutReasonLeadsProbeOutput;
+var
+  Driver: TNoisyStallFPCCompilerDriver;
+  ErrorMessage: string;
+begin
+  Driver := TNoisyStallFPCCompilerDriver.Create(ExpandFileName(ParamStr(0)));
+  try
+    ErrorMessage := '';
+    try
+      Driver.DefaultTarget;
+    except
+      on E: ELWPTCompilerDriverError do ErrorMessage := E.Message;
+    end;
+    Expect<Boolean>(Pos('(exit 124): probe timed out after '
+      + IntToStr(TestProbeTimeoutMilliseconds) + ' ms', ErrorMessage) > 0)
+      .ToBe(True);
+  finally
+    Driver.Free;
+  end;
+end;
+
+{ A probe sees the compile's long deadline, so its output is bounded by
+  the shared capture budget instead: a flood past it fails the probe with
+  an explicit reason even when the process exits successfully. }
+procedure TLWPTFPCCompilerDriverTests.TestProbeOutputPastBudgetFails;
+var
+  Driver: TFloodFPCCompilerDriver;
+  ErrorMessage: string;
+begin
+  Driver := TFloodFPCCompilerDriver.Create(ExpandFileName(ParamStr(0)));
+  try
+    ErrorMessage := '';
+    try
+      Driver.DefaultTarget;
+    except
+      on E: ELWPTCompilerDriverError do ErrorMessage := E.Message;
+    end;
+    Expect<Boolean>(Pos('probe output exceeded 16777216 bytes',
+      ErrorMessage) > 0).ToBe(True);
+  finally
+    Driver.Free;
+  end;
+end;
+
+{ A probe is a compiler process under the same machine load as the
+  compile it gates, so each probe process gets the compile's per-process
+  deadline: 30 minutes by default, LWPT_COMPILER_TIMEOUT_MS when set. The
+  cases run in a child started with the setting in its environment, so the
+  production lookup reads it as a real invocation would. }
+procedure TLWPTFPCCompilerDriverTests.TestProbeDeadlineIsTheCompileDeadline;
+begin
+  RunIsolatedCase(IsolatedProbeDeadlineDefaultCase,
+    [COMPILER_TIMEOUT_ENVIRONMENT + '=']);
+  RunIsolatedCase(IsolatedProbeDeadlineOverrideCase,
+    [COMPILER_TIMEOUT_ENVIRONMENT + '=' + IsolatedProbeDeadlineOverride]);
+end;
+
+procedure TLWPTFPCCompilerDriverTests.AssertProbeDeadlineIsTheCompileDeadline(
+  const AExpected: QWord);
+var
+  Driver: TLWPTFPCCompilerDriver;
+begin
+  Driver := TLWPTFPCCompilerDriver.Create;
+  try
+    Expect<QWord>(Driver.ProbeTimeoutMilliseconds).ToBe(AExpected);
+    Expect<QWord>(Driver.ProbeTimeoutMilliseconds)
+      .ToBe(Driver.CompilationTimeoutMilliseconds);
+  finally
+    Driver.Free;
   end;
 end;
 
@@ -1222,6 +1397,12 @@ begin
     TestProbeFailureNamesCompilerAndTargetRequirement);
   Test('probe timeout terminates the isolated process tree',
     TestProbeTimeoutTerminatesProcessTree);
+  Test('probe deadline is the compile deadline and its override',
+    TestProbeDeadlineIsTheCompileDeadline);
+  Test('probe output past the capture budget fails the probe',
+    TestProbeOutputPastBudgetFails);
+  Test('a timeout reason leads output the probe printed before it stalled',
+    TestTimeoutReasonLeadsProbeOutput);
   Test('probe rejects a successful response for the wrong target tuple',
     TestProbeRejectsUnexpectedTargetTuple);
   Test('capabilities are defensive and do not advertise unit outputs',
@@ -1268,6 +1449,12 @@ begin
         Suite.AssertExplicitProcessorOverrideStillDispatches
       else if ACase = IsolatedUnitPathsCase then
         Suite.AssertBuildArgumentsPreserveTestCompileFlagSet
+      else if ACase = IsolatedProbeDeadlineDefaultCase then
+        Suite.AssertProbeDeadlineIsTheCompileDeadline(
+          DEFAULT_COMPILER_TIMEOUT_MILLISECONDS)
+      else if ACase = IsolatedProbeDeadlineOverrideCase then
+        Suite.AssertProbeDeadlineIsTheCompileDeadline(
+          StrToQWord(IsolatedProbeDeadlineOverride))
       else
         raise Exception.Create('unknown isolated compiler-driver case "'
           + ACase + '"');
@@ -1289,6 +1476,10 @@ begin
   if (ParamCount >= 2)
      and (ParamStr(1) = ProbeTimeoutGrandchildOption) then
     Halt(RunProbeTimeoutGrandchild);
+  if (ParamCount >= 1) and (ParamStr(1) = ProbeNoisyStallProxyOption) then
+    Halt(RunProbeNoisyStallProxy);
+  if (ParamCount >= 1) and (ParamStr(1) = ProbeFloodProxyOption) then
+    Halt(RunProbeFloodProxy);
   if (ParamCount >= 2) and (ParamStr(1) = ProbeTimeoutProxyOption) then
     Halt(RunProbeTimeoutProxy(ParamStr(2)));
   TestRunnerProgram.AddSuite(TLWPTFPCCompilerDriverTests.Create(

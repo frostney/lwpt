@@ -51,7 +51,7 @@ type
     procedure TestFirstRecordCreatesLifecycleTemporaryRoot;
     procedure TestIndexGrowthCannotExceedBudget;
     procedure TestRepeatedIndexNameKeepsLastValue;
-    procedure TestLargeCacheHitAndAdmissionStayFast;
+    procedure TestLargeCacheHitAndAdmissionWorkScales;
     procedure TestEvictionCountsDeletedReferences;
     procedure TestUndeletedManifestIsNotCountedAsReclaimed;
     procedure TestConcurrentStagingGrowthKeepsEvicting;
@@ -780,7 +780,7 @@ begin
   end;
 end;
 
-procedure TCacheLifecycleContract.TestLargeCacheHitAndAdmissionStayFast;
+procedure TCacheLifecycleContract.TestLargeCacheHitAndAdmissionWorkScales;
 const
   SmallObjects = 2000;
   LargeObjects = 20000;
@@ -788,15 +788,40 @@ const
   { Enforcement also sees the admitted object, its manifest and its index
     entry, which cost a few more evictions of about ObjectBytes each. }
   EvictionSlack = 10;
-  { Ten times the objects and evictions costs about ten times as much when
-    hit and admission are linear, and about a hundred times for each
-    quadratic variant this guards against. Comparing two sizes on the same
-    machine keeps runner speed and per-file costs (far higher on NTFS) out
-    of the bound. }
+  { Ten times the objects and evictions makes linear work at most ten
+    times larger and sorting and searching about fourteen times
+    (n log n). Each quadratic variant this guards against grows its
+    counter 40 to 100 times: a scan or an insertion sort visits about a
+    hundred times the entries, and a walk per eviction takes ten times
+    the walks, each over a larger tree. }
   ScaleMultiple = 30;
-  ScaleSlackMs = 500;
 
-  procedure Measure(const AObjectCount: Integer; out AHitMs, AAdmitMs: Int64);
+type
+  { The work one hit or one admission did, counted by the lifecycle's
+    test counters. }
+  TCacheWork = record
+    Enforcements, Walks, IndexPasses: Integer;
+    EntryVisits: Int64;
+  end;
+
+  procedure ResetWork;
+  begin
+    CacheLifecycleEnforcementCount := 0;
+    CacheLifecycleDirectoryWalkCount := 0;
+    CacheLifecycleIndexPassCount := 0;
+    CacheLifecycleEntryVisitCount := 0;
+  end;
+
+  function CountedWork: TCacheWork;
+  begin
+    Result.Enforcements := CacheLifecycleEnforcementCount;
+    Result.Walks := CacheLifecycleDirectoryWalkCount;
+    Result.IndexPasses := CacheLifecycleIndexPassCount;
+    Result.EntryVisits := CacheLifecycleEntryVisitCount;
+  end;
+
+  procedure Measure(const AObjectCount: Integer; out AHit,
+    AAdmission: TCacheWork);
   var
     Digest, Hit, NewDigest, Source: string;
     Store: TLWPTImmutableObjectStore;
@@ -805,7 +830,6 @@ const
     LastUses: array of Integer;
     LowWater: Int64;
     Index, Evicted, Evictions: Integer;
-    Started: QWord;
     EvictedInOrder: Boolean;
   begin
     ResetScratch;
@@ -841,22 +865,21 @@ const
       ForceDirectories(FCacheRoot + '/lifecycle');
       IndexLines.SaveToFile(FCacheRoot + '/lifecycle/index');
 
-      Started := GetTickCount64;
+      ResetWork;
       Expect<Boolean>(Store.Lookup(Digest, Hit)).ToBe(True);
-      AHitMs := Int64(GetTickCount64 - Started);
+      AHit := CountedWork;
 
       Source := FScratch + '/sources/cold';
       WriteTextFile(Source, 'cold-object');
       NewDigest := 'sha256:' + SHA256File(Source);
-      { WriteTextFile adds the platform line break to each payload. The
-        hit measured the cache and wrote its usage ledger, so the total
-        already counts it. Eviction goes down to the low-water mark. }
+      { WriteTextFile adds the platform line break to each payload.
+        Eviction goes down to the low-water mark. }
       SetBudgetForLowWater(CacheBytes(FCacheRoot), CacheBytes(FCacheRoot)
         - Evictions * FileSizeOf(Store.ObjectPath(Digests[0])));
       LowWater := CacheLowWaterBytes(ResolveCacheMaxBytes);
-      Started := GetTickCount64;
+      ResetWork;
       Expect<Boolean>(Store.Admit(Source, NewDigest) <> '').ToBe(True);
-      AAdmitMs := Int64(GetTickCount64 - Started);
+      AAdmission := CountedWork;
 
       { The evicted objects are exactly the least recently used ones, and
         no more of them than the low-water mark needed. }
@@ -886,8 +909,24 @@ const
     end;
   end;
 
+  function Describe(const AWhat: string; const AObjectCount: Integer;
+    const AWork: TCacheWork): string;
+  begin
+    Result := Format('%s at %d objects: %d enforcements, %d walk steps, '
+      + '%d index passes, %d entry visits', [AWhat, AObjectCount,
+      AWork.Enforcements, AWork.Walks, AWork.IndexPasses,
+      AWork.EntryVisits]);
+  end;
+
+  function Compare(const AWhat: string; const ASmall,
+    ALarge: TCacheWork): string;
+  begin
+    Result := Describe(AWhat, SmallObjects, ASmall) + '; '
+      + Describe(AWhat, LargeObjects, ALarge);
+  end;
+
 var
-  SmallHitMs, SmallAdmitMs, LargeHitMs, LargeAdmitMs: Int64;
+  SmallHit, SmallAdmission, LargeHit, LargeAdmission: TCacheWork;
 begin
   { A grown shared cache holds tens of thousands of objects and index
     entries. Every hit loads the index, and an admission over budget also
@@ -898,17 +937,54 @@ begin
     index for its entry. The fixture makes those steps expensive: real
     objects whose recency is unrelated to the order discovery returns them
     in, an index written in reverse name order, and a budget whose
-    low-water mark forces a quarter of the objects out. }
-  Measure(SmallObjects, SmallHitMs, SmallAdmitMs);
-  Measure(LargeObjects, LargeHitMs, LargeAdmitMs);
-  if LargeHitMs >= ScaleMultiple * SmallHitMs + ScaleSlackMs then
-    Fail(Format('hit took %d ms at %d objects against %d ms at %d; bound '
-      + '%d x + %d ms', [LargeHitMs, LargeObjects, SmallHitMs, SmallObjects,
-      ScaleMultiple, ScaleSlackMs]));
-  if LargeAdmitMs >= ScaleMultiple * SmallAdmitMs + ScaleSlackMs then
-    Fail(Format('admission took %d ms at %d objects against %d ms at %d; '
-      + 'bound %d x + %d ms', [LargeAdmitMs, LargeObjects, SmallAdmitMs,
-      SmallObjects, ScaleMultiple, ScaleSlackMs]));
+    low-water mark forces a quarter of the objects out.
+
+    This counts the work instead of timing it. A hit at 2000 objects
+    takes a few milliseconds of processor time, so on a loaded host it
+    often finishes without waiting, while the hit at 20 000 objects is
+    preempted and waits for a processor; their wall-clock ratio then
+    measures the host's load as much as the code (#444). }
+  Measure(SmallObjects, SmallHit, SmallAdmission);
+  Measure(LargeObjects, LargeHit, LargeAdmission);
+  { The hit leaves its index entry the same length, so it judges room
+    without measuring, at either size, and reads and rewrites the index
+    as many times. }
+  if (SmallHit.Enforcements <> 0) or (LargeHit.Enforcements <> 0)
+     or (SmallHit.Walks <> 0) or (LargeHit.Walks <> 0) then
+    Fail('expected the hit to walk nothing at each size; '
+      + Compare('hit', SmallHit, LargeHit));
+  if (SmallHit.IndexPasses = 0)
+     or (LargeHit.IndexPasses <> SmallHit.IndexPasses) then
+    Fail('expected as many index passes for the hit in the large cache as '
+      + 'in the small one; ' + Compare('hit', SmallHit, LargeHit));
+  { The admission measures the cache once and evicts the whole batch in
+    that one enforcement, with as many index passes at either size. }
+  if (SmallAdmission.Enforcements <> 1)
+     or (LargeAdmission.Enforcements <> 1) then
+    Fail('expected the admission to enforce once at each size; '
+      + Compare('admission', SmallAdmission, LargeAdmission));
+  if (SmallAdmission.IndexPasses = 0)
+     or (LargeAdmission.IndexPasses <> SmallAdmission.IndexPasses) then
+    Fail('expected as many index passes for the admission in the large '
+      + 'cache as in the small one; '
+      + Compare('admission', SmallAdmission, LargeAdmission));
+  { What grows with the cache grows near linearly: the walk steps of the
+    admission's measurements, and the entries the hit's and the
+    admission's sorts, searches and shifts visit. }
+  if LargeAdmission.Walks > ScaleMultiple * SmallAdmission.Walks then
+    Fail(Format('expected the admission''s walk steps to grow at most %d '
+      + 'times; ', [ScaleMultiple])
+      + Compare('admission', SmallAdmission, LargeAdmission));
+  if (SmallHit.EntryVisits = 0)
+     or (LargeHit.EntryVisits > ScaleMultiple * SmallHit.EntryVisits) then
+    Fail(Format('expected the hit''s entry visits to grow at most %d '
+      + 'times; ', [ScaleMultiple]) + Compare('hit', SmallHit, LargeHit));
+  if (SmallAdmission.EntryVisits = 0)
+     or (LargeAdmission.EntryVisits
+       > ScaleMultiple * SmallAdmission.EntryVisits) then
+    Fail(Format('expected the admission''s entry visits to grow at most %d '
+      + 'times; ', [ScaleMultiple])
+      + Compare('admission', SmallAdmission, LargeAdmission));
 end;
 
 procedure TCacheLifecycleContract.TestEvictionCountsDeletedReferences;
@@ -1850,8 +1926,8 @@ begin
     TestFirstRecordCreatesLifecycleTemporaryRoot);
   Test('a repeated index name keeps its last value and is written once',
     TestRepeatedIndexNameKeepsLastValue);
-  Test('a 20 000-object cache keeps hits and multi-eviction admissions '
-    + 'fast', TestLargeCacheHitAndAdmissionStayFast);
+  Test('a 20 000-object cache keeps hit and multi-eviction admission work '
+    + 'near linear', TestLargeCacheHitAndAdmissionWorkScales);
   Test('eviction counts the references it deletes as reclaimed',
     TestEvictionCountsDeletedReferences);
   Test('a manifest that cannot be deleted is not counted as reclaimed',

@@ -15,6 +15,7 @@ uses
   Tests.LwptSubprocess,
   Tests.Scratch,
 
+  LWPT.BuildSession,
   LWPT.ObjectStore,
   LWPT.WorkerBudget;
 
@@ -59,6 +60,7 @@ type
     procedure TestFailedCompileNeverBecomesHit;
     procedure TestFailingExecutionIsAlwaysFresh;
     procedure TestConcurrentMissCompilesOnce;
+    procedure TestPassingRerunRemovesSupersededExecutable;
   end;
 
 constructor TLWPTThreadRun.Create(const AProjectRoot: string;
@@ -653,6 +655,110 @@ begin
   end;
 end;
 
+procedure CollectExecutables(const ARoot, AProgram: string;
+  AFound: TStrings);
+var
+  Search: TSearchRec;
+  Base: string;
+begin
+  if not DirectoryExists(ARoot) then Exit;
+  Base := IncludeTrailingPathDelimiter(ARoot);
+  if FindFirst(Base + '*', faAnyFile, Search) <> 0 then Exit;
+  try
+    repeat
+      if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      if (Search.Attr and faDirectory) <> 0 then
+        CollectExecutables(Base + Search.Name, AProgram, AFound)
+      else if (Search.Name = AProgram)
+        or (Search.Name = AProgram + '.exe') then
+        AFound.Add(Base + Search.Name);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+function ExitProgram(const AName: string; const AExitCode: Integer): string;
+begin
+  Result := 'program ' + AName + ';'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'begin'#10
+    + '  WriteLn(''' + AName + ' exits ' + IntToStr(AExitCode) + ''');'#10
+    + '  Halt(' + IntToStr(AExitCode) + ');'#10
+    + 'end.'#10;
+end;
+
+procedure TTestCache.TestPassingRerunRemovesSupersededExecutable;
+var
+  CacheRoot, Marker, ProjectRoot, FailedSession: string;
+  Environment: TStringArray;
+  Failed, Passed: TLwptResult;
+  Rerun, Unselected: TStringList;
+begin
+  CacheRoot := FScratch + '/superseded-cache';
+  Marker := FScratch + '/superseded-marker';
+  ProjectRoot := FScratch + '/superseded-project';
+  RecursiveDelete(CacheRoot);
+  RecursiveDelete(ProjectRoot);
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "superseded-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(ProjectRoot + '/tests/Rerun.Test.pas', ExitProgram('Rerun', 1));
+  WriteTextFile(ProjectRoot + '/tests/Unselected.Test.pas',
+    ExitProgram('Unselected', 1));
+  Environment := CacheEnvironment(CacheRoot, Marker);
+  { Staging must land in the project's default sessions root, which the
+    assertions below inspect. }
+  SetLength(Environment, Length(Environment) + 1);
+  Environment[High(Environment)] := BUILD_SESSION_DIR_ENV + '=';
+
+  Failed := RunLwpt(['test', '--jobs=1'], ProjectRoot, Environment);
+  Expect<Integer>(Failed.ExitCode).ToBe(1);
+  { Both programs compiled and failed at run time, so each left a retained
+    executable for the rerun to supersede. }
+  Rerun := TStringList.Create;
+  try
+    CollectExecutables(ProjectRoot + '/.lwpt/sessions', 'Rerun.Test', Rerun);
+    Expect<Integer>(Rerun.Count).ToBe(1);
+    Rerun.Clear;
+    CollectExecutables(ProjectRoot + '/.lwpt/sessions', 'Unselected.Test',
+      Rerun);
+    Expect<Integer>(Rerun.Count).ToBe(1);
+  finally
+    Rerun.Free;
+  end;
+  WriteTextFile(ProjectRoot + '/tests/Rerun.Test.pas', ExitProgram('Rerun', 0));
+  Passed := RunLwpt(['test', '--jobs=1', 'tests/Rerun.Test.pas'],
+    ProjectRoot, Environment);
+  RequireSuccess('passing selected rerun', Passed);
+
+  Rerun := TStringList.Create;
+  Unselected := TStringList.Create;
+  try
+    CollectExecutables(ProjectRoot + '/.lwpt/sessions', 'Rerun.Test', Rerun);
+    CollectExecutables(ProjectRoot + '/.lwpt/sessions', 'Unselected.Test',
+      Unselected);
+    { The passing rerun superseded the failed build of the program it ran,
+      so no executable of it is left to be run by hand. The program it did
+      not select keeps its failed build, and the failed session keeps its
+      diagnosis. }
+    Expect<Integer>(Rerun.Count).ToBe(0);
+    Expect<Integer>(Unselected.Count).ToBe(1);
+    FailedSession := Unselected[0];
+    while (ExtractFileName(ExtractFileDir(FailedSession)) <> 'sessions')
+      and (FailedSession <> ExtractFileDir(FailedSession)) do
+      FailedSession := ExtractFileDir(FailedSession);
+    Expect<Boolean>(FileExists(FailedSession + '/failure.txt')).ToBe(True);
+    Expect<Boolean>(FileExists(FailedSession + '/session.state')).ToBe(True);
+    Expect<Boolean>(DirectoryExists(FailedSession + '/logs')).ToBe(True);
+  finally
+    Unselected.Free;
+    Rerun.Free;
+  end;
+end;
+
 procedure TTestCache.SetupTests;
 begin
   Test('equivalent worktrees compile once and execute every run',
@@ -675,6 +781,8 @@ begin
     TestFailingExecutionIsAlwaysFresh);
   Test('concurrent identical misses compile once',
     TestConcurrentMissCompilesOnce);
+  Test('a passing rerun removes the superseded failed executable',
+    TestPassingRerunRemovesSupersededExecutable);
 end;
 
 begin
