@@ -101,3 +101,12 @@ bounded out-of-process operations. Host registration never returns an
 in-process compiler object. Existing profile precedence, version/capability
 validation, process-tree ownership, timeouts, result/artifact validation, and
 no-fallback behavior remain in force.
+
+## Amendment — 2026-11-25
+
+Probes no longer have their own 30-second deadline. As [ADR-0029's
+amendment](./0029-fpc-compiler-driver.md#amendment--2026-11-25) records,
+external, Blaise, Lakon, and Delphi probes share the compile deadline: 30
+minutes by default, or `LWPT_COMPILER_TIMEOUT_MS` when set. A loaded machine
+therefore cannot fail a build at the probe when the compile it gates would have
+finished.

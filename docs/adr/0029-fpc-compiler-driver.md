@@ -92,3 +92,15 @@ compilation uses the ordinary FPC driver path before the compiled script runs.
   invocation-option level: builds pass `@lwpt.cfg`, while test and Windows hook
   compilation expand it for cross-platform response-file compatibility. The
   FPC driver owns both translations.
+
+## Amendment — 2026-11-25
+
+The fixed 30-second probe deadline is withdrawn. A probe is a compiler process
+like a compile and runs under the same machine load. On a heavily loaded
+development machine a healthy `-iV -iTO -iTP` probe exceeded 30 seconds, and
+the build failed before it compiled anything, while the compile itself would
+have had 30 minutes. Every driver's probe now uses the compile deadline: 30
+minutes by default, or `LWPT_COMPILER_TIMEOUT_MS` when set. The timeout still
+terminates and reaps the isolated process tree, so a wedged compiler still
+cannot hold the shared driver lock indefinitely. It holds the lock for no
+longer than the compile that follows would hang.

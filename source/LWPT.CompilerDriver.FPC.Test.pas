@@ -71,7 +71,6 @@ type
   protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; override;
-    function ProbeTimeoutMilliseconds: QWord; override;
   public
     property GrandchildPIDPath: string read FGrandchildPIDPath
       write FGrandchildPIDPath;
@@ -103,6 +102,7 @@ type
     procedure TestExplicitProcessorOverrideStillDispatches;
     procedure TestProbeFailureNamesCompilerAndTargetRequirement;
     procedure TestProbeTimeoutTerminatesProcessTree;
+    procedure TestProbeDeadlineIsTheCompileDeadline;
     procedure TestProbeRejectsUnexpectedTargetTuple;
     procedure TestCapabilitiesAreDefensiveAndDoNotAdvertiseUnits;
     procedure TestBuildArgumentsPreserveBuildFlagSet;
@@ -117,6 +117,48 @@ type
     procedure TestWindowsBareRunnableResolvesFromInheritedPath;
     procedure TestNilDriverBuildRequestIsRejected;
   end;
+
+{$IFDEF UNIX}
+function CSetEnvironmentVariable(AName, AValue: PAnsiChar;
+  AOverwrite: LongInt): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'setenv';
+  {$ELSE}
+  external name 'setenv';
+  {$ENDIF}
+function CUnsetEnvironmentVariable(AName: PAnsiChar): LongInt; cdecl;
+  {$IFDEF LINUX}
+  external 'c' name 'unsetenv';
+  {$ELSE}
+  external name 'unsetenv';
+  {$ENDIF}
+{$ENDIF}
+
+{ Tests run one at a time on the main thread, so changing this process's
+  environment cannot race another reader. An empty value unsets it. }
+procedure SetCompilerTimeoutEnvironment(const AValue: string);
+{$IFDEF UNIX}
+var
+  Name, Value: AnsiString;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Name, Value: UnicodeString;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Name := AnsiString(COMPILER_TIMEOUT_ENVIRONMENT);
+  Value := AnsiString(AValue);
+  if AValue = '' then CUnsetEnvironmentVariable(PAnsiChar(Name))
+  else CSetEnvironmentVariable(PAnsiChar(Name), PAnsiChar(Value), 1);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Name := UnicodeString(COMPILER_TIMEOUT_ENVIRONMENT);
+  Value := UnicodeString(AValue);
+  if AValue = '' then Windows.SetEnvironmentVariableW(PWideChar(Name), nil)
+  else Windows.SetEnvironmentVariableW(PWideChar(Name), PWideChar(Value));
+  {$ENDIF}
+end;
 
 procedure TerminateTestProcess(const APID: Integer);
 {$IFDEF MSWINDOWS}
@@ -235,11 +277,6 @@ begin
   for I := 0 to High(AArguments) do
     Arguments[I + 2] := AArguments[I];
   Result := inherited ExecuteProbe(Arguments, AOutput);
-end;
-
-function TTimeoutFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
-begin
-  Result := TestProbeTimeoutMilliseconds;
 end;
 
 function TLWPTFPCCompilerDriverTests.ArgumentsContain(
@@ -554,7 +591,7 @@ var
   Driver: TTimeoutFPCCompilerDriver;
   ElapsedMilliseconds, StartedAt: QWord;
   GrandchildPID: Integer;
-  ErrorMessage, GrandchildPIDPath, Scratch: string;
+  ErrorMessage, GrandchildPIDPath, PreviousTimeout, Scratch: string;
   Raised: Boolean;
 begin
   Scratch := ExpandFileName('build/tests/tmp/compiler-driver-probe-timeout');
@@ -567,9 +604,13 @@ begin
   Driver := TTimeoutFPCCompilerDriver.Create(ExpandFileName(ParamStr(0)));
   Driver.GrandchildPIDPath := GrandchildPIDPath;
   GrandchildPID := 0;
+  PreviousTimeout := GetEnvironmentVariable(COMPILER_TIMEOUT_ENVIRONMENT);
   try
     Raised := False;
     ErrorMessage := '';
+    { The probe deadline comes from the compile deadline's setting, so the
+      environment shortens it for this test. }
+    SetCompilerTimeoutEnvironment(IntToStr(TestProbeTimeoutMilliseconds));
     StartedAt := GetTickCount64;
     try
       Driver.DefaultTarget;
@@ -597,9 +638,37 @@ begin
       Expect<Boolean>(ProcessIsRunning(GrandchildPID)).ToBe(False);
     end;
   finally
+    SetCompilerTimeoutEnvironment(PreviousTimeout);
     Driver.Free;
     TerminateTestProcess(GrandchildPID);
     RecursiveDelete(Scratch);
+  end;
+end;
+
+{ A probe is a compiler process under the same machine load as the
+  compile it gates. Its deadline is the compile deadline (30 minutes by
+  default, LWPT_COMPILER_TIMEOUT_MS when set), so a loaded machine cannot
+  fail a build at the probe that the compile itself would have survived. }
+procedure TLWPTFPCCompilerDriverTests.TestProbeDeadlineIsTheCompileDeadline;
+var
+  Driver: TLWPTFPCCompilerDriver;
+  PreviousTimeout: string;
+begin
+  PreviousTimeout := GetEnvironmentVariable(COMPILER_TIMEOUT_ENVIRONMENT);
+  Driver := TLWPTFPCCompilerDriver.Create;
+  try
+    SetCompilerTimeoutEnvironment('');
+    Expect<QWord>(Driver.ProbeTimeoutMilliseconds)
+      .ToBe(DEFAULT_COMPILER_TIMEOUT_MILLISECONDS);
+    Expect<QWord>(Driver.ProbeTimeoutMilliseconds)
+      .ToBe(Driver.CompilationTimeoutMilliseconds);
+    SetCompilerTimeoutEnvironment('1234');
+    Expect<QWord>(Driver.ProbeTimeoutMilliseconds).ToBe(1234);
+    Expect<QWord>(Driver.ProbeTimeoutMilliseconds)
+      .ToBe(Driver.CompilationTimeoutMilliseconds);
+  finally
+    SetCompilerTimeoutEnvironment(PreviousTimeout);
+    Driver.Free;
   end;
 end;
 
@@ -1222,6 +1291,8 @@ begin
     TestProbeFailureNamesCompilerAndTargetRequirement);
   Test('probe timeout terminates the isolated process tree',
     TestProbeTimeoutTerminatesProcessTree);
+  Test('probe deadline is the compile deadline and its override',
+    TestProbeDeadlineIsTheCompileDeadline);
   Test('probe rejects a successful response for the wrong target tuple',
     TestProbeRejectsUnexpectedTargetTuple);
   Test('capabilities are defensive and do not advertise unit outputs',

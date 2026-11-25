@@ -24,7 +24,6 @@ type
   protected
     function ExecuteProbe(out AStandardOutput, AStandardError: string):
       Integer; virtual;
-    function ProbeTimeoutMilliseconds: QWord; virtual;
   public
     constructor Create(const AExecutableName: string = '';
       const AVersionConstraint: string = '*');
@@ -70,7 +69,6 @@ const
   BLAISE_DEBUG_FLAG = '--debug';
   BLAISE_UNIT_CACHE_FLAG = '--unit-cache';
   BLAISE_NO_INCREMENTAL_FLAG = '--no-incremental';
-  BLAISE_PROBE_TIMEOUT_MILLISECONDS = 30000;
   BLAISE_VERSION_PREFIX = 'Blaise Compiler v';
   BLAISE_DEFAULT_TARGET_PREFIX = 'Cross-compile target (default: ';
   BLAISE_DEFAULT_TARGET_SUFFIX = ', the host).';
@@ -222,11 +220,6 @@ end;
 function TLWPTBlaiseCompilerDriver.VersionConstraint: string;
 begin
   Result := FVersionConstraint;
-end;
-
-function TLWPTBlaiseCompilerDriver.ProbeTimeoutMilliseconds: QWord;
-begin
-  Result := BLAISE_PROBE_TIMEOUT_MILLISECONDS;
 end;
 
 function TLWPTBlaiseCompilerDriver.ExecuteProbe(out AStandardOutput,

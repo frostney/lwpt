@@ -35,7 +35,6 @@ type
   protected
     function ExecuteProbe(const AArguments: LWPT.Core.TStringArray;
       out AOutput: string): Integer; virtual;
-    function ProbeTimeoutMilliseconds: QWord; virtual;
   public
     constructor Create(const AExecutableName: string = '';
       const AVersionConstraint: string = '*');
@@ -105,7 +104,6 @@ const
   FPC_NO_SUCH_FILE_SIGNATURE = 'no such file';
   FPC_PROBE_POLL_MILLISECONDS = 10;
   FPC_PROBE_TIMEOUT_EXIT_CODE = 124;
-  FPC_PROBE_TIMEOUT_MILLISECONDS = 30000;
 
 type
   TLWPTFPCProbeCacheEntry = class
@@ -643,10 +641,10 @@ begin
     for ArgumentIndex := 0 to High(AArguments) do
       CompilerProcess.Parameters.Add(AArguments[ArgumentIndex]);
     CompilerProcess.Options := [poUsePipes, poStderrToOutPut];
+    TimeoutMilliseconds := ProbeTimeoutMilliseconds;
     ProcessTree := TLWPTProcessTree.Create(CompilerProcess);
     ProcessTree.Execute;
     StartedAt := GetTickCount64;
-    TimeoutMilliseconds := ProbeTimeoutMilliseconds;
     TimedOut := False;
     repeat
       BytesRead := 0;
@@ -716,11 +714,6 @@ begin
     ProcessTree.Free;
     CompilerProcess.Free;
   end;
-end;
-
-function TLWPTFPCCompilerDriver.ProbeTimeoutMilliseconds: QWord;
-begin
-  Result := FPC_PROBE_TIMEOUT_MILLISECONDS;
 end;
 
 function TLWPTFPCCompilerDriver.DefaultTarget: TLWPTTarget;
