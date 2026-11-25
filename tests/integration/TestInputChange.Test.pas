@@ -1,0 +1,256 @@
+{ TestInputChange.Test — a test run whose compiler inputs change after it
+  starts is void instead of reporting results from two source states. }
+program TestInputChange.Test;
+
+{$mode delphi}{$H+}
+
+uses
+  {$IFDEF UNIX}
+  cthreads,
+  {$ENDIF}
+  Classes,
+  SysUtils,
+
+  TestingPascalLibrary,
+  Tests.LwptSubprocess,
+  Tests.Scratch,
+
+  LWPT.ObjectStore,
+  LWPT.WorkerBudget;
+
+const
+  SHARED_ONE = 'unit Shared; interface const V = 1; implementation end.';
+  SHARED_TWO = 'unit Shared; interface const V = 2; implementation end.';
+  SHARED_HALF_EDITED = 'unit Shared; interface const V = ';
+
+type
+  TTestInputChange = class(TTestSuite)
+  private
+    FScratch: string;
+    function Environment(const ACacheRoot: string): TStringArray;
+    function MarkerPath(const AProjectRoot, AName: string): string;
+    procedure WriteProject(const AProjectRoot, AInitialShared,
+      AEditedShared: string);
+    procedure RequireExit(const ALabel: string; const ARun: TLwptResult;
+      const AExpected: Integer);
+  protected
+    procedure BeforeAll; override;
+  public
+    procedure SetupTests; override;
+    procedure TestEditDuringRunVoidsLaterJobs;
+    procedure TestHalfEditedInputIsVoidNotCompileFailure;
+    procedure TestCacheHitAfterEditIsVoid;
+    procedure TestUnchangedContentRunsAsBefore;
+  end;
+
+function PascalString(const AValue: string): string;
+begin
+  Result := '''' + StringReplace(AValue, '''', '''''', [rfReplaceAll])
+    + '''';
+end;
+
+{ A fixture test program that leaves an existence marker when it runs. }
+function MarkerStatements(const AMarker: string): string;
+begin
+  Result := '  TFileStream.Create(' + PascalString(AMarker)
+    + ', fmCreate).Free;'#10;
+end;
+
+procedure TTestInputChange.BeforeAll;
+begin
+  FScratch := CreateScratchRoot('test-input-change');
+end;
+
+function TTestInputChange.Environment(const ACacheRoot: string): TStringArray;
+begin
+  SetLength(Result, 4);
+  Result[0] := CACHE_DIR_ENV + '=' + ACacheRoot;
+  Result[1] := WORKER_STATE_DIR_ENV + '=' + FScratch + '/worker-state';
+  Result[2] := WORKER_BUDGET_ENV + '=2';
+  Result[3] := WORKER_LEASE_TOKEN_ENV + '=';
+end;
+
+function TTestInputChange.MarkerPath(const AProjectRoot,
+  AName: string): string;
+begin
+  Result := AProjectRoot + '-markers/' + AName;
+end;
+
+{ Three programs that --jobs=1 runs in source order. A rewrites the shared
+  unit with AEditedShared once it runs, so B and C always compile after the
+  edit: the regression needs no timing. B and C use the unit and leave
+  markers, which prove whether they ran. }
+procedure TTestInputChange.WriteProject(const AProjectRoot, AInitialShared,
+  AEditedShared: string);
+begin
+  RecursiveDelete(AProjectRoot);
+  RecursiveDelete(AProjectRoot + '-markers');
+  ForceDirectories(AProjectRoot + '-markers');
+  WriteTextFile(AProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "test-input-change-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(AProjectRoot + '/source/Shared.pas', AInitialShared + #10);
+  WriteTextFile(AProjectRoot + '/tests/A.Test.pas',
+      'program A;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes;'#10
+    + 'var Lines: TStringList;'#10
+    + 'begin'#10
+    + '  Lines := TStringList.Create;'#10
+    + '  try'#10
+    + '    Lines.LineBreak := #10;'#10
+    + '    Lines.Text := ' + PascalString(AEditedShared) + ';'#10
+    + '    Lines.SaveToFile('
+    + PascalString(AProjectRoot + '/source/Shared.pas') + ');'#10
+    + '  finally'#10
+    + '    Lines.Free;'#10
+    + '  end;'#10
+    + 'end.'#10);
+  WriteTextFile(AProjectRoot + '/tests/B.Test.pas',
+      'program B;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, Shared;'#10
+    + 'begin'#10
+    + '  WriteLn(''B V='', V);'#10
+    + MarkerStatements(MarkerPath(AProjectRoot, 'b-ran'))
+    + 'end.'#10);
+  WriteTextFile(AProjectRoot + '/tests/C.Test.pas',
+      'program C;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes, Shared;'#10
+    + 'begin'#10
+    + MarkerStatements(MarkerPath(AProjectRoot, 'c-ran'))
+    + 'end.'#10);
+end;
+
+procedure TTestInputChange.RequireExit(const ALabel: string;
+  const ARun: TLwptResult; const AExpected: Integer);
+var
+  Diagnostics: TStringList;
+begin
+  if ARun.ExitCode = AExpected then Exit;
+  Diagnostics := TStringList.Create;
+  try
+    DumpRunFailure(ALabel, ARun, AExpected, Diagnostics);
+    Fail(Diagnostics.Text);
+  finally
+    Diagnostics.Free;
+  end;
+end;
+
+function Contains(const ANeedle, AText: string): Boolean;
+begin
+  Result := Pos(ANeedle, AText) > 0;
+end;
+
+procedure TTestInputChange.TestEditDuringRunVoidsLaterJobs;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/edit';
+  WriteProject(ProjectRoot, SHARED_ONE, SHARED_TWO);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/edit-cache'));
+  RequireExit('edited run', Run, 1);
+  Expect<Boolean>(Contains('tests/A.Test.pas ... pass', Run.Stdout))
+    .ToBe(True);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
+    + 'changed after this test run started (source/Shared.pas)', Run.Stdout))
+    .ToBe(True);
+  Expect<Boolean>(Contains(
+    'tests/C.Test.pas ... cancelled (run void: inputs changed)', Run.Stdout))
+    .ToBe(True);
+  Expect<Boolean>(Contains('summary: 1 passed, 0 failed, 0 did not compile, '
+    + '1 cancelled, 1 void; run void: compiler inputs changed after it '
+    + 'started (source/Shared.pas); elapsed ', Run.Stdout)).ToBe(True);
+  Expect<Boolean>(Contains('its results are void; rerun lwpt test',
+    Run.Stderr)).ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'b-ran'))).ToBe(False);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'c-ran'))).ToBe(False);
+end;
+
+procedure TTestInputChange.TestHalfEditedInputIsVoidNotCompileFailure;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/half-edited';
+  WriteProject(ProjectRoot, SHARED_ONE, SHARED_HALF_EDITED);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/half-edited-cache'));
+  RequireExit('half-edited run', Run, 1);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID', Run.Stdout))
+    .ToBe(True);
+  Expect<Boolean>(Contains('COMPILE FAILED', Run.Stdout)).ToBe(False);
+  Expect<Boolean>(Contains('0 did not compile, 1 cancelled, 1 void',
+    Run.Stdout)).ToBe(True);
+end;
+
+procedure TTestInputChange.TestCacheHitAfterEditIsVoid;
+var
+  CacheRoot, ProjectRoot: string;
+  Seed, Run: TLwptResult;
+begin
+  CacheRoot := FScratch + '/cache-hit-cache';
+  ProjectRoot := FScratch + '/cache-hit';
+  RecursiveDelete(CacheRoot);
+  { Seed B's cached executable for the edited state: A rewrites the unit
+    with the bytes it already has, so this run passes and stores B. }
+  WriteProject(ProjectRoot, SHARED_TWO, SHARED_TWO);
+  Seed := RunLwpt(['test', '--jobs=1', '--verbose'], ProjectRoot,
+    Environment(CacheRoot));
+  RequireExit('cache seed run', Seed, 0);
+  Expect<Boolean>(Contains('cache stored:', Seed.Stdout)).ToBe(True);
+
+  { Start from the original state; after A's edit, B's fingerprint matches
+    the seeded entry, so B reuses it instead of compiling. }
+  WriteTextFile(ProjectRoot + '/source/Shared.pas', SHARED_ONE + #10);
+  RecursiveDelete(ProjectRoot + '-markers');
+  ForceDirectories(ProjectRoot + '-markers');
+  Run := RunLwpt(['test', '--jobs=1', '--verbose'], ProjectRoot,
+    Environment(CacheRoot));
+  RequireExit('cache hit after edit', Run, 1);
+  Expect<Boolean>(Contains('cache hit:', Run.Stdout)).ToBe(True);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID', Run.Stdout))
+    .ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'b-ran'))).ToBe(False);
+end;
+
+procedure TTestInputChange.TestUnchangedContentRunsAsBefore;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/unchanged';
+  { A rewrites the unit with identical bytes: content, not timestamps,
+    decides whether inputs changed. }
+  WriteProject(ProjectRoot, SHARED_ONE, SHARED_ONE);
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/unchanged-cache'));
+  RequireExit('unchanged run', Run, 0);
+  Expect<Boolean>(Contains('summary: 3 passed, 0 failed, 0 did not compile, '
+    + '0 cancelled; elapsed ', Run.Stdout)).ToBe(True);
+  Expect<Boolean>(Contains('void', Run.Stdout + Run.Stderr)).ToBe(False);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'b-ran'))).ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'c-ran'))).ToBe(True);
+end;
+
+procedure TTestInputChange.SetupTests;
+begin
+  Test('an input edited during the run voids later jobs and stops the run',
+    TestEditDuringRunVoidsLaterJobs);
+  Test('a half-edited input is void, not a compile failure',
+    TestHalfEditedInputIsVoidNotCompileFailure);
+  Test('a cache hit taken after an edit is void',
+    TestCacheHitAfterEditIsVoid);
+  Test('rewriting identical content keeps the run unchanged',
+    TestUnchangedContentRunsAsBefore);
+end;
+
+begin
+  TestRunnerProgram.AddSuite(TTestInputChange.Create('test input change'));
+  TestRunnerProgram.Run;
+end.

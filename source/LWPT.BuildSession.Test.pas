@@ -53,7 +53,9 @@ type
     procedure TestCacheFingerprintCoversPrerequisiteOutputs;
     procedure TestCacheFingerprintSeparatesOperationIdentity;
     procedure TestPublicationLockUsesSessionsRoot;
+    procedure TestInputSnapshotNamesChangedFiles;
     {$IFDEF UNIX}
+    procedure TestInputSnapshotRecordsUnreadableFiles;
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
     procedure TestDirectoryAliasesHaveDeterministicFingerprint;
     procedure TestPublicationLockUsesFilesystemIdentity;
@@ -241,6 +243,95 @@ begin
 
   Expect<Boolean>(Changed <> Baseline).ToBe(True);
 end;
+
+procedure TLWPTBuildSessionTests.TestInputSnapshotNamesChangedFiles;
+var
+  Excluded, Paths: TStringArray;
+  Snapshot: TLWPTInputSnapshot;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/a.pas', 'unit a; interface implementation end.');
+  WriteText(FScratch + '/source/out/generated.txt', 'first');
+  SetLength(Paths, 4);
+  Paths[0] := 'source';
+  Paths[1] := 'source/';
+  Paths[2] := FScratch + '/source';
+  Paths[3] := MANIFEST_FILE;
+  SetLength(Excluded, 1);
+  Excluded[0] := 'source/out';
+  Snapshot := CaptureInputSnapshot(FScratch, Paths, Excluded);
+  Expect<Integer>(Length(Snapshot.Paths)).ToBe(2);
+  Expect<string>(FirstChangedInput(FScratch, Snapshot, Excluded)).ToBe('');
+
+  WriteText(FScratch + '/source/a.pas', 'unit a; interface implementation end.');
+  WriteText(FScratch + '/source/out/generated.txt', 'second');
+  Expect<string>(FirstChangedInput(FScratch, Snapshot, Excluded)).ToBe('');
+
+  WriteText(FScratch + '/source/a.pas', 'unit a; interface const V = 1; '
+    + 'implementation end.');
+  Expect<string>(FirstChangedInput(FScratch, Snapshot, Excluded))
+    .ToBe(ExpandFileName(FScratch + '/source') + PathDelim + 'a.pas');
+
+  WriteText(FScratch + '/source/a.pas', 'unit a; interface implementation end.');
+  WriteText(FScratch + '/source/b.pas', 'unit b; interface implementation end.');
+  Expect<string>(FirstChangedInput(FScratch, Snapshot, Excluded))
+    .ToBe(ExpandFileName(FScratch + '/source') + PathDelim + 'b.pas');
+
+  SysUtils.DeleteFile(FScratch + '/source/b.pas');
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "other"');
+  Expect<string>(FirstChangedInput(FScratch, Snapshot, Excluded))
+    .ToBe(ExpandFileName(FScratch + '/' + MANIFEST_FILE));
+end;
+
+{$IFDEF UNIX}
+procedure TLWPTBuildSessionTests.TestInputSnapshotRecordsUnreadableFiles;
+var
+  Descriptor: THandle;
+  Paths: TStringArray;
+  Request: TLWPTBuildPublicationRequest;
+  Snapshot: TLWPTInputSnapshot;
+  CacheRefused: Boolean;
+begin
+  ResetScratch;
+  WriteText(FScratch + '/' + MANIFEST_FILE, '[package]'#10'name = "app"');
+  WriteText(FScratch + '/source/app.pas', 'begin end.');
+  WriteText(FScratch + '/source/Unused.pas', 'unit Unused; interface '
+    + 'implementation end.');
+  Expect<Integer>(FpChmod(FScratch + '/source/Unused.pas', 0)).ToBe(0);
+  try
+    SetLength(Paths, 1);
+    Paths[0] := 'source';
+    Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
+    Expect<string>(FirstChangedInput(FScratch, Snapshot, nil)).ToBe('');
+
+    { The cache keeps failing on the same file, so its callers still fall
+      back to an uncached compile; only the snapshot tolerates it. }
+    Descriptor := FileOpen(FScratch + '/source/Unused.pas', fmOpenRead);
+    if Descriptor <> THandle(-1) then FileClose(Descriptor)
+    else
+    begin
+      Request := BasicRequest;
+      CacheRefused := False;
+      try
+        CaptureBuildCacheFingerprint(FScratch, MANIFEST_FILE, CFG_FILE,
+          LOCKFILE, LWPT_DIR + '/modules', Request,
+          BUILD_CACHE_OPERATION_TEST_PROGRAM);
+      except
+        on E: Exception do CacheRefused := True;
+      end;
+      Expect<Boolean>(CacheRefused).ToBe(True);
+    end;
+
+    WriteText(FScratch + '/source/Later.pas', 'unit Later; interface '
+      + 'implementation end.');
+    Expect<string>(FirstChangedInput(FScratch, Snapshot, nil))
+      .ToBe(ExpandFileName(FScratch + '/source') + PathDelim + 'Later.pas');
+  finally
+    FpChmod(FScratch + '/source/Unused.pas', &600);
+  end;
+end;
+{$ENDIF}
 
 procedure TLWPTBuildSessionTests.TestCacheFingerprintSeparatesOperationIdentity;
 var
@@ -1095,7 +1186,11 @@ begin
     TestCacheFingerprintSeparatesOperationIdentity);
   Test('publication locks use the resolved sessions root',
     TestPublicationLockUsesSessionsRoot);
+  Test('input snapshots hash each path once and name changed files',
+    TestInputSnapshotNamesChangedFiles);
   {$IFDEF UNIX}
+  Test('input snapshots record unreadable files without failing',
+    TestInputSnapshotRecordsUnreadableFiles);
   Test('symlinked search roots detect changes and terminate cycles',
     TestSymlinkedSearchRootChangeRefusesPublication);
   Test('directory aliases produce deterministic fingerprints',

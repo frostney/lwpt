@@ -50,6 +50,14 @@ type
 
   TLWPTBuildPublicationResult = (bprPublished, bprStale);
 
+  { Compiler-input content at one moment: each distinct path once, with the
+    content the build cache fingerprint would hash for it. Contents[i]
+    belongs to Paths[i]. }
+  TLWPTInputSnapshot = record
+    Paths: TStringArray;
+    Contents: TStringArray;
+  end;
+
   TLWPTBuildSession = class
   private
     FProjectRoot: string;
@@ -92,6 +100,17 @@ function CaptureBuildCacheFingerprint(
   const AOperation: string = BUILD_CACHE_OPERATION_BUILD_ENTRY): string;
 function NeutralBuildCacheRequest(const ARequest: TLWPTBuildRequest;
   const APublicOutput: string): TLWPTBuildRequest;
+{ Fingerprint each distinct path in APaths once, walking directories with the
+  build cache's walk and AExcludedPaths. Relative paths resolve against
+  AProjectRoot. A file that cannot be read is recorded by its size and time
+  instead of failing the capture. }
+function CaptureInputSnapshot(const AProjectRoot: string;
+  const APaths, AExcludedPaths: TStringArray): TLWPTInputSnapshot;
+{ Fingerprint ASnapshot's paths again and return the first one whose content
+  differs, or '' when every path still matches. }
+function FirstChangedInput(const AProjectRoot: string;
+  const ASnapshot: TLWPTInputSnapshot;
+  const AExcludedPaths: TStringArray): string;
 function BuildSessionPathKey(const AValue: string): string;
 procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
   var ADirs: TStringArray);
@@ -396,8 +415,39 @@ begin
 end;
 {$ENDIF}
 
-function InputDirectoryFingerprint(const AProjectRoot, ARoot: string;
-  const AExcludedPaths: TStringArray): string;
+{ A file's content hash. The build cache lets an unreadable file fail its
+  fingerprint (the cache then steps aside); a run-level input snapshot must
+  not fail, so ATolerateUnreadable records such a file by its metadata. The
+  compiler cannot read that file either, and a change to it still shows. }
+function InputFileContent(const APath: string;
+  const ATolerateUnreadable: Boolean): string;
+var
+  Info: TSearchRec;
+begin
+  if not ATolerateUnreadable then Exit(SHA256File(APath));
+  try
+    Result := SHA256File(APath);
+  except
+    on E: Exception do
+    begin
+      Result := 'unreadable';
+      if SysUtils.FindFirst(APath, faAnyFile or faSymLink, Info) = 0 then
+      try
+        Result := Result + ':' + IntToStr(Info.Size) + ':'
+          + IntToStr(Info.Time) + ':' + IntToStr(Info.Attr);
+      finally
+        SysUtils.FindClose(Info);
+      end;
+    end;
+  end;
+end;
+
+{ The sorted "<length>:<relative path>=<content>" entries of every file below
+  ARoot, joined by LF. The cache hashes this text; an input snapshot keeps it
+  so a change can be named by file. }
+function InputDirectoryListing(const AProjectRoot, ARoot: string;
+  const AExcludedPaths: TStringArray;
+  const ATolerateUnreadable: Boolean): string;
 var
   Files, VisitedDirectories: TStringList;
   SessionsRoot: string;
@@ -453,7 +503,7 @@ var
             Collect(Full, Relative + '/')
           else if FileExists(Full) then
             Files.Add(IntToStr(Length(Relative)) + ':' + Relative + '='
-              + SHA256File(Full));
+              + InputFileContent(Full, ATolerateUnreadable));
         end
         else if (Attr and faDirectory) <> 0 then
         begin
@@ -462,7 +512,7 @@ var
         end
         else
           Files.Add(IntToStr(Length(Relative)) + ':' + Relative + '='
-            + SHA256File(Full));
+            + InputFileContent(Full, ATolerateUnreadable));
       end;
     finally
       Entries.Free;
@@ -481,29 +531,152 @@ begin
       with CRLF on Windows and LF elsewhere. LF keeps LF-platform digests
       byte-identical. }
     Files.LineBreak := #10;
-    Result := TextHash(Files.Text);
+    Result := Files.Text;
   finally
     VisitedDirectories.Free;
     Files.Free;
   end;
 end;
 
-function PathFingerprint(const AProjectRoot, APath: string;
+function InputDirectoryFingerprint(const AProjectRoot, ARoot: string;
   const AExcludedPaths: TStringArray): string;
+begin
+  Result := TextHash(InputDirectoryListing(AProjectRoot, ARoot,
+    AExcludedPaths, False));
+end;
+
+{ A path's content as the cache sees it. ASnapshot keeps a directory's full
+  listing instead of its hash and records unreadable files by metadata. }
+function PathState(const AProjectRoot, APath: string;
+  const AExcludedPaths: TStringArray; const ASnapshot: Boolean): string;
 var
-  Full: string;
+  Full, Listing: string;
 begin
   Full := RootedPath(AProjectRoot, APath);
   if Full = '' then Exit('<none>');
   { Explicit files remain inputs even when they are also declared outputs.
     Exclusions apply to broad tree walks so unrelated published artifacts do
     not invalidate another target. }
-  if FileExists(Full) then Exit('file:' + SHA256File(Full));
+  if FileExists(Full) then Exit('file:' + InputFileContent(Full, ASnapshot));
   if PathIsExcluded(AProjectRoot, Full, AExcludedPaths) then Exit('<excluded>');
   if DirectoryExists(Full) then
-    Exit('tree:' + InputDirectoryFingerprint(AProjectRoot, Full,
-      AExcludedPaths));
+  begin
+    Listing := InputDirectoryListing(AProjectRoot, Full, AExcludedPaths,
+      ASnapshot);
+    if ASnapshot then Exit('tree:' + Listing);
+    Exit('tree:' + TextHash(Listing));
+  end;
   Result := 'missing';
+end;
+
+function PathFingerprint(const AProjectRoot, APath: string;
+  const AExcludedPaths: TStringArray): string;
+begin
+  Result := PathState(AProjectRoot, APath, AExcludedPaths, False);
+end;
+
+{ The first file whose entry differs between two directory listings, as a
+  path relative to the listed directory; '' when none can be named. }
+function FirstChangedListingEntry(const ABefore, AAfter: string): string;
+var
+  Before, After: TStringList;
+
+  function EntryPath(const AEntry: string): string;
+  var
+    Colon: Integer;
+  begin
+    Colon := Pos(':', AEntry);
+    Result := Copy(AEntry, Colon + 1,
+      StrToIntDef(Copy(AEntry, 1, Colon - 1), 0));
+  end;
+
+  function FirstMissing(const AFrom, AIn: TStringList): string;
+  var
+    i, Index: Integer;
+  begin
+    for i := 0 to AFrom.Count - 1 do
+      if not AIn.Find(AFrom[i], Index) then Exit(EntryPath(AFrom[i]));
+    Result := '';
+  end;
+
+begin
+  Before := TStringList.Create;
+  After := TStringList.Create;
+  try
+    Before.CaseSensitive := True;
+    After.CaseSensitive := True;
+    Before.LineBreak := #10;
+    After.LineBreak := #10;
+    Before.Text := ABefore;
+    After.Text := AAfter;
+    Before.Sorted := True;
+    After.Sorted := True;
+    Result := FirstMissing(After, Before);
+    if Result = '' then Result := FirstMissing(Before, After);
+  finally
+    After.Free;
+    Before.Free;
+  end;
+end;
+
+function CaptureInputSnapshot(const AProjectRoot: string;
+  const APaths, AExcludedPaths: TStringArray): TLWPTInputSnapshot;
+var
+  Unique: TStringList;
+  Full: string;
+  i: Integer;
+begin
+  Unique := TStringList.Create;
+  try
+    {$IFDEF MSWINDOWS}
+    Unique.CaseSensitive := False;
+    {$ELSE}
+    Unique.CaseSensitive := True;
+    {$ENDIF}
+    Unique.Sorted := True;
+    Unique.Duplicates := dupIgnore;
+    for i := 0 to High(APaths) do
+    begin
+      Full := RootedPath(AProjectRoot, APaths[i]);
+      if Full <> '' then Unique.Add(ExcludeTrailingPathDelimiter(Full));
+    end;
+    SetLength(Result.Paths, Unique.Count);
+    SetLength(Result.Contents, Unique.Count);
+    for i := 0 to Unique.Count - 1 do
+    begin
+      Result.Paths[i] := Unique[i];
+      Result.Contents[i] := PathState(AProjectRoot, Unique[i],
+        AExcludedPaths, True);
+    end;
+  finally
+    Unique.Free;
+  end;
+end;
+
+function FirstChangedInput(const AProjectRoot: string;
+  const ASnapshot: TLWPTInputSnapshot;
+  const AExcludedPaths: TStringArray): string;
+var
+  Current, Entry: string;
+  i: Integer;
+begin
+  for i := 0 to High(ASnapshot.Paths) do
+  begin
+    Current := PathState(AProjectRoot, ASnapshot.Paths[i], AExcludedPaths,
+      True);
+    if Current = ASnapshot.Contents[i] then Continue;
+    Result := ASnapshot.Paths[i];
+    if (Copy(Current, 1, 5) = 'tree:')
+       and (Copy(ASnapshot.Contents[i], 1, 5) = 'tree:') then
+    begin
+      Entry := FirstChangedListingEntry(Copy(ASnapshot.Contents[i], 6, MaxInt),
+        Copy(Current, 6, MaxInt));
+      if Entry <> '' then
+        Result := IncludeTrailingPathDelimiter(Result) + Entry;
+    end;
+    Exit;
+  end;
+  Result := '';
 end;
 
 procedure AddField(AFields: TStrings; const AName, AValue: string);

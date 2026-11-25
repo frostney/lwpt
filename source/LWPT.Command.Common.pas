@@ -41,6 +41,12 @@ function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AConfigurationFile: string = CFG_FILE): TProcess;
 procedure AppendCompilerEnvironmentSearchPaths(
   var AUnitPaths, AIncludePaths: TStringArray);
+{ The unit and include search paths a Pascal source compile receives:
+  AUnitPaths, then AConfigurationFile's unit directories, then the
+  LWPT_FPC_UNIT_PATHS environment additions. }
+procedure PascalSourceSearchPaths(const AUnitPaths: array of string;
+  const AConfigurationFile: string;
+  out AUnitSearchPaths, AIncludeSearchPaths: TStringArray);
 { True when AHook must run: it declares no staleness gate (inputs plus
   output), its output is missing, or an input is not older than the output.
   Times are compared at full filesystem resolution; see HookIsStale in the
@@ -103,6 +109,31 @@ begin
     end;
 end;
 
+procedure PascalSourceSearchPaths(const AUnitPaths: array of string;
+  const AConfigurationFile: string;
+  out AUnitSearchPaths, AIncludeSearchPaths: TStringArray);
+var
+  ConfigurationUnitPaths: TStringArray;
+  i, UnitPathCount: Integer;
+begin
+  SetLength(ConfigurationUnitPaths, 0);
+  AppendUnitDirsFromCfg(AConfigurationFile, ConfigurationUnitPaths);
+  UnitPathCount := Length(AUnitPaths) + Length(ConfigurationUnitPaths);
+  SetLength(AUnitSearchPaths, UnitPathCount);
+  SetLength(AIncludeSearchPaths, UnitPathCount);
+  for i := 0 to High(AUnitPaths) do
+  begin
+    AUnitSearchPaths[i] := AUnitPaths[i];
+    AIncludeSearchPaths[i] := AUnitPaths[i];
+  end;
+  for i := 0 to High(ConfigurationUnitPaths) do
+  begin
+    AUnitSearchPaths[Length(AUnitPaths) + i] := ConfigurationUnitPaths[i];
+    AIncludeSearchPaths[Length(AUnitPaths) + i] := ConfigurationUnitPaths[i];
+  end;
+  AppendCompilerEnvironmentSearchPaths(AUnitSearchPaths, AIncludeSearchPaths);
+end;
+
 function CreatePascalCompilerProcess(const ASrcFile: string;
   const AUnitPaths, AExtraArguments: array of string; out AOutBin: string;
   out ARequest: TLWPTBuildRequest; const ABuildRoot: string;
@@ -112,8 +143,7 @@ var
   Arguments: LWPT.Core.TStringArray;
   BuildDir: string;
   Capabilities: TLWPTCompilerCapabilities;
-  ConfigurationUnitPaths: TStringArray;
-  i, UnitPathCount: Integer;
+  i: Integer;
   ScanDirs: TStringArray;
 
   function SourceBuildKey(const APath: string): string;
@@ -142,28 +172,11 @@ begin
     { Describe the compilation before the selected driver adapts it. }
     ARequest := ADriver.CreateBuildRequest(ASrcFile, AOutBin);
     AOutBin := ARequest.Outputs.Artifact;
-    SetLength(ConfigurationUnitPaths, 0);
-    AppendUnitDirsFromCfg(AConfigurationFile, ConfigurationUnitPaths);
-    UnitPathCount := Length(AUnitPaths) + Length(ConfigurationUnitPaths);
-    SetLength(ARequest.Inputs.UnitPaths, UnitPathCount);
-    SetLength(ARequest.Inputs.IncludePaths, UnitPathCount);
-    for i := 0 to High(AUnitPaths) do
-    begin
-      ARequest.Inputs.UnitPaths[i] := AUnitPaths[i];
-      ARequest.Inputs.IncludePaths[i] := AUnitPaths[i];
-    end;
-    for i := 0 to High(ConfigurationUnitPaths) do
-    begin
-      ARequest.Inputs.UnitPaths[Length(AUnitPaths) + i] :=
-        ConfigurationUnitPaths[i];
-      ARequest.Inputs.IncludePaths[Length(AUnitPaths) + i] :=
-        ConfigurationUnitPaths[i];
-    end;
+    PascalSourceSearchPaths(AUnitPaths, AConfigurationFile,
+      ARequest.Inputs.UnitPaths, ARequest.Inputs.IncludePaths);
     SetLength(ARequest.Inputs.ExtraArguments, Length(AExtraArguments));
     for i := 0 to High(AExtraArguments) do
       ARequest.Inputs.ExtraArguments[i] := AExtraArguments[i];
-    AppendCompilerEnvironmentSearchPaths(ARequest.Inputs.UnitPaths,
-      ARequest.Inputs.IncludePaths);
     ARequest.Outputs.ExecutableDirectory := BuildDir;
     ARequest.Outputs.UnitDirectory := BuildDir + '/units';
     ARequest.Outputs.ObjectDirectory := BuildDir + '/units';

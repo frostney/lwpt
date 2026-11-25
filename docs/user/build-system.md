@@ -542,6 +542,27 @@ hook is not part of that invocation. With no selector every discovered program
 runs; with selectors every match runs, without path-derived groups or skips. See
 [ADR-0034](../adr/0034-freeze-test-selection-before-pretest.md).
 
+Once `[pretest]` has finished, the invocation's compiler inputs must hold
+still. Before any program compiles or reuses a cached executable, `lwpt test`
+records the content of every path a selected program's compile can read: the
+paths the test cache fingerprint covers (manifest, cfg, lockfile, installed
+modules, unit, include, and workspace paths, `LWPT_FPC_UNIT_PATHS`,
+project-root files, and each selected program's source file and directory),
+with session staging and declared build outputs excluded, each hashed once.
+Every program checks that record again after its executable exists, compiled
+or reused, and before it runs, and also when its compile fails. If anything
+changed, that program is reported as `VOID` with the first changed file, every
+other program still running or not yet started is cancelled, and the command
+exits 1 with `run void: compiler inputs changed after it started (<path>)` in
+its summary. One invocation therefore never reports results from two source
+states, and a compile that read a half-edited file is reported as void rather
+than as a compile failure. Content decides, not timestamps: rewriting a file
+with identical bytes does not void the run, and a file LWPT cannot read is
+recorded by its size and modification time. Test programs must not write into
+a compiler-input directory such as their own source directory; write scratch
+files to a temporary or build directory. `lwpt build` has no such check,
+because its prebuild hooks may generate inputs between entries.
+
 LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](../adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`, and a `[pretest]` `lwpt-testing` hook that runs `./build/lwpt build lwpt-testing` so the test-flavoured binary is current before any test program spawns it ([ADR-0044](../adr/0044-test-seams-only-in-test-builds.md)).
 
 ## Pre-commit hook (Lefthook)

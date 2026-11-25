@@ -96,9 +96,11 @@ type
     ExcludedPaths: TStringArray;
   end;
 
+  { tjsVoided: the job found that compiler inputs changed after the run
+    started, so the run's results no longer describe one source state. }
   TTestJobStatus = (tjsPending, tjsCompiling, tjsRunning, tjsPassed,
     tjsCompileFailed, tjsRunFailed, tjsCancelled,
-    tjsWorkerError);
+    tjsWorkerError, tjsVoided);
 
   TTestJob = record
     Source: string;
@@ -125,6 +127,7 @@ type
     ExitCode: Integer;
     Status: TTestJobStatus;
     StartedAt: QWord;
+    RunVoided: Boolean;
   end;
 
   TTestScheduler = class;
@@ -163,6 +166,10 @@ type
     FCacheContext: TLWPTTestCacheContext;
     FStartedReported: array of Boolean;
     FTerminalReported: array of Boolean;
+    FRunInputs: TLWPTInputSnapshot;
+    FVoidedInput: string;
+    procedure CaptureRunInputs;
+    function VoidIfInputsChanged(const AIndex: Integer): Boolean;
     function ClaimJob(out AIndex: Integer): Boolean;
     function AcquireLease: TLWPTWorkerLease;
     function StartProcess(const AIndex: Integer;
@@ -206,10 +213,12 @@ type
     destructor Destroy; override;
     procedure Run;
     procedure PrintResults(const AProjectRoot: string; out APassed,
-      AFailed, ACompileFailed, ACancelled: Integer);
+      AFailed, ACompileFailed, ACancelled, AVoided: Integer);
     function InventoryJSON(const AProjectRoot: string): string;
     procedure ValidateInventory(const AProjectRoot: string);
     property InternalError: string read FInternalError;
+    { The project-relative input that voided the run, or ''. }
+    property VoidedInput: string read FVoidedInput;
     function EffectiveWorkerCount: Integer;
   end;
 
@@ -456,6 +465,88 @@ begin
   FBudgetSession.Free;
   DoneCriticalSection(FCriticalSection);
   inherited Destroy;
+end;
+
+function InputDisplayPath(const AProjectRoot, APath: string): string;
+begin
+  if PathContains(AProjectRoot, APath) then
+    Result := CanonicalPathGlob(ExtractRelativePath(
+      IncludeTrailingPathDelimiter(AProjectRoot), APath))
+  else
+    Result := APath;
+end;
+
+{ One fingerprint of everything any selected job's compile can read, taken
+  after pretest and before any job compiles or reuses a cached result: the
+  union of the per-program cache fingerprint's paths, each hashed once. }
+procedure TTestScheduler.CaptureRunInputs;
+var
+  IncludeSearchPaths, Paths, UnitSearchPaths: TStringArray;
+
+  procedure AddPath(const APath: string);
+  begin
+    SetLength(Paths, Length(Paths) + 1);
+    Paths[High(Paths)] := APath;
+  end;
+
+  procedure AddPaths(const APaths: TStringArray);
+  var
+    i: Integer;
+  begin
+    for i := 0 to High(APaths) do AddPath(APaths[i]);
+  end;
+
+var
+  i: Integer;
+begin
+  SetLength(Paths, 0);
+  AddPath(FCacheContext.ManifestPath);
+  AddPath(FCacheContext.ConfigurationPath);
+  AddPath(LOCKFILE);
+  AddPath(FCacheContext.ModulesPath);
+  AddPaths(FCacheContext.CompilerImplicitInputs);
+  AddPaths(FCacheContext.WorkspacePaths);
+  PascalSourceSearchPaths(FUnitPaths, FCacheContext.ConfigurationPath,
+    UnitSearchPaths, IncludeSearchPaths);
+  AddPaths(UnitSearchPaths);
+  AddPaths(IncludeSearchPaths);
+  for i := 0 to High(FJobs) do
+  begin
+    AddPath(FJobs[i].Source);
+    AddPath(ExtractFileDir(FJobs[i].Source));
+  end;
+  FRunInputs := CaptureInputSnapshot(FProjectRoot, Paths,
+    FCacheContext.ExcludedPaths);
+end;
+
+{ Called by every job once its executable exists (compiled or reused) and
+  before it runs, and when a compile fails. A changed input voids the job and
+  stops the run: results from before and after the change must not be
+  reported together. }
+function TTestScheduler.VoidIfInputsChanged(const AIndex: Integer): Boolean;
+var
+  Changed: string;
+begin
+  Changed := FirstChangedInput(FProjectRoot, FRunInputs,
+    FCacheContext.ExcludedPaths);
+  Result := Changed <> '';
+  if not Result then Exit;
+  Changed := InputDisplayPath(FProjectRoot, Changed);
+  EnterCriticalSection(FCriticalSection);
+  try
+    if FJobs[AIndex].Status <> tjsWorkerError then
+    begin
+      FJobs[AIndex].Status := tjsVoided;
+      FJobs[AIndex].ExitCode := 1;
+      FJobs[AIndex].ErrorMessage := 'compiler inputs changed after this '
+        + 'test run started (' + Changed + '); its results are void; rerun '
+        + PROGRAM_NAME + ' test';
+    end;
+    if FVoidedInput = '' then FVoidedInput := Changed;
+    if not FCancelled then CancelPendingAndActiveLocked;
+  finally
+    LeaveCriticalSection(FCriticalSection);
+  end;
 end;
 
 function TTestScheduler.ClaimJob(out AIndex: Integer): Boolean;
@@ -1076,8 +1167,9 @@ begin
               if CaptureFingerprint <> CacheFingerprint then
               begin
                 CompilerProcess.Free;
-                FailJob(AIndex, tjsCompileFailed, 1,
-                  'inputs changed while waiting for cached test program');
+                if not VoidIfInputsChanged(AIndex) then
+                  FailJob(AIndex, tjsCompileFailed, 1,
+                    'inputs changed while waiting for cached test program');
                 Exit;
               end;
               if AcceptCachedResult('cache wait hit') then
@@ -1102,8 +1194,9 @@ begin
               begin
                 CompilerProcess.Free;
                 FreeAndNil(ProducerLease);
-                FailJob(AIndex, tjsCompileFailed, 1,
-                  'inputs changed while waiting for cached test program');
+                if not VoidIfInputsChanged(AIndex) then
+                  FailJob(AIndex, tjsCompileFailed, 1,
+                    'inputs changed while waiting for cached test program');
                 Exit;
               end;
               if FCacheContext.Cache.Materialize(CacheFingerprint,
@@ -1177,7 +1270,8 @@ begin
     begin
       FreeAndNil(ProducerLease);
       SetJobOutput(AIndex, True, E.Message);
-      FailJob(AIndex, tjsCompileFailed, 1, E.Message);
+      if not VoidIfInputsChanged(AIndex) then
+        FailJob(AIndex, tjsCompileFailed, 1, E.Message);
       Exit;
     end;
   end;
@@ -1185,6 +1279,13 @@ begin
   begin
     FreeAndNil(ProducerLease);
     CompleteJob(AIndex, tjsCancelled);
+    Exit;
+  end;
+  { The executable now exists, compiled or reused, and nothing has run it.
+    A compile that failed on a half-edited file is void, not a failure. }
+  if VoidIfInputsChanged(AIndex) then
+  begin
+    FreeAndNil(ProducerLease);
     Exit;
   end;
   if not BuildResult.Success then
@@ -1299,7 +1400,7 @@ end;
 function IsTerminalTestStatus(const AStatus: TTestJobStatus): Boolean; inline;
 begin
   Result := AStatus in [tjsPassed, tjsCompileFailed, tjsRunFailed,
-    tjsCancelled, tjsWorkerError];
+    tjsCancelled, tjsWorkerError, tjsVoided];
 end;
 
 function TTestScheduler.AllJobsTerminal: Boolean;
@@ -1348,6 +1449,7 @@ begin
         AEvent.ExitCode := FJobs[i].ExitCode;
         AEvent.Status := FJobs[i].Status;
         AEvent.StartedAt := FJobs[i].StartedAt;
+        AEvent.RunVoided := FVoidedInput <> '';
         Exit(True);
       end;
     Result := False;
@@ -1359,10 +1461,12 @@ end;
 procedure TTestScheduler.PrintProgressEvent(
   const AEvent: TTestProgressEvent);
 var
-  Detail, LogOutput, LogReference: string;
+  CancelReason, Detail, LogOutput, LogReference: string;
   JobEvent: TLWPTJobEvent;
   JobState: TLWPTJobState;
 begin
+  if AEvent.RunVoided then CancelReason := 'run void: inputs changed'
+  else CancelReason := 'bail threshold reached';
   LogReference := FSession.JobLogReference(
     ObservabilityTestIdentityNamespace + AEvent.Source);
   if AEvent.Kind = tpkStart then
@@ -1382,7 +1486,7 @@ begin
     JobEvent := TLWPTJobEvent.Create(
       ObservabilityTestIdentityNamespace + AEvent.Source,
       FSession.SessionID, ojsSkipped, 0, 0,
-      'bail threshold reached before start', '');
+      CancelReason + ' before start', '');
     try
       FReporter.ReportJob(JobEvent, '', '', FVerbose);
     finally
@@ -1410,12 +1514,17 @@ begin
     tjsCancelled:
       begin
         JobState := ojsSkipped;
-        Detail := 'bail threshold reached';
+        Detail := CancelReason;
       end;
     tjsWorkerError:
       begin
         JobState := ojsFailed;
         Detail := 'scheduler error';
+      end;
+    tjsVoided:
+      begin
+        JobState := ojsFailed;
+        Detail := 'inputs changed';
       end;
   end;
   JobEvent := TLWPTJobEvent.Create(
@@ -1441,6 +1550,7 @@ var
   InvocationStartedAt, NowTick: QWord;
   HeartbeatEvent: TLWPTHeartbeatEvent;
 begin
+  CaptureRunInputs;
   InvocationStartedAt := GetTickCount64;
   FReporter.StartHeartbeatClock(InvocationStartedAt, InvocationStartedAt);
   Started := 0;
@@ -1496,15 +1606,18 @@ begin
 end;
 
 procedure TTestScheduler.PrintResults(const AProjectRoot: string;
-  out APassed, AFailed, ACompileFailed, ACancelled: Integer);
+  out APassed, AFailed, ACompileFailed, ACancelled, AVoided: Integer);
 var
   i: Integer;
-  DisplayPath: string;
+  CancelReason, DisplayPath: string;
 begin
   APassed := 0;
   AFailed := 0;
   ACompileFailed := 0;
   ACancelled := 0;
+  AVoided := 0;
+  if FVoidedInput <> '' then CancelReason := 'run void: inputs changed'
+  else CancelReason := 'bail threshold reached';
   for i := 0 to High(FJobs) do
   begin
     DisplayPath := ExtractRelativePath(
@@ -1528,13 +1641,18 @@ begin
         end;
       tjsCancelled:
         begin
-          WriteLn('cancelled (bail threshold reached)');
+          WriteLn('cancelled (', CancelReason, ')');
           Inc(ACancelled);
         end;
       tjsWorkerError:
         begin
           WriteLn('ERROR (', FJobs[i].ErrorMessage, ')');
           Inc(AFailed);
+        end;
+      tjsVoided:
+        begin
+          WriteLn('VOID (', FJobs[i].ErrorMessage, ')');
+          Inc(AVoided);
         end;
     else
       begin
@@ -1597,7 +1715,7 @@ begin
           + IntToStr(AJob.ExitCode);
     tjsCancelled:
       Result := 'cancelled before its inventory record was read';
-    tjsWorkerError:
+    tjsWorkerError, tjsVoided:
       Result := AJob.ErrorMessage;
   else
     Result := 'did not complete';
@@ -1770,6 +1888,16 @@ begin
   end;
 end;
 
+{ The summary's void clause; empty for a run whose inputs held still, so
+  its summary line keeps the established format. }
+function RunVoidSummary(const AVoided: Integer;
+  const AVoidedInput: string): string;
+begin
+  if AVoidedInput = '' then Exit('');
+  Result := ', ' + IntToStr(AVoided) + ' void; run void: compiler inputs '
+    + 'changed after it started (' + AVoidedInput + ')';
+end;
+
 function CmdTest(const AManifestPath: string;
   const AJobs, ABail: Integer; const AVerbose, AInventory: Boolean;
   const ASelectors: TStrings; const AUseCache: Boolean): Integer;
@@ -1789,8 +1917,8 @@ var
   DiscoveredTests, Tests: TStringList;
   UnitPaths: TStringArray;
   ModulesRoot, ProjectRoot, CollisionFirst, CollisionSecond,
-    InventoryPath, ManifestContentHash: string;
-  i, n, Passed, Failed, CompileFailed, Cancelled,
+    InventoryPath, ManifestContentHash, VoidedInput: string;
+  i, n, Passed, Failed, CompileFailed, Cancelled, Voided,
     EffectiveBail: Integer;
   Session: TLWPTBuildSession;
   Scheduler: TTestScheduler;
@@ -1807,6 +1935,8 @@ begin
   Failed := 0;
   CompileFailed := 0;
   Cancelled := 0;
+  Voided := 0;
+  VoidedInput := '';
   CompilerSelection := nil;
   DiscoveredTests := nil;
   Tests := nil;
@@ -1966,6 +2096,11 @@ begin
         if not AInventory then
           WriteLn('effective workers: ', Scheduler.EffectiveWorkerCount);
         Scheduler.Run;
+        VoidedInput := Scheduler.VoidedInput;
+        if VoidedInput <> '' then
+          WriteLn(ErrOutput, PROGRAM_NAME, ' test: compiler inputs changed ',
+            'after this test run started (', VoidedInput, '); its results ',
+            'are void; rerun ', PROGRAM_NAME, ' test');
         Scheduler.ValidateInventory(ProjectRoot);
         if AInventory then
         begin
@@ -1974,7 +2109,7 @@ begin
         end
         else
           Scheduler.PrintResults(ProjectRoot, Passed, Failed, CompileFailed,
-            Cancelled);
+            Cancelled, Voided);
         if Scheduler.InternalError <> '' then
           WriteLn(ErrOutput, PROGRAM_NAME, ' test: scheduler error: ',
             Scheduler.InternalError);
@@ -1982,14 +2117,16 @@ begin
         Scheduler.Free;
       end;
 
-      if (Failed = 0) and (CompileFailed = 0) and (Cancelled = 0) then
+      if (Failed = 0) and (CompileFailed = 0) and (Cancelled = 0)
+         and (Voided = 0) and (VoidedInput = '') then
         Result := 0
       else
         Result := 1;
     if not AInventory then RunHooks('posttest', Man.PostTest, ProjectRoot);
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
-      + IntToStr(Cancelled) + ' cancelled');
+      + IntToStr(Cancelled) + ' cancelled' + RunVoidSummary(Voided,
+        VoidedInput));
       finally
         Session.Free;
       end;
@@ -2007,7 +2144,8 @@ begin
     CompilerSelection.Free;
     if not AInventory then
       WriteLn('summary: ', Passed, ' passed, ', Failed, ' failed, ',
-        CompileFailed, ' did not compile, ', Cancelled, ' cancelled; elapsed ',
+        CompileFailed, ' did not compile, ', Cancelled, ' cancelled',
+        RunVoidSummary(Voided, VoidedInput), '; elapsed ',
         FormatElapsedMilliseconds(GetTickCount64 - StartedAt));
   end;
 end;
