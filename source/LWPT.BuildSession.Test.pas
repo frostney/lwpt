@@ -9,6 +9,7 @@ uses
   BaseUnix,
   {$ENDIF}
   Classes,
+  Process,
   SysUtils,
 
   TestingPascalLibrary,
@@ -19,22 +20,6 @@ uses
   LWPT.Core;
 
 type
-  { Runs one snapshot and recheck off the test thread, so a snapshot that
-    blocks can be detected and released instead of hanging the program. }
-  TSnapshotThread = class(TThread)
-  private
-    FRoot: string;
-    FPaths: TStringArray;
-    FChanged: string;
-    FError: string;
-  protected
-    procedure Execute; override;
-  public
-    constructor Create(const ARoot: string; const APaths: TStringArray);
-    property Changed: string read FChanged;
-    property Error: string read FError;
-  end;
-
   TLWPTBuildSessionTests = class(TTestSuite)
   private
     FScratch: string;
@@ -71,7 +56,9 @@ type
     procedure TestCacheFingerprintSeparatesOperationIdentity;
     procedure TestPublicationLockUsesSessionsRoot;
     procedure TestInputSnapshotNamesChangedFiles;
+    procedure TestCaptureInputFileMatchesSnapshot;
     {$IFDEF UNIX}
+    procedure TestCaptureInputFileRefusesSpecialFiles;
     procedure TestInputSnapshotRecordsUnreadableFiles;
     procedure TestInputSnapshotNeverOpensSpecialFiles;
     procedure TestSymlinkedSearchRootChangeRefusesPublication;
@@ -85,24 +72,97 @@ type
     procedure TestRepairUsesHistoricalRelocatedRootsOnly;
   end;
 
-constructor TSnapshotThread.Create(const ARoot: string;
-  const APaths: TStringArray);
-begin
-  FRoot := ARoot;
-  FPaths := Copy(APaths, 0, Length(APaths));
-  FreeOnTerminate := False;
-  inherited Create(False);
-end;
+const
+  { Runs one input scan in a child process (see RunScanHelper):
+    "snapshot <root> <path>..." takes a snapshot and rechecks it, and
+    "capture <root> <path>" reads one file through CaptureInputFile. }
+  SCAN_HELPER_ARGUMENT = '--input-scan-helper';
 
-procedure TSnapshotThread.Execute;
+procedure RunScanHelperMode;
 var
+  Content, Outcome: string;
+  Paths: TStringArray;
   Snapshot: TLWPTInputSnapshot;
+  i: Integer;
 begin
   try
-    Snapshot := CaptureInputSnapshot(FRoot, FPaths, nil);
-    FChanged := FirstChangedInput(FRoot, Snapshot, nil);
+    { Each result is complete before anything is printed, so a scan that
+      raises prints only its error. }
+    if ParamStr(2) = 'capture' then
+    begin
+      Outcome := CaptureInputFile(ParamStr(3), ParamStr(4), Content);
+      WriteLn('state=', Outcome);
+    end
+    else
+    begin
+      SetLength(Paths, ParamCount - 3);
+      for i := 4 to ParamCount do Paths[i - 4] := ParamStr(i);
+      Snapshot := CaptureInputSnapshot(ParamStr(3), Paths, nil);
+      Outcome := FirstChangedInput(ParamStr(3), Snapshot, nil);
+      WriteLn('changed=', Outcome);
+    end;
   except
-    on E: Exception do FError := E.ClassName + ': ' + E.Message;
+    on E: Exception do WriteLn('error=', E.ClassName, ': ', E.Message);
+  end;
+  Halt(0);
+end;
+
+{$IFDEF UNIX}
+{ Runs this program in scan-helper mode and returns its output. A scan that
+  blocks, for example in open() on a FIFO, cannot be interrupted from a
+  thread of this process, so the helper is a child that is killed and
+  reaped at the deadline: ATimedOut then reports the block and the test
+  fails instead of hanging. }
+function RunScanHelper(const AArguments: array of string;
+  out ATimedOut: Boolean): string;
+const
+  HELPER_DEADLINE_MILLISECONDS = 30000;
+  { SIGKILL cannot be caught, so a killed helper is reaped at once. }
+  HELPER_REAP_MILLISECONDS = 10000;
+var
+  Helper: TProcess;
+  Output: TStringList;
+  i: Integer;
+begin
+  Result := '';
+  Helper := TProcess.Create(nil);
+  try
+    Helper.Executable := ParamStr(0);
+    Helper.Parameters.Add(SCAN_HELPER_ARGUMENT);
+    for i := 0 to High(AArguments) do Helper.Parameters.Add(AArguments[i]);
+    Helper.Options := [poUsePipes, poStderrToOutPut];
+    Helper.Execute;
+    ATimedOut := not Helper.WaitOnExit(HELPER_DEADLINE_MILLISECONDS);
+    if ATimedOut then
+    begin
+      FpKill(Helper.ProcessID, SIGKILL);
+      if not Helper.WaitOnExit(HELPER_REAP_MILLISECONDS) then
+        raise Exception.Create('input scan helper survived SIGKILL');
+      Exit;
+    end;
+    Output := TStringList.Create;
+    try
+      Output.LoadFromStream(Helper.Output);
+      Result := Trim(Output.Text);
+    finally
+      Output.Free;
+    end;
+  finally
+    Helper.Free;
+  end;
+end;
+{$ENDIF}
+
+{ Writes AContent byte for byte, with no line-ending translation. }
+procedure WriteBytes(const APath, AContent: string);
+var
+  Stream: TFileStream;
+begin
+  Stream := TFileStream.Create(APath, fmCreate);
+  try
+    if AContent <> '' then Stream.WriteBuffer(AContent[1], Length(AContent));
+  finally
+    Stream.Free;
   end;
 end;
 
@@ -323,6 +383,39 @@ begin
     .ToBe(ExpandFileName(FScratch + '/' + MANIFEST_FILE));
 end;
 
+procedure TLWPTBuildSessionTests.TestCaptureInputFileMatchesSnapshot;
+var
+  Content: string;
+  Paths: TStringArray;
+  Snapshot: TLWPTInputSnapshot;
+  State: string;
+begin
+  ResetScratch;
+  WriteBytes(FScratch + '/lwpt.cfg', '-Fuunits'#10'-Fiincs'#0'bytes'#10);
+  SetLength(Paths, 2);
+  Paths[0] := 'lwpt.cfg';
+  Paths[1] := 'absent.cfg';
+  Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
+  { The bytes read once and the state they hash to are what the snapshot
+    records for the same file. }
+  State := CaptureInputFile(FScratch, 'lwpt.cfg', Content);
+  Expect<string>(Content).ToBe('-Fuunits'#10'-Fiincs'#0'bytes'#10);
+  Expect<string>(State).ToBe(InputSnapshotState(FScratch, Snapshot,
+    'lwpt.cfg'));
+  Expect<string>(State).ToBe(InputSnapshotState(FScratch, Snapshot,
+    FScratch + '/lwpt.cfg'));
+  Expect<string>(CaptureInputFile(FScratch, 'absent.cfg', Content))
+    .ToBe('missing');
+  Expect<string>(Content).ToBe('');
+  Expect<string>(InputSnapshotState(FScratch, Snapshot, 'absent.cfg'))
+    .ToBe('missing');
+  Expect<string>(InputSnapshotState(FScratch, Snapshot, 'other.cfg'))
+    .ToBe('');
+  WriteBytes(FScratch + '/lwpt.cfg', '-Fuother'#10);
+  Expect<Boolean>(CaptureInputFile(FScratch, 'lwpt.cfg', Content) = State)
+    .ToBe(False);
+end;
+
 {$IFDEF UNIX}
 procedure TLWPTBuildSessionTests.TestInputSnapshotRecordsUnreadableFiles;
 var
@@ -372,48 +465,42 @@ begin
 end;
 
 procedure TLWPTBuildSessionTests.TestInputSnapshotNeverOpensSpecialFiles;
-const
-  SNAPSHOT_DEADLINE_MILLISECONDS = 30000;
 var
+  Output: string;
   Paths: TStringArray;
   Snapshot: TLWPTInputSnapshot;
-  StartedAt: QWord;
-  Worker: TSnapshotThread;
-  Writer: LongInt;
+  TimedOut: Boolean;
 begin
   ResetScratch;
   WriteText(FScratch + '/source/app.pas', 'begin end.');
-  { Opening a FIFO with no writer blocks. The snapshot runs in a thread with
-    a deadline; if it blocks, opening the FIFO for writing releases it so
-    the test fails instead of hanging. }
+  { Opening a FIFO with no writer blocks, so both scans run in a helper
+    process that the deadline kills. }
   Expect<Integer>(FpMkfifo(FScratch + '/source/pipe', &600)).ToBe(0);
+  Output := RunScanHelper(['snapshot', FScratch, 'source', 'source/pipe'],
+    TimedOut);
+  if TimedOut then Fail('input snapshot blocked opening a FIFO');
+  Expect<string>(Output).ToBe('changed=');
   SetLength(Paths, 2);
   Paths[0] := 'source';
   Paths[1] := 'source/pipe';
-  Worker := TSnapshotThread.Create(FScratch, Paths);
-  try
-    StartedAt := GetTickCount64;
-    while not Worker.Finished
-          and (GetTickCount64 - StartedAt < SNAPSHOT_DEADLINE_MILLISECONDS) do
-      Sleep(10);
-    if not Worker.Finished then
-    begin
-      Writer := FpOpen(FScratch + '/source/pipe', O_WRONLY or O_NONBLOCK);
-      if Writer >= 0 then FpClose(Writer);
-      Worker.WaitFor;
-      Fail('input snapshot blocked opening a FIFO');
-    end;
-    Worker.WaitFor;
-    Expect<string>(Worker.Error).ToBe('');
-    Expect<string>(Worker.Changed).ToBe('');
-  finally
-    Worker.Free;
-  end;
   Snapshot := CaptureInputSnapshot(FScratch, Paths, nil);
   Expect<Integer>(Length(Snapshot.Paths)).ToBe(2);
   WriteText(FScratch + '/source/app.pas', 'begin WriteLn; end.');
   Expect<string>(FirstChangedInput(FScratch, Snapshot, nil))
     .ToBe(ExpandFileName(FScratch + '/source') + PathDelim + 'app.pas');
+end;
+
+procedure TLWPTBuildSessionTests.TestCaptureInputFileRefusesSpecialFiles;
+var
+  Output: string;
+  TimedOut: Boolean;
+begin
+  ResetScratch;
+  Expect<Integer>(FpMkfifo(FScratch + '/pipe.cfg', &600)).ToBe(0);
+  Output := RunScanHelper(['capture', FScratch, 'pipe.cfg'], TimedOut);
+  if TimedOut then Fail('reading one input file blocked opening a FIFO');
+  Expect<string>(Output).ToBe('error=ELWPTError: pipe.cfg is not a '
+    + 'regular file');
 end;
 {$ENDIF}
 
@@ -1272,7 +1359,11 @@ begin
     TestPublicationLockUsesSessionsRoot);
   Test('input snapshots hash each path once and name changed files',
     TestInputSnapshotNamesChangedFiles);
+  Test('one read of an input file states what the snapshot records',
+    TestCaptureInputFileMatchesSnapshot);
   {$IFDEF UNIX}
+  Test('reading one input file refuses special files without blocking',
+    TestCaptureInputFileRefusesSpecialFiles);
   Test('input snapshots record unreadable files without failing',
     TestInputSnapshotRecordsUnreadableFiles);
   Test('input snapshots never open special files',
@@ -1297,6 +1388,8 @@ begin
 end;
 
 begin
+  if (ParamCount >= 3) and (ParamStr(1) = SCAN_HELPER_ARGUMENT) then
+    RunScanHelperMode;
   TestRunnerProgram.AddSuite(TLWPTBuildSessionTests.Create(
     'build sessions and publication'));
   TestRunnerProgram.Run;

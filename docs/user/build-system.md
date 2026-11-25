@@ -549,19 +549,27 @@ cache fingerprint covers (manifest, cfg, lockfile, installed modules, unit,
 include, and workspace paths, `LWPT_FPC_UNIT_PATHS`, project-root files, and
 each selected program's source file and directory), plus the unit, include,
 object, and library directories that the cfg file, `[test]` flags, or the
-selected compiler profile's `args` name. A search path that lists several
-directories is split at `;`, and an entry with a wildcard or a `$FPC...`
-macro is watched through its fixed leading directory. A file a program reads
+selected compiler profile's `args` name. Those options are read as FPC 3.2
+reads them: entries split at `;`, and outside Windows also at `:`; Pascal
+quotes removed; and a leading `=` read against an empty sysroot, except in
+`-Fl`, whose `=` entries are watched below every `-XR` sysroot those options
+set and below none. An entry with a `*` wildcard or a `$` macro is watched
+through its fixed leading directory. A file a program reads
 from outside this set, such as `{$I ../elsewhere/Value.inc}`, is not watched.
 Session staging and declared build outputs, including outputs at the project
 root, are excluded, and each path is hashed once. A file that appears at the
-project root also counts as a change.
+project root also counts as a change. The cfg file is read once for the
+record, without blocking, and must be a regular file; otherwise the command
+stops before any program starts. Every program compiles from the run's copy
+of those bytes, so a cfg edited, replaced, or removed during the run voids
+the run instead of reaching a compile.
 
 Every program checks that record again after its executable exists, compiled
 or reused, and before it runs, and also when its compile or compile
 preparation fails. If anything changed, that program is reported as `VOID`
 with the first changed file, every other program still running or not yet
-started is cancelled, and the command exits 1 with
+started is cancelled (a program whose compiler the void terminated counts as
+cancelled, whatever that compiler printed), and the command exits 1 with
 `run void: compiler inputs changed after it started (<path>)` in its summary.
 A program whose cached-compile fingerprint moved while it compiled voids the
 run in the same way, even if the inputs moved back before the check. A

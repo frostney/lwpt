@@ -111,6 +111,16 @@ function CaptureInputSnapshot(const AProjectRoot: string;
 function FirstChangedInput(const AProjectRoot: string;
   const ASnapshot: TLWPTInputSnapshot;
   const AExcludedPaths: TStringArray): string;
+{ Read the file at APath (relative paths resolve against AProjectRoot) once,
+  without blocking, and return the state an input snapshot records for it,
+  with the bytes that state describes in AContent: 'missing' and no content
+  when nothing or a directory is there. Raises ELWPTError when the path is
+  another kind of special file or cannot be read. }
+function CaptureInputFile(const AProjectRoot, APath: string;
+  out AContent: string): string;
+{ The state ASnapshot recorded for APath, or '' when it has no such path. }
+function InputSnapshotState(const AProjectRoot: string;
+  const ASnapshot: TLWPTInputSnapshot; const APath: string): string;
 function BuildSessionPathKey(const AValue: string): string;
 procedure AppendUnitDirsFromOptions(const AOptions: TStrings;
   var ADirs: TStringArray);
@@ -729,6 +739,77 @@ begin
   finally
     Digests.Free;
   end;
+end;
+
+function CaptureInputFile(const AProjectRoot, APath: string;
+  out AContent: string): string;
+var
+  Bytes: TMemoryStream;
+  Full: string;
+  Stream: TStream;
+  {$IFDEF UNIX}
+  Descriptor: LongInt;
+  Status: BaseUnix.Stat;
+  {$ENDIF}
+begin
+  AContent := '';
+  Full := RootedPath(AProjectRoot, APath);
+  if (Full = '') or not FileExists(Full) then Exit('missing');
+  {$IFDEF UNIX}
+  { Opening a FIFO for reading blocks until a writer appears, so open
+    without blocking and read only the regular file that descriptor names. }
+  Descriptor := OpenProtectedDescriptor(Full, O_RDONLY or O_NONBLOCK, 0);
+  if Descriptor < 0 then
+    raise ELWPTError.Create('cannot read ' + APath + ': '
+      + SysErrorMessage(FpGetErrNo));
+  if (FpFStat(Descriptor, Status) <> 0)
+     or not fpS_ISREG(Status.st_mode) then
+  begin
+    FpClose(Descriptor);
+    raise ELWPTError.Create(APath + ' is not a regular file');
+  end;
+  Stream := TLWPTProtectedFileStream.Create(THandle(Descriptor));
+  {$ELSE}
+  try
+    Stream := OpenProtectedFileStream(Full, fmOpenRead or fmShareDenyNone);
+  except
+    on E: Exception do
+      raise ELWPTError.Create('cannot read ' + APath + ': ' + E.Message);
+  end;
+  {$ENDIF}
+  Bytes := TMemoryStream.Create;
+  try
+    try
+      Bytes.CopyFrom(Stream, 0);
+    finally
+      Stream.Free;
+    end;
+    SetString(AContent, PAnsiChar(Bytes.Memory), Bytes.Size);
+    { The digest InputFileContent takes of the same bytes. }
+    Bytes.Position := 0;
+    Result := 'file:' + SHA256Stream(Bytes);
+  finally
+    Bytes.Free;
+  end;
+end;
+
+function InputSnapshotState(const AProjectRoot: string;
+  const ASnapshot: TLWPTInputSnapshot; const APath: string): string;
+var
+  Full: string;
+  i: Integer;
+begin
+  Result := '';
+  Full := RootedPath(AProjectRoot, APath);
+  if Full = '' then Exit;
+  Full := ExcludeTrailingPathDelimiter(Full);
+  for i := 0 to High(ASnapshot.Paths) do
+    {$IFDEF MSWINDOWS}
+    if SameText(ASnapshot.Paths[i], Full) then
+    {$ELSE}
+    if ASnapshot.Paths[i] = Full then
+    {$ENDIF}
+      Exit(ASnapshot.Contents[i]);
 end;
 
 procedure AddField(AFields: TStrings; const AName, AValue: string);

@@ -41,12 +41,19 @@ function  CreatePascalCompilerProcess(const ASrcFile: string;
   const AConfigurationFile: string = CFG_FILE): TProcess;
 procedure AppendCompilerEnvironmentSearchPaths(
   var AUnitPaths, AIncludePaths: TStringArray);
-{ The unit and include search paths a Pascal source compile receives:
-  AUnitPaths, then AConfigurationFile's unit directories, then the
-  LWPT_FPC_UNIT_PATHS environment additions. }
-procedure PascalSourceSearchPaths(const AUnitPaths: array of string;
-  const AConfigurationFile: string;
-  out AUnitSearchPaths, AIncludeSearchPaths: TStringArray);
+{ Appends the directories that the unit, include, object and library search
+  options among AOptions (-Fu, -Fi, -Fo, -Fl, -I) can make the compiler
+  read, resolved as FPC 3.2 resolves them. An option lists entries separated
+  by ";", and outside Windows also by ":". An entry may be Pascal-quoted. A
+  leading "=" names a path below the sysroot, which -XR sets for -Fl and
+  which is empty for every other option. "*" wildcards and "$" macros expand
+  when the compiler runs, so such an entry adds its fixed leading directory,
+  which holds every directory it can resolve to. An "=" entry of -Fl adds one
+  directory per -XR value in AOptions and one without a sysroot, because the
+  sysroot that applies depends on option order. An empty entry names the
+  current directory, which this adds nothing for. }
+procedure AppendCompilerSearchDirectories(const AOptions: array of string;
+  var ADirectories: TStringArray);
 { True when AHook must run: it declares no staleness gate (inputs plus
   output), its output is missing, or an input is not older than the output.
   Times are compared at full filesystem resolution; see HookIsStale in the
@@ -109,29 +116,123 @@ begin
     end;
 end;
 
-procedure PascalSourceSearchPaths(const AUnitPaths: array of string;
-  const AConfigurationFile: string;
-  out AUnitSearchPaths, AIncludeSearchPaths: TStringArray);
+procedure AppendCompilerSearchDirectories(const AOptions: array of string;
+  var ADirectories: TStringArray);
+const
+  SEARCH_OPTIONS: array[0..4] of string = ('-Fu', '-Fi', '-Fo', '-Fl', '-I');
+  SYSROOT_OPTION = '-XR';
 var
-  ConfigurationUnitPaths: TStringArray;
-  i, UnitPathCount: Integer;
+  Sysroots: TStringArray;
+
+  procedure AddDirectory(APath: string);
+  var
+    Count, Position: Integer;
+  begin
+    for Position := 1 to Length(APath) do
+      if APath[Position] in ['*', '?', '$'] then
+      begin
+        APath := Copy(APath, 1, Position - 1);
+        while (APath <> '') and not (APath[Length(APath)] in ['/', '\']) do
+          Delete(APath, Length(APath), 1);
+        if APath = '' then APath := '.';
+        Break;
+      end;
+    if APath = '' then Exit;
+    Count := Length(ADirectories);
+    SetLength(ADirectories, Count + 1);
+    ADirectories[Count] := APath;
+  end;
+
+  { FPC's DePascalQuote: a leading ' starts a quoted entry in which ''
+    stands for one quote; without its closing quote the entry stays as
+    written. }
+  function PascalUnquoted(const AEntry: string): string;
+  var
+    Position: Integer;
+  begin
+    Result := '';
+    Position := 2;
+    while Position <= Length(AEntry) do
+    begin
+      if AEntry[Position] = '''' then
+      begin
+        if (Position < Length(AEntry)) and (AEntry[Position + 1] = '''') then
+          Inc(Position)
+        else
+          Exit;
+      end;
+      Result := Result + AEntry[Position];
+      Inc(Position);
+    end;
+    Result := AEntry;
+  end;
+
+  procedure AddEntry(AEntry: string; const ALibrary: Boolean);
+  var
+    Bare: string;
+    i: Integer;
+  begin
+    AEntry := Trim(AEntry);
+    { A double-quoted entry reaches FPC as written, since no shell or
+      response-file reader removes the quotes: watch both spellings. }
+    if (Length(AEntry) >= 2) and (AEntry[1] = '"')
+       and (AEntry[Length(AEntry)] = '"') then
+      AddEntry(Copy(AEntry, 2, Length(AEntry) - 2), ALibrary)
+    else if (AEntry <> '') and (AEntry[1] = '''') then
+      AEntry := PascalUnquoted(AEntry);
+    if (AEntry = '') or (AEntry[1] <> '=') then
+    begin
+      AddDirectory(AEntry);
+      Exit;
+    end;
+    Bare := Copy(AEntry, 2, MaxInt);
+    if ALibrary then
+      for i := 0 to High(Sysroots) do AddDirectory(Sysroots[i] + Bare);
+    AddDirectory(Bare);
+  end;
+
+  procedure AddOption(const AOption: string);
+  var
+    Entries, Option: string;
+    i, Position, StartAt: Integer;
+  begin
+    Option := Trim(AOption);
+    for i := 0 to High(SEARCH_OPTIONS) do
+      if (Length(Option) > Length(SEARCH_OPTIONS[i]))
+         and (Copy(Option, 1, Length(SEARCH_OPTIONS[i]))
+           = SEARCH_OPTIONS[i]) then
+      begin
+        Entries := Copy(Option, Length(SEARCH_OPTIONS[i]) + 1, MaxInt);
+        StartAt := 1;
+        for Position := 1 to Length(Entries) + 1 do
+          if (Position > Length(Entries)) or (Entries[Position] = ';')
+             {$IFNDEF MSWINDOWS}or (Entries[Position] = ':'){$ENDIF} then
+          begin
+            AddEntry(Copy(Entries, StartAt, Position - StartAt),
+              SEARCH_OPTIONS[i] = '-Fl');
+            StartAt := Position + 1;
+          end;
+        Exit;
+      end;
+  end;
+
+var
+  Count, i: Integer;
+  Option: string;
 begin
-  SetLength(ConfigurationUnitPaths, 0);
-  AppendUnitDirsFromCfg(AConfigurationFile, ConfigurationUnitPaths);
-  UnitPathCount := Length(AUnitPaths) + Length(ConfigurationUnitPaths);
-  SetLength(AUnitSearchPaths, UnitPathCount);
-  SetLength(AIncludeSearchPaths, UnitPathCount);
-  for i := 0 to High(AUnitPaths) do
+  SetLength(Sysroots, 0);
+  for i := 0 to High(AOptions) do
   begin
-    AUnitSearchPaths[i] := AUnitPaths[i];
-    AIncludeSearchPaths[i] := AUnitPaths[i];
+    Option := Trim(AOptions[i]);
+    if (Length(Option) > Length(SYSROOT_OPTION))
+       and (Copy(Option, 1, Length(SYSROOT_OPTION)) = SYSROOT_OPTION) then
+    begin
+      Count := Length(Sysroots);
+      SetLength(Sysroots, Count + 1);
+      Sysroots[Count] := Copy(Option, Length(SYSROOT_OPTION) + 1, MaxInt);
+    end;
   end;
-  for i := 0 to High(ConfigurationUnitPaths) do
-  begin
-    AUnitSearchPaths[Length(AUnitPaths) + i] := ConfigurationUnitPaths[i];
-    AIncludeSearchPaths[Length(AUnitPaths) + i] := ConfigurationUnitPaths[i];
-  end;
-  AppendCompilerEnvironmentSearchPaths(AUnitSearchPaths, AIncludeSearchPaths);
+  for i := 0 to High(AOptions) do AddOption(AOptions[i]);
 end;
 
 function CreatePascalCompilerProcess(const ASrcFile: string;
@@ -143,7 +244,8 @@ var
   Arguments: LWPT.Core.TStringArray;
   BuildDir: string;
   Capabilities: TLWPTCompilerCapabilities;
-  i: Integer;
+  ConfigurationUnitPaths: TStringArray;
+  i, UnitPathCount: Integer;
   ScanDirs: TStringArray;
 
   function SourceBuildKey(const APath: string): string;
@@ -172,11 +274,28 @@ begin
     { Describe the compilation before the selected driver adapts it. }
     ARequest := ADriver.CreateBuildRequest(ASrcFile, AOutBin);
     AOutBin := ARequest.Outputs.Artifact;
-    PascalSourceSearchPaths(AUnitPaths, AConfigurationFile,
-      ARequest.Inputs.UnitPaths, ARequest.Inputs.IncludePaths);
+    SetLength(ConfigurationUnitPaths, 0);
+    AppendUnitDirsFromCfg(AConfigurationFile, ConfigurationUnitPaths);
+    UnitPathCount := Length(AUnitPaths) + Length(ConfigurationUnitPaths);
+    SetLength(ARequest.Inputs.UnitPaths, UnitPathCount);
+    SetLength(ARequest.Inputs.IncludePaths, UnitPathCount);
+    for i := 0 to High(AUnitPaths) do
+    begin
+      ARequest.Inputs.UnitPaths[i] := AUnitPaths[i];
+      ARequest.Inputs.IncludePaths[i] := AUnitPaths[i];
+    end;
+    for i := 0 to High(ConfigurationUnitPaths) do
+    begin
+      ARequest.Inputs.UnitPaths[Length(AUnitPaths) + i] :=
+        ConfigurationUnitPaths[i];
+      ARequest.Inputs.IncludePaths[Length(AUnitPaths) + i] :=
+        ConfigurationUnitPaths[i];
+    end;
     SetLength(ARequest.Inputs.ExtraArguments, Length(AExtraArguments));
     for i := 0 to High(AExtraArguments) do
       ARequest.Inputs.ExtraArguments[i] := AExtraArguments[i];
+    AppendCompilerEnvironmentSearchPaths(ARequest.Inputs.UnitPaths,
+      ARequest.Inputs.IncludePaths);
     ARequest.Outputs.ExecutableDirectory := BuildDir;
     ARequest.Outputs.UnitDirectory := BuildDir + '/units';
     ARequest.Outputs.ObjectDirectory := BuildDir + '/units';

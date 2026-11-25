@@ -168,6 +168,10 @@ type
     FTerminalReported: array of Boolean;
     FRunInputs: TLWPTInputSnapshot;
     FVoidedInput: string;
+    { The run's own copy of the compiler configuration file as the input
+      snapshot recorded it, or '' when the project has none. Jobs read this
+      copy, never the live file. }
+    FRunConfigurationPath: string;
     procedure CaptureRunInputs;
     function ChangedRunInput: string;
     function VoidRun(const AIndex: Integer; const AChanged: string): Boolean;
@@ -500,46 +504,13 @@ begin
   Result := False;
 end;
 
-{ The compiler configuration file's content at one moment, so the run can
-  tell whether it read one version throughout its capture. }
-function ConfigurationState(const APath: string): string;
-begin
-  if (APath = '') or not FileExists(APath) then Exit('missing');
-  try
-    Result := SHA256File(APath);
-  except
-    on E: Exception do Result := 'unreadable';
-  end;
-end;
-
-{ A compiler option that names directories the compiler searches: unit,
-  include, object or library paths. APath is the option's argument, which
-  may list several directories. }
-function CompilerFlagSearchPath(const AFlag: string;
-  out APath: string): Boolean;
-const
-  PREFIXES: array[0..4] of string = ('-Fu', '-Fi', '-Fo', '-Fl', '-I');
-var
-  i: Integer;
-begin
-  for i := 0 to High(PREFIXES) do
-    if (Length(AFlag) > Length(PREFIXES[i]))
-       and (Copy(AFlag, 1, Length(PREFIXES[i])) = PREFIXES[i]) then
-    begin
-      APath := Copy(AFlag, Length(PREFIXES[i]) + 1, MaxInt);
-      Exit(True);
-    end;
-  APath := '';
-  Result := False;
-end;
-
 { One fingerprint of everything any selected job's compile can read, taken
   after pretest and before any job compiles or reuses a cached result: the
-  union of the per-program cache fingerprint's paths plus the search
-  directories [test] flags name, each hashed once. }
+  union of the per-program cache fingerprint's paths plus every directory
+  the compiler's search options can name, each hashed once. }
 procedure TTestScheduler.CaptureRunInputs;
 var
-  IncludeSearchPaths, Paths, UnitSearchPaths: TStringArray;
+  Options, Paths: TStringArray;
 
   procedure AddPath(const APath: string);
   begin
@@ -547,101 +518,84 @@ var
     Paths[High(Paths)] := APath;
   end;
 
-  { A compiler search path can list directories separated by ";" and use
-    wildcards and $FPC... macros that the compiler expands. Such an entry is
-    watched through its fixed leading directory, which contains every
-    directory it can resolve to now or later. }
-  procedure AddSearchPath(const APath: string);
-  var
-    Entries: TStringList;
-    Entry: string;
-    i, Position, Wildcard: Integer;
+  procedure AddOption(const AOption: string);
   begin
-    Entries := TStringList.Create;
-    try
-      Entries.StrictDelimiter := True;
-      Entries.Delimiter := ';';
-      Entries.DelimitedText := APath;
-      for i := 0 to Entries.Count - 1 do
-      begin
-        Entry := Trim(Entries[i]);
-        if (Length(Entry) >= 2) and (Entry[1] = '"')
-           and (Entry[Length(Entry)] = '"') then
-          Entry := Copy(Entry, 2, Length(Entry) - 2);
-        if Entry = '' then Continue;
-        Wildcard := 0;
-        for Position := 1 to Length(Entry) do
-          if Entry[Position] in ['*', '?', '$'] then
-          begin
-            Wildcard := Position;
-            Break;
-          end;
-        if Wildcard > 0 then
-        begin
-          Entry := Copy(Entry, 1, Wildcard - 1);
-          while (Entry <> '') and not (Entry[Length(Entry)] in ['/', '\']) do
-            Delete(Entry, Length(Entry), 1);
-          if Entry = '' then Entry := '.';
-        end;
-        AddPath(Entry);
-      end;
-    finally
-      Entries.Free;
-    end;
+    SetLength(Options, Length(Options) + 1);
+    Options[High(Options)] := AOption;
   end;
 
-  procedure AddSearchPaths(const APaths: TStringArray);
+  { Every option that can reach the compiler: the configuration file's
+    lines, the request's unit and include paths (the manifest's units, its
+    modules and LWPT_FPC_UNIT_PATHS), [test] flags and the selected
+    profile's own arguments. }
+  procedure CollectOptions(const AConfiguration: string);
   var
-    i: Integer;
-  begin
-    for i := 0 to High(APaths) do AddSearchPath(APaths[i]);
-  end;
-
-  { Every search option in the configuration file, not only its unit paths:
-    the compiler also reads include, object and library directories there. }
-  procedure AddConfigurationSearchPaths(const AConfigurationPath: string);
-  var
+    IncludeSearchPaths, ProfileArguments, UnitSearchPaths: TStringArray;
     Lines: TStringList;
-    FlagPath: string;
     i: Integer;
   begin
-    if (AConfigurationPath = '') or not FileExists(AConfigurationPath) then
-      Exit;
+    SetLength(Options, 0);
     Lines := TStringList.Create;
     try
-      LoadProtectedStrings(Lines, AConfigurationPath);
-      for i := 0 to Lines.Count - 1 do
-        if CompilerFlagSearchPath(Trim(Lines[i]), FlagPath) then
-          AddSearchPath(FlagPath);
+      Lines.Text := AConfiguration;
+      for i := 0 to Lines.Count - 1 do AddOption(Lines[i]);
     finally
       Lines.Free;
     end;
+    UnitSearchPaths := Copy(FUnitPaths, 0, Length(FUnitPaths));
+    IncludeSearchPaths := Copy(FUnitPaths, 0, Length(FUnitPaths));
+    AppendCompilerEnvironmentSearchPaths(UnitSearchPaths, IncludeSearchPaths);
+    for i := 0 to High(UnitSearchPaths) do
+      AddOption('-Fu' + UnitSearchPaths[i]);
+    for i := 0 to High(IncludeSearchPaths) do
+      AddOption('-Fi' + IncludeSearchPaths[i]);
+    for i := 0 to High(FCompilerArguments) do
+      AddOption(FCompilerArguments[i]);
+    ProfileArguments := FCompilerDriver.InvocationArguments(nil);
+    for i := 0 to High(ProfileArguments) do AddOption(ProfileArguments[i]);
   end;
 
-  { Search options that reach the compiler outside the request's search
-    paths: [test] flags and the selected profile's own arguments. }
-  procedure AddOptionSearchPaths(const AOptions: TStringArray);
+  { The run's copy of the configuration bytes the snapshot recorded. }
+  procedure PublishRunConfiguration(const AState, AContent: string);
   var
-    FlagPath: string;
-    i: Integer;
+    Stream: TLWPTProtectedFileStream;
   begin
-    for i := 0 to High(AOptions) do
-      if CompilerFlagSearchPath(AOptions[i], FlagPath) then
-        AddSearchPath(FlagPath);
+    if AState = 'missing' then
+    begin
+      FRunConfigurationPath := '';
+      Exit;
+    end;
+    ForceDirectories(FBuildRoot);
+    FRunConfigurationPath := IncludeTrailingPathDelimiter(FBuildRoot)
+      + 'run-configuration.cfg';
+    Stream := OpenProtectedFileStream(FRunConfigurationPath, fmCreate);
+    try
+      if AContent <> '' then Stream.WriteBuffer(AContent[1], Length(AContent));
+    finally
+      Stream.Free;
+    end;
   end;
 
 const
   CONFIGURATION_CAPTURE_ATTEMPTS = 3;
 var
-  ConfigurationBefore, SourceDirectory: string;
+  ConfigurationContent, ConfigurationState, Recorded, SourceDirectory: string;
+  Directories: TStringArray;
   Attempt, i: Integer;
 begin
-  { The search paths come from the cfg file and its hash from the snapshot;
-    a cfg replaced in between would pair new bytes with old directories, so
-    the capture repeats until the cfg held still across it. }
+  { One read of the configuration file gives the bytes its search options
+    come from and the state they hash to; the capture holds only when the
+    snapshot recorded that same state, so the watched directories and the
+    recorded file always describe one version of it. Jobs then compile from
+    the run's copy of those bytes and never read the live file, which the
+    snapshot keeps watching. }
   for Attempt := 1 to CONFIGURATION_CAPTURE_ATTEMPTS do
   begin
-    ConfigurationBefore := ConfigurationState(FCacheContext.ConfigurationPath);
+    ConfigurationState := CaptureInputFile(FProjectRoot,
+      FCacheContext.ConfigurationPath, ConfigurationContent);
+    CollectOptions(ConfigurationContent);
+    SetLength(Directories, 0);
+    AppendCompilerSearchDirectories(Options, Directories);
     SetLength(Paths, 0);
     AddPath(FCacheContext.ManifestPath);
     AddPath(FCacheContext.ConfigurationPath);
@@ -651,13 +605,7 @@ begin
       AddPath(FCacheContext.CompilerImplicitInputs[i]);
     for i := 0 to High(FCacheContext.WorkspacePaths) do
       AddPath(FCacheContext.WorkspacePaths[i]);
-    PascalSourceSearchPaths(FUnitPaths, FCacheContext.ConfigurationPath,
-      UnitSearchPaths, IncludeSearchPaths);
-    AddSearchPaths(UnitSearchPaths);
-    AddSearchPaths(IncludeSearchPaths);
-    AddConfigurationSearchPaths(FCacheContext.ConfigurationPath);
-    AddOptionSearchPaths(FCompilerArguments);
-    AddOptionSearchPaths(FCompilerDriver.InvocationArguments(nil));
+    for i := 0 to High(Directories) do AddPath(Directories[i]);
     for i := 0 to High(FJobs) do
     begin
       AddPath(FJobs[i].Source);
@@ -670,17 +618,22 @@ begin
     end;
     FRunInputs := CaptureInputSnapshot(FProjectRoot, Paths,
       FCacheContext.ExcludedPaths);
-    if ConfigurationState(FCacheContext.ConfigurationPath)
-       = ConfigurationBefore then Exit;
+    Recorded := InputSnapshotState(FProjectRoot, FRunInputs,
+      FCacheContext.ConfigurationPath);
+    { A missing file is recorded as missing, or as excluded or a directory,
+      none of which a compile reads as its configuration. }
+    if (Recorded = ConfigurationState)
+       or ((ConfigurationState = 'missing')
+         and (Copy(Recorded, 1, 5) <> 'file:')) then
+    begin
+      PublishRunConfiguration(ConfigurationState, ConfigurationContent);
+      Exit;
+    end;
   end;
   raise ELWPTError.Create('the compiler configuration file kept changing '
     + 'while this test run started; rerun ' + PROGRAM_NAME + ' test');
 end;
 
-{ Called by every job once its executable exists (compiled or reused) and
-  before it runs, and when a compile fails. A changed input voids the job and
-  stops the run: results from before and after the change must not be
-  reported together. }
 { The first run input that differs from the snapshot, as a display path,
   or ''. The snapshot sees a recorded file change or disappear; a file that
   appears at the project root is a new implicit compiler input. }
@@ -1293,20 +1246,36 @@ var
 begin
   ProducerLease := nil;
   ReleasingWorkerForWait := False;
+  CompilerProcess := nil;
+  RelativeSource := TestRelativePath(FProjectRoot, FJobs[AIndex].Source);
   try
   try
     CompilerProcess := CreatePascalCompilerProcess(FJobs[AIndex].Source,
       FUnitPaths, FCompilerArguments, Binary, BuildRequest, FBuildRoot,
-      FCompilerDriver, FCacheContext.ConfigurationPath);
+      FCompilerDriver, FRunConfigurationPath);
+    NeutralRequest := BuildRequest;
+    NeutralRequest.Inputs.EntryPoint := RelativeSource;
+    SetLength(NeutralRequest.Inputs.Sources, 1);
+    NeutralRequest.Inputs.Sources[0] := RelativeSource;
+    NeutralRequest := NeutralBuildCacheRequest(NeutralRequest,
+      'test-programs/' + RelativeSource);
+    PublicationRequest := Default(TLWPTBuildPublicationRequest);
+    PublicationRequest.BuildRequest := NeutralRequest;
+    PublicationRequest.CompilerExecutable := FCompilerDriver.ExecutableName;
+    PublicationRequest.CompilerArguments :=
+      FCompilerDriver.InvocationArguments(FCompilerDriver.BuildArguments(
+        NeutralRequest, PascalSourceCompilerInvocationOptions(
+          FRunConfigurationPath)));
   except
     { A staging path over the compiler's budget fails this one test with
       the explanatory message instead of aborting the whole scheduler. }
     on E: Exception do
     begin
-      { Preparation reads the search directories and the cfg file too, so a
-        changed input explains its failure, whatever it raised. Otherwise a
-        staging-path budget error fails this one test, and anything else
-        stays a scheduler error. }
+      FreeAndNil(CompilerProcess);
+      { Preparation reads the search directories, so a changed input
+        explains its failure, whatever it raised. Otherwise a staging-path
+        budget error fails this one test, and anything else stays a
+        scheduler error. }
       if VoidIfInputsChanged(AIndex) then
       begin
         SetJobOutput(AIndex, True, E.Message);
@@ -1319,21 +1288,7 @@ begin
     end;
   end;
 
-  RelativeSource := TestRelativePath(FProjectRoot, FJobs[AIndex].Source);
   ArtifactSetPath := ExtractFileDir(Binary) + '/cache-tmp/artifact-set';
-  NeutralRequest := BuildRequest;
-  NeutralRequest.Inputs.EntryPoint := RelativeSource;
-  SetLength(NeutralRequest.Inputs.Sources, 1);
-  NeutralRequest.Inputs.Sources[0] := RelativeSource;
-  NeutralRequest := NeutralBuildCacheRequest(NeutralRequest,
-    'test-programs/' + RelativeSource);
-  PublicationRequest := Default(TLWPTBuildPublicationRequest);
-  PublicationRequest.BuildRequest := NeutralRequest;
-  PublicationRequest.CompilerExecutable := FCompilerDriver.ExecutableName;
-  PublicationRequest.CompilerArguments := FCompilerDriver.InvocationArguments(
-    FCompilerDriver.BuildArguments(NeutralRequest,
-      PascalSourceCompilerInvocationOptions(
-        FCacheContext.ConfigurationPath)));
   PublicationRequest.ManifestContentHash :=
     FCacheContext.ManifestContentHash;
   PublicationRequest.PublicOutput := 'test-programs/' + RelativeSource;
@@ -1491,6 +1446,14 @@ begin
     Output := CacheDiagnostic
       + FCompilerDriver.DisplayOutput(StandardOutput, StandardError);
     SetJobOutput(AIndex, True, Output);
+    { A compiler the run terminated left no result to interpret: whatever it
+      printed, or failed to print, says nothing about the program. }
+    if IsCancelled then
+    begin
+      FreeAndNil(ProducerLease);
+      CompleteJob(AIndex, tjsCancelled);
+      Exit;
+    end;
     BuildResult := FCompilerDriver.NormalizeExecutionResult(BuildRequest, Code,
       StandardOutput, StandardError);
     ValidateReportedArtifacts(FCompilerDriver.CompilerID, BuildRequest,
@@ -1500,7 +1463,8 @@ begin
     begin
       FreeAndNil(ProducerLease);
       SetJobOutput(AIndex, True, E.Message);
-      if not VoidIfInputsChanged(AIndex) then
+      if IsCancelled then CompleteJob(AIndex, tjsCancelled)
+      else if not VoidIfInputsChanged(AIndex) then
         FailJob(AIndex, tjsCompileFailed, 1, E.Message);
       Exit;
     end;
