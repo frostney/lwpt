@@ -575,6 +575,28 @@ begin
   Result := HookIsStale(AHook, AProjectRoot, InputDigest);
 end;
 
+function CurrentHookInputsDigest(const AHook: THook;
+  const AProjectRoot: string): string;
+var
+  Files: TStringList;
+  i: Integer;
+begin
+  Files := TStringList.Create;
+  try
+    Files.Sorted := True;
+    Files.Duplicates := dupIgnore;
+    try
+      for i := 0 to High(AHook.Inputs) do
+        ResolveInputExpression(AHook, AProjectRoot, AHook.Inputs[i], Files);
+    except
+      on E: Exception do Exit('');
+    end;
+    Result := HookInputsDigest(AProjectRoot, Files);
+  finally
+    Files.Free;
+  end;
+end;
+
 procedure RecordHookRun(const AHook: THook;
   const AProjectRoot, AInputDigest: string);
 var
@@ -582,9 +604,12 @@ var
   OutputDigest, RecordPath: string;
 begin
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
-    or (AInputDigest = '') then Exit;
+    or (AInputDigest = '') or AHook.SessionPrivateOutput then Exit;
   OutputDigest := SHA256File(ResolveProjectPath(AProjectRoot, AHook.Output));
   if OutputDigest = '' then Exit;
+  { An input edited while the command ran may or may not have reached the
+    output. Recording neither digest keeps the next invocation stale. }
+  if CurrentHookInputsDigest(AHook, AProjectRoot) <> AInputDigest then Exit;
   RecordPath := HookRunRecordPath(AHook, AProjectRoot);
   Lines := TStringList.Create;
   try

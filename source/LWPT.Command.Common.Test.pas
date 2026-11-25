@@ -65,6 +65,8 @@ type
     procedure TestChangedInputContentWithOlderTimeIsStale;
     procedure TestChangedDeclarationIsStale;
     procedure TestRecordedRunStaysFreshAcrossChecks;
+    procedure TestInputEditedDuringRunIsNotRecorded;
+    procedure TestSessionPrivateOutputKeepsNoRecord;
   end;
 
 procedure THookStalenessTests.BeforeEach;
@@ -273,6 +275,46 @@ begin
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
 end;
 
+{ An input edited while the command ran may not have reached the output.
+  Recording the pre-run digest with that output would let a later revert
+  of the input pass as fresh, so nothing is recorded. }
+procedure THookStalenessTests.TestInputEditedDuringRunIsNotRecorded;
+var
+  Hook: THook;
+  InputDigest, InputPath: string;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  InputPath := IncludeTrailingPathDelimiter(FRoot) + 'lwpt.toml';
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  HookIsStale(Hook, FRoot, InputDigest);
+  { The run: the input changes mid-run and the output reflects the edit. }
+  WriteTextFile(InputPath, 'edited during the run');
+  SetFileModificationTime(InputPath, OlderSeconds, OlderNanoseconds);
+  WriteStamped(OutputName, OutputNanoseconds);
+  RecordHookRun(Hook, FRoot, InputDigest);
+  { Revert the input to the content the run started from. }
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
+{ A per-entry postbuild output retargeted to a session's private candidate
+  changes path with every session, so it never gets a record. }
+procedure THookStalenessTests.TestSessionPrivateOutputKeepsNoRecord;
+var
+  Hook: THook;
+  InputDigest: string;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  Hook.SessionPrivateOutput := True;
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  HookIsStale(Hook, FRoot, InputDigest);
+  RecordHookRun(Hook, FRoot, InputDigest);
+  Expect<Boolean>(DirectoryExists(IncludeTrailingPathDelimiter(FRoot)
+    + '.lwpt/sessions/hook-runs')).ToBe(False);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+end;
+
 procedure THookStalenessTests.SetupTests;
 var
   Support: TTimestampSupport;
@@ -300,6 +342,10 @@ begin
   Test('a changed command or argument is stale', TestChangedDeclarationIsStale);
   Test('a recorded run stays fresh across checks',
     TestRecordedRunStaysFreshAcrossChecks);
+  Test('an input edited during the run is not recorded',
+    TestInputEditedDuringRunIsNotRecorded);
+  Test('a session-private output keeps no record',
+    TestSessionPrivateOutputKeepsNoRecord);
   if Support.WideDates then
     Test('an input dated 2300 is newer than a 2023 output',
       TestFarFutureInputIsStale)

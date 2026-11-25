@@ -495,6 +495,8 @@ begin
       APublicOutput, ACandidateOutput);
     Result[i].Output := ReplaceOutputReference(AHooks[i].Output,
       APublicOutput, ACandidateOutput);
+    Result[i].SessionPrivateOutput := AHooks[i].SessionPrivateOutput
+      or (Result[i].Output <> AHooks[i].Output);
     Result[i].Runnable.Args := Copy(AHooks[i].Runnable.Args, 0,
       Length(AHooks[i].Runnable.Args));
     for j := 0 to High(Result[i].Runnable.Args) do
