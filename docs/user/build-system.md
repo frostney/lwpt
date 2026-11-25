@@ -343,12 +343,14 @@ follows the order in which sessions take the build-coordination lock to
 finish: a failing session records its result and releases its guard before
 it releases that lock, so of overlapping runs, the last to take the lock keeps
 its staging if it failed, even if it compiled earlier. When the sweep cannot
-take the lock or cannot remove a superseded directory (on Windows, for
-example, an executable that is still running), the command prints a warning
-naming what remains, without changing its result. Staging is matched by job
+take the lock, cannot remove a superseded directory (on Windows, for example,
+an executable that is still running), or finds matching staging in a session
+it cannot verify as this project's (an unreadable record, or one written by
+an LWPT that did not record session identities), it leaves that staging and
+the command prints a warning naming it, without changing its result. Staging is matched by job
 keys derived from the entry name or the program's absolute path, so staging
-retained from before a project moved or was renamed, or by an LWPT that did
-not record session identities, is not matched; `lwpt repair` reclaims it. `lwpt repair` removes inactive
+retained from before a project moved or was renamed is not matched; `lwpt
+repair` reclaims it. `lwpt repair` removes inactive
 sessions only after their OS-held owner guard is absent; malformed state fails
 closed while its guard remains held. Reusable artifacts remain separate from
 session ownership and are admitted only after successful publication.

@@ -1373,7 +1373,8 @@ end;
 procedure TLWPTBuildSessionTests.TestFinishContinuesPastUnreadableSessions;
 var
   Unreadable, Reclaimable, Session: TLWPTBuildSession;
-  UnreadableRoot, UnreadableProgram, ReclaimableProgram: string;
+  UnreadableRoot, UnreadableProgram, ReclaimableProgram, Warnings: string;
+  WarningCount: Integer;
 begin
   ResetScratch;
   Unreadable := TLWPTBuildSession.Create(FScratch);
@@ -1398,9 +1399,14 @@ begin
     WriteText(Session.ProgramJobsRoot('tests') + '/B.Test-key/B.Test',
       'newer build');
     Session.Finish(True);
+    Warnings := Session.CleanupWarnings.Text;
+    WarningCount := Session.CleanupWarnings.Count;
     Session.Free;
     Expect<Boolean>(FileExists(UnreadableProgram + '/A.Test')).ToBe(True);
     Expect<Boolean>(DirectoryExists(ReclaimableProgram)).ToBe(False);
+    { The retained executable stays runnable, so the run reports it. }
+    Expect<Integer>(WarningCount).ToBe(1);
+    Expect<Boolean>(Pos(UnreadableProgram, Warnings) > 0).ToBe(True);
   finally
     FpChmod(PAnsiChar(UnreadableRoot + '/session.state'), &644);
   end;

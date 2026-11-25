@@ -1607,7 +1607,7 @@ procedure TLWPTBuildSession.PruneSupersededJobs;
 const
   SESSION_PATTERNS: array[0..1] of string = ('s-*', 'session-*');
 var
-  JobsRoot, OtherRoot, OtherJobs, ProgramJob: string;
+  JobsRoot, OtherRoot, OtherJobs, ProgramJob, OtherIdentity: string;
   Jobs, Programs, Sessions: TLWPTDirectoryEntries;
   Units: TStringList;
   JobIndex, ProgramIndex, SessionIndex, UnitIndex, PatternIndex: Integer;
@@ -1616,6 +1616,28 @@ var
   begin
     Result := ((AEntry.Attr and faDirectory) <> 0)
       and (AEntry.Name <> '.') and (AEntry.Name <> '..');
+  end;
+
+  { Report a session whose ownership could not be verified when it holds
+    staging this session supersedes, because that staging stays runnable. }
+  procedure ReportUnverified(const AReason: string);
+  var
+    Index: Integer;
+    Target: string;
+  begin
+    for Index := 0 to Units.Count - 1 do
+    begin
+      Target := OtherJobs + '/' + Units[Index];
+      try
+        if not (LongPathDirectoryExists(Target)
+          or IsDirSymlinkOrJunction(Target)) then Continue;
+      except
+        on Exception do;
+      end;
+      FCleanupWarnings.Add(Format('superseded staging %s was not removed '
+        + 'because its session could not be verified as this project''s '
+        + '(%s); run %s repair', [Target, AReason, PROGRAM_NAME]));
+    end;
   end;
 
   procedure RemoveUnit(const AUnit: string);
@@ -1689,9 +1711,16 @@ begin
             or (not LongPathDirectoryExists(OtherJobs)) then Continue;
           { A sessions root can be shared through a link with another
             project, whose build-entry keys can match ours: only this
-            project's own sessions are superseded. }
-          if ReadSessionProjectIdentity(OtherRoot) <> FProjectIdentity then
+            project's own sessions are superseded. A record without an
+            identity (an older LWPT wrote it) cannot be attributed, so it
+            is retained and reported when it holds matching staging. }
+          OtherIdentity := ReadSessionProjectIdentity(OtherRoot);
+          if OtherIdentity = '' then
+          begin
+            ReportUnverified('it records no project identity');
             Continue;
+          end;
+          if OtherIdentity <> FProjectIdentity then Continue;
           if not SessionIsInactive(FSessionsRoot,
             Sessions[SessionIndex].Name) then Continue;
           for UnitIndex := 0 to Units.Count - 1 do
@@ -1699,8 +1728,12 @@ begin
           LongPathRemoveDir(OtherJobs);
         except
           { An unreadable session record retains that session; the sweep
-            continues with the others. }
-          on Exception do Continue;
+            continues with the others and reports the retained staging. }
+          on E: Exception do
+          begin
+            ReportUnverified(E.Message);
+            Continue;
+          end;
         end;
       end;
     end;
