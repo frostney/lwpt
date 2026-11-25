@@ -12,6 +12,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Tests.PayloadHandoff,
+  Tests.ProcessSupport,
 
   LWPT.BuildRequest,
   LWPT.BuildSession,
@@ -1121,8 +1123,7 @@ var
   Holder: TProcess;
   Session: TLWPTBuildSession;
   ReadyPath, ReleasePath, HeldRoot, HeldProgram: string;
-  Lines: TStringList;
-  Waited: Integer;
+  StartedAt: QWord;
 begin
   ResetScratch;
   ReadyPath := FScratch + '/held.ready';
@@ -1134,22 +1135,13 @@ begin
     Holder.Parameters.Add(FScratch);
     Holder.Parameters.Add(ReadyPath);
     Holder.Parameters.Add(ReleasePath);
-    Holder.Execute;
-    Waited := 0;
-    while (not FileExists(ReadyPath)) and Holder.Running
-      and (Waited < HOLD_WAIT_MILLISECONDS) do
-    begin
-      Sleep(20);
-      Inc(Waited, 20);
-    end;
-    Expect<Boolean>(FileExists(ReadyPath)).ToBe(True);
-    Lines := TStringList.Create;
-    try
-      Lines.LoadFromFile(ReadyPath);
-      HeldRoot := Trim(Lines[0]);
-    finally
-      Lines.Free;
-    end;
+    ExecuteOwnedChild(Holder);
+    StartedAt := GetTickCount64;
+    while (not PayloadIsReadable(ReadyPath))
+      and (not WaitForChildExit(Holder, 20))
+      and (GetTickCount64 - StartedAt < HOLD_WAIT_MILLISECONDS) do;
+    Expect<Boolean>(PayloadIsReadable(ReadyPath)).ToBe(True);
+    HeldRoot := Trim(ReadPayloadText(ReadyPath));
     HeldProgram := HeldRoot + '/jobs/' + BuildSessionPathKey('tests') + '/'
       + HOLD_SESSION_PROGRAM;
     Expect<Boolean>(DirectoryExists(HeldProgram)).ToBe(True);
@@ -1164,11 +1156,13 @@ begin
     Session.Free;
     Expect<Boolean>(DirectoryExists(HeldProgram)).ToBe(True);
 
-    WriteText(ReleasePath, 'release');
-    Holder.WaitOnExit;
-    Expect<Integer>(Holder.ExitStatus).ToBe(0);
+    PublishReadablePayload(ReleasePath, 'release');
+    Expect<Integer>(FinishChild(Holder, HOLD_WAIT_MILLISECONDS,
+      'held build session')).ToBe(0);
   finally
-    if Holder.Running then Holder.Terminate(1);
+    if not PayloadIsReadable(ReleasePath) then
+      PublishReadablePayload(ReleasePath, 'release');
+    ReapChild(Holder, HOLD_WAIT_MILLISECONDS);
     Holder.Free;
   end;
 
@@ -1188,34 +1182,23 @@ function RunHeldSession(const AProjectRoot, AReadyPath,
   AReleasePath: string): Integer;
 var
   Session: TLWPTBuildSession;
-  Lines: TStringList;
-  Waited: Integer;
+  ProgramRoot: string;
+  StartedAt: QWord;
 begin
   Result := 1;
   Session := TLWPTBuildSession.Create(AProjectRoot);
   try
-    Lines := TStringList.Create;
-    try
-      ForceDirectories(Session.ProgramJobsRoot('tests') + '/'
-        + HOLD_SESSION_PROGRAM);
-      Lines.Text := 'held program';
-      Lines.SaveToFile(Session.ProgramJobsRoot('tests') + '/'
-        + HOLD_SESSION_PROGRAM + '/program');
-      Lines.Text := Session.SessionRoot;
-      Lines.SaveToFile(AReadyPath + '.tmp');
-      RenameFile(AReadyPath + '.tmp', AReadyPath);
-    finally
-      Lines.Free;
-    end;
-    Waited := 0;
-    while (not FileExists(AReleasePath))
-      and (Waited < HOLD_WAIT_MILLISECONDS) do
-    begin
+    ProgramRoot := Session.ProgramJobsRoot('tests') + '/'
+      + HOLD_SESSION_PROGRAM;
+    ForceDirectories(ProgramRoot);
+    PublishReadablePayload(ProgramRoot + '/program', 'held program');
+    PublishReadablePayload(AReadyPath, Session.SessionRoot);
+    StartedAt := GetTickCount64;
+    while (not PayloadIsReadable(AReleasePath))
+      and (GetTickCount64 - StartedAt < HOLD_WAIT_MILLISECONDS) do
       Sleep(20);
-      Inc(Waited, 20);
-    end;
     Session.Finish(False, 'held session released');
-    if FileExists(AReleasePath) then Result := 0;
+    if PayloadIsReadable(AReleasePath) then Result := 0;
   finally
     Session.Free;
   end;
