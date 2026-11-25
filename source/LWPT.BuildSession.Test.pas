@@ -13,6 +13,8 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Tests.PayloadHandoff,
+  Tests.ProcessSupport,
 
   LWPT.BuildRequest,
   LWPT.BuildSession,
@@ -70,9 +72,31 @@ type
     procedure TestRepairRemovesInactiveAndKeepsLiveSessions;
     procedure TestRepairRemovesInterruptedSessionCreation;
     procedure TestRepairUsesHistoricalRelocatedRootsOnly;
+    procedure TestFinishPrunesSupersededJobsFromInactiveSessions;
+    procedure TestFinishPrunesSupersededBuildCandidates;
+    procedure TestFinishNeverPrunesLiveSessions;
+    procedure TestFailedFinishReleasesGuardUnderCoordinationLock;
+    procedure TestFinishKeepsSameProcessLiveSessions;
+    {$IFDEF UNIX}
+    procedure TestFinishNeverPrunesThroughLinkedDefaultRoot;
+    {$ENDIF}
+    function StartHeldSession(const AReadyPath,
+      AReleasePath: string): TProcess;
+    function WaitForHeldSession(AHolder: TProcess;
+      const AReadyPath: string): string;
+    function ReadSessionStateLine(const ASessionRoot: string): string;
+    procedure ForceSessionState(const ASessionRoot, AState: string);
+    procedure TestFailedFinishSettlesBeforeCoordinationRelease;
+    {$IFDEF UNIX}
+    procedure TestFinishContinuesPastUnreadableSessions;
+    procedure TestFinishReportsUnremovableStaging;
+    {$ENDIF}
   end;
 
 const
+  HOLD_SESSION_SWITCH = '--hold-build-session';
+  HOLD_SESSION_PROGRAM = 'held-program';
+  HOLD_WAIT_MILLISECONDS = 60000;
   { Runs one input scan in a child process (see RunScanHelper):
     "snapshot <root> <path>..." takes a snapshot and rechecks it, and
     "capture <root> <path>" reads one file through CaptureInputFile. }
@@ -1307,6 +1331,461 @@ begin
   if DirectoryExists(ConfiguredRoot) then WipeDir(ConfiguredRoot);
 end;
 
+procedure TLWPTBuildSessionTests.
+  TestFinishPrunesSupersededJobsFromInactiveSessions;
+var
+  OldSession, NewSession: TLWPTBuildSession;
+  OldRoot, OldTests: string;
+begin
+  ResetScratch;
+  OldSession := TLWPTBuildSession.Create(FScratch);
+  OldRoot := OldSession.SessionRoot;
+  OldTests := OldSession.ProgramJobsRoot('tests');
+  WriteText(OldTests + '/A.Test-key/A.Test', 'old build');
+  WriteText(OldTests + '/A.Test-key/units/A.o', 'old object');
+  WriteText(OldTests + '/B.Test-key/B.Test', 'not rerun');
+  OldSession.WriteJobLog('A.Test', 'old build failed');
+  OldSession.Finish(False, '1 failed');
+  OldSession.Free;
+
+  NewSession := TLWPTBuildSession.Create(FScratch);
+  WriteText(NewSession.ProgramJobsRoot('tests') + '/A.Test-key/A.Test',
+    'fixed build');
+  NewSession.Finish(True);
+  NewSession.Free;
+
+  { Only the program the new run built is superseded; the older run's
+    diagnosis (log, failure detail, state) and its other programs stay. }
+  Expect<Boolean>(DirectoryExists(OldTests + '/A.Test-key')).ToBe(False);
+  Expect<Boolean>(FileExists(OldTests + '/B.Test-key/B.Test')).ToBe(True);
+  Expect<Boolean>(FileExists(OldRoot + '/failure.txt')).ToBe(True);
+  Expect<Boolean>(FileExists(OldRoot + '/session.state')).ToBe(True);
+  Expect<Boolean>(FileExists(OldRoot + ObservabilityLogsDirectory
+    + BuildSessionPathKey('A.Test') + ObservabilityLogExtension)).ToBe(True);
+end;
+
+procedure TLWPTBuildSessionTests.TestFinishPrunesSupersededBuildCandidates;
+var
+  OldSession, NewSession: TLWPTBuildSession;
+  OldRoot, OldJob, NewJob: string;
+begin
+  ResetScratch;
+  OldSession := TLWPTBuildSession.Create(FScratch);
+  OldRoot := OldSession.SessionRoot;
+  OldJob := OldSession.JobRoot('app-dev');
+  WriteText(OldJob + '/bin/app', 'stale candidate');
+  WriteText(OldJob + '/units/app.o', 'stale object');
+  WriteText(OldJob + '/cache-artifact/app', 'stale candidate copy');
+  OldSession.Finish(False, 'build entry became stale');
+  OldSession.Free;
+
+  { A failed new build still supersedes the older candidate and keeps its
+    own staging for diagnosis. }
+  NewSession := TLWPTBuildSession.Create(FScratch);
+  NewJob := NewSession.JobRoot('app-dev');
+  WriteText(NewJob + '/bin/app', 'current candidate');
+  WriteText(NewJob + '/units/app.o', 'current object');
+  NewSession.Finish(False, 'build entry failed');
+  NewSession.Free;
+
+  Expect<Boolean>(DirectoryExists(OldRoot + '/jobs')).ToBe(False);
+  Expect<Boolean>(FileExists(OldRoot + '/failure.txt')).ToBe(True);
+  Expect<Boolean>(FileExists(NewJob + '/bin/app')).ToBe(True);
+end;
+
+function TLWPTBuildSessionTests.StartHeldSession(const AReadyPath,
+  AReleasePath: string): TProcess;
+begin
+  Result := TProcess.Create(nil);
+  Result.Executable := ExpandFileName(ParamStr(0));
+  Result.Parameters.Add(HOLD_SESSION_SWITCH);
+  Result.Parameters.Add(FScratch);
+  Result.Parameters.Add(AReadyPath);
+  Result.Parameters.Add(AReleasePath);
+  ExecuteOwnedChild(Result);
+end;
+
+function TLWPTBuildSessionTests.WaitForHeldSession(AHolder: TProcess;
+  const AReadyPath: string): string;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while (not PayloadIsReadable(AReadyPath))
+    and (not WaitForChildExit(AHolder, 20))
+    and (GetTickCount64 - StartedAt < HOLD_WAIT_MILLISECONDS) do;
+  Expect<Boolean>(PayloadIsReadable(AReadyPath)).ToBe(True);
+  Result := Trim(ReadPayloadText(AReadyPath));
+end;
+
+{ Rewrites only the recorded state, keeping the PID, schema and project
+  identity lines, so the record still names this project. }
+procedure TLWPTBuildSessionTests.ForceSessionState(const ASessionRoot,
+  AState: string);
+var
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ASessionRoot + '/session.state');
+    Expect<Boolean>(Lines.Count > 3).ToBe(True);
+    Lines[1] := AState;
+    Lines.SaveToFile(ASessionRoot + '/session.state');
+  finally
+    Lines.Free;
+  end;
+end;
+
+function TLWPTBuildSessionTests.ReadSessionStateLine(
+  const ASessionRoot: string): string;
+var
+  Lines: TStringList;
+begin
+  Result := '';
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ASessionRoot + '/session.state');
+    if Lines.Count > 1 then Result := Trim(Lines[1]);
+  finally
+    Lines.Free;
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestFinishNeverPrunesLiveSessions;
+var
+  Holder: TProcess;
+  Session: TLWPTBuildSession;
+  ReadyPath, ReleasePath, HeldRoot, HeldProgram: string;
+begin
+  ResetScratch;
+  ReadyPath := FScratch + '/held.ready';
+  ReleasePath := FScratch + '/held.release';
+  Holder := StartHeldSession(ReadyPath, ReleasePath);
+  try
+    HeldRoot := WaitForHeldSession(Holder, ReadyPath);
+    HeldProgram := HeldRoot + '/jobs/' + BuildSessionPathKey('tests') + '/'
+      + HOLD_SESSION_PROGRAM;
+    Expect<Boolean>(DirectoryExists(HeldProgram)).ToBe(True);
+    { Make the recorded state alone say "inactive", so only the live owner
+      guard can protect the session. }
+    ForceSessionState(HeldRoot, 'failed');
+
+    Session := TLWPTBuildSession.Create(FScratch);
+    WriteText(Session.ProgramJobsRoot('tests') + '/' + HOLD_SESSION_PROGRAM
+      + '/program', 'newer build');
+    Session.Finish(True);
+    Session.Free;
+    Expect<Boolean>(DirectoryExists(HeldProgram)).ToBe(True);
+
+    PublishReadablePayload(ReleasePath, 'release');
+    Expect<Integer>(FinishChild(Holder, HOLD_WAIT_MILLISECONDS,
+      'held build session')).ToBe(0);
+  finally
+    try
+      if not PayloadIsReadable(ReleasePath) then
+        PublishReadablePayload(ReleasePath, 'release');
+    finally
+      ReapChild(Holder, HOLD_WAIT_MILLISECONDS);
+      Holder.Free;
+    end;
+  end;
+
+  { Once its owner has finished, the same staging is superseded. }
+  Session := TLWPTBuildSession.Create(FScratch);
+  WriteText(Session.ProgramJobsRoot('tests') + '/' + HOLD_SESSION_PROGRAM
+    + '/program', 'newest build');
+  Session.Finish(True);
+  Session.Free;
+  Expect<Boolean>(DirectoryExists(HeldProgram)).ToBe(False);
+  Expect<Boolean>(FileExists(HeldRoot + '/session.state')).ToBe(True);
+end;
+
+procedure TLWPTBuildSessionTests.
+  TestFailedFinishReleasesGuardUnderCoordinationLock;
+var
+  Holder: TProcess;
+  CoordinationLock: TObject;
+  ReadyPath, ReleasePath, HeldRoot: string;
+begin
+  ResetScratch;
+  ReadyPath := FScratch + '/held.ready';
+  ReleasePath := FScratch + '/held.release';
+  CoordinationLock := nil;
+  Holder := StartHeldSession(ReadyPath, ReleasePath);
+  try
+    HeldRoot := WaitForHeldSession(Holder, ReadyPath);
+    { While another session sweeps under the coordination lock, a failing
+      session must not record its terminal state or drop its owner guard;
+      otherwise the sweep could skip it as live and its superseded
+      executable would outlive both. }
+    CoordinationLock := AcquireBuildCoordinationLock(FScratch);
+    PublishReadablePayload(ReleasePath, 'release');
+    Expect<Boolean>(WaitForChildExit(Holder, 1000)).ToBe(False);
+    Expect<string>(ReadSessionStateLine(HeldRoot)).ToBe('active');
+    FreeAndNil(CoordinationLock);
+    Expect<Integer>(FinishChild(Holder, HOLD_WAIT_MILLISECONDS,
+      'held build session')).ToBe(0);
+    Expect<string>(ReadSessionStateLine(HeldRoot)).ToBe('failed');
+  finally
+    try
+      CoordinationLock.Free;
+      if not PayloadIsReadable(ReleasePath) then
+        PublishReadablePayload(ReleasePath, 'release');
+    finally
+      ReapChild(Holder, HOLD_WAIT_MILLISECONDS);
+      Holder.Free;
+    end;
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestFinishKeepsSameProcessLiveSessions;
+var
+  LiveSession, Session: TLWPTBuildSession;
+  LiveProgram: string;
+  Removed, Retained: Integer;
+begin
+  ResetScratch;
+  LiveSession := TLWPTBuildSession.Create(FScratch);
+  try
+    LiveProgram := LiveSession.ProgramJobsRoot('tests') + '/A.Test-key';
+    WriteText(LiveProgram + '/A.Test', 'live build');
+    { Only the owner guard says "live". A Unix record-lock probe from this
+      same process would succeed and, on close, drop that guard. }
+    ForceSessionState(LiveSession.SessionRoot, 'failed');
+
+    Session := TLWPTBuildSession.Create(FScratch);
+    WriteText(Session.ProgramJobsRoot('tests') + '/A.Test-key/A.Test',
+      'newer build');
+    Session.Finish(True);
+    Session.Free;
+    Expect<Boolean>(FileExists(LiveProgram + '/A.Test')).ToBe(True);
+
+    RepairBuildSessions(IncludeTrailingPathDelimiter(FScratch), Removed,
+      Retained);
+    Expect<Integer>(Removed).ToBe(0);
+    Expect<Integer>(Retained).ToBe(1);
+    Expect<Boolean>(FileExists(LiveProgram + '/A.Test')).ToBe(True);
+  finally
+    LiveSession.Finish(True);
+    LiveSession.Free;
+  end;
+end;
+
+{$IFDEF UNIX}
+procedure TLWPTBuildSessionTests.TestFinishNeverPrunesThroughLinkedDefaultRoot;
+var
+  OtherProject, OtherJob, Project, ProjectJob: string;
+  OtherSession, Session: TLWPTBuildSession;
+  Variant: Integer;
+begin
+  for Variant := 0 to 1 do
+  begin
+    ResetScratch;
+    OtherProject := FScratch + '/other';
+    ForceDirectories(OtherProject);
+    OtherSession := TLWPTBuildSession.Create(OtherProject);
+    OtherJob := OtherSession.JobRoot('app-dev');
+    WriteText(OtherJob + '/bin/app', 'other project candidate');
+    OtherSession.Finish(False, 'other project failed');
+    OtherSession.Free;
+
+    { Variant 0 links .lwpt, variant 1 links .lwpt/sessions, into the other
+      project, so both projects' sessions share one physical root. }
+    Project := FScratch + '/project';
+    ForceDirectories(Project);
+    if Variant = 0 then
+      Expect<Integer>(FpSymlink(PAnsiChar(OtherProject + '/' + LWPT_DIR),
+        PAnsiChar(Project + '/' + LWPT_DIR))).ToBe(0)
+    else
+    begin
+      ForceDirectories(Project + '/' + LWPT_DIR);
+      Expect<Integer>(FpSymlink(
+        PAnsiChar(OtherProject + '/' + BUILD_SESSIONS_DIR),
+        PAnsiChar(Project + '/' + BUILD_SESSIONS_DIR))).ToBe(0);
+    end;
+
+    { The linked project never supersedes the other project's staging. }
+    Session := TLWPTBuildSession.Create(Project);
+    ProjectJob := Session.JobRoot('app-dev');
+    WriteText(ProjectJob + '/bin/app', 'this project candidate');
+    Session.Finish(False, 'this project failed');
+    Session.Free;
+    Expect<Boolean>(FileExists(OtherJob + '/bin/app')).ToBe(True);
+
+    { Nor does the other project supersede the linked project's staging. }
+    OtherSession := TLWPTBuildSession.Create(OtherProject);
+    WriteText(OtherSession.JobRoot('app-dev') + '/bin/app', 'other rebuild');
+    OtherSession.Finish(True);
+    OtherSession.Free;
+    Expect<Boolean>(FileExists(ProjectJob + '/bin/app')).ToBe(True);
+    Expect<Boolean>(FileExists(OtherJob + '/bin/app')).ToBe(False);
+
+    { Each project still supersedes its own staging through the link. }
+    Session := TLWPTBuildSession.Create(Project);
+    WriteText(Session.JobRoot('app-dev') + '/bin/app', 'this rebuild');
+    Session.Finish(True);
+    Session.Free;
+    Expect<Boolean>(FileExists(ProjectJob + '/bin/app')).ToBe(False);
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestFinishContinuesPastUnreadableSessions;
+var
+  Unreadable, Reclaimable, Session: TLWPTBuildSession;
+  UnreadableRoot, UnreadableProgram, ReclaimableProgram, Warnings: string;
+  WarningCount: Integer;
+begin
+  ResetScratch;
+  Unreadable := TLWPTBuildSession.Create(FScratch);
+  UnreadableRoot := Unreadable.SessionRoot;
+  UnreadableProgram := Unreadable.ProgramJobsRoot('tests') + '/A.Test-key';
+  WriteText(UnreadableProgram + '/A.Test', 'unreadable record');
+  Unreadable.Finish(False, 'failed');
+  Unreadable.Free;
+  Reclaimable := TLWPTBuildSession.Create(FScratch);
+  { A different program, so this session's own finish leaves the first
+    session's staging alone. }
+  ReclaimableProgram := Reclaimable.ProgramJobsRoot('tests') + '/B.Test-key';
+  WriteText(ReclaimableProgram + '/B.Test', 'older build');
+  Reclaimable.Finish(False, 'failed');
+  Reclaimable.Free;
+  Expect<Integer>(FpChmod(PAnsiChar(UnreadableRoot + '/session.state'), 0))
+    .ToBe(0);
+  try
+    Session := TLWPTBuildSession.Create(FScratch);
+    WriteText(Session.ProgramJobsRoot('tests') + '/A.Test-key/A.Test',
+      'newer build');
+    WriteText(Session.ProgramJobsRoot('tests') + '/B.Test-key/B.Test',
+      'newer build');
+    Session.Finish(True);
+    Warnings := Session.CleanupWarnings.Text;
+    WarningCount := Session.CleanupWarnings.Count;
+    Session.Free;
+    Expect<Boolean>(FileExists(UnreadableProgram + '/A.Test')).ToBe(True);
+    Expect<Boolean>(DirectoryExists(ReclaimableProgram)).ToBe(False);
+    { The retained executable stays runnable, so the run reports it. }
+    Expect<Integer>(WarningCount).ToBe(1);
+    Expect<Boolean>(Pos(UnreadableProgram, Warnings) > 0).ToBe(True);
+  finally
+    FpChmod(PAnsiChar(UnreadableRoot + '/session.state'), &644);
+  end;
+end;
+
+procedure TLWPTBuildSessionTests.TestFinishReportsUnremovableStaging;
+var
+  OldSession, Session: TLWPTBuildSession;
+  OldTests, OldProgram: string;
+  Warnings: string;
+begin
+  ResetScratch;
+  OldSession := TLWPTBuildSession.Create(FScratch);
+  OldTests := OldSession.ProgramJobsRoot('tests');
+  OldProgram := OldTests + '/A.Test-key';
+  WriteText(OldProgram + '/A.Test', 'old build');
+  OldSession.Finish(False, 'failed');
+  OldSession.Free;
+  { The job root refuses the removal of its program directory. }
+  Expect<Integer>(FpChmod(PAnsiChar(OldTests), &555)).ToBe(0);
+  try
+    Session := TLWPTBuildSession.Create(FScratch);
+    try
+      WriteText(Session.ProgramJobsRoot('tests') + '/A.Test-key/A.Test',
+        'newer build');
+      Session.Finish(True);
+      Warnings := Session.CleanupWarnings.Text;
+      Expect<Integer>(Session.CleanupWarnings.Count).ToBe(1);
+    finally
+      Session.Free;
+    end;
+    Expect<Boolean>(Pos(OldProgram, Warnings) > 0).ToBe(True);
+    Expect<Boolean>(Pos('repair', Warnings) > 0).ToBe(True);
+  finally
+    FpChmod(PAnsiChar(OldTests), &755);
+  end;
+end;
+{$ENDIF}
+
+{$IFDEF OBJECTSTORE_TESTING}
+var
+  FinishHookCalled: Boolean;
+  FinishHookState: string;
+
+procedure RecordFinishState(const ASessionRoot: string);
+var
+  Lines: TStringList;
+begin
+  FinishHookCalled := True;
+  Lines := TStringList.Create;
+  try
+    Lines.LoadFromFile(ASessionRoot + '/session.state');
+    if Lines.Count > 1 then FinishHookState := Trim(Lines[1]);
+  finally
+    Lines.Free;
+  end;
+end;
+{$ENDIF}
+
+procedure TLWPTBuildSessionTests.
+  TestFailedFinishSettlesBeforeCoordinationRelease;
+{$IFDEF OBJECTSTORE_TESTING}
+var
+  Session: TLWPTBuildSession;
+begin
+  ResetScratch;
+  FinishHookCalled := False;
+  FinishHookState := '';
+  Session := TLWPTBuildSession.Create(FScratch);
+  try
+    WriteText(Session.ProgramJobsRoot('tests') + '/A.Test-key/A.Test',
+      'failed build');
+    { A sweep by another session can enter only once this lock is released,
+      so by then the failed state must be recorded and the guard gone. }
+    SessionFinishBeforeCoordinationReleaseTestHook := RecordFinishState;
+    try
+      Session.Finish(False, 'failed');
+    finally
+      SessionFinishBeforeCoordinationReleaseTestHook := nil;
+    end;
+  finally
+    Session.Free;
+  end;
+  Expect<Boolean>(FinishHookCalled).ToBe(True);
+  Expect<string>(FinishHookState).ToBe('failed');
+end;
+{$ELSE}
+begin
+  Fail('compile build-session tests with -dOBJECTSTORE_TESTING');
+end;
+{$ENDIF}
+
+{ Child mode for TestFinishNeverPrunesLiveSessions: hold a live session with
+  staged job output until the parent releases it. }
+function RunHeldSession(const AProjectRoot, AReadyPath,
+  AReleasePath: string): Integer;
+var
+  Session: TLWPTBuildSession;
+  ProgramRoot: string;
+  StartedAt: QWord;
+begin
+  Result := 1;
+  Session := TLWPTBuildSession.Create(AProjectRoot);
+  try
+    ProgramRoot := Session.ProgramJobsRoot('tests') + '/'
+      + HOLD_SESSION_PROGRAM;
+    ForceDirectories(ProgramRoot);
+    PublishReadablePayload(ProgramRoot + '/program', 'held program');
+    PublishReadablePayload(AReadyPath, Session.SessionRoot);
+    StartedAt := GetTickCount64;
+    while (not PayloadIsReadable(AReleasePath))
+      and (GetTickCount64 - StartedAt < HOLD_WAIT_MILLISECONDS) do
+      Sleep(20);
+    Session.Finish(False, 'held session released');
+    if PayloadIsReadable(AReleasePath) then Result := 0;
+  finally
+    Session.Free;
+  end;
+end;
+
 procedure TLWPTBuildSessionTests.SetupTests;
 begin
   Test('sessions have unique private job roots',
@@ -1385,11 +1864,36 @@ begin
     TestRepairRemovesInterruptedSessionCreation);
   Test('repair uses historical relocated roots without scanning siblings',
     TestRepairUsesHistoricalRelocatedRootsOnly);
+  Test('finishing sessions prune superseded test programs from inactive '
+    + 'sessions', TestFinishPrunesSupersededJobsFromInactiveSessions);
+  Test('finishing sessions prune superseded build candidates',
+    TestFinishPrunesSupersededBuildCandidates);
+  Test('finishing sessions never prune live sessions',
+    TestFinishNeverPrunesLiveSessions);
+  Test('failed sessions release their guard under the coordination lock',
+    TestFailedFinishReleasesGuardUnderCoordinationLock);
+  Test('finishing sessions keep same-process live sessions',
+    TestFinishKeepsSameProcessLiveSessions);
+  Test('failed sessions settle their state before the coordination lock '
+    + 'is released', TestFailedFinishSettlesBeforeCoordinationRelease);
+  {$IFDEF UNIX}
+  Test('finishing sessions never prune another project through a link',
+    TestFinishNeverPrunesThroughLinkedDefaultRoot);
+  Test('finishing sessions continue past unreadable session records',
+    TestFinishContinuesPastUnreadableSessions);
+  Test('finishing sessions report staging they cannot remove',
+    TestFinishReportsUnremovableStaging);
+  {$ENDIF}
 end;
 
 begin
   if (ParamCount >= 3) and (ParamStr(1) = SCAN_HELPER_ARGUMENT) then
     RunScanHelperMode;
+  if (ParamCount = 4) and (ParamStr(1) = HOLD_SESSION_SWITCH) then
+  begin
+    ExitCode := RunHeldSession(ParamStr(2), ParamStr(3), ParamStr(4));
+    Exit;
+  end;
   TestRunnerProgram.AddSuite(TLWPTBuildSessionTests.Create(
     'build sessions and publication'));
   TestRunnerProgram.Run;

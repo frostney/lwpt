@@ -1,5 +1,9 @@
 # Select compiler drivers through root-owned profiles
 
+> **Amended 2026-11-25:** the 30-second probe deadline below is superseded.
+> Each probe process now gets the compile's per-process deadline; see
+> [the amendment](#amendment--2026-11-25).
+
 ADR-0022 defined the versioned compiler-neutral request/result contract and
 ADR-0029 routed FPC through a driver seam. This ADR completes the compiler
 foundation from [issue #44](https://github.com/frostney/lwpt/issues/44) by
@@ -101,3 +105,12 @@ bounded out-of-process operations. Host registration never returns an
 in-process compiler object. Existing profile precedence, version/capability
 validation, process-tree ownership, timeouts, result/artifact validation, and
 no-fallback behavior remain in force.
+
+## Amendment — 2026-11-25
+
+Probes no longer have their own 30-second deadline. As [ADR-0029's
+amendment](./0029-fpc-compiler-driver.md#amendment--2026-11-25) records,
+external, Blaise, Lakon, and Delphi probe processes each get the compile's
+per-process deadline: 30 minutes by default, or `LWPT_COMPILER_TIMEOUT_MS` when
+set. A probe no longer has a separate deadline 60 times shorter than the
+compile's, which a loaded machine reached first.

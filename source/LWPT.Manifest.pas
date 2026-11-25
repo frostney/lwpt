@@ -178,6 +178,10 @@ type
     RawArgs : TStringArray;
     Inputs : array of string;
     Output : string;
+    { True when the output was retargeted to a build session's private
+      candidate. Its path changes with every session, so no record of a
+      run is kept for it and its gate never skips on a record. }
+    SessionPrivateOutput : Boolean;
   end;
   THookArray = array of THook;
 

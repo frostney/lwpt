@@ -136,7 +136,7 @@ Do **not** use `--no-verify` unless a maintainer explicitly authorises it on the
 | `FPC_TARGET_OS` | Requested compiler target operating system. A non-host value is probed and passed as `-T<value>`; unavailable targets fail without fallback. | unset (host OS) |
 | `LWPT_FPC` | Path to the FPC binary; overrides `PATH` lookup. The bare `FPC` variable is honoured as a fallback. | unset (`fpc` on `PATH`) |
 | `LWPT_FPC_UNIT_PATHS` | Path-separator-delimited unit directories appended as `-Fu`/`-Fi` to every compile (CI uses it for non-standard FPC installs; see the prose below) | unset |
-| `LWPT_COMPILER_TIMEOUT_MS` | Positive compiler-process timeout in milliseconds; capability probes retain their fixed 30-second deadline | 30 minutes |
+| `LWPT_COMPILER_TIMEOUT_MS` | Positive per-process compiler timeout in milliseconds, for each compile and each capability probe | 30 minutes |
 | `LWPT_HEARTBEAT_INTERVAL_MS` | Diagnostic tuning knob: build/test heartbeat interval; values are clamped to the default ceiling | `30000` |
 | `PATH` | Must contain `fpc`, `instantfpc`, `lefthook`; `git` too for `lwpt health --hotspots`, the only command that runs it | system default |
 | `LWPT_BUILD_ENTRY` | Per-entry postbuild hook context: selected build-entry name | supplied by LWPT |

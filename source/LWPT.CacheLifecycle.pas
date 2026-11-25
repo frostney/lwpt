@@ -86,6 +86,14 @@ var
     every access, so a test can show that an admission makes as many of
     them in a large cache as in a small one. }
   CacheLifecycleIndexPassCount: Integer;
+  { Counts the entries the in-memory steps over the index and the cache's
+    objects visit: each comparison of index names (a sort, a binary
+    search, or a scan such as Values[] or IndexOfName), each comparison of
+    two objects' recency, and each entry an insertion or a deletion
+    shifts. Sorting and searching visit about n log n entries and a scan
+    per entry about n squared, so a test can tell the two apart by
+    counting instead of timing. }
+  CacheLifecycleEntryVisitCount: Int64;
 {$ENDIF}
 
 implementation
@@ -120,6 +128,53 @@ type
   end;
 
   TLWPTCacheObjectArray = array of TLWPTCacheObject;
+
+  { Holds index entries or names. In a test build it counts the entries
+    its comparisons and shifts visit, wherever the list's own sort,
+    search or scan does them; otherwise it is a plain TStringList. }
+  {$IFDEF OBJECTSTORE_TESTING}
+  TLWPTIndexEntryList = class(TStringList)
+  protected
+    function DoCompareText(const AS1, AS2: string): PtrInt; override;
+    procedure InsertItem(AIndex: Integer; const AText: string;
+      AObject: TObject); overload; override;
+  public
+    procedure Delete(AIndex: Integer); override;
+  end;
+  {$ELSE}
+  TLWPTIndexEntryList = TStringList;
+  {$ENDIF}
+
+{$IFDEF OBJECTSTORE_TESTING}
+function TLWPTIndexEntryList.DoCompareText(const AS1, AS2: string): PtrInt;
+begin
+  Inc(CacheLifecycleEntryVisitCount);
+  Result := inherited DoCompareText(AS1, AS2);
+end;
+
+procedure TLWPTIndexEntryList.InsertItem(AIndex: Integer;
+  const AText: string; AObject: TObject);
+begin
+  Inc(CacheLifecycleEntryVisitCount, Count - AIndex);
+  inherited InsertItem(AIndex, AText, AObject);
+end;
+
+procedure TLWPTIndexEntryList.Delete(AIndex: Integer);
+begin
+  Inc(CacheLifecycleEntryVisitCount, Count - AIndex - 1);
+  inherited Delete(AIndex);
+end;
+{$ENDIF}
+
+{ Index names compare as TStringList's default name comparison does:
+  case-insensitively and locale-aware. }
+function CompareIndexNames(const ALeft, ARight: string): Integer;
+begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleEntryVisitCount);
+  {$ENDIF}
+  Result := AnsiCompareText(ALeft, ARight);
+end;
 
 function LifecycleRoot(const ACacheRoot: string): string;
 begin
@@ -277,7 +332,7 @@ function BuildNameLookup(const AEntries: TStringList): TStringList;
 var
   Index: Integer;
 begin
-  Result := TStringList.Create;
+  Result := TLWPTIndexEntryList.Create;
   Result.Capacity := AEntries.Count;
   for Index := 0 to AEntries.Count - 1 do
     Result.AddObject(AEntries.Names[Index], TObject(PtrInt(Index)));
@@ -292,7 +347,7 @@ function CompareIndexNameThenLine(AList: TStringList; AIndex1,
 var
   Left, Right: PtrInt;
 begin
-  Result := AnsiCompareText(AList[AIndex1], AList[AIndex2]);
+  Result := CompareIndexNames(AList[AIndex1], AList[AIndex2]);
   if Result <> 0 then Exit;
   Left := PtrInt(AList.Objects[AIndex1]);
   Right := PtrInt(AList.Objects[AIndex2]);
@@ -330,7 +385,7 @@ begin
   AValid := False;
   if not ReadSmallTextFile(IndexPath(ACacheRoot), Text) then Exit;
   Lines := TStringList.Create;
-  Parsed := TStringList.Create;
+  Parsed := TLWPTIndexEntryList.Create;
   try
     { Values[Name] := ... scans every earlier entry, so a large index
       loaded that way costs O(n^2) on every cache hit. Parse every line
@@ -365,7 +420,7 @@ begin
     for Index := 0 to Parsed.Count - 1 do
     begin
       if (Index < Parsed.Count - 1)
-         and (AnsiCompareText(Parsed[Index], Parsed[Index + 1]) = 0) then
+         and (CompareIndexNames(Parsed[Index], Parsed[Index + 1]) = 0) then
         Continue;
       AEntries.Add(Parsed[Index] + '='
         + IntToStr(Values[PtrInt(Parsed.Objects[Index])]));
@@ -390,7 +445,7 @@ begin
   while Low <= High do
   begin
     Middle := (Low + High) div 2;
-    Comparison := AnsiCompareText(AEntries.Names[Middle], AName);
+    Comparison := CompareIndexNames(AEntries.Names[Middle], AName);
     if Comparison = 0 then
     begin
       AEntries[Middle] := AName + '=' + AValue;
@@ -877,6 +932,9 @@ end;
   object key, so the order is total and eviction is deterministic. }
 function CompareLRU(const ALeft, ARight: TLWPTCacheObject): Integer;
 begin
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(CacheLifecycleEntryVisitCount);
+  {$ENDIF}
   if ALeft.LastUse < ARight.LastUse then Exit(-1);
   if ALeft.LastUse > ARight.LastUse then Exit(1);
   Result := CompareStr(ObjectKey(ALeft.Namespace, ALeft.Digest),
@@ -1403,7 +1461,7 @@ var
   Index: Integer;
   Kept: TStringList;
 begin
-  Kept := TStringList.Create;
+  Kept := TLWPTIndexEntryList.Create;
   try
     Kept.NameValueSeparator := AEntries.NameValueSeparator;
     Kept.Capacity := AEntries.Count;
@@ -1510,7 +1568,7 @@ begin
     is paid once per band of admissions. }
   Target := CacheLowWaterBytes(Budget);
   Objects := DiscoverObjects(ACacheRoot);
-  Entries := TStringList.Create;
+  Entries := TLWPTIndexEntryList.Create;
   Coordinator := TLWPTProducerLeaseCoordinator.Create(
     ProducerLeaseRoot(ACacheRoot));
   Edges := TLWPTBuildReferenceEdges.Create(ACacheRoot);
@@ -1675,7 +1733,7 @@ var
 begin
   LedgerTrusted := LoadLedger(FCacheRoot, Ledger);
   IndexBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot));
-  Entries := TStringList.Create;
+  Entries := TLWPTIndexEntryList.Create;
   try
     Entries.NameValueSeparator := '=';
     LoadIndex(FCacheRoot, Sequence, Entries, IndexValid);
@@ -1732,7 +1790,7 @@ begin
   ControlBytes := CacheFileBytes(FCacheRoot, IndexPath(FCacheRoot))
     + CacheFileBytes(FCacheRoot,
       ManifestPath(FCacheRoot, FNamespace, ADigest));
-  Entries := TStringList.Create;
+  Entries := TLWPTIndexEntryList.Create;
   try
     try
       WriteManifest(FCacheRoot, FNamespace, ADigest, AObjectPath, Size);
@@ -1775,7 +1833,7 @@ var
   AdditionalBytes, ExistingBytes, Sequence: Int64;
   Ledger: TLWPTCacheLedger;
 begin
-  Entries := TStringList.Create;
+  Entries := TLWPTIndexEntryList.Create;
   try
     Entries.NameValueSeparator := '=';
     LoadIndex(FCacheRoot, Sequence, Entries, IndexValid);
@@ -2102,7 +2160,7 @@ begin
     end;
 
     Objects := DiscoverObjects(CacheRoot);
-    Entries := TStringList.Create;
+    Entries := TLWPTIndexEntryList.Create;
     try
       Entries.NameValueSeparator := '=';
       LoadIndex(CacheRoot, Sequence, Entries, IndexValid);

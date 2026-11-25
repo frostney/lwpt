@@ -62,7 +62,6 @@ uses
   LWPT.ProcessRunner;
 
 const
-  EXTERNAL_DRIVER_PROBE_TIMEOUT_MILLISECONDS = 30000;
   EXTERNAL_DRIVER_DIAGNOSTIC_CONTEXT_BYTES = 4096;
 
 type
@@ -166,8 +165,7 @@ begin
     Options := DefaultProcessRunOptions('compiler driver "'
       + FCompilerID + '" ' + AOperation);
     Options.SeparateStandardError := True;
-    Options.TimeoutMilliseconds :=
-      EXTERNAL_DRIVER_PROBE_TIMEOUT_MILLISECONDS;
+    Options.TimeoutMilliseconds := ProbeTimeoutMilliseconds;
     ProcessRunner := TLWPTDuplexProcessRunner.Create(DriverProcess);
     Result := ProcessRunner.Run(AInput, Options, AStandardOutput,
       AStandardError);

@@ -793,6 +793,10 @@ begin
   Expect<Boolean>(Pos('scheduler error', R.Stdout + R.Stderr) = 0).ToBe(True);
 end;
 
+{ Probes share the compile deadline, so the setting must leave a loaded
+  runner room to start the proxy for its probe; the proxy's compile then
+  sleeps 30 seconds, well past it. The diagnostic must name the compile, so
+  a probe that ran out of time cannot pass for compile cancellation. }
 procedure TCompilerProfiles.TestCompileTimeoutCleansUp;
 var
   R: TLwptResult;
@@ -800,10 +804,10 @@ begin
   SetMode('timeout');
   WriteManifest('external');
   R := RunLwpt(['build', '--no-cache', '--jobs', '1'], FScratch,
-    [COMPILER_TIMEOUT_ENVIRONMENT + '=100']);
+    [COMPILER_TIMEOUT_ENVIRONMENT + '=10000']);
   Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
-  Expect<Boolean>(Pos('timed out after 100 ms', R.Stdout + R.Stderr) > 0)
-    .ToBe(True);
+  Expect<Boolean>(Pos('" compile timed out after 10000 ms',
+    R.Stdout + R.Stderr) > 0).ToBe(True);
   Expect<Boolean>(FileExists(ExpectedExe(FScratch + '/build/app'))).ToBe(False);
 end;
 

@@ -59,7 +59,6 @@ uses
 
 const
   DELPHI_HELP_FLAG = '-h';
-  DELPHI_HELP_TIMEOUT_MILLISECONDS = 30000;
   DELPHI_PROBE_DIAGNOSTIC_CONTEXT_BYTES = 4096;
   DELPHI_IDENTITY_PREFIX = 'Embarcadero Delphi for ';
   DELPHI_VERSION_MARKER = ' compiler version ';
@@ -302,7 +301,7 @@ begin
     ProcessRunner := TLWPTDuplexProcessRunner.Create(CompilerProcess);
     try
       Options := DefaultProcessRunOptions('Delphi compiler probe');
-      Options.TimeoutMilliseconds := DELPHI_HELP_TIMEOUT_MILLISECONDS;
+      Options.TimeoutMilliseconds := ProbeTimeoutMilliseconds;
       Result := ProcessRunner.Run('', Options, AOutput, StandardError);
       if StandardError <> '' then
       begin

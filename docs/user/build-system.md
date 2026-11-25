@@ -35,14 +35,16 @@ The contract LWPT's build system satisfies, the self-host pattern that makes `lw
   complete process tree, and terminates it on timeout or capture failure.
   Stdin pumping and writer cleanup remain deadline-bounded when an escaped
   descendant retains the pipe.
-  Capability probes time out after 30 seconds. Compiles
-  default to 30 minutes; `LWPT_COMPILER_TIMEOUT_MS` sets a positive
-  millisecond override for unusually short or long toolchains.
+  Every compiler process, compile or capability probe, gets the same
+  per-process deadline: 30 minutes by default; `LWPT_COMPILER_TIMEOUT_MS` sets
+  a positive millisecond override for unusually short or long toolchains.
+  Probes have no separate, shorter deadline for a loaded machine to reach
+  before the compile's.
 - **Dependency-aware parallel builds.** Independent ready build entries run in
   parallel by default, bounded by `--jobs=<n>` and the machine-wide
   `LWPT.WorkerBudget`. `--jobs=1` is the sequential escape hatch. See
   [ADR-0023](../adr/0023-parallel-build-target-scheduler.md).
-- **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](../adr/0011-build-lifecycle-hooks.md). Each entry directly executes its declared `command` and ordered `args`; paired literal/glob `inputs` and `output` apply shared strict staleness evaluation. The earlier `[generated]` shape is no longer parsed.
+- **Generator hooks** are declared in `[prebuild]` / `[postbuild]` / `[pretest]` per [ADR-0011](../adr/0011-build-lifecycle-hooks.md). Each entry directly executes its declared `command` and ordered `args`; paired literal/glob `inputs` and `output` apply shared strict staleness evaluation by modification time and by the content recorded at the last successful run. The earlier `[generated]` shape is no longer parsed.
 
 ## The contract
 
@@ -327,7 +329,30 @@ per-entry hook. See ADR-0023.
 
 Successful sessions remove compiler jobs but retain stable
 job logs and completed state for diagnosis. Failed, stale, or interrupted
-sessions retain their private diagnostics. `lwpt repair` removes inactive
+sessions retain their private diagnostics until a later `lwpt build` or
+`lwpt test` stages the same build entry or test program: when that later
+session finishes, pass or fail, it removes that entry's or program's staging
+(executables, units and candidates) from every inactive session in its
+resolved sessions root and keeps their logs, `failure.txt` and state. So the
+only executable left in session staging for an entry or program is the latest
+run's, and only when that run failed; an executable copied by hand from an
+older session can no longer be a silently superseded build. A session counts as
+inactive by the same rule `lwpt repair` uses, and a session whose owner guard
+is held is never touched. Each session records its project's identity, and
+only the same project's sessions are swept, even when a linked `.lwpt` or
+`.lwpt/sessions` makes several projects share one directory. Retention
+follows the order in which sessions take the build-coordination lock to
+finish: a failing session records its result and releases its guard before
+it releases that lock, so of overlapping runs, the last to take the lock keeps
+its staging if it failed, even if it compiled earlier. When the sweep cannot
+take the lock, cannot remove a superseded directory (on Windows, for example,
+an executable that is still running), or finds matching staging in a session
+it cannot verify as this project's (an unreadable record, or one written by
+an LWPT that did not record session identities), it leaves that staging and
+the command prints a warning naming it, without changing its result. Staging is matched by job
+keys derived from the entry name or the program's absolute path, so staging
+retained from before a project moved or was renamed is not matched; `lwpt
+repair` reclaims it. `lwpt repair` removes inactive
 sessions only after their OS-held owner guard is absent; malformed state fails
 closed while its guard remains held. Reusable artifacts remain separate from
 session ownership and are admitted only after successful publication.
@@ -530,9 +555,13 @@ build-foo = { command = "instantfpc",
               output = "source/Foo.inc" }
 ```
 
-`lwpt build` (and `lwpt test`, for `[pretest]`) walks each hook before the phase runs. Every input expression is a project-relative literal or LWPT glob and must match at least one file. A missing output, or any match that is not older than the output, runs the command; otherwise it skips. Run tasks with `inputs` and `output` use the same gate. Commands containing a path resolve from the project root, bare names use inherited `PATH`, and arguments are passed directly without shell or interpreter inference. Pascal hooks therefore select `instantfpc` explicitly, as LWPT's own stamping hook does on every supported platform.
+`lwpt build` (and `lwpt test`, for `[pretest]`) walks each hook before the phase runs. Every input expression is a project-relative literal or LWPT glob and must match at least one file. A missing output, any match that is not older than the output, or inputs or an output whose content differs from the record of the last successful run runs the command; otherwise it skips. Run tasks with `inputs` and `output` use the same gate. Commands containing a path resolve from the project root, bare names use inherited `PATH`, and arguments are passed directly without shell or interpreter inference. Pascal hooks therefore select `instantfpc` explicitly, as LWPT's own stamping hook does on every supported platform.
 
 The gate compares last-write times at the filesystem's full resolution: `stat`'s nanosecond field on Linux and macOS, and the raw UTC `FILETIME` (100-nanosecond ticks) on Windows. It does not use `FileAge`'s whole-second (Unix) or 2-second local DOS (Windows) times, which made an input edited in the same tick as the output's last write look as old as the output, so the edit was skipped ([#367](https://github.com/frostney/lwpt/issues/367)). An input whose time equals the output's counts as stale. At full resolution equal times are rare. On filesystems that keep coarse timestamps (FAT, some network filesystems, and HFS+ at one second), a later edit can carry the output's exact time. Running in that case means an edit is never missed. The cost is that the command re-runs until its output is strictly newer than every input. That is usually one extra run, but it repeats while the equality persists: for example, when several invocations land in one coarse tick, or when a generator skips rewriting an unchanged output or preserves its time.
+
+Times alone cannot tell whether an output was generated from the inputs that are there now. A version-control checkout, a merge-conflict resolution or a copy can write an output from another generation after the inputs, so it is newer than every input and still stale. After each successful run, LWPT therefore records the command's declaration, the SHA-256 of every matched input and the SHA-256 of the output, in `.lwpt/sessions/hook-runs/`, one small record per gated output. The record is staged through the project's temporary directory (`.lwpt/tmp/`, or `[lwpt].tmp-dir`) like other toolkit-state writes, and `lwpt repair` leaves it alone. `lwpt init` adds `.lwpt/sessions/` to `.gitignore`; a project set up by hand should ignore it too. The command runs again when there is no record, or when the declaration, an input's content or the output's content differs from it. Making an input newer than the output (`touch`) still forces a run.
+
+A missing record runs the command; a successful run then records it, so the next invocation can skip. That happens after a fresh clone or the upgrade to this behavior. Some runs leave no record and therefore run every time: the run of a postbuild output that is retargeted to the session's private candidate (per-entry postbuild, and whole-build postbuild in builds without dependency edges), whose path changes with every build; a run during which an input changed; and a run whose output or inputs could not be read, such as a matched FIFO, which is never opened in a way that blocks. "An input changed" means its digest after the command differs from the one taken before it, so a change reverted while the command ran is not seen. Two invocations in one checkout that run the same generator at the same time still race on its output file, as they did with times alone; LWPT does not serialise them.
 
 Test discovery is the exception to the general `pre*` naming intuition:
 `lwpt test` freezes its discovered inventory and positional file, directory,

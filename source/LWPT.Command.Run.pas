@@ -102,7 +102,7 @@ begin
     *answer* the user is asking for, so any propagation other than
     "what the command returned" loses information. }
   Result := RunUserTask(Found,
-    ExtractFileDir(ExpandFileName(AManifestPath)));
+    ExtractFileDir(ExpandFileName(AManifestPath)), ResolveTmpDir(Man));
 end;
 
 end.

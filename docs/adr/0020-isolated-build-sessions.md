@@ -8,8 +8,9 @@
   manifest snapshot it parses and publishes only while all declared inputs
   still match.
 - **Ownership remains observable for the full session lifecycle.** Failed,
-  stale, and interrupted work remains private for `lwpt repair`; successful
-  cleanup retains its OS guard until the private contents are gone.
+  stale, and interrupted work remains private for `lwpt repair` until a later
+  session supersedes it; successful cleanup retains its OS guard until the
+  private contents are gone.
 
 Each `lwpt build` and `lwpt test` invocation owns a unique private build
 session. The root is selected by `LWPT_SESSION_DIR`, then
@@ -21,7 +22,12 @@ compilation, acquires a short lock derived from the requested public output,
 captures the fingerprint again, and atomically replaces the public executable
 only when the two fingerprints match. Failed, stale, or interrupted candidates
 remain private; `lwpt repair` reclaims inactive sessions while conservatively
-retaining sessions whose recorded process is alive.
+retaining sessions whose recorded process is alive. When a later session that
+staged the same build entry or test program finishes, it removes that entry's
+or program's staging from every inactive session in its resolved sessions root,
+under the same inactivity rule and the lock repair holds, and keeps their logs,
+failure detail and state. An older candidate therefore cannot be mistaken for
+the current build when someone runs it by hand.
 
 ## Considered options
 

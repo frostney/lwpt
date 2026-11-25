@@ -2192,7 +2192,7 @@ begin
         begin
           WriteLn('test session: ', Session.SessionID, ' (',
             Session.SessionReference, ')');
-          RunHooks('pretest', Man.PreTest, ProjectRoot);
+          RunHooks('pretest', Man.PreTest, ProjectRoot, ResolveTmpDir(Man));
         end;
 
     ModulesRoot := ResolveModulesDir(Man);
@@ -2235,7 +2235,7 @@ begin
           WriteLn('no *.Test.pas files found');
         Result := 0;
         if not AInventory then
-          RunHooks('posttest', Man.PostTest, ProjectRoot);
+          RunHooks('posttest', Man.PostTest, ProjectRoot, ResolveTmpDir(Man));
         Session.Finish(True);
         Exit;
       end;
@@ -2252,7 +2252,7 @@ begin
         { Mirror the other exit paths: posttest cleanup/reporting hooks
           run even when the scheduler never starts. }
         if not AInventory then
-          RunHooks('posttest', Man.PostTest, ProjectRoot);
+          RunHooks('posttest', Man.PostTest, ProjectRoot, ResolveTmpDir(Man));
         Session.Finish(False, 'test staging key collision');
         Exit;
       end;
@@ -2300,7 +2300,8 @@ begin
           WriteLn('discovered ', Tests.Count, ' test file(s)');
       end;
       Scheduler := TTestScheduler.Create(Tests, UnitPaths,
-        Man.TestFlags, Session.JobRoot('tests'), AJobs, EffectiveBail, Session,
+        Man.TestFlags, Session.ProgramJobsRoot('tests'), AJobs, EffectiveBail,
+        Session,
         ProjectRoot, AVerbose, AInventory,
         (ASelectors = nil) or (ASelectors.Count = 0), InventoryPath,
         CompilerDriver, CacheContext);
@@ -2334,11 +2335,14 @@ begin
         Result := 0
       else
         Result := 1;
-    if not AInventory then RunHooks('posttest', Man.PostTest, ProjectRoot);
+    if not AInventory then RunHooks('posttest', Man.PostTest, ProjectRoot, ResolveTmpDir(Man));
     Session.Finish(Result = 0, IntToStr(Failed) + ' failed, '
       + IntToStr(CompileFailed) + ' did not compile, '
       + IntToStr(Cancelled) + ' cancelled' + RunVoidSummary(Voided,
         VoidedInput));
+    for i := 0 to Session.CleanupWarnings.Count - 1 do
+      WriteLn(ErrOutput, PROGRAM_NAME, ' test: warning: ',
+        Session.CleanupWarnings[i]);
       finally
         Session.Free;
       end;

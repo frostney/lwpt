@@ -105,12 +105,14 @@ begin
       NeedManifestWrite := True;
     end;
 
-    RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot);
+    RunHooks('preinstall', Ctx.Manifest.PreInstall, Ctx.ProjectRoot,
+      ResolveTmpDir(Ctx.Manifest));
     if NeedManifestWrite then
       RunManifestMutationTransaction(Ctx, Lines)
     else
       RunInstallTransaction(Ctx, itmMaterialize);
-    RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot);
+    RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot,
+      ResolveTmpDir(Ctx.Manifest));
     WriteLn('updated ', IntToStr(Length(Planned)), ' dependenc',
       BoolToStr(Length(Planned) = 1, 'y', 'ies'));
   finally
