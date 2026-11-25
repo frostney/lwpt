@@ -558,9 +558,11 @@ its summary. One invocation therefore never reports results from two source
 states, and a compile that read a half-edited file is reported as void rather
 than as a compile failure. Content decides, not timestamps: rewriting a file
 with identical bytes does not void the run, and a file LWPT cannot read is
-recorded by its size and modification time. Test programs must not write into
-a compiler-input directory such as their own source directory; write scratch
-files to a temporary or build directory. `lwpt build` has no such check,
+recorded by its size and modification time. Nothing that runs during the
+invocation may write into those inputs: not a test program (into its own
+source directory, for example), and not the compiler or an external profile's
+driver (into a project-root file, for example). Write scratch and state files
+to a temporary directory or a subdirectory that is not an input. `lwpt build` has no such check,
 because its prebuild hooks may generate inputs between entries.
 
 LWPT's own root manifest previously carried a paired `[prebuild]` + `[pretest]` `embed-testing-library` hook that regenerated `source/LWPT.Embedded.TestingLibrary.inc`. [ADR-0015](../adr/0015-drop-export-testing-becomes-workspace-package.md) removed that embedded-blob hook. The current root manifest instead declares the `[prebuild]` `stamp-version` hook, which derives `source/Version.inc` from `lwpt.toml`, and a `[pretest]` `lwpt-testing` hook that runs `./build/lwpt build lwpt-testing` so the test-flavoured binary is current before any test program spawns it ([ADR-0044](../adr/0044-test-seams-only-in-test-builds.md)).

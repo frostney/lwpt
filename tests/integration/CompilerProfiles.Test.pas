@@ -26,6 +26,7 @@ const
   LAKON_DRIVER_ID = 'lakon';
   LAKON_MODE = 'lakon-cfg';
   LEASE_OBSERVER_ENV = PROJECT_NAME + '_LEASE_OBSERVER';
+  PROBE_COUNT_PATH = '.driver-state/probe-count';
 
 type
   TCompilerProfiles = class(TTestSuite)
@@ -138,6 +139,9 @@ begin
   end;
 end;
 
+{ The driver counts its probes in a subdirectory, not in a project-root file:
+  root files are compiler inputs, and lwpt test voids a run whose inputs
+  change after it starts. }
 function IncrementProbeCount: Integer;
 var
   Lines: TStringList;
@@ -145,14 +149,15 @@ begin
   Result := 0;
   Lines := TStringList.Create;
   try
-    if FileExists('.probe-count') then
+    if FileExists(PROBE_COUNT_PATH) then
     begin
-      Lines.LoadFromFile('.probe-count');
+      Lines.LoadFromFile(PROBE_COUNT_PATH);
       Result := StrToIntDef(Trim(Lines.Text), 0);
     end;
     Inc(Result);
     Lines.Text := IntToStr(Result);
-    Lines.SaveToFile('.probe-count');
+    ForceDirectories(ExtractFileDir(ExpandFileName(PROBE_COUNT_PATH)));
+    Lines.SaveToFile(PROBE_COUNT_PATH);
   finally
     Lines.Free;
   end;
@@ -470,7 +475,7 @@ end;
 procedure TCompilerProfiles.SetMode(const AMode: string);
 begin
   WriteTextFile(FScratch + '/.driver-mode', AMode);
-  WriteTextFile(FScratch + '/.probe-count', '0');
+  WriteTextFile(FScratch + '/' + PROBE_COUNT_PATH, '0');
   if FileExists(FScratch + '/.lease-observed') then
     DeleteFile(FScratch + '/.lease-observed');
   if FileExists(FScratch + '/.entry-lease-observed') then
