@@ -2,6 +2,12 @@
 
 > **Status note (2026-10-05):** the self-hosted registry that "Considered options" calls "still issue #29" has shipped ([#29](https://github.com/frostney/lwpt/issues/29) is closed): origins and mirrors per [ADR-0043](./0043-self-hosted-registry-origin.md) and [ADR-0045](./0045-verified-registry-mirror.md), publication per [ADR-0049](./0049-registry-remote-publication.md), and `registry:` dependencies per [ADR-0051](./0051-registry-dependency-sources.md). `outdated` and `update` still compare and update git-host dependencies only; `registry:` dependencies are skipped.
 
+> **Clarification (2026-11-26):** `update` applies [ADR-0019's lockfile-diff
+> pruning](./0019-add-remove-subcommands.md#subcommand-contracts) inside the
+> install lock whether or not the update rewrites a constraint. An in-range
+> update leaves the manifest file untouched. Plain `install` retains the
+> pruning policy in ADR-0019. See [#457](https://github.com/frostney/lwpt/issues/457).
+
 The subcommand surface, frozen at twelve since [ADR-0027](./0027-agents-subcommand.md) and the pre-approved [ADR-0006](./0006-stack-contracts-deferred-from-v1.md) pair (`health`, `duplication`) ([Hard Constraint in AGENTS.md](../../AGENTS.md)), expands to fourteen with `lwpt outdated` and `lwpt update`. The problem they solve: every LWPT consumer (wasmlight, duetto, lakon, and any later git-host dep) has no sanctioned way to learn that a newer tag exists, rewrite the authored `^`/`~` constraint when the latest release is outside it, and land a lockfile that still went through the install transaction. Today the documented path is `lwpt add <source@new-version>` or a hand-edit plus `lwpt install`. That is fine for one package, one human; it is not a weekly ecosystem loop. Dependabot cannot read `lwpt.toml`. We chose two thin frontends over the existing resolver and git smart-HTTP tag listing ([ADR-0009](./0009-source-syntax-and-tag-resolution.md)) rather than a new HTTP/JSON GitHub-releases client because the tag advertisement is already host-uniform, already fixtureable (`LWPT_TEST_GIT_FIXTURE_DIR`), and already what `lwpt install` trusts. Release notes stay out of the binary.
 
 ## Subcommand contracts

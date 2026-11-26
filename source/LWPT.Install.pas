@@ -157,6 +157,7 @@ function  RunInstallTransaction(const AContext: TManifestContext; const AMode: T
 { The lock gate every lock-reading command runs before it changes anything
   (ADR-0052): a v3 lock is refused with LockfileSchemaV3Message. }
 procedure RequireProjectLockfileSchema(const AContext: TManifestContext);
+{ Always prune by lockfile diff. Nil lines leave the manifest untouched. }
 function  RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 procedure RecoverInterruptedInstall(const AContext: TManifestContext);
 
@@ -6594,19 +6595,17 @@ begin
     Result := ELockfileError.Create(SchemaUpgradeArchivesMessage(Missing));
 end;
 
-{ The shared transaction body. AManifestLines <> nil is the manifest-
-  mutation flow (ADR-0019, `lwpt add` / `lwpt remove`): the previous
-  lockfile is snapshotted right after the lock is acquired, the edited
-  lwpt.toml is committed (atomically) after lockfile + cfg, and the
-  lockfile diff prunes orphaned module trees + archives — all INSIDE
-  the cross-process install lock, so a concurrent install can neither
-  observe a manifest/lockfile mismatch nor race the prune deletions.
-  AManifestLines = nil is the plain `lwpt install` flow.
+{ Add, remove and update prune orphaned module trees and archives by
+  comparing the old and new locks (ADR-0019, ADR-0039). The lockfile
+  snapshot, rollback retention, pruning and any manifest write all run
+  under the cross-process install lock. An in-range update prunes with
+  nil AManifestLines, so there is no manifest publication to roll back.
   AAcceptMovedTags lets resolution re-pin a locked tag that the host now
   advertises at a different commit (`install --accept-moved-tags`). }
 function RunInstallTransactionCore(const AContext: TManifestContext;
   const AMode: TInstallTransactionMode;
   const AManifestLines: TStringList;
+  const APruneOrphans: Boolean;
   const AAcceptMovedTags: Boolean): TInstallTransactionResult;
 var
   Man : TManifest;
@@ -7029,11 +7028,8 @@ begin
       WriteLn(LWPT.Core.LOCKFILE, ' is current (', Length(Resolved),
               ' packages); wrote ', CfgPath);
 
-    if AManifestLines <> nil then
+    if APruneOrphans then
     begin
-      { Retain stale committed graph paths before publishing the manifest.
-        The manifest is the last fallible publication step: after it lands,
-        only best-effort tmp cleanup remains. }
       RetainOrphanedPackagePaths(OldLock, Resolved, ModulesRoot,
         ArchivesRoot, RollbackRoot, OrphanRollbacks);
       {$IFDEF INSTALL_TESTING}
@@ -7041,8 +7037,9 @@ begin
         raise EExtractError.Create(
           'injected failure after orphan retention');
       {$ENDIF}
-      AtomicWriteText(ManifestPath, TmpRoot, AManifestLines);
     end;
+    if AManifestLines <> nil then
+      AtomicWriteText(ManifestPath, TmpRoot, AManifestLines);
 
     Result.PackageCount := Length(Resolved);
     Result.LockfilePath := LockfilePath;
@@ -7108,7 +7105,8 @@ end;
 
 function RunInstallTransaction(const AContext: TManifestContext; const AMode: TInstallTransactionMode; const AAcceptMovedTags: Boolean): TInstallTransactionResult;
 begin
-  Result := RunInstallTransactionCore(AContext, AMode, nil, AAcceptMovedTags);
+  Result := RunInstallTransactionCore(AContext, AMode, nil, False,
+    AAcceptMovedTags);
 end;
 
 procedure RequireProjectLockfileSchema(const AContext: TManifestContext);
@@ -7131,7 +7129,7 @@ end;
 function RunManifestMutationTransaction(const AContext: TManifestContext; const AManifestLines: TStringList): TInstallTransactionResult;
 begin
   Result := RunInstallTransactionCore(AContext, itmMaterialize, AManifestLines,
-    False);
+    True, False);
 end;
 
 end.
