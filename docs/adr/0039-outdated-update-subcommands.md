@@ -1,7 +1,7 @@
 # `lwpt outdated` and `lwpt update` are the Dependabot-equivalent for the LWPT ecosystem
 
 > **Status note (2026-10-05):** the self-hosted registry that "Considered options" calls "still issue #29" has shipped ([#29](https://github.com/frostney/lwpt/issues/29) is closed): origins and mirrors per [ADR-0043](./0043-self-hosted-registry-origin.md) and [ADR-0045](./0045-verified-registry-mirror.md), publication per [ADR-0049](./0049-registry-remote-publication.md), and `registry:` dependencies per [ADR-0051](./0051-registry-dependency-sources.md). `outdated` and `update` still compare and update git-host dependencies only; `registry:` dependencies are skipped.
-
+>
 > **Clarification (2026-11-26):** `update` applies [ADR-0019's lockfile-diff
 > pruning](./0019-add-remove-subcommands.md#subcommand-contracts) inside the
 > install lock whether or not the update rewrites a constraint. An in-range
