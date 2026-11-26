@@ -606,22 +606,25 @@ begin
   if DirectoryExists(FScratch) then WipeDir(FScratch);
 end;
 
+{ Writes exact bytes without the platform line break of WriteTextFile. }
+procedure WriteExactFile(const APath: string; const ABytes: RawByteString);
+begin
+  ForceDirectories(ExtractFileDir(APath));
+  with TFileStream.Create(APath, fmCreate) do
+    try
+      if Length(ABytes) > 0 then WriteBuffer(ABytes[1], Length(ABytes));
+    finally
+      Free;
+    end;
+end;
+
 function TCacheLifecycleContract.WriteObject(const AName,
   ABytes: string; const AStore: TLWPTImmutableObjectStore): string;
 var
-  Raw: RawByteString;
   Source: string;
-  Stream: TFileStream;
 begin
   Source := FScratch + '/sources/' + AName;
-  ForceDirectories(ExtractFileDir(Source));
-  Stream := TFileStream.Create(Source, fmCreate);
-  try
-    Raw := RawByteString(ABytes);
-    if Length(Raw) > 0 then Stream.WriteBuffer(Raw[1], Length(Raw));
-  finally
-    Stream.Free;
-  end;
+  WriteExactFile(Source, RawByteString(ABytes));
   Result := 'sha256:' + SHA256File(Source);
   Expect<Boolean>(AStore.Admit(Source, Result) <> '').ToBe(True);
 end;
@@ -1212,19 +1215,25 @@ end;
 procedure TCacheLifecycleContract.
   TestRepairRebuildsIndexAndRemovesCorruption;
 var
+  ContentPrefix: string;
   CorruptDigest, HealthyDigest, MalformedEntry, MalformedPrefix,
     MalformedRootEntry: string;
   FirstReport, SecondReport: TLWPTCacheRepairReport;
   Store: TLWPTImmutableObjectStore;
+  {$IFDEF DARWIN}
+  FirstHashCount: SizeInt;
+  {$ENDIF}
 begin
   Store := TLWPTImmutableObjectStore.Create(
     FCacheRoot + '/dependency-archives', FCacheRoot,
     DEPENDENCY_ARCHIVE_NAMESPACE);
   try
-    CorruptDigest := WriteObject('corrupt', 'corrupt-me', Store);
+    ContentPrefix := StringOfChar('x', 65535) + #0;
+    CorruptDigest := WriteObject('corrupt', ContentPrefix + 'a', Store);
     HealthyDigest := WriteObject('healthy', 'keep-me', Store);
     WriteTextFile(FCacheRoot + '/lifecycle/index', 'broken');
-    WriteTextFile(Store.ObjectPath(CorruptDigest), 'wrong');
+    WriteExactFile(Store.ObjectPath(CorruptDigest),
+      RawByteString(ContentPrefix + 'b'));
     WriteTextFile(FCacheRoot + '/dependency-archives/tmp/incomplete',
       'partial');
     MalformedRootEntry := FCacheRoot
@@ -1234,7 +1243,13 @@ begin
     WriteTextFile(MalformedRootEntry, 'root-residue');
     WriteTextFile(MalformedPrefix, 'prefix-residue');
     WriteTextFile(MalformedEntry, 'entry-residue');
+    {$IFDEF DARWIN}
+    FirstHashCount := NativeSHA256StreamCount;
+    {$ENDIF}
     FirstReport := RepairSharedCache(FCacheRoot);
+    {$IFDEF DARWIN}
+    Expect<SizeInt>(NativeSHA256StreamCount - FirstHashCount).ToBe(2);
+    {$ENDIF}
     Expect<Boolean>(FirstReport.IndexRebuilt).ToBe(True);
     Expect<Integer>(FirstReport.CorruptObjectsRemoved).ToBe(1);
     Expect<Integer>(FirstReport.IncompleteEntriesRemoved).ToBe(5);
@@ -1245,6 +1260,9 @@ begin
     Expect<Boolean>(FileExists(MalformedPrefix)).ToBe(False);
     Expect<Boolean>(FileExists(MalformedEntry)).ToBe(False);
     SecondReport := RepairSharedCache(FCacheRoot);
+    {$IFDEF DARWIN}
+    Expect<SizeInt>(NativeSHA256StreamCount - FirstHashCount).ToBe(3);
+    {$ENDIF}
     Expect<Integer>(SecondReport.CorruptObjectsRemoved).ToBe(0);
     Expect<Integer>(SecondReport.IncompleteEntriesRemoved).ToBe(0);
     Expect<Int64>(SecondReport.BytesReclaimed).ToBe(0);
@@ -1319,20 +1337,6 @@ begin
     on ELWPTCacheLifecycleError do Refused := True;
   end;
   Expect<Boolean>(Refused).ToBe(True);
-end;
-
-{ Exact bytes, unlike WriteTextFile, which writes the platform line break:
-  the index is LF-only, and an index fixture whose size changes on the
-  first rewrite would move the measured total under the test. }
-procedure WriteExactFile(const APath: string; const ABytes: RawByteString);
-begin
-  ForceDirectories(ExtractFileDir(APath));
-  with TFileStream.Create(APath, fmCreate) do
-    try
-      if Length(ABytes) > 0 then WriteBuffer(ABytes[1], Length(ABytes));
-    finally
-      Free;
-    end;
 end;
 
 function ReadExactFile(const APath: string): RawByteString;
