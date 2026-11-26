@@ -48,7 +48,7 @@ type
     FRoot: string;
     function CanonicalDigest(const ADigest: string): string;
     function StoreRootsHaveLink: Boolean;
-    function StagingPathHasLink: Boolean;
+    function StagingPathHasLink(const AStagingDirectory: string): Boolean;
     function ObjectPathHasLink(const APath: string): Boolean;
     procedure DiscardObjectLocked(const ADigest, APath: string);
     function VerifyObject(const ADigest: string; out APath: string;
@@ -342,12 +342,15 @@ begin
     or IsDirSymlinkOrJunction(FRoot);
 end;
 
-{ The staging root and its ancestors inside the cache; each digest's staging
-  directory is checked by its own creation and by WipeDir. }
-function TLWPTImmutableObjectStore.StagingPathHasLink: Boolean;
+{ True when a digest's staging directory, the staging root, or a root above
+  them is a symlink or junction. Staged bytes are written, hashed, published
+  and removed through this path, so each of those steps checks it first. }
+function TLWPTImmutableObjectStore.StagingPathHasLink(
+  const AStagingDirectory: string): Boolean;
 begin
   Result := StoreRootsHaveLink
-    or IsDirSymlinkOrJunction(IncludeTrailingPathDelimiter(FRoot) + 'tmp');
+    or IsDirSymlinkOrJunction(IncludeTrailingPathDelimiter(FRoot) + 'tmp')
+    or IsDirSymlinkOrJunction(AStagingDirectory);
 end;
 
 { True when anything from the namespace root down to the object entry, the
@@ -441,6 +444,7 @@ begin
     moved link stays in quarantine unread, and nothing is restored through a
     link. }
   if (QuarantinePath <> '')
+     and not IsDirSymlinkOrJunction(ExtractFileDir(QuarantinePath))
      and not IsDirSymlinkOrJunction(QuarantinePath)
      and (('sha256:' + SHA256File(QuarantinePath)) = Expected)
      and not ObjectPathHasLink(APath) then
@@ -561,9 +565,15 @@ begin
         'object staging root');
       EnsureUnlinkedDirectory(TmpRoot, 'object staging directory');
       Staged := MakeTmpPath(TmpRoot, 'object');
+      if StagingPathHasLink(TmpRoot) then
+        raise ELWPTObjectStoreError.CreateFmt(
+          'object staging path must not contain a link: %s', [TmpRoot]);
       if not CopyFileContent(ASourcePath, Staged) then
         raise ELWPTObjectStoreError.CreateFmt(
           'failed to stage object %s', [Expected]);
+      if StagingPathHasLink(TmpRoot) or IsDirSymlinkOrJunction(Staged) then
+        raise ELWPTObjectStoreError.CreateFmt(
+          'object staging path must not contain a link: %s', [Staged]);
       Actual := 'sha256:' + SHA256File(Staged);
       if Actual <> Expected then
         raise ELWPTObjectStoreError.CreateFmt(
@@ -585,6 +595,11 @@ begin
         if ObjectPathHasLink(Result) then
           raise ELWPTObjectStoreError.CreateFmt(
             'object path must not contain a link: %s', [Result]);
+        { The rename's source is reached through the staging path, which
+          must still be the verified staged file. }
+        if StagingPathHasLink(TmpRoot) or IsDirSymlinkOrJunction(Staged) then
+          raise ELWPTObjectStoreError.CreateFmt(
+            'object staging path must not contain a link: %s', [Staged]);
         {$IFDEF OBJECTSTORE_TESTING}
         if Assigned(ObjectStoreBeforePublicationTestHook) then
           ObjectStoreBeforePublicationTestHook(Staged, Result);
@@ -620,7 +635,7 @@ begin
         MutationLease := nil;
       end;
     except
-      if (Staged <> '') and not StagingPathHasLink
+      if (Staged <> '') and not StagingPathHasLink(TmpRoot)
          and FileExists(Staged) then
         SysUtils.DeleteFile(Staged);
       if Published then
@@ -641,14 +656,14 @@ begin
           Published := True;
         end;
       end;
-      if (TmpRoot <> '') and not StagingPathHasLink
+      if (TmpRoot <> '') and not StagingPathHasLink(TmpRoot)
          and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
       raise;
     end;
   finally
     { A linked ancestor would make the wipe empty a directory outside the
       cache; repair removes such residue instead. }
-    if (TmpRoot <> '') and not StagingPathHasLink
+    if (TmpRoot <> '') and not StagingPathHasLink(TmpRoot)
        and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
     ObjectLease.Free;
   end;

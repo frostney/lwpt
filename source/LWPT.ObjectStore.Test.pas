@@ -152,6 +152,7 @@ type
     procedure TestShardLinkedBeforeMaterializeCopyIsNeverRead;
     procedure TestDiscardNeverDeletesThroughALinkedShard;
     procedure TestAdmissionRefusesAStoreRootLinkedAfterCreation;
+    procedure TestPublicationRefusesAStagingDirectoryLinkedAfterStaging;
   end;
 
 procedure WriteSignal(const APath: string);
@@ -593,6 +594,17 @@ begin
   ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
 end;
 
+{ Puts a copy of the staged file outside the cache under the same name, then
+  replaces the staging directory with a link to that copy's directory. }
+procedure SwapStagingDirectoryAfterStage(const APath: string);
+begin
+  ObjectStoreAfterStageTestHook := nil;
+  if not CopyFileContent(APath, IncludeTrailingPathDelimiter(SwapShardTarget)
+    + ExtractFileName(APath)) then
+    raise Exception.Create('failed to copy the staged object outside');
+  ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
+end;
+
 procedure SwapShardBeforeMaterializeCopy(const ADigest, APath: string);
 begin
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
@@ -632,6 +644,7 @@ end;
 procedure TObjectStoreContract.ResetScratch;
 begin
   ObjectStoreBeforeQuarantineTestHook := nil;
+  ObjectStoreAfterStageTestHook := nil;
   SwapShardTarget := '';
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyTestHook := nil;
@@ -906,6 +919,38 @@ begin
     Expect<Integer>(CountFiles(FOutside)).ToBe(1);
     Expect<string>(ReadBytes(FOutside + '/tmp/keep')).ToBe('outside bytes');
   finally
+    Store.Free;
+  end;
+end;
+
+{ The digest's staging directory becomes a link after the staged bytes were
+  verified: publication must not rename the file the link reaches into the
+  store. }
+procedure TObjectStoreContract.
+  TestPublicationRefusesAStagingDirectoryLinkedAfterStaging;
+var
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    SwapShardTarget := FOutside;
+    ObjectStoreAfterStageTestHook := SwapStagingDirectoryAfterStage;
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('object staging path must not contain a link',
+          E.Message) > 0;
+    end;
+    Expect<Boolean>(Assigned(ObjectStoreAfterStageTestHook)).ToBe(False);
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(CountFiles(FOutside)).ToBe(1);
+    Expect<Boolean>(FileExists(Store.ObjectPath(FDigest))).ToBe(False);
+  finally
+    ObjectStoreAfterStageTestHook := nil;
     Store.Free;
   end;
 end;
@@ -1505,6 +1550,8 @@ begin
     TestDiscardNeverDeletesThroughALinkedShard);
   LinkTest('admission refuses a store root linked after the store was created',
     TestAdmissionRefusesAStoreRootLinkedAfterCreation);
+  LinkTest('publication refuses a staging directory linked after staging',
+    TestPublicationRefusesAStagingDirectoryLinkedAfterStaging);
 end;
 
 begin
