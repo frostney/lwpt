@@ -665,10 +665,22 @@ end;
 procedure TSHA256NISTVectors.TestSpansTwoBlocks;
 const
   EXPECTED = 'cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0';
+var
+  Bytes: TBytes;
+  Stream: TBytesStream;
 begin
   { 1,000,000 repetitions of "a" — the standard "long message" NIST
     vector. Exercises the multi-block iteration path proper. }
-  Expect<string>(SHA256Hex(RepeatBytes(Ord('a'), 1000000))).ToBe(EXPECTED);
+  Bytes := RepeatBytes(Ord('a'), 1000000);
+  Expect<string>(SHA256Hex(Bytes)).ToBe(EXPECTED);
+  Stream := TBytesStream.Create(Bytes);
+  try
+    Stream.Position := Stream.Size;
+    Expect<string>(SHA256Stream(Stream)).ToBe(EXPECTED);
+    Expect<Int64>(Stream.Position).ToBe(0);
+  finally
+    Stream.Free;
+  end;
 end;
 
 procedure TSHA256NISTVectors.SetupTests;

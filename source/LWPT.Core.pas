@@ -323,6 +323,11 @@ function  SHA256Hex(const AData: TBytes): string;
 function  SHA256Stream(AStream: TStream;
   AProgress: TSHA256Progress = nil): string;
 function  SHA256File(const APath: string): string;
+{$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+threadvar
+  { Completed CommonCrypto stream hashes on the calling test thread. }
+  NativeSHA256StreamCount: SizeInt;
+{$ENDIF}
 function  CanonicalTreeHashPath(const APath: string;
   const ASourceDelimiter: Char): string;
 function  NormalizeTreeHashContent(const ABytes: TBytes): TBytes;
@@ -2759,24 +2764,69 @@ begin
   Result := SHA256DigestHex(SHA256Bytes(AData));
 end;
 
+{$IFDEF DARWIN}
+type
+  { CC_SHA256_CTX from <CommonCrypto/CommonDigest.h>. The CommonCrypto
+    symbols are exported by the libSystem LWPT already links on Darwin. }
+  TCommonCryptoSHA256Context = record
+    Count: array[0..1] of UInt32;
+    Hash: array[0..7] of UInt32;
+    Words: array[0..15] of UInt32;
+  end;
+
+function CommonCryptoSHA256Init(var AContext: TCommonCryptoSHA256Context):
+  LongInt; cdecl; external 'c' name 'CC_SHA256_Init';
+function CommonCryptoSHA256Update(var AContext: TCommonCryptoSHA256Context;
+  AData: Pointer; ACount: UInt32): LongInt;
+  cdecl; external 'c' name 'CC_SHA256_Update';
+function CommonCryptoSHA256Final(ADigest: PByte;
+  var AContext: TCommonCryptoSHA256Context): LongInt;
+  cdecl; external 'c' name 'CC_SHA256_Final';
+{$ENDIF}
+
 function SHA256Stream(AStream: TStream;
   AProgress: TSHA256Progress): string;
 var
   Buffer: array[0..65535] of Byte;
+  {$IFDEF DARWIN}
+  Context: TCommonCryptoSHA256Context;
+  {$ELSE}
   Context: TSHA256Context;
+  {$ENDIF}
   Digest: TSHA256Digest;
   ReadCount: Integer;
 begin
   AStream.Position := 0;
   try
+    {$IFDEF DARWIN}
+    if CommonCryptoSHA256Init(Context) <> 1 then
+      raise EVerifyError.Create('CommonCrypto SHA-256 initialization failed');
+    {$ELSE}
     SHA256Init(Context);
+    {$ENDIF}
     repeat
       if Assigned(AProgress) then AProgress;
       ReadCount := AStream.Read(Buffer[0], SizeOf(Buffer));
-      if ReadCount > 0 then SHA256Update(Context, Buffer[0], ReadCount);
+      if ReadCount > 0 then
+      begin
+        {$IFDEF DARWIN}
+        if CommonCryptoSHA256Update(Context, @Buffer[0], UInt32(ReadCount)) <> 1 then
+          raise EVerifyError.Create('CommonCrypto SHA-256 update failed');
+        {$ELSE}
+        SHA256Update(Context, Buffer[0], ReadCount);
+        {$ENDIF}
+      end;
     until ReadCount = 0;
     if Assigned(AProgress) then AProgress;
+    {$IFDEF DARWIN}
+    if CommonCryptoSHA256Final(@Digest[0], Context) <> 1 then
+      raise EVerifyError.Create('CommonCrypto SHA-256 finalization failed');
+    {$IFDEF OBJECTSTORE_TESTING}
+    Inc(NativeSHA256StreamCount);
+    {$ENDIF}
+    {$ELSE}
     SHA256Final(Context, Digest);
+    {$ENDIF}
     Result := SHA256DigestHex(Digest);
   finally
     AStream.Position := 0;
