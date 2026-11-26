@@ -419,6 +419,8 @@ begin
     Line := Lines[I];
     if (Line = '') or (Line[1] = '#') then Continue;
     if Line[Length(Line)] = #13 then SetLength(Line, Length(Line) - 1);
+    { Git handles each pattern as a C string, which ends at a NUL byte. }
+    if Pos(#0, Line) > 0 then SetLength(Line, Pos(#0, Line) - 1);
     Line := TrimTrailingSpaces(Line);
     if Line = '' then Continue;
 

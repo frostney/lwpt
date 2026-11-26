@@ -516,10 +516,14 @@ var
   Top: string;
 begin
   Top := NewWorktree('line-endings');
-  WriteRaw(Top + '/.gitignore', #$EF#$BB#$BF'bom'#13#10'cr'#13#10'last');
+  WriteRaw(Top + '/.gitignore', #$EF#$BB#$BF'bom'#13#10'cr'#13#10
+    + 'nul'#0'/tail'#10'last');
   CheckCases(Top, Top, [
     C('bom', True),
     C('cr', True),
+    { A NUL byte ends the pattern, so `nul` stays an unanchored name. }
+    C('sub/nul', True),
+    C('tail', False),
     C('last', True),
     C('other', False)], True);
 end;
@@ -825,7 +829,7 @@ begin
   Test('bracket expressions, ranges and classes', TestBracketExpressions);
   Test('nested files and info/exclude follow Git''s precedence',
     TestNestedFilesAndPrecedence);
-  Test('CRLF line endings and a byte order mark',
+  Test('CRLF line endings, a byte order mark and a NUL byte',
     TestLineEndingsAndByteOrderMark);
   Test('symlinked or non-regular ignore files are skipped',
     TestSymlinkedOrNonRegularIgnoreFilesAreSkipped);

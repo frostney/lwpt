@@ -916,6 +916,9 @@ function WriteIgnoredTestsProject(const AScratch: string): string;
 begin
   Result := AScratch + '/ignored-tests-project';
   ForceDirectories(Result + '/source');
+  { Its own `.git` makes the project its worktree top, so the ignore files
+    of the checkout the scratch directory sits in never apply. }
+  ForceDirectories(Result + '/.git');
   WriteTextFile(Result + '/lwpt.toml',
     '[package]'#10 +
     'name = "ignored-tests-project"'#10 +
