@@ -89,13 +89,19 @@ begin
   end;
 end;
 
-{ The only reader that accepts a schema-v3 lock (ADR-0052): after every
-  other recovery step, it upgrades the lock to v4 without network access and
+{ The only reader that accepts a schema-v3 lock (ADR-0052): after the
+  project's other recovery steps, it upgrades the lock to v4 without network access and
   without moving versions, re-deriving each module from its archive, proof,
   or source through the install transaction. A v4 lock, or none, is left
   alone. Returns True when it upgraded. }
 function UpgradeLegacyLockfile(const ACtx: TManifestContext): Boolean;
-var LockfilePath: string; SchemaVersion: Integer;
+var LockfilePath: string; SchemaVersion, Removed, LeasesReclaimed: Integer;
+
+  function Plural(ACount: Integer): string;
+  begin
+    if ACount = 1 then Result := 'y' else Result := 'ies';
+  end;
+
 begin
   Result := False;
   LockfilePath := ResolveRepairPath(ACtx.ProjectRoot, LOCKFILE);
@@ -110,6 +116,14 @@ begin
     WriteLn('repair: upgrading ', LOCKFILE, ' from schema v',
       LOCKFILE_SCHEMA_V3, ' to v', LOCKFILE_SCHEMA_VERSION,
       ' without network access or version changes');
+    { The upgrade reads the per-user archive store before the shared-cache
+      step below: give it the same link safety that step gives. }
+    Removed := RemoveDependencyArchiveLinks(ResolveCacheRoot,
+      LeasesReclaimed);
+    if (Removed > 0) or (LeasesReclaimed > 0) then
+      WriteLn('repair: reclaimed ', LeasesReclaimed, ' abandoned producer ',
+        'lease(s) and removed ', Removed, ' linked or malformed per-user ',
+        'archive-store entr', Plural(Removed), ' before the upgrade');
     RunInstallTransaction(ACtx, itmSchemaUpgrade);
     Result := True;
   end
@@ -213,6 +227,15 @@ begin
   WriteLn('repair: removed ', RetiredRemoved, ' retired executable image(s), ',
     RetiredInUse, ' still in use');
 
+  { The project's own recovery ends with the lock upgrade, before the
+    per-user steps below: re-verifying a large shared cache can take
+    minutes, and a manifest or archive the upgrade needs restored must be
+    reported without that wait. The upgrade's install transaction needs no
+    per-user recovery first, as no install does: a cache read verifies the
+    object it returns, and its guard is a kernel lock, which a dead owner
+    no longer holds. }
+  Upgraded := UpgradeLegacyLockfile(Ctx);
+
   Reclaimed := RepairWorkerBudget;
   WorkerSnapshot := GetWorkerBudgetSnapshot;
   WorkerLines := TStringList.Create;
@@ -245,8 +268,6 @@ begin
     WriteLn('repair: verified the shared-cache LRU index');
 
   ReportRegistryDocumentStore;
-
-  Upgraded := UpgradeLegacyLockfile(Ctx);
 
   if Upgraded then
     WriteLn('repair complete. Project install recovery, per-user shared-cache '

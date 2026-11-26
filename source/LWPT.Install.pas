@@ -2032,6 +2032,39 @@ begin
   end;
 end;
 
+type
+  { A network-free install (--offline, --frozen's registry check, or the
+    v3-to-v4 upgrade) found that the manifest no longer agrees with the
+    lock. Fact is the disagreement alone. The message adds the mode label
+    and the hint for an ordinary network-free install, an online install;
+    the upgrade gives its own hint instead, because an online install
+    refuses the v3 lock it would leave (ADR-0052 section 5). }
+  ELockDisagreement = class(EVerifyError)
+  private
+    FFact: string;
+  public
+    constructor CreateFact(const AMode, AFact, AHint: string);
+    property Fact: string read FFact;
+  end;
+
+  { The v3-to-v4 upgrade found no usable copy of a locked archive while
+    staging. The transaction replaces it with one message naming every
+    missing archive, so one restore covers them all. }
+  EUpgradeArchiveMissing = class(ELockfileError);
+
+  { A locked archive the upgrade cannot re-derive a module from: Path is
+    project-relative, as the user sees it. }
+  TUpgradeMissingArchive = record
+    Name, Path: string;
+  end;
+  TUpgradeMissingArchiveArray = array of TUpgradeMissingArchive;
+
+constructor ELockDisagreement.CreateFact(const AMode, AFact, AHint: string);
+begin
+  inherited Create(AMode + ' ' + AFact + '. ' + AHint);
+  FFact := AFact;
+end;
+
 procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
   const ALockEntries: array of TResolved;
   const ACheckTreeHash: Boolean); forward;
@@ -2078,6 +2111,30 @@ begin
     + PROGRAM_NAME + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE;
 end;
 
+{ Every locked archive the upgrade lacks, in one message; a single one
+  keeps the message above. }
+function SchemaUpgradeArchivesMessage(
+  const AMissing: TUpgradeMissingArchiveArray): string;
+var Listed: string; i: Integer;
+begin
+  if Length(AMissing) = 1 then
+    Exit(SchemaUpgradeArchiveMessage(AMissing[0].Name, AMissing[0].Path));
+  Listed := '';
+  for i := 0 to High(AMissing) do
+  begin
+    if (i > 0) and (Length(AMissing) = 2) then Listed := Listed + ' and '
+    else if (i > 0) and (i = High(AMissing)) then Listed := Listed + ', and '
+    else if i > 0 then Listed := Listed + ', ';
+    Listed := Listed + 'for "' + AMissing[i].Name + '" at `'
+      + AMissing[i].Path + '`';
+  end;
+  Result := SchemaUpgradePrefix + 'the archives ' + Listed + ' are missing '
+    + 'or do not match their locked `archiveHash`, and the per-user cache '
+    + 'has no matching copy. Restore those exact archives, for example from '
+    + 'version control, and run `' + PROGRAM_NAME + ' repair` again.'
+    + SCHEMA_UPGRADE_ALTERNATIVE;
+end;
+
 function SchemaUpgradeProofMessage(const AName, ADisplayPath: string): string;
 begin
   Result := SchemaUpgradePrefix + 'the registry proof document for "' + AName
@@ -2087,12 +2144,34 @@ begin
     + PROGRAM_NAME + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE;
 end;
 
-function SchemaUpgradeAgreementMessage(const ADetail: string): string;
+{ The upgrade keeps every locked version and never resolves or fetches, so
+  it needs the manifest the v3 lock was written from and every archive that
+  lock names. One message names all of them: the dependency that
+  disagrees, and each locked archive that neither the project nor the
+  per-user cache holds, so a single restore makes the next repair succeed.
+  Each missing archive is named by its project-relative path. }
+function SchemaUpgradeAgreementMessage(const AFact: string;
+  const AMissingArchives: TUpgradeMissingArchiveArray): string;
+var Restore: string; i: Integer;
 begin
+  Restore := 'the ' + MANIFEST_FILE + ' that `' + LWPT.Core.LOCKFILE
+    + '` was written from';
+  if Length(AMissingArchives) = 1 then
+    Restore := Restore + ' and the missing locked archive `'
+      + AMissingArchives[0].Path + '`'
+  else if Length(AMissingArchives) > 1 then
+  begin
+    Restore := Restore + ' and the missing locked archives ';
+    for i := 0 to High(AMissingArchives) do
+    begin
+      if i > 0 then Restore := Restore + ', ';
+      Restore := Restore + '`' + AMissingArchives[i].Path + '`';
+    end;
+  end;
   Result := SchemaUpgradePrefix + 'the manifest does not agree with the '
-    + 'lockfile (' + ADetail + '). Restore the ' + MANIFEST_FILE + ' that `'
-    + LWPT.Core.LOCKFILE + '` was written from, run `' + PROGRAM_NAME
-    + ' repair`, and then change the manifest.'
+    + 'lockfile: ' + AFact + '. Restore ' + Restore + ', for example from '
+    + 'version control, run `' + PROGRAM_NAME + ' repair`, and then change '
+    + 'the manifest and run `' + PROGRAM_NAME + ' install`.'
     + SCHEMA_UPGRADE_ALTERNATIVE;
 end;
 
@@ -2774,7 +2853,7 @@ end;
 
 procedure TLockedRegistry.Fail(const AMessage: string);
 begin
-  raise EVerifyError.Create(FMode + ' ' + AMessage + '. Run `' + PROGRAM_NAME
+  raise ELockDisagreement.CreateFact(FMode, AMessage, 'Run `' + PROGRAM_NAME
     + ' install` online to resolve and prove it again.');
 end;
 
@@ -3479,17 +3558,16 @@ var
   var Entry: TResolved;
   begin
     if not FindPriorLock(ANode, Entry) then
-      raise EVerifyError.CreateFmt(
-        '[offline] dependency "%s" has no compatible lock entry for '
-        + 'its current source. Run `' + PROGRAM_NAME
-        + ' install` online to resolve it.',
-        [ANode.Name]);
+      raise ELockDisagreement.CreateFact('[offline]', Format(
+        'dependency "%s" has no compatible lock entry for its current '
+        + 'source', [ANode.Name]),
+        'Run `' + PROGRAM_NAME + ' install` online to resolve it.');
     if not PriorSelectionSatisfies(ANode, Entry) then
-      raise EVerifyError.CreateFmt(
-        '[offline] locked version "%s" no longer satisfies the manifest '
-        + 'requirements for "%s". Run `' + PROGRAM_NAME
-        + ' install` online to resolve '
-        + 'the changed graph.', [Entry.Version, ANode.Name]);
+      raise ELockDisagreement.CreateFact('[offline]', Format(
+        'locked version "%s" no longer satisfies the manifest requirements '
+        + 'for "%s"', [Entry.Version, ANode.Name]),
+        'Run `' + PROGRAM_NAME + ' install` online to resolve the changed '
+        + 'graph.');
     if Entry.ArchiveHash = '' then
       raise EVerifyError.CreateFmt(
         '[offline] lock entry for "%s" has no archive hash. Run '
@@ -3578,8 +3656,8 @@ var
             [ANode.Name, E.Message]);
       end;
     if AUpgrade then
-      raise ELockfileError.Create(SchemaUpgradeArchiveMessage(ANode.Name,
-        ProjectDisplayPath(AProjectRoot, ProjectArchive)));
+      raise EUpgradeArchiveMissing.Create(SchemaUpgradeArchiveMessage(
+        ANode.Name, ProjectDisplayPath(AProjectRoot, ProjectArchive)));
     raise EFetchError.CreateFmt(
       '[offline] verified archive for "%s" is unavailable '
       + '(expected %s; cache result: %s). Restore the committed archive '
@@ -4515,6 +4593,65 @@ var
     end;
   end;
 
+  { The v3-to-v4 upgrade checks every root requirement against the lock
+    before it stages anything, with the checks selection itself applies.
+    Staging stops at the first missing archive, so without this a bumped
+    or added dependency later in the graph would be reported only once
+    that archive was back, one restore at a time (ADR-0052 section 5).
+    Requirements that transitive manifests add are still checked as the
+    graph is walked. }
+  procedure RequireRootAgreement;
+  var k, m: Integer; Facts: string; State: TSelectionState;
+    Known, SourceMatches: Boolean;
+
+    procedure AddFact(const AFact: string);
+    begin
+      if Facts <> '' then Facts := Facts + '; ';
+      Facts := Facts + AFact;
+    end;
+
+  begin
+    Facts := '';
+    for k := 0 to High(R.Nodes) do
+    begin
+      if NodeHasSourceConflict(R.Nodes[k]) then Continue;
+      Known := False;
+      SourceMatches := False;
+      for m := 0 to High(APriorLock) do
+        if SameText(APriorLock[m].Name, R.Nodes[k].Name) then
+        begin
+          Known := True;
+          if LockSourceMatches(R.Nodes[k], APriorLock[m]) then
+            SourceMatches := True;
+        end;
+      if not Known then
+      begin
+        AddFact(Format('manifest graph reaches "%s" but the lockfile has '
+          + 'no entry', [R.Nodes[k].Name]));
+        Continue;
+      end;
+      { A local or workspace source is read live, so only its identity can
+        disagree before the walk: the same check the end of the walk
+        applies (VerifyOfflineAgainstLockfile). }
+      if not IsNetworkBacked(R.Nodes[k]) then
+      begin
+        if not SourceMatches then
+          AddFact(Format('source or extraction policy changed for "%s"',
+            [R.Nodes[k].Name]));
+        Continue;
+      end;
+      try
+        State := Default(TSelectionState);
+        SelectLockedNode(R.Nodes[k], State);
+      except
+        on E: ELockDisagreement do AddFact(E.Fact);
+      end;
+    end;
+    if Facts <> '' then
+      raise ELockDisagreement.CreateFact('[offline]', Facts, 'Run `'
+        + PROGRAM_NAME + ' install` online to resolve the changed graph.');
+  end;
+
 begin
   PlanRoot := MakeTmpPath(ATmpRoot, 'resolver-plan');
   PlanModules := PlanRoot + '/modules';
@@ -4547,6 +4684,7 @@ begin
         AddRequirement(R, ARootMan.Deps[i], ARootMan.Name,
           ARootMan.CustomSources);
       for i := 0 to High(R.Nodes) do EnqueueNode(i);
+      if AUpgrade and (Round = 1) then RequireRootAgreement;
 
       Head := 0;
       while Head < Length(Queue) do
@@ -5017,6 +5155,9 @@ end;
 
 procedure VerifyOfflineAgainstLockfile(const AResolved: array of TResolved;
   const ALockEntries: array of TResolved; const ACheckTreeHash: Boolean);
+const
+  CHANGED_GRAPH_HINT = 'Run `' + PROGRAM_NAME
+    + ' install` online to resolve the changed graph.';
 
   function LockedCommitIdentity(const AEntry: TResolved): string;
   var Kind: TVersionKind; Value: string;
@@ -5055,35 +5196,30 @@ begin
   for i := 0 to High(AResolved) do
   begin
     if not FindLockEntry(AResolved[i].Name, Lock) then
-      raise EVerifyError.CreateFmt(
-        '[offline] manifest graph reaches "%s" but the lockfile has no '
-        + 'entry. Run `' + PROGRAM_NAME
-        + ' install` online to resolve the changed graph.',
-        [AResolved[i].Name]);
+      raise ELockDisagreement.CreateFact('[offline]', Format(
+        'manifest graph reaches "%s" but the lockfile has no entry',
+        [AResolved[i].Name]), CHANGED_GRAPH_HINT);
     if ((Lock.SourceIdentity <> '')
         and (AResolved[i].SourceIdentity <> Lock.SourceIdentity))
        or ((Lock.SourceIdentity = '')
         and (AResolved[i].SrcOriginal <> Lock.SrcOriginal)) then
-      raise EVerifyError.CreateFmt(
-        '[offline] source or extraction policy changed for "%s". Run '
-        + '`' + PROGRAM_NAME + ' install` online to resolve the changed graph.',
-        [AResolved[i].Name]);
+      raise ELockDisagreement.CreateFact('[offline]', Format(
+        'source or extraction policy changed for "%s"',
+        [AResolved[i].Name]), CHANGED_GRAPH_HINT);
     if (Lock.ConstraintFingerprint <> '')
        and (AResolved[i].ConstraintFingerprint <>
          Lock.ConstraintFingerprint) then
-      raise EVerifyError.CreateFmt(
-        '[offline] accumulated constraints changed for "%s". Run '
-        + '`' + PROGRAM_NAME + ' install` online to resolve the changed graph.',
-        [AResolved[i].Name]);
+      raise ELockDisagreement.CreateFact('[offline]', Format(
+        'accumulated constraints changed for "%s"',
+        [AResolved[i].Name]), CHANGED_GRAPH_HINT);
     LockCommit := LockedCommitIdentity(Lock);
     if (AResolved[i].Version <> Lock.Version)
        or not SameText(AResolved[i].CommitSHA, LockCommit)
        or (AResolved[i].RegistryOrigin <> Lock.RegistryOrigin)
        or (AResolved[i].RegistryRecord <> Lock.RegistryRecord) then
-      raise EVerifyError.CreateFmt(
-        '[offline] locked resolution identity changed for "%s". Run '
-        + '`' + PROGRAM_NAME + ' install` online to resolve the changed graph.',
-        [AResolved[i].Name]);
+      raise ELockDisagreement.CreateFact('[offline]', Format(
+        'locked resolution identity changed for "%s"',
+        [AResolved[i].Name]), CHANGED_GRAPH_HINT);
     { The v3-to-v4 upgrade never consults a v3 computedHash: it is the
       value the #352 flaw lets a forged tree match (ADR-0052). A local or
       workspace source is copied again, so its mismatch means the source
@@ -5109,11 +5245,9 @@ begin
   end;
   for i := 0 to High(ALockEntries) do
     if not GraphHasEntry(ALockEntries[i].Name) then
-      raise EVerifyError.CreateFmt(
-        '[offline] lockfile has "%s" but the manifest graph does not '
-        + 'reach it. Run `' + PROGRAM_NAME
-        + ' install` online to resolve the changed graph.',
-        [ALockEntries[i].Name]);
+      raise ELockDisagreement.CreateFact('[offline]', Format(
+        'lockfile has "%s" but the manifest graph does not reach it',
+        [ALockEntries[i].Name]), CHANGED_GRAPH_HINT);
 end;
 
 { Frozen-mode archive-hash recovery helper. The resolver doesn't know
@@ -6378,6 +6512,88 @@ begin
   end;
 end;
 
+{ The locked archives the v3-to-v4 upgrade could not re-derive a module
+  from: those that neither the project (with the locked archiveHash) nor
+  the per-user cache holds. Checked only once the upgrade has failed, so its
+  message can name every file to restore. A lock key outside the package
+  grammar was not written by LWPT and never becomes a path. An archive
+  that cannot be read, or that is reached through a link (a linked archive
+  or archives directory), counts as missing and is never read. }
+function UpgradeMissingArchives(const AOldLock: TResolvedArray;
+  const AArchivesRoot, AProjectRoot: string;
+  AObjectStore: TLWPTImmutableObjectStore): TUpgradeMissingArchiveArray;
+var
+  i: Integer;
+  ArchivePath, CachedPath: string;
+  Present, RootLinked: Boolean;
+begin
+  Result := nil;
+  RootLinked := IsDirSymlinkOrJunction(
+    ExcludeTrailingPathDelimiter(AArchivesRoot));
+  for i := 0 to High(AOldLock) do
+  begin
+    if not (AOldLock[i].SrcKind in [skGitHost, skURL, skRegistry]) then
+      Continue;
+    if (AOldLock[i].ArchiveHash = '')
+       or not ValidPackageName(AOldLock[i].Name) then
+      Continue;
+    ArchivePath := ArchivePathForRef(AArchivesRoot, AOldLock[i].Name,
+      AOldLock[i].SrcKind, AOldLock[i].Version);
+    try
+      Present := not RootLinked
+        and not IsDirSymlinkOrJunction(ArchivePath)
+        and LongPathFileExists(ArchivePath)
+        and ('sha256:' + SHA256File(ArchivePath) = AOldLock[i].ArchiveHash);
+    except
+      on E: Exception do Present := False;
+    end;
+    if not Present and (AObjectStore <> nil) then
+      try
+        Present := AObjectStore.Lookup(AOldLock[i].ArchiveHash, CachedPath);
+      except
+        { An unreadable cache holds no copy the upgrade could use. }
+        on E: Exception do Present := False;
+      end;
+    if Present then Continue;
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)].Name := AOldLock[i].Name;
+    Result[High(Result)].Path := ProjectDisplayPath(AProjectRoot,
+      ArchivePath);
+  end;
+end;
+
+{ An agreement failure during the upgrade names the migration, not the
+  online install an ordinary network-free install suggests: that install
+  would refuse the remaining v3 lock (ADR-0052 section 5). }
+function UpgradeDisagreementError(AError: EVerifyError;
+  const AOldLock: TResolvedArray; const AArchivesRoot, AProjectRoot: string;
+  AObjectStore: TLWPTImmutableObjectStore): ELockfileError;
+var Fact: string;
+begin
+  if AError is ELockDisagreement then
+    Fact := ELockDisagreement(AError).Fact
+  else
+    Fact := AError.Message;
+  Result := ELockfileError.Create(SchemaUpgradeAgreementMessage(Fact,
+    UpgradeMissingArchives(AOldLock, AArchivesRoot, AProjectRoot,
+      AObjectStore)));
+end;
+
+{ Staging stops at the first missing archive; the message names every
+  locked archive that is missing, so one restore covers them all. }
+function UpgradeArchivesError(AError: EUpgradeArchiveMissing;
+  const AOldLock: TResolvedArray; const AArchivesRoot, AProjectRoot: string;
+  AObjectStore: TLWPTImmutableObjectStore): ELockfileError;
+var Missing: TUpgradeMissingArchiveArray;
+begin
+  Missing := UpgradeMissingArchives(AOldLock, AArchivesRoot, AProjectRoot,
+    AObjectStore);
+  if Length(Missing) = 0 then
+    Result := ELockfileError.Create(AError.Message)
+  else
+    Result := ELockfileError.Create(SchemaUpgradeArchivesMessage(Missing));
+end;
+
 { The shared transaction body. AManifestLines <> nil is the manifest-
   mutation flow (ADR-0019, `lwpt add` / `lwpt remove`): the previous
   lockfile is snapshotted right after the lock is acquired, the edited
@@ -6557,14 +6773,15 @@ begin
                                Man.Workspaces, OldLock, ObjectStore, Offline,
                                AAcceptMovedTags, Consumer, Locked, Upgrade);
       except
-        { Agreement failures name the migration, not an online install that
-          would refuse the remaining v3 lock (ADR-0052 section 5). }
         on E: EVerifyError do
           if Upgrade then
-            raise ELockfileError.Create(
-              SchemaUpgradeAgreementMessage(E.Message))
+            raise UpgradeDisagreementError(E, OldLock, ArchivesRoot,
+              AContext.ProjectRoot, ObjectStore)
           else
             raise;
+        on E: EUpgradeArchiveMissing do
+          raise UpgradeArchivesError(E, OldLock, ArchivesRoot,
+            AContext.ProjectRoot, ObjectStore);
       end;
       PublicationPending := True;
     end;
@@ -6728,7 +6945,16 @@ begin
 
     if Offline then
     begin
-      VerifyOfflineAgainstLockfile(Resolved, OldLock, not Upgrade);
+      try
+        VerifyOfflineAgainstLockfile(Resolved, OldLock, not Upgrade);
+      except
+        on E: EVerifyError do
+          if Upgrade then
+            raise UpgradeDisagreementError(E, OldLock, ArchivesRoot,
+              AContext.ProjectRoot, ObjectStore)
+          else
+            raise;
+      end;
       { Missing proof documents are restored from verified locked content
         with the modules and cfg; the lock stays byte-identical. }
       PublishRegistryProofs(ArchivesRoot, TmpRoot, RollbackRoot,

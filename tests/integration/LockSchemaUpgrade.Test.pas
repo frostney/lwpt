@@ -19,6 +19,7 @@ uses
   BaseUnix,
   {$ENDIF}
   Classes,
+  Process,
   SysUtils,
 
   LWPT.Core,
@@ -26,6 +27,7 @@ uses
   Tests.HTTPMockServer,
   Tests.LockSchema,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch,
   Tests.TarSynth;
 
@@ -36,6 +38,7 @@ const
   ARCHIVE_ORIGIN_ENV = PROJECT_NAME + '_TEST_ARCHIVE_ORIGIN';
   ARCHIVE_TIMEOUT_ENV = PROJECT_NAME + '_TEST_ARCHIVE_TIMEOUT_MS';
   SHARED_ARCHIVE = '.lwpt/archives/shared-v1.0.0.tar.gz';
+  EARLY_ARCHIVE = ARCHIVES_DIR + '/early-v1.0.0.tar.gz';
   { A refused or failed command may not touch these; repair's own recovery
     steps own .lwpt/tmp and build sessions. }
   REPAIR_OWNED: array[0..1] of string = ('.lwpt/tmp', '.lwpt/sessions');
@@ -62,6 +65,11 @@ type
     procedure ExpectRefusedLock(const ALabel, ARoot, AHistorical,
       AReason: string);
     function ArchiveMessage: string;
+    function RunMerged(const ARoot: string;
+      const AArguments: array of string): string;
+    procedure BumpShared(const ARoot: string);
+    { Seed plus a git-host `early` that the graph stages before `shared`. }
+    function SeedWithEarly(const AName: string; out ARoot: string): string;
   protected
     procedure BeforeAll; override;
     procedure AfterAll; override;
@@ -79,6 +87,18 @@ type
     procedure TestRepairMissingArchiveFailsWithMigrationMessage;
     procedure TestRepairCorruptArchiveFailsWithMigrationMessage;
     procedure TestRepairManifestDisagreementLeavesV3;
+    procedure TestUpgradeThenBump;
+    procedure TestBumpThenUpgradeNamesEveryRestore;
+    procedure TestBumpWithCachedArchiveNamesOnlyTheManifest;
+    procedure TestUpgradeFailureReadsWholeInMergedOutput;
+    procedure TestBumpBehindAMissingArchiveNamesBoth;
+    procedure TestEveryMissingArchiveIsNamedAtOnce;
+    procedure TestCraftedLockKeyNeverBecomesAnArchivePath;
+    procedure TestUnreadableArchiveKeepsTheMigrationMessage;
+    procedure TestLocalPolicyChangeBehindAMissingArchiveNamesBoth;
+    procedure TestUpgradeNeverReadsThroughALinkedCacheDirectory;
+    procedure TestLinkedProjectArchiveIsNamedNotRead;
+    procedure TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade;
     procedure TestRepairLeavesV4Alone;
     procedure TestLegacyRollbackRecoveredByRepairOnV3;
     procedure TestLegacyRollbackRecoveredByInstallOnV4;
@@ -240,6 +260,92 @@ begin
     + 'again. To give up the version-stable migration, delete `' + LOCKFILE
     + '` and run `' + PROGRAM_NAME + ' install`; that needs network access '
     + 'and moves range dependencies to their newest matching versions.';
+end;
+
+{ The upgrade's agreement failure (ADR-0052 section 5): AFact is the
+  disagreement and ARestore every file to bring back. }
+function AgreementMessage(const AFact, ARestore: string): string;
+begin
+  Result := '`' + PROGRAM_NAME + ' repair` cannot upgrade `' + LOCKFILE
+    + '` from schema v3: the manifest does not agree with the lockfile: '
+    + AFact + '. Restore ' + ARestore + ', for example from version '
+    + 'control, run `' + PROGRAM_NAME + ' repair`, and then change the '
+    + 'manifest and run `' + PROGRAM_NAME + ' install`. To give up the '
+    + 'version-stable migration, delete `' + LOCKFILE + '` and run `'
+    + PROGRAM_NAME + ' install`; that needs network access and moves range '
+    + 'dependencies to their newest matching versions.';
+end;
+
+function ManifestRestore: string;
+begin
+  Result := 'the ' + MANIFEST_FILE + ' that `' + LOCKFILE
+    + '` was written from';
+end;
+
+function BumpFact: string;
+begin
+  Result := 'locked version "v1.0.0" no longer satisfies the manifest '
+    + 'requirements for "shared"';
+end;
+
+{ The text before the per-user recovery: repair reports the upgrade's
+  verdict before it re-verifies the shared cache, which can take minutes. }
+function PerUserRecoveryStart: string;
+begin
+  Result := 'repair: shared cache ';
+end;
+
+{ The same run as Run, with standard error merged into standard output as
+  a CI log or an agent's captured shell output receives it. }
+function TLockSchemaUpgrade.RunMerged(const ARoot: string;
+  const AArguments: array of string): string;
+var
+  P: TProcess;
+  i: Integer;
+  MergedIntoOutput: string;
+begin
+  Result := '';
+  P := TProcess.Create(nil);
+  try
+    P.Executable := LwptTestingBinaryPath;
+    for i := 0 to High(AArguments) do P.Parameters.Add(AArguments[i]);
+    P.CurrentDirectory := ARoot;
+    ConfigureProcessEnvironment(P,
+      [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot,
+       PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot]);
+    P.Options := [poUsePipes, poStderrToOutPut];
+    P.Execute;
+    MergedIntoOutput := '';
+    FinishChild(P, Result, MergedIntoOutput,
+      LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS, 'merged repair');
+  finally
+    P.Free;
+  end;
+end;
+
+{ The field report's bump: a newer major is advertised and archived, and
+  the manifest moves to it. }
+procedure TLockSchemaUpgrade.BumpShared(const ARoot: string);
+begin
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10
+    + 'tag|v2.0.0|' + NEWER_COMMIT + '|'#10);
+  WriteArchive('shared', NEWER_COMMIT, '2.0.0');
+  WriteExactFile(ARoot + '/' + MANIFEST_FILE, StringReplace(
+    ReadBinaryFile(ARoot + '/' + MANIFEST_FILE), 'fixture/shared@^1.0.0',
+    'fixture/shared@^2.0.0', []));
+end;
+
+function TLockSchemaUpgrade.SeedWithEarly(const AName: string;
+  out ARoot: string): string;
+begin
+  Seed(AName, ARoot);
+  WriteRefs('early', 'tag|v1.0.0|' + OTHER_COMMIT + '|'#10);
+  WriteArchive('early', OTHER_COMMIT, '1.0.0');
+  WriteExactFile(ARoot + '/' + MANIFEST_FILE, StringReplace(
+    ReadBinaryFile(ARoot + '/' + MANIFEST_FILE), '[dependencies]'#10,
+    '[dependencies]'#10 + 'early = "fixture/early@^1.0.0"'#10, []));
+  ExpectSuccess('seed early', Run(ARoot, ['install']));
+  Result := LockText(ARoot);
 end;
 
 { ---------------------------------------------------------------------------
@@ -619,7 +725,7 @@ begin
 end;
 
 procedure TLockSchemaUpgrade.TestRepairManifestDisagreementLeavesV3;
-var Root, V3, Manifest, Before: string;
+var Root, V3, Manifest, Before: string; Outcome: TLwptResult;
 begin
   Seed('repair-drift', Root);
   V3 := DowngradeLockToV3(Root);
@@ -628,16 +734,328 @@ begin
     'fixture/shared@^1.0.0', 'fixture/shared@^2.0.0', []));
   Before := ProjectSnapshot(Root, REPAIR_OWNED);
   ClearRequests;
-  ExpectFailureWith('repair drift', Run(Root, ['repair']),
-    'the manifest does not agree with the lockfile');
-  ExpectFailureWith('repair drift hint', Run(Root, ['repair']),
-    'Restore the ' + MANIFEST_FILE + ' that `' + LOCKFILE
-    + '` was written from, run `' + PROGRAM_NAME + ' repair`, and then '
-    + 'change the manifest.');
+  { The archive is still committed, so only the manifest is named, and
+    the hint is the migration's, never the online install that refuses
+    the remaining v3 lock. }
+  Outcome := Run(Root, ['repair']);
+  ExpectFailureWith('repair drift', Outcome,
+    AgreementMessage(BumpFact, ManifestRestore));
+  Expect<Boolean>(Pos('online', Outcome.Stderr) = 0).ToBe(True);
+  Expect<Boolean>(Pos(PerUserRecoveryStart, Outcome.Stdout) = 0).ToBe(True);
   Expect<string>(Requests).ToBe('');
   Expect<string>(LockText(Root)).ToBe(V3);
   Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
 end;
+
+{ The working order of the field report: upgrade, then bump. The upgrade
+  runs before the per-user recovery, so its verdict never waits on it. }
+procedure TLockSchemaUpgrade.TestUpgradeThenBump;
+var Root, Lock: string; Outcome: TLwptResult;
+begin
+  Seed('upgrade-then-bump', Root);
+  DowngradeLockToV3(Root);
+  ClearRequests;
+  Outcome := Run(Root, ['repair']);
+  ExpectSuccess('repair', Outcome);
+  Expect<string>(Requests).ToBe('');
+  Expect<Boolean>(Pos('upgraded ' + LOCKFILE, Outcome.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(PerUserRecoveryStart, Outcome.Stdout)
+    > Pos('upgraded ' + LOCKFILE, Outcome.Stdout)).ToBe(True);
+  BumpShared(Root);
+  ExpectSuccess('install after the bump', Run(Root, ['install']));
+  Lock := LockText(Root);
+  Expect<Boolean>(Pos('version = 4', Lock) > 0).ToBe(True);
+  Expect<string>(LockEntryField(Lock, 'shared', 'resolvedRef'))
+    .ToBe('v2.0.0');
+  ExpectSuccess('frozen after the bump', Run(Root, ['install', '--frozen']));
+end;
+
+{ The failing order of the field report: bump the manifest and drop the
+  old archive, then repair. One message, given before the per-user
+  recovery, names both files to restore; following it upgrades the lock,
+  and the bump then installs. }
+procedure TLockSchemaUpgrade.TestBumpThenUpgradeNamesEveryRestore;
+var Root, V3, Manifest, Archive, Before, Lock: string;
+  Outcome: TLwptResult;
+begin
+  Seed('bump-then-upgrade', Root);
+  V3 := DowngradeLockToV3(Root);
+  Manifest := ReadBinaryFile(Root + '/' + MANIFEST_FILE);
+  Archive := ReadBinaryFile(Root + '/' + SHARED_ARCHIVE);
+  BumpShared(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  Before := ProjectSnapshot(Root, REPAIR_OWNED);
+  ClearRequests;
+  Outcome := Run(Root, ['repair']);
+  ExpectFailureWith('repair after the bump', Outcome,
+    AgreementMessage(BumpFact, ManifestRestore
+      + ' and the missing locked archive `' + SHARED_ARCHIVE + '`'));
+  Expect<Boolean>(Pos(PerUserRecoveryStart, Outcome.Stdout) = 0).ToBe(True);
+  Expect<string>(Requests).ToBe('');
+  Expect<string>(LockText(Root)).ToBe(V3);
+  Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
+
+  { Do what the message says. }
+  WriteExactFile(Root + '/' + MANIFEST_FILE, Manifest);
+  WriteExactFile(Root + '/' + SHARED_ARCHIVE, Archive);
+  ExpectSuccess('repair after the restore', Run(Root, ['repair']));
+  Expect<string>(Requests).ToBe('');
+  Lock := LockText(Root);
+  Expect<Boolean>(Pos('version = 4', Lock) > 0).ToBe(True);
+  Expect<string>(LockEntryField(Lock, 'shared', 'resolvedRef'))
+    .ToBe('v1.0.0');
+  BumpShared(Root);
+  ExpectSuccess('install after the bump', Run(Root, ['install']));
+  Expect<string>(LockEntryField(LockText(Root), 'shared', 'resolvedRef'))
+    .ToBe('v2.0.0');
+  ExpectSuccess('frozen after the bump', Run(Root, ['install', '--frozen']));
+end;
+
+{ An archive the per-user cache still holds is not named: the upgrade
+  restores it from there, so restoring the manifest alone is enough. }
+procedure TLockSchemaUpgrade.TestBumpWithCachedArchiveNamesOnlyTheManifest;
+var Root, Manifest: string;
+begin
+  Seed('bump-cached', Root);
+  DowngradeLockToV3(Root);
+  Manifest := ReadBinaryFile(Root + '/' + MANIFEST_FILE);
+  BumpShared(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  ExpectFailureWith('repair with a cached archive', Run(Root, ['repair']),
+    AgreementMessage(BumpFact, ManifestRestore));
+  WriteExactFile(Root + '/' + MANIFEST_FILE, Manifest);
+  ExpectSuccess('repair after restoring the manifest',
+    Run(Root, ['repair']));
+  Expect<Boolean>(Pos('version = 4', LockText(Root)) > 0).ToBe(True);
+  Expect<Boolean>(FileExists(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+end;
+
+{ Standard output to a pipe is buffered and standard error is not, so the
+  failure must flush the progress lines first: in a merged log the message
+  starts its own line, whole, after the lines it follows. }
+procedure TLockSchemaUpgrade.TestUpgradeFailureReadsWholeInMergedOutput;
+var Root, Output, Failure: string; FailureAt: Integer;
+begin
+  Seed('merged-output', Root);
+  DowngradeLockToV3(Root);
+  BumpShared(Root);
+  Output := RunMerged(Root, ['repair']);
+  Failure := PROGRAM_NAME + ' repair: ' + AgreementMessage(BumpFact,
+    ManifestRestore) + LineEnding;
+  FailureAt := Pos(LineEnding + Failure, Output);
+  if FailureAt = 0 then
+    WriteLn('--- merged repair output ---'#10, Output, '---');
+  Expect<Boolean>(FailureAt > 0).ToBe(True);
+  Expect<Boolean>(Pos('resolving dependency graph', Output) < FailureAt)
+    .ToBe(True);
+  Expect<Boolean>(Pos('resolving dependency graph', Output) > 0).ToBe(True);
+end;
+
+{ Staging stops at the first missing archive. An unchanged dependency
+  staged first must not hide a later bumped one: the root requirements are
+  checked before anything is staged, so one message names both. }
+procedure TLockSchemaUpgrade.TestBumpBehindAMissingArchiveNamesBoth;
+var Root, V3, Before: string;
+begin
+  SeedWithEarly('bump-behind', Root);
+  V3 := DowngradeLockToV3(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + EARLY_ARCHIVE))
+    .ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  BumpShared(Root);
+  Before := ProjectSnapshot(Root, REPAIR_OWNED);
+  ClearRequests;
+  ExpectFailureWith('repair behind a missing archive', Run(Root, ['repair']),
+    AgreementMessage(BumpFact, ManifestRestore
+      + ' and the missing locked archive `' + EARLY_ARCHIVE + '`'));
+  Expect<string>(Requests).ToBe('');
+  Expect<string>(LockText(Root)).ToBe(V3);
+  Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
+end;
+
+{ With the manifest unchanged, every missing archive is named at once. }
+procedure TLockSchemaUpgrade.TestEveryMissingArchiveIsNamedAtOnce;
+var Root, V3: string;
+begin
+  SeedWithEarly('missing-both', Root);
+  V3 := DowngradeLockToV3(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + EARLY_ARCHIVE))
+    .ToBe(True);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  ExpectFailureWith('repair with two missing archives', Run(Root, ['repair']),
+    '`' + PROGRAM_NAME + ' repair` cannot upgrade `' + LOCKFILE + '` from '
+    + 'schema v3: the archives for "early" at '
+    + '`' + EARLY_ARCHIVE + '` and for "shared" at `'
+    + SHARED_ARCHIVE + '` are missing or do not match their locked '
+    + '`archiveHash`, and the per-user cache has no matching copy. Restore '
+    + 'those exact archives, for example from version control, and run `'
+    + PROGRAM_NAME + ' repair` again. To give up the version-stable '
+    + 'migration, delete `' + LOCKFILE + '` and run `' + PROGRAM_NAME
+    + ' install`; that needs network access and moves range dependencies to '
+    + 'their newest matching versions.');
+  Expect<string>(LockText(Root)).ToBe(V3);
+end;
+
+{ A lock key outside the package grammar was not written by LWPT. Naming
+  missing archives must never turn it into a path, which could reach
+  outside the archives directory. }
+procedure TLockSchemaUpgrade.TestCraftedLockKeyNeverBecomesAnArchivePath;
+var Root, V3: string;
+begin
+  Seed('crafted-key', Root);
+  V3 := DowngradeLockToV3(Root);
+  WriteExactFile(Root + '/' + LOCKFILE, V3 + #10 + '[package."../../outside"]'
+    + #10 + 'source = "fixture/shared"' + #10 + 'resolvedRef = "v1.0.0"'
+    + #10 + 'resolvedURL = "https://github.com/fixture/shared/archive/'
+    + SHARED_COMMIT + '.tar.gz"' + #10 + 'computedHash = "sha256:'
+    + StringOfChar('0', 64) + '"' + #10 + 'archiveHash = "sha256:'
+    + StringOfChar('0', 64) + '"' + #10);
+  BumpShared(Root);
+  ExpectFailureWith('repair with a crafted key', Run(Root, ['repair']),
+    AgreementMessage(BumpFact, ManifestRestore));
+end;
+
+{ An archive that cannot be read must not replace the migration message
+  with a bare file error: it is named as one to restore. }
+{$IFDEF UNIX}
+procedure TLockSchemaUpgrade.TestUnreadableArchiveKeepsTheMigrationMessage;
+var Root: string;
+begin
+  Seed('unreadable', Root);
+  DowngradeLockToV3(Root);
+  RecursiveDelete(FCacheRoot);
+  BumpShared(Root);
+  Expect<Integer>(FpChmod(Root + '/' + SHARED_ARCHIVE, 0)).ToBe(0);
+  try
+    ExpectFailureWith('repair with an unreadable archive',
+      Run(Root, ['repair']), AgreementMessage(BumpFact, ManifestRestore
+        + ' and the missing locked archive `' + SHARED_ARCHIVE + '`'));
+  finally
+    FpChmod(Root + '/' + SHARED_ARCHIVE, &644);
+  end;
+end;
+{$ELSE}
+procedure TLockSchemaUpgrade.TestUnreadableArchiveKeepsTheMigrationMessage;
+begin
+end;
+{$ENDIF}
+
+{ A local or workspace dependency is read live, so its changed source or
+  extraction policy is checked before anything is staged too. }
+procedure TLockSchemaUpgrade.TestLocalPolicyChangeBehindAMissingArchiveNamesBoth;
+var Root, V3: string;
+begin
+  Seed('local-policy', Root);
+  V3 := DowngradeLockToV3(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  WriteExactFile(Root + '/' + MANIFEST_FILE, StringReplace(
+    ReadBinaryFile(Root + '/' + MANIFEST_FILE),
+    'local-dep = "./local-dep"',
+    'local-dep = { source = "./local-dep", exclude = ["**/*.Test.pas"] }',
+    []));
+  ExpectFailureWith('repair with a changed local policy',
+    Run(Root, ['repair']), AgreementMessage(
+      'source or extraction policy changed for "local-dep"', ManifestRestore
+      + ' and the missing locked archive `' + SHARED_ARCHIVE + '`'));
+  Expect<string>(LockText(Root)).ToBe(V3);
+end;
+
+{ The upgrade reads the per-user archive store before repair's shared-cache
+  step, so it must not follow a link there: a corrupt "object" reached
+  through a linked directory would otherwise be hashed and moved into the
+  cache's quarantine from outside the cache. }
+{$IFDEF UNIX}
+procedure TLockSchemaUpgrade.TestUpgradeNeverReadsThroughALinkedCacheDirectory;
+var Root, V3, Hex, Prefix, Outside: string;
+begin
+  Seed('linked-cache', Root);
+  V3 := DowngradeLockToV3(Root);
+  Hex := Copy(LockEntryField(V3, 'shared', 'archiveHash'), 8, MaxInt);
+  Expect<Integer>(Length(Hex)).ToBe(64);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  Prefix := FCacheRoot + '/dependency-archives/sha256/' + Copy(Hex, 1, 2);
+  Expect<Boolean>(DirectoryExists(Prefix)).ToBe(True);
+  RecursiveDelete(Prefix);
+  Outside := Root + '-outside';
+  WriteExactFile(Outside + '/' + Copy(Hex, 3, MaxInt), 'outside bytes');
+  Expect<Integer>(FpSymlink(PChar(Outside), PChar(Prefix))).ToBe(0);
+  ExpectFailureWith('repair with a linked cache directory',
+    Run(Root, ['repair']), ArchiveMessage);
+  Expect<string>(ReadBinaryFile(Outside + '/' + Copy(Hex, 3, MaxInt)))
+    .ToBe('outside bytes');
+  Expect<Boolean>(FpReadLink(Prefix) = '').ToBe(True);
+  Expect<string>(LockText(Root)).ToBe(V3);
+end;
+{$ELSE}
+procedure TLockSchemaUpgrade.TestUpgradeNeverReadsThroughALinkedCacheDirectory;
+begin
+end;
+{$ENDIF}
+
+{ Naming the archives to restore never reads through a link: a linked
+  archive, or a linked archives directory, is named as missing even when
+  its target holds the locked bytes. }
+{$IFDEF UNIX}
+procedure TLockSchemaUpgrade.TestLinkedProjectArchiveIsNamedNotRead;
+var Root, Outside, Expected: string;
+begin
+  Seed('linked-archive', Root);
+  DowngradeLockToV3(Root);
+  RecursiveDelete(FCacheRoot);
+  BumpShared(Root);
+  Expected := AgreementMessage(BumpFact, ManifestRestore
+    + ' and the missing locked archive `' + SHARED_ARCHIVE + '`');
+  Outside := Root + '-outside';
+  ForceDirectories(Outside);
+  { A linked archive. }
+  Expect<Boolean>(RenameFile(Root + '/' + SHARED_ARCHIVE,
+    Outside + '/archive.tar.gz')).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(Outside + '/archive.tar.gz'),
+    PChar(Root + '/' + SHARED_ARCHIVE))).ToBe(0);
+  ExpectFailureWith('repair with a linked archive', Run(Root, ['repair']),
+    Expected);
+  { A linked archives directory holding the real archive. }
+  Expect<Integer>(FpUnlink(PChar(Root + '/' + SHARED_ARCHIVE))).ToBe(0);
+  Expect<Boolean>(RenameFile(Outside + '/archive.tar.gz',
+    Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  Expect<Boolean>(RenameFile(Root + '/' + ARCHIVES_DIR,
+    Outside + '/archives')).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(Outside + '/archives'),
+    PChar(Root + '/' + ARCHIVES_DIR))).ToBe(0);
+  ExpectFailureWith('repair with a linked archives directory',
+    Run(Root, ['repair']), Expected);
+end;
+
+{ The guard the pre-upgrade cache cleanup takes depends on producer-lease
+  state that repair recovers; a linked lease root is recovered first, as
+  the shared-cache step would, and the upgrade then succeeds. }
+procedure TLockSchemaUpgrade.TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade;
+var Root, Leases, Outside: string; Outcome: TLwptResult;
+begin
+  Seed('linked-leases', Root);
+  DowngradeLockToV3(Root);
+  Leases := FCacheRoot + '/producer-leases';
+  RecursiveDelete(Leases);
+  Outside := Root + '-outside-leases';
+  WriteExactFile(Outside + '/kept', 'outside');
+  Expect<Integer>(FpSymlink(PChar(Outside), PChar(Leases))).ToBe(0);
+  Outcome := Run(Root, ['repair']);
+  ExpectSuccess('repair with a linked lease root', Outcome);
+  Expect<Boolean>(Pos('version = 4', LockText(Root)) > 0).ToBe(True);
+  Expect<string>(ReadBinaryFile(Outside + '/kept')).ToBe('outside');
+end;
+{$ELSE}
+procedure TLockSchemaUpgrade.TestLinkedProjectArchiveIsNamedNotRead;
+begin
+end;
+
+procedure TLockSchemaUpgrade.TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade;
+begin
+end;
+{$ENDIF}
 
 procedure TLockSchemaUpgrade.TestRepairLeavesV4Alone;
 var Root, V4, Before: string; Outcome: TLwptResult;
@@ -824,6 +1242,47 @@ begin
     TestRepairCorruptArchiveFailsWithMigrationMessage);
   Test('repair refuses a manifest that disagrees with the v3 lock',
     TestRepairManifestDisagreementLeavesV3);
+  Test('repair upgrades first, then the bumped manifest installs',
+    TestUpgradeThenBump);
+  Test('repair on a bumped manifest names every file to restore, then '
+    + 'upgrades', TestBumpThenUpgradeNamesEveryRestore);
+  Test('repair does not name an archive the per-user cache holds',
+    TestBumpWithCachedArchiveNamesOnlyTheManifest);
+  Test('repair''s failure reads whole and in order in merged output',
+    TestUpgradeFailureReadsWholeInMergedOutput);
+  Test('repair names a bumped dependency behind a missing archive',
+    TestBumpBehindAMissingArchiveNamesBoth);
+  Test('repair names every missing archive at once',
+    TestEveryMissingArchiveIsNamedAtOnce);
+  Test('repair never turns a crafted lock key into an archive path',
+    TestCraftedLockKeyNeverBecomesAnArchivePath);
+  Test('repair names a changed local source behind a missing archive',
+    TestLocalPolicyChangeBehindAMissingArchiveNamesBoth);
+  {$IFDEF UNIX}
+  Test('repair''s upgrade never reads through a linked cache directory',
+    TestUpgradeNeverReadsThroughALinkedCacheDirectory);
+  Test('repair names a linked archive or archives directory as missing',
+    TestLinkedProjectArchiveIsNamedNotRead);
+  Test('repair recovers a linked lease root before the upgrade',
+    TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade);
+  {$ELSE}
+  Skip('repair names a linked archive or archives directory as missing',
+    TestLinkedProjectArchiveIsNamedNotRead, 'link fixtures need FpSymlink');
+  Skip('repair recovers a linked lease root before the upgrade',
+    TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade,
+    'link fixtures need FpSymlink');
+  Skip('repair''s upgrade never reads through a linked cache directory',
+    TestUpgradeNeverReadsThroughALinkedCacheDirectory,
+    'link fixtures need FpSymlink');
+  {$ENDIF}
+  {$IFDEF UNIX}
+  Test('repair names an unreadable archive instead of failing on it',
+    TestUnreadableArchiveKeepsTheMigrationMessage);
+  {$ELSE}
+  Skip('repair names an unreadable archive instead of failing on it',
+    TestUnreadableArchiveKeepsTheMigrationMessage,
+    'file permissions that deny the owner need FpChmod');
+  {$ENDIF}
   Test('repair leaves a v4 lock alone', TestRepairLeavesV4Alone);
   Test('repair recovers a legacy rollback file on a v3 lock',
     TestLegacyRollbackRecoveredByRepairOnV3);
