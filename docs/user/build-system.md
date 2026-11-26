@@ -601,9 +601,12 @@ read, so `core.excludesFile` does not apply and matching is case-sensitive
 whatever `core.ignorecase` says. The project root itself, and every directory
 above it, is never ignored: a project kept in an ignored folder still
 discovers its own tests, while patterns from the `.gitignore` files above it
-still apply to its contents. An ignore file that exists but cannot be read
-stops `lwpt test` before anything compiles, where Git would only warn, so
-ignored programs never start running because a rule went missing.
+still apply to its contents. A unit root outside the project root but inside
+its worktree, such as `units = ["../shared"]`, is filtered by the same rules;
+a path outside the worktree (or, without one, outside the project root) has
+no rules. An ignore file that exists but cannot be read or inspected stops
+`lwpt test` before anything compiles, where Git would only warn, so ignored
+programs never start running because a rule went missing.
 
 Selectors narrow discovery and never widen it. A file or directory selector
 that names an ignored path fails before `[pretest]` and names the pattern:

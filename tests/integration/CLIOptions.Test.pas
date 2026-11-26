@@ -90,6 +90,7 @@ type
     procedure TestPretestCannotAddTestPrograms;
     procedure TestInvalidTestSelectorsFailBeforePretest;
     procedure TestDiscoverySkipsGitIgnoredPaths;
+    procedure TestDiscoverySkipsIgnoredPathsInSiblingUnitRoot;
     procedure TestSelectorNamingIgnoredPathIsRefused;
     procedure TestInventorySkipsHooksAndTestBodies;
     procedure TestCommittedInventoryMismatchFailsActionably;
@@ -957,6 +958,39 @@ begin
   Expect<Integer>(Pos('Ignored.Test.pas', R.Stdout)).ToBe(0);
 end;
 
+procedure TCLIOptionsE2E.TestDiscoverySkipsIgnoredPathsInSiblingUnitRoot;
+var
+  Root, ProjectPath: string;
+  R: TLwptResult;
+begin
+  { The project's worktree is marked by its own `.git`, so the result does
+    not depend on the checkout the scratch directory sits in. }
+  Root := FScratch + '/sibling-units-worktree';
+  ProjectPath := Root + '/app';
+  ForceDirectories(Root + '/.git');
+  ForceDirectories(ProjectPath + '/source');
+  WriteTextFile(Root + '/.gitignore', 'shared/ignored/'#10);
+  WriteTextFile(ProjectPath + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "sibling-units"'#10 +
+    'version = "0.0.0"'#10 +
+    'units = ["source", "../shared"]'#10);
+  WriteTextFile(ProjectPath + '/source/App.Test.pas',
+    'program App.Test;'#10'{$mode delphi}{$H+}'#10'begin'#10'end.'#10);
+  WriteTextFile(Root + '/shared/Shared.Test.pas',
+    'program Shared.Test;'#10'{$mode delphi}{$H+}'#10'begin'#10'end.'#10);
+  WriteTextFile(Root + '/shared/ignored/Bad.Test.pas',
+    'program Bad.Test;'#10'{$mode delphi}{$H+}'#10'begin'#10
+    + '  WriteLn(''ignored program ran'');'#10'  Halt(1);'#10'end.'#10);
+  R := RunLwpt(['test', '--jobs=1'], ProjectPath);
+  DumpRunFailure('sibling unit root skips Git-ignored paths', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('discovered 2 test file(s)', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('Shared.Test.pas', R.Stdout) > 0).ToBe(True);
+  Expect<Integer>(Pos('Bad.Test.pas', R.Stdout)).ToBe(0);
+  Expect<Integer>(Pos('ignored program ran', R.Stdout + R.Stderr)).ToBe(0);
+end;
+
 procedure TCLIOptionsE2E.TestSelectorNamingIgnoredPathIsRefused;
 var
   ProjectPath: string;
@@ -1186,6 +1220,8 @@ begin
     TestInvalidTestSelectorsFailBeforePretest);
   Test('test discovery skips Git-ignored paths',
     TestDiscoverySkipsGitIgnoredPaths);
+  Test('a sibling unit root skips Git-ignored paths',
+    TestDiscoverySkipsIgnoredPathsInSiblingUnitRoot);
   Test('a selector naming a Git-ignored path is refused with its rule',
     TestSelectorNamingIgnoredPathIsRefused);
   Test('test inventory skips hooks and registered test bodies',

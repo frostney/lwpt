@@ -12,7 +12,11 @@ uses
   {$IFDEF UNIX}
   BaseUnix,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Classes,
+  Process,
   SysUtils,
 
   LWPT.Core,
@@ -57,6 +61,7 @@ type
     procedure TestLineEndingsAndByteOrderMark;
     procedure TestSymlinkedOrNonRegularIgnoreFilesAreSkipped;
     procedure TestParentFilesApplyButProjectRootIsNeverIgnored;
+    procedure TestSiblingUnitRootIsJudged;
     procedure TestWorktreeAndSubmoduleInfoExclude;
     procedure TestRealLinkedWorktreeReadsCommonInfoExclude;
     procedure TestProjectWithoutGitReadsItsOwnFiles;
@@ -76,6 +81,11 @@ begin
   Result.Text := AText;
   Result.Matches := AMatches;
 end;
+
+{$IFDEF MSWINDOWS}
+function CreateSymbolicLinkW(ALink, ATarget: PWideChar; AFlags: DWORD): BOOLEAN;
+  stdcall; external 'kernel32' name 'CreateSymbolicLinkW';
+{$ENDIF}
 
 function NativePath(const APath: string): string;
 begin
@@ -107,6 +117,16 @@ begin
   if IsDirectoryCase(ACase) then SetLength(Result, Length(Result) - 1);
 end;
 
+{ The case's path as git takes it: relative to the worktree top, so a case
+  outside the project root (`../shared/x`) names its real location. }
+function TopRelative(const ATop, AProjectRoot: string;
+  const ACase: TIgnoreCase): string;
+begin
+  Result := StringReplace(ExtractRelativePath(IncludeTrailingPathDelimiter(
+    ATop), ExpandFileName(AProjectRoot + PathDelim
+    + NativePath(CasePath(ACase)))), PathDelim, '/', [rfReplaceAll]);
+end;
+
 function YesNo(const AValue: Boolean): string;
 begin
   if AValue then Result := 'ignored' else Result := 'not ignored';
@@ -126,21 +146,48 @@ end;
 function TGitIgnoreTests.RunGit(const ADirectory: string;
   const AArguments: array of string; out AOutput: string): Integer;
 var
-  Arguments: array of string;
+  Process: TProcess;
+  Name, Entry, Unused: string;
   I: Integer;
 begin
-  { No user or system configuration reaches the repository under test:
-    case folding, global excludes and commit signing are pinned off. }
-  SetLength(Arguments, Length(AArguments) + 6);
-  Arguments[0] := '-c';
-  Arguments[1] := 'core.ignorecase=false';
-  Arguments[2] := '-c';
-  Arguments[3] := 'core.excludesFile=' + FRoot + PathDelim
-    + 'no-such-global-excludes';
-  Arguments[4] := '-c';
-  Arguments[5] := 'commit.gpgsign=false';
-  for I := 0 to High(AArguments) do Arguments[I + 6] := AArguments[I];
-  Result := RunChildCommand(ADirectory, FGit, Arguments, AOutput);
+  { No user or system configuration, hook, template or repository-selection
+    variable reaches the repository under test: git reads no system or
+    global file, every inherited GIT_* variable is dropped, and case
+    folding, the default per-user excludes file and hooks are pinned off. }
+  AOutput := '';
+  Unused := '';
+  Process := TProcess.Create(nil);
+  try
+    Process.Executable := FGit;
+    for I := 1 to GetEnvironmentVariableCount do
+    begin
+      Entry := GetEnvironmentString(I);
+      Name := Copy(Entry, 1, Pos('=', Entry) - 1);
+      if (Name <> '') and not SameText(Copy(Name, 1, 4), 'GIT_') then
+        Process.Environment.Add(Entry);
+    end;
+    Process.Environment.Add('GIT_CONFIG_NOSYSTEM=1');
+    Process.Environment.Add('GIT_CONFIG_GLOBAL=' + FRoot + PathDelim
+      + 'no-such-global-config');
+    Process.Parameters.Add('-c');
+    Process.Parameters.Add('core.ignorecase=false');
+    Process.Parameters.Add('-c');
+    Process.Parameters.Add('core.excludesFile=' + FRoot + PathDelim
+      + 'no-such-global-excludes');
+    Process.Parameters.Add('-c');
+    Process.Parameters.Add('core.hooksPath=' + FRoot + PathDelim
+      + 'no-such-hooks');
+    Process.Parameters.Add('-c');
+    Process.Parameters.Add('commit.gpgsign=false');
+    for I := 0 to High(AArguments) do Process.Parameters.Add(AArguments[I]);
+    Process.CurrentDirectory := ADirectory;
+    Process.Options := [poUsePipes, poStderrToOutPut];
+    Process.Execute;
+    Result := FinishChild(Process, AOutput, Unused,
+      CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'git');
+  finally
+    Process.Free;
+  end;
 end;
 
 { A directory with a `.git` of its own: a real repository when git is
@@ -153,7 +200,7 @@ begin
   ForceDirectories(Result);
   if FGit <> '' then
   begin
-    if RunGit(Result, ['init', '-q', '.'], Output) <> 0 then
+    if RunGit(Result, ['init', '-q', '--template=', '.'], Output) <> 0 then
       raise Exception.Create('git init failed in ' + Result + ': ' + Output);
   end;
   ForceDirectories(Result + PathDelim + '.git' + PathDelim + 'info');
@@ -166,7 +213,7 @@ procedure TGitIgnoreTests.CheckCases(const ATop, AProjectRoot: string;
   const ACases: array of TIgnoreCase; const ACrossCheck: Boolean);
 var
   Matcher: TLWPTGitIgnore;
-  Mismatches, Output, Prefix, Path: string;
+  Mismatches, Output, Path: string;
   Arguments: array of string;
   GitIgnored: TStringList;
   I, ExitCode: Integer;
@@ -196,15 +243,12 @@ begin
 
   if ACrossCheck and (FGit <> '') then
   begin
-    Prefix := StringReplace(ExtractRelativePath(
-      IncludeTrailingPathDelimiter(ATop), IncludeTrailingPathDelimiter(
-      AProjectRoot)), PathDelim, '/', [rfReplaceAll]);
     SetLength(Arguments, 3 + Length(ACases));
     Arguments[0] := 'check-ignore';
     Arguments[1] := '--no-index';
     Arguments[2] := '--';
     for I := 0 to High(ACases) do
-      Arguments[3 + I] := Prefix + CasePath(ACases[I]);
+      Arguments[3 + I] := TopRelative(ATop, AProjectRoot, ACases[I]);
     ExitCode := RunGit(ATop, Arguments, Output);
     if not (ExitCode in [0, 1]) then
       Mismatches := Mismatches + Format('git check-ignore exited %d: %s; ',
@@ -215,7 +259,8 @@ begin
       GitIgnored.CaseSensitive := True;
       for I := 0 to High(ACases) do
       begin
-        Actual := GitIgnored.IndexOf(Prefix + CasePath(ACases[I])) >= 0;
+        Actual := GitIgnored.IndexOf(TopRelative(ATop, AProjectRoot,
+          ACases[I])) >= 0;
         if Actual <> ACases[I].Ignored then
           Mismatches := Mismatches + Format('%s: git says %s, expected %s; ',
             [ACases[I].Path, YesNo(Actual), YesNo(ACases[I].Ignored)]);
@@ -487,13 +532,53 @@ begin
     a directory; neither contributes patterns. }
   Top := NewWorktree('non-regular');
   ForceDirectories(Top + '/dir/.gitignore');
-  {$IFDEF UNIX}
   WriteRaw(Top + '/rules', 'linked'#10);
+  {$IFDEF UNIX}
   Expect<Integer>(FpSymlink('rules', PChar(Top + '/.gitignore'))).ToBe(0);
-  {$ENDIF}
   CheckCases(Top, Top, [
     C('linked', False),
     C('dir/x', False)], True);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  CheckCases(Top, Top, [C('dir/x', False)], True);
+  { 2 = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE. Git for Windows'
+    lstat reports the link as one, so it is not cross-checked here. }
+  if CreateSymbolicLinkW(PWideChar(UnicodeString(NativePath(Top
+       + '/.gitignore'))), PWideChar(UnicodeString('rules')), 2)
+     and FileExists(Top + '/.gitignore') then
+    CheckCases(Top, Top, [C('linked', False)], False)
+  else
+    WriteLn('file symbolic links unavailable: the Windows link case '
+      + 'needs developer mode or the privilege');
+  {$ENDIF}
+end;
+
+procedure TGitIgnoreTests.TestSiblingUnitRootIsJudged;
+var
+  Top, Project: string;
+  Matcher: TLWPTGitIgnore;
+begin
+  { A unit root declared as `../shared` sits beside the project root in the
+    same worktree; its paths are judged like any other. }
+  Top := NewWorktree('sibling');
+  Project := Top + PathDelim + 'app';
+  WriteRaw(Top + '/.gitignore', 'shared/ignored/'#10'*.skip'#10);
+  WriteRaw(Top + '/shared/.gitignore', 'local'#10);
+  CheckCases(Top, Project, [
+    C('a.txt', False),
+    C('../shared/Kept.Test.pas', False),
+    C('../shared/ignored/', True),
+    C('../shared/ignored/Bad.Test.pas', True),
+    C('../shared/x.skip', True),
+    C('../shared/local', True)], True);
+  { A path outside the worktree has no rules here at all. }
+  Matcher := TLWPTGitIgnore.Create(Project);
+  try
+    Expect<Boolean>(Matcher.IsIgnored(FRoot + PathDelim + 'outside.skip',
+      False)).ToBe(False);
+  finally
+    Matcher.Free;
+  end;
 end;
 
 procedure TGitIgnoreTests.TestParentFilesApplyButProjectRootIsNeverIgnored;
@@ -531,8 +616,12 @@ begin
   try
     Expect<string>(Matcher.Top).ToBe(Top);
     Expect<Boolean>(Matcher.IsIgnored(Project, True)).ToBe(False);
+    { The project's ignored ancestor is exempt, but a sibling path in the
+      worktree is judged like any other. }
+    Expect<Boolean>(Matcher.IsIgnored(Top + PathDelim + 'scratch',
+      True)).ToBe(False);
     Expect<Boolean>(Matcher.IsIgnored(Top + PathDelim + 'scratch' + PathDelim
-      + 'outside.skip', False)).ToBe(False);
+      + 'outside.skip', False)).ToBe(True);
   finally
     Matcher.Free;
   end;
@@ -697,6 +786,23 @@ begin
     FpChmod(Top + '/.gitignore', &644);
   end;
   Expect<Boolean>(Pos('cannot read ignore file', Message) > 0).ToBe(True);
+
+  { A directory that hides an ignore file fails the same way, rather than
+    reading as a missing file. }
+  Top := NewWorktree('unreadable-info');
+  WriteRaw(Top + '/.git/info/exclude', 'x'#10);
+  Expect<Integer>(FpChmod(Top + '/.git/info', 0)).ToBe(0);
+  Message := '';
+  try
+    try
+      TLWPTGitIgnore.Create(Top).Free;
+    except
+      on E: ELWPTError do Message := E.Message;
+    end;
+  finally
+    FpChmod(Top + '/.git/info', &755);
+  end;
+  Expect<Boolean>(Pos('cannot read ignore file', Message) > 0).ToBe(True);
 end;
 {$ELSE}
 begin
@@ -725,6 +831,8 @@ begin
     TestSymlinkedOrNonRegularIgnoreFilesAreSkipped);
   Test('parent files apply but the project root is never ignored',
     TestParentFilesApplyButProjectRootIsNeverIgnored);
+  Test('a sibling unit root inside the worktree is judged',
+    TestSiblingUnitRootIsJudged);
   Test('worktree and submodule .git files locate info/exclude',
     TestWorktreeAndSubmoduleInfoExclude);
   Test('a real linked worktree reads the common info/exclude',
@@ -732,7 +840,8 @@ begin
   Test('a project outside any worktree reads its own files',
     TestProjectWithoutGitReadsItsOwnFiles);
   Test('reports the deciding rule', TestReportsDecidingRule);
-  Test('an unreadable ignore file fails', TestUnreadableIgnoreFileFails);
+  Test('an ignore file that cannot be read or inspected fails',
+    TestUnreadableIgnoreFileFails);
 end;
 
 begin

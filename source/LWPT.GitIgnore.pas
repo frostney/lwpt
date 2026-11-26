@@ -17,9 +17,11 @@
   `core.ignorecase` is false). A tracked file that matches a pattern is
   ignored too, because the index is never read.
 
-  The project root itself, and every directory above it, is never ignored:
-  only paths strictly below the project root are judged, against every
-  pattern that applies to them. A directory that is ignored makes every
+  The project root itself, and every directory above it, is never ignored,
+  and neither is a path outside the top. Every other path below the top,
+  including one in a sibling of the project root such as a unit root
+  declared as `../shared`, is judged against every pattern that applies to
+  it. A directory that is ignored makes every
   path below it ignored, and the `.gitignore` files inside it are never
   read, so a negated pattern cannot re-include a file whose parent
   directory is excluded.
@@ -70,13 +72,14 @@ type
       out ARule: TLWPTIgnoreRule): Boolean;
     function RelativeToTop(const APath: string;
       out ARelative: string): Boolean;
+    function IsProjectOrAbove(const ARelative: string): Boolean;
   public
     { Reads the ignore files that apply to AProjectRoot as they are needed.
       Raises ELWPTError when an ignore file exists but cannot be read. }
     constructor Create(const AProjectRoot: string);
     destructor Destroy; override;
     { True when APath (absolute or relative to the current directory) is
-      ignored. Paths outside the project root, and the root itself, are
+      ignored. The project root, its ancestors, and paths outside Top are
       never ignored. }
     function IsIgnored(const APath: string;
       const AIsDirectory: Boolean): Boolean;
@@ -100,6 +103,9 @@ implementation
 uses
   {$IFDEF UNIX}
   BaseUnix,
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
   {$ENDIF}
   SysUtils,
 
@@ -449,13 +455,22 @@ function ReadIgnoreFile(const APath: string; const AFollowLinks: Boolean;
 {$IFDEF UNIX}
 var
   Info: Stat;
-  Descriptor, Count, Previous, StatResult: LongInt;
+  Descriptor, Count, Previous, StatResult, Error: LongInt;
   Buffer: array[0..8191] of Byte;
 begin
   AText := '';
   if AFollowLinks then StatResult := FpStat(APath, Info)
   else StatResult := FpLstat(APath, Info);
-  if (StatResult <> 0) or not FpS_ISREG(Info.st_mode) then Exit(False);
+  if StatResult <> 0 then
+  begin
+    { Only a missing file means no rules; a file that cannot be inspected
+      fails like one that cannot be read. }
+    Error := FpGetErrNo;
+    if (Error = ESysENOENT) or (Error = ESysENOTDIR) then Exit(False);
+    raise ELWPTError.CreateFmt('cannot read ignore file "%s": %s',
+      [APath, SysErrorMessage(Error)]);
+  end;
+  if not FpS_ISREG(Info.st_mode) then Exit(False);
   { Non-blocking, so a file swapped for a FIFO after the check fails the
     regular-file test below instead of blocking the open. }
   Descriptor := OpenProtectedDescriptor(APath, O_RDONLY or O_NONBLOCK, 0);
@@ -488,11 +503,36 @@ begin
   Result := True;
 end;
 {$ELSE}
+const
+  IO_REPARSE_TAG_SYMLINK = DWORD($A000000C);
+  FILE_ATTRIBUTE_REPARSE_POINT = $400;
 var
   Stream: TLWPTProtectedFileStream;
+  Data: TWin32FindDataW;
+  Handle: THandle;
+  Error: DWORD;
 begin
   AText := '';
-  if not FileExists(APath) then Exit(False);
+  { FindFirstFileW reports a reparse point's tag, which Git for Windows'
+    lstat uses to tell a symlink from a regular file. }
+  Handle := Windows.FindFirstFileW(PWideChar(WindowsExtendedPath(APath)),
+    Data);
+  if Handle = THandle(Windows.INVALID_HANDLE_VALUE) then
+  begin
+    Error := Windows.GetLastError;
+    if (Error = Windows.ERROR_FILE_NOT_FOUND)
+       or (Error = Windows.ERROR_PATH_NOT_FOUND) then
+      Exit(False);
+    raise ELWPTError.CreateFmt('cannot read ignore file "%s": %s',
+      [APath, SysErrorMessage(Error)]);
+  end;
+  Windows.FindClose(Handle);
+  if (Data.dwFileAttributes and Windows.FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+    Exit(False);
+  if not AFollowLinks
+     and ((Data.dwFileAttributes and FILE_ATTRIBUTE_REPARSE_POINT) <> 0)
+     and (Data.dwReserved0 = IO_REPARSE_TAG_SYMLINK) then
+    Exit(False);
   try
     Stream := OpenProtectedFileStream(APath, fmOpenRead or fmShareDenyNone);
     try
@@ -754,12 +794,17 @@ var
 begin
   ARelative := '';
   Full := ExcludeTrailingPathDelimiter(ExpandFileName(APath));
-  if (Length(Full) <= Length(FProjectRoot))
-     or not PathContains(FProjectRoot, Full) then
+  if (Length(Full) <= Length(FTop)) or not PathContains(FTop, Full) then
     Exit(False);
   ARelative := StringReplace(Copy(Full, Length(FTop) + 2, MaxInt),
     PathDelim, '/', [rfReplaceAll]);
   Result := ARelative <> '';
+end;
+
+function TLWPTGitIgnore.IsProjectOrAbove(const ARelative: string): Boolean;
+begin
+  Result := (ARelative = FProjectRelative)
+    or (Copy(FProjectRelative, 1, Length(ARelative) + 1) = ARelative + '/');
 end;
 
 function TLWPTGitIgnore.IsIgnored(const APath: string;
@@ -774,16 +819,16 @@ function TLWPTGitIgnore.FindRule(const APath: string;
   const AIsDirectory: Boolean; out ARule: TLWPTIgnoreRule): Boolean;
 var
   Relative: string;
-  Start, I: Integer;
+  I: Integer;
 begin
   ARule := Default(TLWPTIgnoreRule);
-  if not RelativeToTop(APath, Relative) then Exit(False);
-  { Judge each directory between the project root and the path first: an
-    ignored one decides for everything below it. }
-  if FProjectRelative = '' then Start := 1
-  else Start := Length(FProjectRelative) + 2;
-  for I := Start to Length(Relative) do
+  if not RelativeToTop(APath, Relative) or IsProjectOrAbove(Relative) then
+    Exit(False);
+  { Judge each directory above the path first, except the project root and
+    its ancestors: an ignored one decides for everything below it. }
+  for I := 1 to Length(Relative) do
     if (Relative[I] = '/')
+       and not IsProjectOrAbove(Copy(Relative, 1, I - 1))
        and DirectoryIgnored(Copy(Relative, 1, I - 1), ARule) then
       Exit(True);
   Result := MatchOwn(Relative, AIsDirectory, ARule);
