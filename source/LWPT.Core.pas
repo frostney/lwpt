@@ -222,7 +222,11 @@ procedure AtomicWriteBytes(const ADst, ATmpRoot: string; const ABytes: TBytes);
   no flock (LWPT coordinates with explicit fcntl locks and atomic renames),
   and they open and mark each descriptor close-on-exec under the same guard
   every managed and unmanaged spawn holds. The guard covers only that step;
-  all I/O happens after it is released. Begin/End calls must be paired. }
+  all I/O happens after it is released. A spawn holds it until the parent's
+  ends of the new child's pipes are close-on-exec too: FPC's TProcess creates
+  them inheritable on Unix, and a later child holding a copy of a stdin write
+  end keeps that stdin from reaching end-of-file. Begin/End calls must be
+  paired. }
 procedure BeginProcessHandleSetup;
 procedure EndProcessHandleSetup;
 

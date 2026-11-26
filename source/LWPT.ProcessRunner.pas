@@ -128,25 +128,6 @@ var
   AbandonedPipeWriters: TList;
   AbandonedPipeWritersCriticalSection: TRTLCriticalSection;
 
-function DuplicatePipeHandle(const AHandle: THandle): THandle;
-{$IFDEF MSWINDOWS}
-var
-  Duplicated: THandle;
-{$ENDIF}
-begin
-  {$IFDEF UNIX}
-  Result := FpDup(AHandle);
-  if Result < 0 then RaiseLastOSError;
-  {$ELSE}
-  Duplicated := 0;
-  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, AHandle,
-    Windows.GetCurrentProcess, @Duplicated, 0, False,
-    DUPLICATE_SAME_ACCESS) then
-    RaiseLastOSError;
-  Result := Duplicated;
-  {$ENDIF}
-end;
-
 procedure ClosePipeHandle(var AHandle: THandle);
 var
   HandleToClose: THandle;
@@ -167,7 +148,10 @@ begin
   inherited Create(True);
   FreeOnTerminate := False;
   FInputHandle := THandle(-1);
-  FInputHandle := DuplicatePipeHandle(AProcess.Input.Handle);
+  { The writer's own copy of the child's standard input. It must not leak
+    into a sibling spawned while it is open, or the child would not see
+    end-of-file until that sibling exits. }
+  FInputHandle := DuplicateParentPipeHandle(AProcess.Input.Handle);
   FText := AText;
 end;
 

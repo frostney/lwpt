@@ -25,6 +25,9 @@ uses
   cthreads,
   BaseUnix,
   {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   Tests.ShutdownProbe, { before Classes, SysUtils and LWPT units: finalizes after them }
   Classes,
   Pipes,
@@ -79,6 +82,26 @@ const
   ForeignProcessGroupID = 1;
   FailedQueryResult = -1;
   IsolationFailure = 'could not isolate process tree';
+  { Pipe inheritance (#448). The sibling outlives every end-of-input bound
+    by far, so a reader that only finishes when the sibling ends fails its
+    bound instead of passing late. }
+  StdinReaderSwitch = '--process-tree-read-stdin';
+  LingeringSiblingSwitch = '--process-tree-linger';
+  StdinReaderReadyLine = 'stdin reader ready';
+  StdinReaderTriggerExitCode = 3;
+  PipeChildLifetimeMilliseconds = 60000;
+  StdinEndMilliseconds = 15000;
+  PipePollMilliseconds = 10;
+  { Sixteen times the largest default pipe capacity (16 pages of 64 KiB on
+    Linux), so the writer still owns its copy of the reader's stdin when the
+    sibling starts. The reader's queued-byte report proves it on every run. }
+  WriterPayloadBytes = 16 * 1024 * 1024;
+  StdinReaderQueuedPrefix = 'queued ';
+  PipeProtectionFailurePrefix = 'could not protect child process pipes';
+  {$IFDEF UNIX}
+  { POSIX fixes FD_CLOEXEC at 1; Linux FPC's BaseUnix does not declare it. }
+  PipeCloseOnExecFlag = 1;
+  {$ENDIF}
 
 type
   TSpawnResult = record
@@ -340,6 +363,459 @@ begin
   {$IFDEF MSWINDOWS}
   Test('a CANCEL frame pending at shutdown is still acknowledged',
     TestPendingCancelFrameSurvivesShutdown);
+  {$ENDIF}
+end;
+
+{ Pipe inheritance between concurrent children (#448). The parent's end of a
+  child's pipe must never be copied into a sibling spawned while it is open:
+  a sibling holding a copy of a stdin write end keeps that stdin from
+  reaching end-of-file until the sibling exits. The reader child waits for a
+  trigger file, then reads standard input to end-of-file and prints the byte
+  count; the sibling stays alive until a stop file appears. Each case closes
+  the reader's input while the sibling still runs and requires the reader to
+  finish well before the sibling would end on its own. }
+type
+  TProcessTreePipeInheritance = class(TTestSuite)
+  public
+    procedure SetupTests;  override;
+    procedure TestManagedChildSeesEndOfInput;
+    procedure TestUnmanagedChildSeesEndOfInput;
+    procedure TestWriterCopySeesEndOfInput;
+    {$IFDEF UNIX}
+    procedure TestProtectionFailureEndsTheChild;
+    {$ENDIF}
+  end;
+
+var
+  PipeSignalSequence: Integer;
+  { The writer case starts its sibling from the output callback, which only
+    takes plain procedures, so its state lives here. }
+  WriterSibling: TProcess;
+  WriterSiblingTrigger: string;
+  WriterSiblingStarted: Boolean;
+  WriterSiblingError: string;
+
+{ A fresh path for a trigger or stop file; the file does not exist yet. }
+function NewPipeSignalPath(const AKind: string): string;
+begin
+  Inc(PipeSignalSequence);
+  Result := IncludeTrailingPathDelimiter(GetTempDir(False)) + PROGRAM_NAME
+    + '-pipe-inheritance-' + IntToStr(GetProcessID) + '-'
+    + IntToStr(PipeSignalSequence) + '.' + AKind;
+  if FileExists(Result) then SysUtils.DeleteFile(Result);
+end;
+
+procedure CreateSignalFile(const APath: string);
+begin
+  FileClose(FileCreate(APath));
+end;
+
+function WaitForSignalFile(const APath: string): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while not FileExists(APath) do
+  begin
+    if GetTickCount64 - StartedAt >= PipeChildLifetimeMilliseconds then
+      Exit(False);
+    Sleep(PipePollMilliseconds);
+  end;
+  Result := True;
+end;
+
+{ Child mode: announce, wait for the trigger, report the bytes already
+  queued on standard input, then count it to end-of-file. Nothing is read
+  before the trigger, so the queued count is everything the parent wrote
+  until then. Without the trigger it exits with a distinct code. }
+procedure RunStdinReader(const ATrigger: string);
+var
+  Buffer: array[0..4095] of Byte;
+  Count: LongInt;
+  StandardInput: TInputPipeStream;
+  Total: Int64;
+begin
+  WriteLn(StdinReaderReadyLine);
+  Flush(Output);
+  if not WaitForSignalFile(ATrigger) then Halt(StdinReaderTriggerExitCode);
+  StandardInput := TInputPipeStream.Create(StdInputHandle);
+  try
+    WriteLn(StdinReaderQueuedPrefix, StandardInput.NumBytesAvailable);
+    Total := 0;
+    repeat
+      Count := StandardInput.Read(Buffer[0], SizeOf(Buffer));
+      if Count > 0 then Inc(Total, Count);
+    until Count <= 0;
+  finally
+    StandardInput.Free;
+  end;
+  WriteLn(Total);
+end;
+
+{ Child mode: stay alive until the stop file appears, within a lifetime far
+  beyond any case's end-of-input bound. }
+procedure RunLingeringSibling(const AStop: string);
+begin
+  WaitForSignalFile(AStop);
+end;
+
+function NewPipeChild(const AMode, ASignalPath: string): TProcess;
+begin
+  Result := TProcess.Create(nil);
+  Result.Executable := ExpandFileName(ParamStr(0));
+  Result.Parameters.Add(AMode);
+  Result.Parameters.Add(ASignalPath);
+end;
+
+{ Starts the sibling through the other guarded spawn path, so every case
+  spawns through both. }
+function StartLingeringSibling(const AStop: string): TProcess;
+begin
+  Result := NewPipeChild(LingeringSiblingSwitch, AStop);
+  try
+    Result.Options := [poUsePipes, poStderrToOutPut];
+    ExecuteUnmanagedProcess(Result);
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure StopLingeringSibling(var ASibling: TProcess; const AStop: string);
+begin
+  if Assigned(ASibling) then
+  begin
+    CreateSignalFile(AStop);
+    ReapChild(ASibling, PipeChildLifetimeMilliseconds);
+    FreeAndNil(ASibling);
+  end;
+  if FileExists(AStop) then SysUtils.DeleteFile(AStop);
+end;
+
+function OutputHasLine(const AOutput, ALine: string): Boolean;
+var
+  Lines: TStringList;
+begin
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AOutput;
+    Result := Lines.IndexOf(ALine) >= 0;
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ The byte count the reader found queued on its stdin at the trigger, or -1
+  when it did not report one. }
+function ReaderQueuedBytes(const AOutput: string): Int64;
+var
+  Index: Integer;
+  Lines: TStringList;
+begin
+  Result := -1;
+  Lines := TStringList.Create;
+  try
+    Lines.Text := AOutput;
+    for Index := 0 to Lines.Count - 1 do
+      if Pos(StdinReaderQueuedPrefix, Lines[Index]) = 1 then
+        Exit(StrToInt64Def(Copy(Lines[Index],
+          Length(StdinReaderQueuedPrefix) + 1, MaxInt), -1));
+  finally
+    Lines.Free;
+  end;
+end;
+
+{ The parent's ends of a started child's pipes: close-on-exec on Unix,
+  non-inheritable on Windows. }
+function ParentPipeEndProtected(const AHandle: THandle): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Flags: DWORD;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Result := (FpFcntl(AHandle, F_GETFD) and PipeCloseOnExecFlag) <> 0;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Flags := 0;
+  Result := Windows.GetHandleInformation(AHandle, @Flags)
+    and ((Flags and Windows.HANDLE_FLAG_INHERIT) = 0);
+  {$ENDIF}
+end;
+
+{ Read before the input closes and asserted after the behaviour, so a
+  regression still shows whether the reader saw end-of-input. }
+function ParentPipeEndsProtected(const AProcess: TProcess): Boolean;
+begin
+  Result := ParentPipeEndProtected(AProcess.Input.Handle)
+    and ParentPipeEndProtected(AProcess.Output.Handle)
+    and ParentPipeEndProtected(AProcess.Stderr.Handle);
+end;
+
+function PipeRunOptions: TLWPTProcessRunOptions;
+begin
+  Result := DefaultProcessRunOptions('pipe inheritance reader');
+  Result.SeparateStandardError := True;
+  Result.TimeoutMilliseconds := StdinEndMilliseconds;
+end;
+
+{ A managed reader, started by TLWPTProcessTree.Execute through the runner,
+  keeps its own stdin: the sibling starts while that stdin is open, and
+  closing it must still end the reader. }
+procedure TProcessTreePipeInheritance.TestManagedChildSeesEndOfInput;
+var
+  EndsProtected: Boolean;
+  ErrorMessage, ReaderStderr, ReaderStdout, Stop, Trigger: string;
+  ReaderExitCode: Integer;
+  Reader, Sibling: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+begin
+  Trigger := NewPipeSignalPath('trigger');
+  Stop := NewPipeSignalPath('stop');
+  CreateSignalFile(Trigger);
+  Sibling := nil;
+  ErrorMessage := '';
+  ReaderExitCode := -1;
+  Reader := NewPipeChild(StdinReaderSwitch, Trigger);
+  try
+    Runner := TLWPTDuplexProcessRunner.Create(Reader);
+    try
+      Runner.Start(PipeRunOptions);
+      EndsProtected := ParentPipeEndsProtected(Reader);
+      Sibling := StartLingeringSibling(Stop);
+      try
+        { Empty input: Communicate closes the original stdin handle. }
+        ReaderExitCode := Runner.Communicate('', PipeRunOptions,
+          ReaderStdout, ReaderStderr);
+      except
+        on E: Exception do ErrorMessage := E.Message;
+      end;
+      Expect<string>(ErrorMessage).ToBe('');
+      Expect<Integer>(ReaderExitCode).ToBe(0);
+      Expect<Boolean>(OutputHasLine(ReaderStdout, '0')).ToBe(True);
+      Expect<Boolean>(Sibling.Running).ToBe(True);
+      Expect<Boolean>(EndsProtected).ToBe(True);
+    finally
+      Runner.Free;
+    end;
+  finally
+    StopLingeringSibling(Sibling, Stop);
+    Reader.Free;
+    SysUtils.DeleteFile(Trigger);
+  end;
+end;
+
+{ The same contract for a reader started by ExecuteUnmanagedProcess. }
+procedure TProcessTreePipeInheritance.TestUnmanagedChildSeesEndOfInput;
+var
+  EndsProtected, Exited: Boolean;
+  ReaderStderr, ReaderStdout, Stop, Trigger: string;
+  Reader, Sibling: TProcess;
+begin
+  Trigger := NewPipeSignalPath('trigger');
+  Stop := NewPipeSignalPath('stop');
+  CreateSignalFile(Trigger);
+  Sibling := nil;
+  ReaderStdout := '';
+  ReaderStderr := '';
+  Reader := NewPipeChild(StdinReaderSwitch, Trigger);
+  try
+    Reader.Options := [poUsePipes];
+    ExecuteUnmanagedProcess(Reader);
+    try
+      EndsProtected := ParentPipeEndsProtected(Reader);
+      Sibling := StartLingeringSibling(Stop);
+      Reader.CloseInput;
+      Exited := WaitForChildExit(Reader, ReaderStdout, ReaderStderr,
+        StdinEndMilliseconds);
+      Expect<Boolean>(Exited).ToBe(True);
+      Expect<Boolean>(Sibling.Running).ToBe(True);
+      Expect<Integer>(ChildProcessExitCode(Reader)).ToBe(0);
+      Expect<Boolean>(OutputHasLine(ReaderStdout, '0')).ToBe(True);
+      Expect<Boolean>(EndsProtected).ToBe(True);
+    finally
+      StopLingeringSibling(Sibling, Stop);
+      Reader.CloseInput;
+      ReapChild(Reader, StdinEndMilliseconds);
+    end;
+  finally
+    Reader.Free;
+    SysUtils.DeleteFile(Trigger);
+  end;
+end;
+
+{ Starts the sibling once the reader has announced itself. By then the
+  runner has closed the original stdin handle and its writer thread owns the
+  only write end: a duplicate, blocked because the payload exceeds the pipe
+  capacity and the reader does not read before the trigger. The case checks
+  that precondition from the reader's queued-byte report. }
+procedure StartSiblingOnReaderOutput(const AData: RawByteString;
+  const AStandardError: Boolean);
+begin
+  if WriterSiblingStarted or AStandardError then Exit;
+  WriterSiblingStarted := True;
+  try
+    WriterSibling := StartLingeringSibling(WriterSiblingTrigger + '.stop');
+  except
+    on E: Exception do WriterSiblingError := E.Message;
+  end;
+  CreateSignalFile(WriterSiblingTrigger);
+end;
+
+{ The writer's duplicate of the child's stdin must not leak into a sibling
+  either: once the writer closes it, the reader must see end-of-file. }
+procedure TProcessTreePipeInheritance.TestWriterCopySeesEndOfInput;
+var
+  ErrorMessage, Payload, ReaderStderr, ReaderStdout, Stop: string;
+  ReaderExitCode: Integer;
+  Options: TLWPTProcessRunOptions;
+  Reader: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+begin
+  WriterSiblingTrigger := NewPipeSignalPath('trigger');
+  Stop := WriterSiblingTrigger + '.stop';
+  if FileExists(Stop) then SysUtils.DeleteFile(Stop);
+  WriterSibling := nil;
+  WriterSiblingStarted := False;
+  WriterSiblingError := '';
+  ErrorMessage := '';
+  ReaderExitCode := -1;
+  Payload := StringOfChar('x', WriterPayloadBytes);
+  Reader := NewPipeChild(StdinReaderSwitch, WriterSiblingTrigger);
+  try
+    Runner := TLWPTDuplexProcessRunner.Create(Reader);
+    try
+      Options := PipeRunOptions;
+      Options.OnOutputChunk := StartSiblingOnReaderOutput;
+      Runner.Start(Options);
+      try
+        ReaderExitCode := Runner.Communicate(Payload, Options,
+          ReaderStdout, ReaderStderr);
+      except
+        on E: Exception do ErrorMessage := E.Message;
+      end;
+      Expect<Boolean>(Runner.UsedStandardInputWriter).ToBe(True);
+      Expect<Boolean>(WriterSiblingStarted).ToBe(True);
+      Expect<string>(WriterSiblingError).ToBe('');
+      Expect<string>(ErrorMessage).ToBe('');
+      Expect<Integer>(ReaderExitCode).ToBe(0);
+      Expect<Boolean>(OutputHasLine(ReaderStdout, IntToStr(WriterPayloadBytes)))
+        .ToBe(True);
+      { Precondition, proven rather than assumed from a pipe size: less than
+        the payload was queued at the trigger, so the writer had not finished
+        and still held its copy when the sibling started before it. }
+      Expect<Boolean>(ReaderQueuedBytes(ReaderStdout) >= 0).ToBe(True);
+      Expect<Boolean>(ReaderQueuedBytes(ReaderStdout) < WriterPayloadBytes)
+        .ToBe(True);
+      Expect<Boolean>(Assigned(WriterSibling) and WriterSibling.Running)
+        .ToBe(True);
+    finally
+      Runner.Free;
+    end;
+  finally
+    StopLingeringSibling(WriterSibling, Stop);
+    Reader.Free;
+    SysUtils.DeleteFile(WriterSiblingTrigger);
+  end;
+end;
+
+{$IFDEF UNIX}
+{ A pipe end that cannot be made close-on-exec fails the spawn: the child is
+  ended and reaped, and the error names the cause, on both guarded paths
+  and for the writer's duplicate. }
+procedure TProcessTreePipeInheritance.TestProtectionFailureEndsTheChild;
+var
+  ErrorMessage, ReaderStderr, ReaderStdout, Trigger: string;
+  Reader: TProcess;
+  Runner: TLWPTDuplexProcessRunner;
+begin
+  Trigger := NewPipeSignalPath('trigger');
+  try
+    { Managed spawn. }
+    ErrorMessage := '';
+    Reader := NewPipeChild(StdinReaderSwitch, Trigger);
+    try
+      Runner := TLWPTDuplexProcessRunner.Create(Reader);
+      try
+        ProcessTreePipeProtectionErrorForTesting := ESysEBADF;
+        try
+          Runner.Start(PipeRunOptions);
+        except
+          on E: Exception do ErrorMessage := E.Message;
+        end;
+        ProcessTreePipeProtectionErrorForTesting := 0;
+        Expect<Boolean>(Pos(PipeProtectionFailurePrefix, ErrorMessage) > 0)
+          .ToBe(True);
+        Expect<Boolean>(Reader.Running).ToBe(False);
+      finally
+        Runner.Free;
+      end;
+    finally
+      Reader.Free;
+    end;
+
+    { Unmanaged spawn. }
+    ErrorMessage := '';
+    Reader := NewPipeChild(StdinReaderSwitch, Trigger);
+    try
+      Reader.Options := [poUsePipes];
+      ProcessTreePipeProtectionErrorForTesting := ESysEBADF;
+      try
+        ExecuteUnmanagedProcess(Reader);
+      except
+        on E: Exception do ErrorMessage := E.Message;
+      end;
+      ProcessTreePipeProtectionErrorForTesting := 0;
+      Expect<Boolean>(Pos(PipeProtectionFailurePrefix, ErrorMessage) > 0)
+        .ToBe(True);
+      Expect<Boolean>(Reader.Running).ToBe(False);
+    finally
+      Reader.Free;
+    end;
+
+    { The writer's duplicate: the runner ends the started tree. }
+    ErrorMessage := '';
+    Reader := NewPipeChild(StdinReaderSwitch, Trigger);
+    try
+      Runner := TLWPTDuplexProcessRunner.Create(Reader);
+      try
+        Runner.Start(PipeRunOptions);
+        ProcessTreePipeProtectionErrorForTesting := ESysEBADF;
+        try
+          Runner.Communicate('input', PipeRunOptions, ReaderStdout,
+            ReaderStderr);
+        except
+          on E: Exception do ErrorMessage := E.Message;
+        end;
+        ProcessTreePipeProtectionErrorForTesting := 0;
+        Expect<Boolean>(Pos('could not prepare standard-input writer: '
+          + PipeProtectionFailurePrefix, ErrorMessage) > 0).ToBe(True);
+        Expect<Boolean>(WaitForChildExit(Reader, StdinEndMilliseconds))
+          .ToBe(True);
+      finally
+        Runner.Free;
+      end;
+    finally
+      ReapChild(Reader, PipeChildLifetimeMilliseconds);
+      Reader.Free;
+    end;
+  finally
+    ProcessTreePipeProtectionErrorForTesting := 0;
+  end;
+end;
+{$ENDIF}
+
+procedure TProcessTreePipeInheritance.SetupTests;
+begin
+  Test('a managed child sees end of input while a sibling runs',
+    TestManagedChildSeesEndOfInput);
+  Test('an unmanaged child sees end of input while a sibling runs',
+    TestUnmanagedChildSeesEndOfInput);
+  Test('the writer''s stdin copy does not leak into a sibling',
+    TestWriterCopySeesEndOfInput);
+  {$IFDEF UNIX}
+  Test('a pipe end that cannot be protected ends the child and raises',
+    TestProtectionFailureEndsTheChild);
   {$ENDIF}
 end;
 
@@ -714,6 +1190,16 @@ begin
     RunShutdownChild;
     Exit;
   end;
+  if ParamStr(1) = StdinReaderSwitch then
+  begin
+    RunStdinReader(ParamStr(2));
+    Exit;
+  end;
+  if ParamStr(1) = LingeringSiblingSwitch then
+  begin
+    RunLingeringSibling(ParamStr(2));
+    Exit;
+  end;
   {$IFDEF UNIX}
   if ParamStr(1) = ReportGroupSwitch then
   begin
@@ -725,6 +1211,8 @@ begin
   {$ENDIF}
   TestRunnerProgram.AddSuite(TProcessTreeShutdown.Create(
     PROJECT_NAME + '.ProcessTree: forwarder shutdown'));
+  TestRunnerProgram.AddSuite(TProcessTreePipeInheritance.Create(
+    PROJECT_NAME + '.ProcessTree: pipe inheritance between children'));
   TestRunnerProgram.Run;
   ExitCode := TestResultToExitCode;
 end.
