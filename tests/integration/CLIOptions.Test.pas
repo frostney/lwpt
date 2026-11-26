@@ -89,6 +89,8 @@ type
     procedure TestTestWithoutSelectorsRunsCompleteDiscovery;
     procedure TestPretestCannotAddTestPrograms;
     procedure TestInvalidTestSelectorsFailBeforePretest;
+    procedure TestDiscoverySkipsGitIgnoredPaths;
+    procedure TestSelectorNamingIgnoredPathIsRefused;
     procedure TestInventorySkipsHooksAndTestBodies;
     procedure TestCommittedInventoryMismatchFailsActionably;
     procedure TestInventoryFailureReportsExitCodeAndOutput;
@@ -890,6 +892,98 @@ begin
   ExpectRejected('../*.Test.pas', 'must be project-root-relative');
 end;
 
+{ A project whose Git ignore rules hide folders of failing test programs:
+  the root file ignores `.agent/` and all of `scratch/` but one program, a
+  nested file ignores one program name below `tests/`, and every hidden
+  program fails if it is ever compiled and run. }
+function WriteIgnoredTestsProject(const AScratch: string): string;
+
+  procedure WriteProgram(const APath, AName: string; const AFails: Boolean);
+  var
+    Body: string;
+  begin
+    if AFails then
+      Body := '  WriteLn(''ignored program ran'');'#10 + '  Halt(1);'#10
+    else
+      Body := '  WriteLn(''kept program ran'');'#10;
+    WriteTextFile(APath,
+      'program ' + AName + ';'#10 +
+      '{$mode delphi}{$H+}'#10 +
+      'begin'#10 + Body + 'end.'#10);
+  end;
+
+begin
+  Result := AScratch + '/ignored-tests-project';
+  ForceDirectories(Result + '/source');
+  WriteTextFile(Result + '/lwpt.toml',
+    '[package]'#10 +
+    'name = "ignored-tests-project"'#10 +
+    'version = "0.0.0"'#10 +
+    'units = ["source"]'#10);
+  WriteTextFile(Result + '/.gitignore',
+    '.agent/'#10 +
+    'scratch/*'#10 +
+    '!scratch/Kept.Test.pas'#10);
+  WriteTextFile(Result + '/tests/.gitignore', 'Local.Test.pas'#10);
+  WriteProgram(Result + '/source/Plain.Test.pas', 'Plain.Test', False);
+  WriteProgram(Result + '/tests/Normal.Test.pas', 'Normal.Test', False);
+  WriteProgram(Result + '/tests/Local.Test.pas', 'Local.Test', True);
+  WriteProgram(Result + '/tests/deep/Local.Test.pas', 'DeepLocal.Test', True);
+  WriteProgram(Result + '/scratch/Kept.Test.pas', 'Kept.Test', False);
+  WriteProgram(Result + '/scratch/Failing.Test.pas', 'Failing.Test', True);
+  WriteProgram(Result + '/.agent/scratch/probe/tests/Ignored.Test.pas',
+    'Ignored.Test', True);
+end;
+
+procedure TCLIOptionsE2E.TestDiscoverySkipsGitIgnoredPaths;
+var
+  ProjectPath: string;
+  R: TLwptResult;
+begin
+  ProjectPath := WriteIgnoredTestsProject(FScratch);
+  R := RunLwpt(['test', '--jobs=1'], ProjectPath);
+  DumpRunFailure('discovery skips Git-ignored paths', R, 0);
+  Expect<Integer>(R.ExitCode).ToBe(0);
+  Expect<Boolean>(Pos('discovered 3 test file(s)', R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('source/Plain.Test.pas') + ' ... pass',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('tests/Normal.Test.pas') + ' ... pass',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(NativeDisplayPath('scratch/Kept.Test.pas') + ' ... pass',
+    R.Stdout) > 0).ToBe(True);
+  Expect<Integer>(Pos('ignored program ran', R.Stdout + R.Stderr)).ToBe(0);
+  Expect<Integer>(Pos('Local.Test.pas', R.Stdout)).ToBe(0);
+  Expect<Integer>(Pos('Failing.Test.pas', R.Stdout)).ToBe(0);
+  Expect<Integer>(Pos('Ignored.Test.pas', R.Stdout)).ToBe(0);
+end;
+
+procedure TCLIOptionsE2E.TestSelectorNamingIgnoredPathIsRefused;
+var
+  ProjectPath: string;
+
+  procedure ExpectRefused(const ASelector, ARule: string);
+  var
+    R: TLwptResult;
+  begin
+    R := RunLwpt(['test', ASelector, '--jobs=1'], ProjectPath);
+    Expect<Boolean>(R.ExitCode <> 0).ToBe(True);
+    Expect<Boolean>(Pos('test selector "' + ASelector + '" is ignored by '
+      + ARule + '; test discovery skips Git-ignored paths',
+      R.Stderr) > 0).ToBe(True);
+    Expect<Integer>(Pos('test session:', R.Stdout)).ToBe(0);
+    Expect<Integer>(Pos('ignored program ran', R.Stdout + R.Stderr)).ToBe(0);
+  end;
+
+begin
+  ProjectPath := WriteIgnoredTestsProject(FScratch);
+  ExpectRefused('.agent/scratch/probe/tests/Ignored.Test.pas',
+    '.gitignore:1 (.agent/)');
+  ExpectRefused('.agent', '.gitignore:1 (.agent/)');
+  ExpectRefused('scratch/Failing.Test.pas', '.gitignore:2 (scratch/*)');
+  ExpectRefused('tests/deep/Local.Test.pas',
+    'tests/.gitignore:1 (Local.Test.pas)');
+end;
+
 procedure WriteInventoryProbe(const AProjectPath: string);
 begin
   WriteTextFile(AProjectPath + '/source/Inventory.Test.pas',
@@ -1090,6 +1184,10 @@ begin
     TestPretestCannotAddTestPrograms);
   Test('invalid test selectors fail before pretest and session creation',
     TestInvalidTestSelectorsFailBeforePretest);
+  Test('test discovery skips Git-ignored paths',
+    TestDiscoverySkipsGitIgnoredPaths);
+  Test('a selector naming a Git-ignored path is refused with its rule',
+    TestSelectorNamingIgnoredPathIsRefused);
   Test('test inventory skips hooks and registered test bodies',
     TestInventorySkipsHooksAndTestBodies);
   Test('committed inventory mismatches fail with expected and actual counts',

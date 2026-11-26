@@ -50,6 +50,7 @@ program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10
 program	*	source/LWPT.Formatter.Test.pas	7	97
+program	*	source/LWPT.GitIgnore.Test.pas	1	15
 program	*	source/LWPT.GitPack.Test.pas	1	23
 program	*	source/LWPT.GitProtocol.Test.pas	4	48
 program	*	source/LWPT.Gzip.Test.pas	1	20
@@ -110,7 +111,7 @@ program	windows/*	tests/integration/BuildEntries.Test.pas	1	13
 program	*	tests/integration/BuildFairness.Test.pas	1	2
 program	*	tests/integration/BuildSessions.Test.pas	1	16
 program	*	tests/integration/ChildWaitGuard.Test.pas	1	12
-program	*	tests/integration/CLIOptions.Test.pas	1	39
+program	*	tests/integration/CLIOptions.Test.pas	1	41
 program	*	tests/integration/CLIUnitClosure.Test.pas	1	2
 program	*	tests/integration/CompilerProfiles.Test.pas	1	18
 program	*	tests/integration/Duplication.Test.pas	1	6

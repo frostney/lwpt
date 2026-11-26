@@ -571,6 +571,52 @@ hook is not part of that invocation. With no selector every discovered program
 runs; with selectors every match runs, without path-derived groups or skips. See
 [ADR-0034](../adr/0034-freeze-test-selection-before-pretest.md).
 
+Discovery walks the manifest's unit roots and the project root for
+`*.Test.pas` files. It skips every `.lwpt/`, `build/` and `.git/` directory
+and every path that the project's Git ignore rules ignore, such as scratch
+reproductions under an ignored `.agent/`. LWPT reads those rules itself and
+never runs `git`, so they apply in a project that is not a Git checkout too:
+
+- every `.gitignore` from the enclosing worktree root down to the path's own
+  directory, each applying to its own subtree. The worktree root is the
+  nearest directory at or above the project root that holds a `.git`
+  directory or `.git` file. Without one, the project root is the top.
+- that worktree's `info/exclude`. For a linked worktree or a submodule, LWPT
+  finds it through the `.git` file and the Git directory's `commondir`.
+
+Patterns follow [gitignore(5)](https://git-scm.com/docs/gitignore) and Git's
+wildmatch: blank lines and `#` comments; unescaped trailing spaces are dropped;
+`\` escapes the next character; `!` negates; a trailing `/` matches
+directories only; a leading or middle `/` anchors the pattern to its file's
+directory; and `*`, `?`, `[...]` and `**` work as in Git. The last matching
+pattern wins, deeper `.gitignore` files win over shallower ones, and
+`info/exclude` loses to all of them. A file cannot be re-included once a
+directory above it is excluded, and `.gitignore` files inside an excluded
+directory are never read. As in Git, an in-tree `.gitignore` that is a symlink
+or a directory, and a pattern file larger than 100 MiB, contribute nothing.
+
+Discovery reads ignore files, not Git's index, so a tracked test program that
+matches an ignore pattern is skipped too. Per-user Git configuration is not
+read, so `core.excludesFile` does not apply and matching is case-sensitive
+whatever `core.ignorecase` says. The project root itself, and every directory
+above it, is never ignored: a project kept in an ignored folder still
+discovers its own tests, while patterns from the `.gitignore` files above it
+still apply to its contents. An ignore file that exists but cannot be read
+stops `lwpt test` before anything compiles, where Git would only warn, so
+ignored programs never start running because a rule went missing.
+
+Selectors narrow discovery and never widen it. A file or directory selector
+that names an ignored path fails before `[pretest]` and names the pattern:
+
+```text
+lwpt test: test selector ".agent/scratch/probe/tests/Ignored.Test.pas" is ignored by .gitignore:28 (.agent/); test discovery skips Git-ignored paths
+```
+
+To run such a program, re-include it with a negated pattern
+(`!scratch/Repro.Test.pas`, with `scratch/*` rather than `scratch/` above it)
+or move it. A test program that a generator writes into an ignored directory is
+not discovered either.
+
 Once `[pretest]` has finished, the invocation's compiler inputs must hold
 still. Before any program compiles or reuses a cached executable, `lwpt test`
 records the content of a fixed set of compiler inputs: the paths the test

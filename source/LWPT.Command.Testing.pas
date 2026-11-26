@@ -42,6 +42,7 @@ uses
   LWPT.Command.Common,
   LWPT.CompilerDriver,
   LWPT.Core,
+  LWPT.GitIgnore,
   LWPT.Manifest,
   LWPT.Observability,
   LWPT.ProcessRunner,
@@ -240,23 +241,29 @@ begin
     and SameText(Copy(APath, Length(APath) - 8, 9), '.Test.pas');
 end;
 
-procedure CollectTestFiles(const ADir: string; AList: TStringList);
+{ Walks ADir for *.Test.pas files, pruning the built-in toolkit and Git
+  directories and every path the project's Git ignore rules ignore. }
+procedure CollectTestFiles(const ADir: string; AList: TStringList;
+  const AIgnore: TLWPTGitIgnore);
 var
   Search: TSearchRec;
-  Base: string;
+  Base, Path: string;
 begin
-  Base := IncludeTrailingPathDelimiter(ADir);
+  Base := IncludeTrailingPathDelimiter(ExpandFileName(ADir));
   if FindFirst(Base + '*', faAnyFile, Search) <> 0 then Exit;
   try
     repeat
       if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      Path := Base + Search.Name;
       if (Search.Attr and faDirectory) <> 0 then
       begin
-        if not IsExcludedDir(Search.Name) then
-          CollectTestFiles(Base + Search.Name, AList);
+        if not IsExcludedDir(Search.Name)
+           and not AIgnore.IsIgnored(Path, True) then
+          CollectTestFiles(Path, AList, AIgnore);
       end
-      else if IsTestSourcePath(Search.Name) then
-        AList.Add(Base + Search.Name);
+      else if IsTestSourcePath(Search.Name)
+        and not AIgnore.IsIgnored(Path, False) then
+        AList.Add(Path);
     until FindNext(Search) <> 0;
   finally
     FindClose(Search);
@@ -277,8 +284,9 @@ end;
 
 procedure SelectTestFiles(const AProjectRoot: string;
   const ADiscovered: TStringList; const ASelectors: TStrings;
-  const ASelected: TStringList);
+  const ASelected: TStringList; const AIgnore: TLWPTGitIgnore);
 var
+  Rule: TLWPTIgnoreRule;
   Canonical, FullPath, RelativePath, Selector: string;
   i, j, MatchCount: Integer;
   IsDirectory, IsFile, IsGlob: Boolean;
@@ -337,6 +345,13 @@ begin
     end;
     if MatchCount = 0 then
     begin
+      { A selector narrows discovery and never widens it, so naming an
+        ignored path is refused with the pattern that ignores it. }
+      if not IsGlob and AIgnore.FindRule(FullPath, IsDirectory, Rule) then
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" is ignored by %s:%d (%s); test discovery '
+          + 'skips Git-ignored paths', [Selector, Rule.Source, Rule.Line,
+          Rule.Pattern]);
       if IsGlob then
         raise ELWPTError.CreateFmt(
           'test selector "%s" matched no discovered test files', [Selector])
@@ -2130,6 +2145,7 @@ var
   StartedAt: QWord;
   Cache: TLWPTBuildCache;
   CacheContext: TLWPTTestCacheContext;
+  Ignore: TLWPTGitIgnore;
 begin
   StartedAt := GetTickCount64;
   Passed := 0;
@@ -2140,6 +2156,7 @@ begin
   VoidedInput := '';
   CompilerSelection := nil;
   DiscoveredTests := nil;
+  Ignore := nil;
   Tests := nil;
   Cache := nil;
   CacheContext := Default(TLWPTTestCacheContext);
@@ -2159,9 +2176,10 @@ begin
         invocation after the user-visible scope has been resolved. }
       DiscoveredTests := TStringList.Create;
       Tests := TStringList.Create;
+      Ignore := TLWPTGitIgnore.Create(ProjectRoot);
       for i := 0 to High(Man.Units) do
-        CollectTestFiles(Man.Units[i], DiscoveredTests);
-      CollectTestFiles('.', DiscoveredTests);
+        CollectTestFiles(Man.Units[i], DiscoveredTests, Ignore);
+      CollectTestFiles('.', DiscoveredTests, Ignore);
       for i := 0 to DiscoveredTests.Count - 1 do
         DiscoveredTests[i] := ExpandFileName(DiscoveredTests[i]);
       DiscoveredTests.Sort;
@@ -2172,7 +2190,8 @@ begin
           DiscoveredTests.Delete(i);
         Dec(i);
       end;
-      SelectTestFiles(ProjectRoot, DiscoveredTests, ASelectors, Tests);
+      SelectTestFiles(ProjectRoot, DiscoveredTests, ASelectors, Tests,
+        Ignore);
 
       CompilerSelection := TLWPTCompilerSelection.Create(Man, ProjectRoot,
         ACompilerHost);
@@ -2356,6 +2375,7 @@ begin
   finally
     Tests.Free;
     DiscoveredTests.Free;
+    Ignore.Free;
     Cache.Free;
     CompilerSelection.Free;
     if not AInventory then
