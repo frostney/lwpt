@@ -5274,29 +5274,23 @@ begin
     end;
 end;
 
-{ Lockfile-diff pruning (ADR-0019). The install transaction regenerates
-  lwpt.lock + lwpt.cfg from the manifest but never deletes module trees,
-  so a dep leaving the graph would otherwise stay in the committed
-  .lwpt/ state forever. `lwpt add` / `lwpt remove` call this after their
-  transaction with the previous + freshly written lockfile entries:
-  a name present before and absent now loses its modules tree and its
-  cached archive; a name whose resolved ref changed loses the stale old
-  archive. Lives here (not in the command units) because the archive
-  naming scheme is ArchivePathForRef's private knowledge. }
+{ Lockfile-diff pruning (ADR-0019, ADR-0039). Compare the old and new
+  lock entries. Removed packages lose their module trees. An old
+  archive can be removed only when the new lock no longer uses it. }
 function CollectOrphanedPackagePaths(
   const AOldLock, ANewLock: array of TResolved;
   const AModulesRoot, AArchivesRoot: string;
   out APaths: TStringArray): Integer;
+var
+  NewArchives: TStringArray;
+  i: Integer;
 
-  function FindNewEntry(const AName: string; out AOut: TResolved): Boolean;
+  function NewLockKeepsPackage(const AName: string): Boolean;
   var k: Integer;
   begin
     for k := 0 to High(ANewLock) do
       if SameText(ANewLock[k].Name, AName) then
-      begin
-        AOut := ANewLock[k];
         Exit(True);
-      end;
     Result := False;
   end;
 
@@ -5311,13 +5305,32 @@ function CollectOrphanedPackagePaths(
     APaths[n] := APath;
   end;
 
-var
-  i: Integer;
-  Kept: TResolved;
-  ModDir, OldArchive, NewArchive: string;
+  procedure AddUnusedArchive(const AOldEntry: TResolved);
+  var OldArchive, NewArchive: string;
+  begin
+    if AOldEntry.SrcKind = skLocal then Exit;
+    OldArchive := ArchivePathForRef(AArchivesRoot, AOldEntry.Name,
+      AOldEntry.SrcKind, AOldEntry.Version);
+    for NewArchive in NewArchives do
+    begin
+      { A change in package or ref spelling can name the same file on
+        a case-insensitive filesystem. Compare identities for these pairs. }
+      if (NewArchive = OldArchive)
+         or (SameText(NewArchive, OldArchive)
+             and PathsReferToSameObject(NewArchive, OldArchive)) then
+        Exit;
+    end;
+    AddPath(OldArchive);
+  end;
+
 begin
   APaths := nil;
   Result := 0;
+  SetLength(NewArchives, Length(ANewLock));
+  for i := 0 to High(ANewLock) do
+    if ANewLock[i].SrcKind <> skLocal then
+      NewArchives[i] := ArchivePathForRef(AArchivesRoot, ANewLock[i].Name,
+        ANewLock[i].SrcKind, ANewLock[i].Version);
   for i := 0 to High(AOldLock) do
   begin
     { The names steer WipeDir/DeleteFile under .lwpt/. lwpt.lock is
@@ -5330,32 +5343,12 @@ begin
         'lockfile contains unsafe package key "%s"; refusing to prune',
         [AOldLock[i].Name]);
 
-    if FindNewEntry(AOldLock[i].Name, Kept) then
+    if not NewLockKeepsPackage(AOldLock[i].Name) then
     begin
-      { Still in the graph — but an updated spec may have moved it to a
-        new resolved ref (or to a local path, which has no archive at
-        all), leaving the old version's archive behind. Only the OLD
-        side must be non-local for there to be anything to reap. }
-      if AOldLock[i].SrcKind = skLocal then Continue;
-      OldArchive := ArchivePathForRef(AArchivesRoot, AOldLock[i].Name,
-        AOldLock[i].SrcKind, AOldLock[i].Version);
-      if Kept.SrcKind = skLocal then
-        NewArchive := ''
-      else
-        NewArchive := ArchivePathForRef(AArchivesRoot, Kept.Name,
-          Kept.SrcKind, Kept.Version);
-      if OldArchive <> NewArchive then
-        AddPath(OldArchive);
-      Continue;
+      AddPath(IncludeTrailingPathDelimiter(AModulesRoot) + AOldLock[i].Name);
+      Inc(Result);
     end;
-
-    { Gone from the graph — reap the extracted snapshot + cached archive. }
-    ModDir := IncludeTrailingPathDelimiter(AModulesRoot) + AOldLock[i].Name;
-    AddPath(ModDir);
-    if AOldLock[i].SrcKind <> skLocal then
-      AddPath(ArchivePathForRef(AArchivesRoot, AOldLock[i].Name,
-        AOldLock[i].SrcKind, AOldLock[i].Version));
-    Inc(Result);
+    AddUnusedArchive(AOldLock[i]);
   end;
 end;
 

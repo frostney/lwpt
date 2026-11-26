@@ -5,7 +5,8 @@
 > **Clarification (2026-11-26):** `update` applies [ADR-0019's lockfile-diff
 > pruning](./0019-add-remove-subcommands.md#subcommand-contracts) inside the
 > install lock whether or not the update rewrites a constraint. An in-range
-> update leaves the manifest file untouched. Plain `install` retains the
+> update leaves the manifest file untouched. The transaction keeps every
+> archive path the new lock still references. Plain `install` retains the
 > pruning policy in ADR-0019. See [#457](https://github.com/frostney/lwpt/issues/457).
 
 The subcommand surface, frozen at twelve since [ADR-0027](./0027-agents-subcommand.md) and the pre-approved [ADR-0006](./0006-stack-contracts-deferred-from-v1.md) pair (`health`, `duplication`) ([Hard Constraint in AGENTS.md](../../AGENTS.md)), expands to fourteen with `lwpt outdated` and `lwpt update`. The problem they solve: every LWPT consumer (wasmlight, duetto, lakon, and any later git-host dep) has no sanctioned way to learn that a newer tag exists, rewrite the authored `^`/`~` constraint when the latest release is outside it, and land a lockfile that still went through the install transaction. Today the documented path is `lwpt add <source@new-version>` or a hand-edit plus `lwpt install`. That is fine for one package, one human; it is not a weekly ecosystem loop. Dependabot cannot read `lwpt.toml`. We chose two thin frontends over the existing resolver and git smart-HTTP tag listing ([ADR-0009](./0009-source-syntax-and-tag-resolution.md)) rather than a new HTTP/JSON GitHub-releases client because the tag advertisement is already host-uniform, already fixtureable (`LWPT_TEST_GIT_FIXTURE_DIR`), and already what `lwpt install` trusts. Release notes stay out of the binary.

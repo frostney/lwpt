@@ -25,7 +25,8 @@ type
     procedure WriteArchive(const AName, ACommit, AManifest: string);
     procedure PrepareOfflineSeed(const AScenario: string;
       out ARoot, ALockText: string);
-    procedure PrepareVersionBump(const ARoot, AConstraint: string);
+    procedure PrepareVersionBump(const ARoot, AConstraint: string;
+      const AOldDependencies: string = ''; const ANewDependencies: string = '');
     function RunInstall(const ARoot: string;
       const AArguments: array of string): TLwptResult;
     function RequestCount(const ALine: string): Integer;
@@ -39,6 +40,8 @@ type
     procedure TestMixedTagSHAUsesImmutableFetchAndFrozenIdentity;
     procedure TestSecondRoundReusesRefAndCandidateCaches;
     procedure TestInRangeUpdatePrunesReplacedArchive;
+    procedure TestUpdateKeepsArchiveAfterDependencyCaseChange;
+    procedure TestUpdateKeepsArchiveClaimedByReplacementPackage;
     procedure TestInstallAfterManifestEditKeepsReplacedArchive;
     procedure TestVerifiedArchiveCacheReusesLockedBytesAcrossProjects;
     procedure TestOfflineCommittedArchiveRestoresProjectState;
@@ -1422,7 +1425,7 @@ begin
 end;
 
 procedure TInstallGitGraph.PrepareVersionBump(const ARoot,
-  AConstraint: string);
+  AConstraint, AOldDependencies, ANewDependencies: string);
 var Run: TLwptResult;
 begin
   FCacheRoot := ARoot + '-cache';
@@ -1431,7 +1434,7 @@ begin
   WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10);
   WriteArchive('shared', SHARED_COMMIT,
     '[package]'#10 + 'name = "shared"'#10 + 'version = "1.0.0"'#10
-    + 'units = ["source"]'#10);
+    + 'units = ["source"]'#10 + AOldDependencies);
   Run := RunInstall(ARoot, ['install']);
   DumpRunFailure('lock shared v1.0.0', Run, 0);
   Expect<Integer>(Run.ExitCode).ToBe(0);
@@ -1442,7 +1445,7 @@ begin
     + 'tag|v1.1.0|' + MUTATED_SHARED_COMMIT + '|'#10);
   WriteArchive('shared', MUTATED_SHARED_COMMIT,
     '[package]'#10 + 'name = "shared"'#10 + 'version = "1.1.0"'#10
-    + 'units = ["source"]'#10);
+    + 'units = ["source"]'#10 + ANewDependencies);
 end;
 
 procedure TInstallGitGraph.TestInRangeUpdatePrunesReplacedArchive;
@@ -1479,6 +1482,62 @@ begin
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<Boolean>(FileExists(Root + '/.lwpt/archives/shared-v1.0.0.tar.gz'))
     .ToBe(False);
+end;
+
+procedure TInstallGitGraph.TestUpdateKeepsArchiveAfterDependencyCaseChange;
+var Root, LockText: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/update-dep-case';
+  WriteRefs('leaf', 'tag|v1.0.0|' + ANCHOR_COMMIT + '|'#10);
+  WriteArchive('leaf', ANCHOR_COMMIT,
+    '[package]'#10 + 'name = "leaf"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  PrepareVersionBump(Root, '^1.0.0',
+    '[dependencies]'#10 + 'leaf = "fixture/leaf@1.0.0"'#10,
+    '[dependencies]'#10 + 'Leaf = "fixture/leaf@1.0.0"'#10);
+
+  Run := RunInstall(Root, ['update', 'shared']);
+  DumpRunFailure('update with a differently cased transitive dependency',
+    Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockText := ReadBinaryFile(Root + '/lwpt.lock');
+  Expect<Boolean>(Pos('[package.Leaf]', LockText) > 0).ToBe(True);
+  Expect<Boolean>(FileExists(Root + '/.lwpt/archives/shared-v1.0.0.tar.gz'))
+    .ToBe(False);
+  Run := RunInstall(Root, ['install', '--frozen']);
+  DumpRunFailure('verify the archive for Leaf', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+end;
+
+procedure TInstallGitGraph.TestUpdateKeepsArchiveClaimedByReplacementPackage;
+var Root, LockText: string; Run: TLwptResult;
+begin
+  Root := FScratch + '/update-archive-reuse';
+  WriteRefs('tool-old', 'tag|v1.0.0|' + PARENT_V1_COMMIT + '|'#10);
+  WriteArchive('tool-old', PARENT_V1_COMMIT,
+    '[package]'#10 + 'name = "tool-old"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteRefs('tool', 'tag|old-v1.0.0|' + PARENT_V2_COMMIT + '|'#10);
+  WriteArchive('tool', PARENT_V2_COMMIT,
+    '[package]'#10 + 'name = "tool"'#10 + 'version = "1.0.0"'#10
+    + 'units = ["source"]'#10);
+  { Both dependencies use the archive filename tool-old-v1.0.0.tar.gz. }
+  PrepareVersionBump(Root, '^1.0.0',
+    '[dependencies]'#10 + 'tool-old = "fixture/tool-old@1.0.0"'#10,
+    '[dependencies]'#10 + 'tool = "fixture/tool@old-v1.0.0"'#10);
+
+  Run := RunInstall(Root, ['update', 'shared']);
+  DumpRunFailure('update with a reused archive pathname', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  LockText := ReadBinaryFile(Root + '/lwpt.lock');
+  Expect<Boolean>(Pos('[package.tool]', LockText) > 0).ToBe(True);
+  Expect<Boolean>(DirectoryExists(Root + '/.lwpt/modules/tool-old'))
+    .ToBe(False);
+  Expect<Boolean>(FileExists(Root + '/.lwpt/archives/shared-v1.0.0.tar.gz'))
+    .ToBe(False);
+  Run := RunInstall(Root, ['install', '--frozen']);
+  DumpRunFailure('verify the archive for tool', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
 end;
 
 procedure TInstallGitGraph.TestInstallAfterManifestEditKeepsReplacedArchive;
@@ -1553,6 +1612,10 @@ begin
     TestSecondRoundReusesRefAndCandidateCaches);
   Test('an in-range update prunes the replaced archive and keeps the '
     + 'manifest untouched', TestInRangeUpdatePrunesReplacedArchive);
+  Test('an update keeps an archive still referenced under a different '
+    + 'dependency case', TestUpdateKeepsArchiveAfterDependencyCaseChange);
+  Test('an update keeps an archive pathname claimed by a replacement package',
+    TestUpdateKeepsArchiveClaimedByReplacementPackage);
   Test('plain install after a manifest edit keeps the replaced archive',
     TestInstallAfterManifestEditKeepsReplacedArchive);
   Test('verified archive objects are reused across projects from lock identity',

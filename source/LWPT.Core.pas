@@ -163,6 +163,8 @@ function  WindowsExtendedPath(const APath: string): UnicodeString;
 
 function  CopyFileContent(const ASrc, ADst: string): Boolean;
 function  PathContains(const AParent, AChild: string): Boolean;
+{ True when both paths resolve to the same filesystem object. }
+function  PathsReferToSameObject(const A, B: string): Boolean;
 function  IsDirSymlinkOrJunction(const APath: string): Boolean;
 procedure CopyDirTree(const ASrc, ADst: string);
 const
@@ -926,12 +928,12 @@ begin
   {$ENDIF}
 end;
 
-{ True when A and B name the same physical directory, with symlinks
+{ True when A and B name the same filesystem object, with symlinks
   and junctions followed: dev+inode on Unix, volume serial + file
   index on Windows. False when either path does not resolve. This is
   the stat-level complement to the lexical PathContains. }
 {$IFDEF UNIX}
-function IsSameDirectory(const A, B: string): Boolean;
+function PathsReferToSameObject(const A, B: string): Boolean;
 var SA, SB: BaseUnix.Stat;
 begin
   if FpStat(A, SA) <> 0 then Exit(False);
@@ -940,9 +942,9 @@ begin
 end;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
-function IsSameDirectory(const A, B: string): Boolean;
+function PathsReferToSameObject(const A, B: string): Boolean;
 
-  function OpenDir(const APath: string): THandle;
+  function OpenPath(const APath: string): THandle;
   begin
     { zero access: metadata only. FILE_FLAG_BACKUP_SEMANTICS is
       required to open a directory handle; reparse points are
@@ -957,10 +959,10 @@ var
   IA, IB: TByHandleFileInformation;
 begin
   Result := False;
-  HA := OpenDir(A);
+  HA := OpenPath(A);
   if HA = INVALID_HANDLE_VALUE then Exit;
   try
-    HB := OpenDir(B);
+    HB := OpenPath(B);
     if HB = INVALID_HANDLE_VALUE then Exit;
     try
       if Windows.GetFileInformationByHandle(HA, IA)
@@ -1046,7 +1048,7 @@ begin
   Anc := ExcludeTrailingPathDelimiter(ExpandFileName(ADst));
   while Anc <> '' do
   begin
-    if IsSameDirectory(ASrc, Anc) then
+    if PathsReferToSameObject(ASrc, Anc) then
       raise EExtractError.CreateFmt(
         'refusing to copy "%s" into itself ("%s" resolves into it)',
         [ASrc, ADst]);
