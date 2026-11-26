@@ -687,12 +687,14 @@ var
 begin
   { Outside any worktree the project root is the top, and its own ignore
     files still apply. The temporary directory normally has no `.git`
-    above it; if it does, that directory is the expected top. }
+    above it; if it does, that directory is the expected top, and the
+    project's own file still decides both cases because a deeper
+    `.gitignore` wins over every rule above it. }
   Project := ExpandFileName(IncludeTrailingPathDelimiter(GetTempDir(False))
     + 'lwpt-gitignore-' + IntToStr(GetProcessID));
   if DirectoryExists(Project) then RecursiveDelete(Project);
   try
-    WriteRaw(Project + '/.gitignore', '*.skip'#10);
+    WriteRaw(Project + '/.gitignore', '*.skip'#10'!a.txt'#10);
     Expected := ExcludeTrailingPathDelimiter(Project);
     Candidate := Expected;
     while True do
@@ -710,6 +712,11 @@ begin
         Break;
       Candidate := ExcludeTrailingPathDelimiter(ExtractFileDir(Candidate));
     end;
+    if Expected = ExcludeTrailingPathDelimiter(Project) then
+      WriteLn('no .git above the temporary directory: the project root is '
+        + 'the top')
+    else
+      WriteLn('the temporary directory is inside the worktree ', Expected);
     with TLWPTGitIgnore.Create(Project) do
     try
       Expect<string>(Top).ToBe(Expected);
