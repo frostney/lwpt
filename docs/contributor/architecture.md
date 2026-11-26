@@ -270,7 +270,8 @@ installs are not supported.
 - **Test:** Each `*.Test.pas` is a self-contained program using
   `TestingPascalLibrary`. The runner discovers all programs or resolves strict
   file, directory, and glob selectors; projects own any grouping and network
-  policy. `lwpt test` resolves the project-scoped compiler
+  policy. Discovery skips Git-ignored paths through `LWPT.GitIgnore`, which
+  reads `.gitignore` files and `info/exclude` itself and never runs `git`. `lwpt test` resolves the project-scoped compiler
   driver once and shares it across every test worker; per-entry compiler
   profiles apply to `lwpt build`, not to individual test files. Workers validate
   each neutral request and first seek a verified compilation artifact set under
@@ -424,7 +425,9 @@ LWPT's own `lwpt.toml` lists `lwpt` as a `[build]` entry with `source = "source/
 `LWPT.CompilerDriver.External.pas`,
 `LWPT.CompilerRegistry.pas`, `LWPT.ProcessRunner.pas`, `LWPT.Formatter.pas`,
 `LWPT.GitProtocol.pas` (ref listing and commit-reachability proofs),
-`LWPT.GitPack.pas` (bounded commits-only packfile reader), `LWPT.SHA1.pas` (self-contained SHA-1 for git object ids; the cross toolchain ships no `sha1` unit),
+`LWPT.GitPack.pas` (bounded commits-only packfile reader),
+`LWPT.GitIgnore.pas` (Git's ignore rules read from the ignore files, without
+running `git`; used by test discovery), `LWPT.SHA1.pas` (self-contained SHA-1 for git object ids; the cross toolchain ships no `sha1` unit),
 `LWPT.FetchPolicy.pas` (built-in forge origins and per-dependency fetch
 destination policy), `LWPT.Gzip.pas` (stream-based RFC 1952 decoding for archive
 extraction), `LWPT.Archive.pas` (archive-contract primitives shared by the
