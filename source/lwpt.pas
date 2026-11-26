@@ -121,6 +121,16 @@ begin
   Result := PROGRAM_NAME + ' ' + ASubcommand + ': ';
 end;
 
+{ A failed command's message goes to standard error, which is unbuffered,
+  while standard output written to a pipe or file stays buffered. Flushing
+  first keeps the message whole and after the progress lines it follows,
+  so a log that merges both streams reads in order. }
+procedure ReportCommandError(const ASubcommand, AMessage: string);
+begin
+  Flush(Output);
+  WriteLn(ErrOutput, ErrPrefix(ASubcommand), AMessage);
+end;
+
 function RejectUnexpectedPositionals(const ASubcommand: string;
   const APositionals: TStrings): Boolean;
 begin
@@ -212,7 +222,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('install'), E.Message);
+      ReportCommandError('install', E.Message);
       Result := 1;
     end;
   end;
@@ -242,7 +252,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('add'), E.Message);
+      ReportCommandError('add', E.Message);
       Result := 1;
     end;
   end;
@@ -270,7 +280,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('remove'), E.Message);
+      ReportCommandError('remove', E.Message);
       Result := 1;
     end;
   end;
@@ -339,7 +349,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('build'), E.Message);
+      ReportCommandError('build', E.Message);
       Result := 1;
     end;
   end;
@@ -363,7 +373,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('format'), E.Message);
+      ReportCommandError('format', E.Message);
       Result := 1;
     end;
   end;
@@ -392,7 +402,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('duplication'), E.Message);
+      ReportCommandError('duplication', E.Message);
       Result := 1;
     end;
   end;
@@ -449,7 +459,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('test'), E.Message);
+      ReportCommandError('test', E.Message);
       Result := 1;
     end;
   end;
@@ -466,7 +476,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('repair'), E.Message);
+      ReportCommandError('repair', E.Message);
       Result := 1;
     end;
   end;
@@ -647,7 +657,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('registry'), E.Message);
+      ReportCommandError('registry', E.Message);
       Result := 1;
     end;
   end;
@@ -680,7 +690,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('init'), E.Message);
+      ReportCommandError('init', E.Message);
       Result := 1;
     end;
   end;
@@ -730,7 +740,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('run'), E.Message);
+      ReportCommandError('run', E.Message);
       Result := 1;
     end;
   end;
@@ -764,7 +774,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('health'), E.Message);
+      ReportCommandError('health', E.Message);
       Result := 1;
     end;
   end;
@@ -794,7 +804,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('agents'), E.Message);
+      ReportCommandError('agents', E.Message);
       Result := 1;
     end;
   end;
@@ -818,7 +828,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('outdated'), E.Message);
+      ReportCommandError('outdated', E.Message);
       Result := 1;
     end;
   end;
@@ -840,7 +850,7 @@ begin
   except
     on E: Exception do
     begin
-      WriteLn(ErrOutput, ErrPrefix('update'), E.Message);
+      ReportCommandError('update', E.Message);
       Result := 1;
     end;
   end;
