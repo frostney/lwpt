@@ -19,6 +19,7 @@ uses
   BaseUnix,
   {$ENDIF}
   Classes,
+  Process,
   SysUtils,
 
   LWPT.Core,
@@ -26,6 +27,7 @@ uses
   Tests.HTTPMockServer,
   Tests.LockSchema,
   Tests.LwptSubprocess,
+  Tests.ProcessSupport,
   Tests.Scratch,
   Tests.TarSynth;
 
@@ -62,6 +64,9 @@ type
     procedure ExpectRefusedLock(const ALabel, ARoot, AHistorical,
       AReason: string);
     function ArchiveMessage: string;
+    function RunMerged(const ARoot: string;
+      const AArguments: array of string): string;
+    procedure BumpShared(const ARoot: string);
   protected
     procedure BeforeAll; override;
     procedure AfterAll; override;
@@ -79,6 +84,10 @@ type
     procedure TestRepairMissingArchiveFailsWithMigrationMessage;
     procedure TestRepairCorruptArchiveFailsWithMigrationMessage;
     procedure TestRepairManifestDisagreementLeavesV3;
+    procedure TestUpgradeThenBump;
+    procedure TestBumpThenUpgradeNamesEveryRestore;
+    procedure TestBumpWithCachedArchiveNamesOnlyTheManifest;
+    procedure TestUpgradeFailureReadsWholeInMergedOutput;
     procedure TestRepairLeavesV4Alone;
     procedure TestLegacyRollbackRecoveredByRepairOnV3;
     procedure TestLegacyRollbackRecoveredByInstallOnV4;
@@ -240,6 +249,79 @@ begin
     + 'again. To give up the version-stable migration, delete `' + LOCKFILE
     + '` and run `' + PROGRAM_NAME + ' install`; that needs network access '
     + 'and moves range dependencies to their newest matching versions.';
+end;
+
+{ The upgrade's agreement failure (ADR-0052 section 5): AFact is the
+  disagreement and ARestore every file to bring back. }
+function AgreementMessage(const AFact, ARestore: string): string;
+begin
+  Result := '`' + PROGRAM_NAME + ' repair` cannot upgrade `' + LOCKFILE
+    + '` from schema v3: the manifest does not agree with the lockfile: '
+    + AFact + '. Restore ' + ARestore + ', for example from version '
+    + 'control, run `' + PROGRAM_NAME + ' repair`, and then change the '
+    + 'manifest and run `' + PROGRAM_NAME + ' install`. To give up the '
+    + 'version-stable migration, delete `' + LOCKFILE + '` and run `'
+    + PROGRAM_NAME + ' install`; that needs network access and moves range '
+    + 'dependencies to their newest matching versions.';
+end;
+
+function ManifestRestore: string;
+begin
+  Result := 'the ' + MANIFEST_FILE + ' that `' + LOCKFILE
+    + '` was written from';
+end;
+
+function BumpFact: string;
+begin
+  Result := 'locked version "v1.0.0" no longer satisfies the manifest '
+    + 'requirements for "shared"';
+end;
+
+{ The text before the per-user recovery: repair reports the upgrade's
+  verdict before it re-verifies the shared cache, which can take minutes. }
+function PerUserRecoveryStart: string;
+begin
+  Result := 'repair: shared cache ';
+end;
+
+{ The same run as Run, with standard error merged into standard output as
+  a CI log or an agent's captured shell output receives it. }
+function TLockSchemaUpgrade.RunMerged(const ARoot: string;
+  const AArguments: array of string): string;
+var
+  P: TProcess;
+  i: Integer;
+  MergedIntoOutput: string;
+begin
+  Result := '';
+  P := TProcess.Create(nil);
+  try
+    P.Executable := LwptTestingBinaryPath;
+    for i := 0 to High(AArguments) do P.Parameters.Add(AArguments[i]);
+    P.CurrentDirectory := ARoot;
+    ConfigureProcessEnvironment(P,
+      [PROJECT_NAME + '_TEST_GIT_FIXTURE_DIR=' + FFixtureRoot,
+       PROJECT_NAME + '_CACHE_DIR=' + FCacheRoot]);
+    P.Options := [poUsePipes, poStderrToOutPut];
+    P.Execute;
+    MergedIntoOutput := '';
+    FinishChild(P, Result, MergedIntoOutput,
+      LWPT_RUN_DEFAULT_TIMEOUT_MILLISECONDS, 'merged repair');
+  finally
+    P.Free;
+  end;
+end;
+
+{ The field report's bump: a newer major is advertised and archived, and
+  the manifest moves to it. }
+procedure TLockSchemaUpgrade.BumpShared(const ARoot: string);
+begin
+  WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10
+    + 'tag|v2.0.0|' + NEWER_COMMIT + '|'#10);
+  WriteArchive('shared', NEWER_COMMIT, '2.0.0');
+  WriteExactFile(ARoot + '/lwpt.toml', StringReplace(
+    ReadBinaryFile(ARoot + '/lwpt.toml'), 'fixture/shared@^1.0.0',
+    'fixture/shared@^2.0.0', []));
 end;
 
 { ---------------------------------------------------------------------------
@@ -619,7 +701,7 @@ begin
 end;
 
 procedure TLockSchemaUpgrade.TestRepairManifestDisagreementLeavesV3;
-var Root, V3, Manifest, Before: string;
+var Root, V3, Manifest, Before: string; Outcome: TLwptResult;
 begin
   Seed('repair-drift', Root);
   V3 := DowngradeLockToV3(Root);
@@ -628,15 +710,122 @@ begin
     'fixture/shared@^1.0.0', 'fixture/shared@^2.0.0', []));
   Before := ProjectSnapshot(Root, REPAIR_OWNED);
   ClearRequests;
-  ExpectFailureWith('repair drift', Run(Root, ['repair']),
-    'the manifest does not agree with the lockfile');
-  ExpectFailureWith('repair drift hint', Run(Root, ['repair']),
-    'Restore the ' + MANIFEST_FILE + ' that `' + LOCKFILE
-    + '` was written from, run `' + PROGRAM_NAME + ' repair`, and then '
-    + 'change the manifest.');
+  { The archive is still committed, so only the manifest is named, and
+    the hint is the migration's, never the online install that refuses
+    the remaining v3 lock. }
+  Outcome := Run(Root, ['repair']);
+  ExpectFailureWith('repair drift', Outcome,
+    AgreementMessage(BumpFact, ManifestRestore));
+  Expect<Boolean>(Pos('online', Outcome.Stderr) = 0).ToBe(True);
+  Expect<Boolean>(Pos(PerUserRecoveryStart, Outcome.Stdout) = 0).ToBe(True);
   Expect<string>(Requests).ToBe('');
   Expect<string>(LockText(Root)).ToBe(V3);
   Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
+end;
+
+{ The working order of the field report: upgrade, then bump. The upgrade
+  runs before the per-user recovery, so its verdict never waits on it. }
+procedure TLockSchemaUpgrade.TestUpgradeThenBump;
+var Root, Lock: string; Outcome: TLwptResult;
+begin
+  Seed('upgrade-then-bump', Root);
+  DowngradeLockToV3(Root);
+  ClearRequests;
+  Outcome := Run(Root, ['repair']);
+  ExpectSuccess('repair', Outcome);
+  Expect<string>(Requests).ToBe('');
+  Expect<Boolean>(Pos('upgraded ' + LOCKFILE, Outcome.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos(PerUserRecoveryStart, Outcome.Stdout)
+    > Pos('upgraded ' + LOCKFILE, Outcome.Stdout)).ToBe(True);
+  BumpShared(Root);
+  ExpectSuccess('install after the bump', Run(Root, ['install']));
+  Lock := LockText(Root);
+  Expect<Boolean>(Pos('version = 4', Lock) > 0).ToBe(True);
+  Expect<string>(LockEntryField(Lock, 'shared', 'resolvedRef'))
+    .ToBe('v2.0.0');
+  ExpectSuccess('frozen after the bump', Run(Root, ['install', '--frozen']));
+end;
+
+{ The failing order of the field report: bump the manifest and drop the
+  old archive, then repair. One message, given before the per-user
+  recovery, names both files to restore; following it upgrades the lock,
+  and the bump then installs. }
+procedure TLockSchemaUpgrade.TestBumpThenUpgradeNamesEveryRestore;
+var Root, V3, Manifest, Archive, Before, Lock: string;
+  Outcome: TLwptResult;
+begin
+  Seed('bump-then-upgrade', Root);
+  V3 := DowngradeLockToV3(Root);
+  Manifest := ReadBinaryFile(Root + '/lwpt.toml');
+  Archive := ReadBinaryFile(Root + '/' + SHARED_ARCHIVE);
+  BumpShared(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  Before := ProjectSnapshot(Root, REPAIR_OWNED);
+  ClearRequests;
+  Outcome := Run(Root, ['repair']);
+  ExpectFailureWith('repair after the bump', Outcome,
+    AgreementMessage(BumpFact, ManifestRestore
+      + ' and the missing locked archive `' + SHARED_ARCHIVE + '`'));
+  Expect<Boolean>(Pos(PerUserRecoveryStart, Outcome.Stdout) = 0).ToBe(True);
+  Expect<string>(Requests).ToBe('');
+  Expect<string>(LockText(Root)).ToBe(V3);
+  Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
+
+  { Do what the message says. }
+  WriteExactFile(Root + '/lwpt.toml', Manifest);
+  WriteExactFile(Root + '/' + SHARED_ARCHIVE, Archive);
+  ExpectSuccess('repair after the restore', Run(Root, ['repair']));
+  Expect<string>(Requests).ToBe('');
+  Lock := LockText(Root);
+  Expect<Boolean>(Pos('version = 4', Lock) > 0).ToBe(True);
+  Expect<string>(LockEntryField(Lock, 'shared', 'resolvedRef'))
+    .ToBe('v1.0.0');
+  BumpShared(Root);
+  ExpectSuccess('install after the bump', Run(Root, ['install']));
+  Expect<string>(LockEntryField(LockText(Root), 'shared', 'resolvedRef'))
+    .ToBe('v2.0.0');
+  ExpectSuccess('frozen after the bump', Run(Root, ['install', '--frozen']));
+end;
+
+{ An archive the per-user cache still holds is not named: the upgrade
+  restores it from there, so restoring the manifest alone is enough. }
+procedure TLockSchemaUpgrade.TestBumpWithCachedArchiveNamesOnlyTheManifest;
+var Root, Manifest: string;
+begin
+  Seed('bump-cached', Root);
+  DowngradeLockToV3(Root);
+  Manifest := ReadBinaryFile(Root + '/lwpt.toml');
+  BumpShared(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  ExpectFailureWith('repair with a cached archive', Run(Root, ['repair']),
+    AgreementMessage(BumpFact, ManifestRestore));
+  WriteExactFile(Root + '/lwpt.toml', Manifest);
+  ExpectSuccess('repair after restoring the manifest',
+    Run(Root, ['repair']));
+  Expect<Boolean>(Pos('version = 4', LockText(Root)) > 0).ToBe(True);
+  Expect<Boolean>(FileExists(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+end;
+
+{ Standard output to a pipe is buffered and standard error is not, so the
+  failure must flush the progress lines first: in a merged log the message
+  starts its own line, whole, after the lines it follows. }
+procedure TLockSchemaUpgrade.TestUpgradeFailureReadsWholeInMergedOutput;
+var Root, Output, Failure: string; FailureAt: Integer;
+begin
+  Seed('merged-output', Root);
+  DowngradeLockToV3(Root);
+  BumpShared(Root);
+  Output := RunMerged(Root, ['repair']);
+  Failure := PROGRAM_NAME + ' repair: ' + AgreementMessage(BumpFact,
+    ManifestRestore) + LineEnding;
+  FailureAt := Pos(LineEnding + Failure, Output);
+  if FailureAt = 0 then
+    WriteLn('--- merged repair output ---'#10, Output, '---');
+  Expect<Boolean>(FailureAt > 0).ToBe(True);
+  Expect<Boolean>(Pos('resolving dependency graph', Output) < FailureAt)
+    .ToBe(True);
+  Expect<Boolean>(Pos('resolving dependency graph', Output) > 0).ToBe(True);
 end;
 
 procedure TLockSchemaUpgrade.TestRepairLeavesV4Alone;
@@ -824,6 +1013,14 @@ begin
     TestRepairCorruptArchiveFailsWithMigrationMessage);
   Test('repair refuses a manifest that disagrees with the v3 lock',
     TestRepairManifestDisagreementLeavesV3);
+  Test('repair upgrades first, then the bumped manifest installs',
+    TestUpgradeThenBump);
+  Test('repair on a bumped manifest names every file to restore, then '
+    + 'upgrades', TestBumpThenUpgradeNamesEveryRestore);
+  Test('repair does not name an archive the per-user cache holds',
+    TestBumpWithCachedArchiveNamesOnlyTheManifest);
+  Test('repair''s failure reads whole and in order in merged output',
+    TestUpgradeFailureReadsWholeInMergedOutput);
   Test('repair leaves a v4 lock alone', TestRepairLeavesV4Alone);
   Test('repair recovers a legacy rollback file on a v3 lock',
     TestLegacyRollbackRecoveredByRepairOnV3);

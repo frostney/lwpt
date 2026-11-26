@@ -227,6 +227,38 @@ Commit the manifest, generated lockfile/configuration, and dependency snapshots
 according to the [dependency state contract](../contributor/architecture.md#lwpt-layout).
 Generated state belongs to `lwpt install`; do not hand-edit its contents.
 
+## Upgrade from LWPT 0.7.0 or earlier
+
+LWPT 0.8.0 and later read only schema-v4 lockfiles, and 0.7.0 and earlier
+wrote schema v3. Every command that reads a v3 `lwpt.lock` refuses it and
+points to `lwpt repair`, which upgrades it without network access and keeps
+every locked version
+([ADR-0052](../adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Because
+it keeps them, it needs the `lwpt.toml` and the archives the lock was written
+from. Upgrade in this order, in one commit:
+
+1. Install the new `lwpt` and leave `lwpt.toml`, `lwpt.lock`, and `.lwpt/`
+   as they are.
+2. Run `lwpt repair`. It upgrades the lock first and then maintains the
+   per-user shared cache, which can take minutes for a large cache.
+3. Move dependency versions, for example LWPT's own packages to the new
+   release. `lwpt update <name>` moves a git-host dependency to its newest
+   tag, keeping an exact pin exact and an inline table's `include` and
+   `exclude`; `lwpt add <source>@<version>` sets a bare-string entry to a
+   chosen version. A command that rewrites the entry also removes the old
+   version's module and archive. Editing `lwpt.toml` by hand and running
+   `lwpt install` also works, but leaves the old archive in
+   `.lwpt/archives/`, as does an update that stays inside its range.
+4. Run `lwpt install --frozen`, and `lwpt agents` if the project keeps the
+   generated `AGENTS.md` block, then commit `lwpt.toml`, `lwpt.lock`,
+   `lwpt.cfg`, and `.lwpt/`.
+
+If the manifest was already changed, or an archive the lock names was
+deleted, `lwpt repair` stops before its cache maintenance and names the
+dependency that disagrees and every file to restore. Restore them, for
+example with `git checkout -- lwpt.toml .lwpt/archives/<file>`, and continue
+from step 2.
+
 ## Choose the existing capability
 
 | Need | LWPT capability | Reference |

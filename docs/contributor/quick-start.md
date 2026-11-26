@@ -362,4 +362,7 @@ is schema v3, it upgrades the lockfile to v4 without network access and
 without changing dependency versions, re-deriving each module from its
 committed archive or source
 ([ADR-0052](../adr/0052-lockfile-schema-v4-framed-tree-digest.md)). Commit the
-resulting `lwpt.lock`.
+resulting `lwpt.lock`. The upgrade runs right after the project's own
+recovery and before the per-user worker and shared-cache steps, so a
+manifest that no longer matches the lock, or a locked archive that is gone,
+is reported at once, naming every file to restore; repair stops there.
