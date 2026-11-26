@@ -151,6 +151,7 @@ type
     procedure TestShardLinkedBeforeQuarantineIsNeverFollowed;
     procedure TestShardLinkedBeforeMaterializeCopyIsNeverRead;
     procedure TestDiscardNeverDeletesThroughALinkedShard;
+    procedure TestAdmissionRefusesAStoreRootLinkedAfterCreation;
   end;
 
 procedure WriteSignal(const APath: string);
@@ -557,11 +558,12 @@ begin
   {$ENDIF}
 end;
 
-function DirectoryLinkSkipReason(const AScratch: string): string;
+{ Runs while tests register, before any suite's BeforeAll. }
+function DirectoryLinkSkipReason: string;
 var
   Probe: string;
 begin
-  Probe := AScratch + '/link-probe';
+  Probe := CreateScratchRoot('object-store-link-probe');
   ForceDirectories(Probe + '/target');
   try
     if TryCreateDirectoryLink(Probe + '/link', Probe + '/target') then
@@ -777,7 +779,7 @@ begin
       Store.Admit(FSource, FDigest);
     except
       on E: ELWPTObjectStoreError do
-        Raised := Pos('object entry must not be a link', E.Message) > 0;
+        Raised := Pos('object path must not contain a link', E.Message) > 0;
     end;
     Expect<Boolean>(Raised).ToBe(True);
     Expect<Boolean>(IsDirSymlinkOrJunction(ObjectPath)).ToBe(True);
@@ -797,7 +799,8 @@ end;
 procedure TObjectStoreContract.
   TestShardLinkedBeforeQuarantineIsNeverFollowed;
 var
-  HitPath, ObjectPath, OutsideFile: string;
+  Destination, ObjectPath, OutsideFile: string;
+  Failure: TLWPTObjectMaterializeFailure;
   Store: TLWPTImmutableObjectStore;
 begin
   Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
@@ -809,9 +812,14 @@ begin
     WriteBytes(OutsideFile, 'outside bytes');
     SwapShardTarget := FOutside;
     ObjectStoreBeforeQuarantineTestHook := SwapShardBeforeQuarantine;
-    Expect<Boolean>(Store.Lookup(FDigest, HitPath)).ToBe(False);
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
     Expect<Boolean>(Assigned(ObjectStoreBeforeQuarantineTestHook))
       .ToBe(False);
+    Expect<string>(ObjectMaterializeFailureName(Failure))
+      .ToBe(ObjectMaterializeFailureName(omfObjectMissing));
+    Expect<Boolean>(FileExists(Destination)).ToBe(False);
     Expect<string>(ReadBytes(OutsideFile)).ToBe('outside bytes');
     Expect<Integer>(QuarantineEntryCount).ToBe(0);
   finally
@@ -848,6 +856,56 @@ begin
     Expect<string>(ReadBytes(OutsideFile)).ToBe(ReadBytes(FSource));
   finally
     ObjectStoreBeforeMaterializeCopyTestHook := nil;
+    Store.Free;
+  end;
+end;
+
+function CountFiles(const ARoot: string): Integer;
+var
+  SR: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(IncludeTrailingPathDelimiter(ARoot) + '*',
+    faAnyFile or faSymLink, SR) <> 0 then Exit;
+  try
+    repeat
+      if (SR.Name = '.') or (SR.Name = '..') then Continue;
+      if (SR.Attr and faDirectory) <> 0 then
+        Inc(Result, CountFiles(IncludeTrailingPathDelimiter(ARoot) + SR.Name))
+      else
+        Inc(Result);
+    until FindNext(SR) <> 0;
+  finally
+    FindClose(SR);
+  end;
+end;
+
+{ The store root becomes a link after the store was created. Admission stages
+  and publishes below that root, so it must refuse instead of writing into,
+  or wiping, the directory the link reaches. }
+procedure TObjectStoreContract.
+  TestAdmissionRefusesAStoreRootLinkedAfterCreation;
+var
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  ForceDirectories(FStoreRoot);
+  WriteBytes(FOutside + '/tmp/keep', 'outside bytes');
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ReplaceWithDirectoryLink(FStoreRoot, FOutside);
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('must not be links', E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(CountFiles(FOutside)).ToBe(1);
+    Expect<string>(ReadBytes(FOutside + '/tmp/keep')).ToBe('outside bytes');
+  finally
     Store.Free;
   end;
 end;
@@ -941,7 +999,6 @@ end;
 procedure TObjectStoreContract.BeforeAll;
 begin
   FScratch := CreateScratchRoot('object-store');
-  FDirectoryLinkSkipReason := DirectoryLinkSkipReason(FScratch);
 end;
 
 procedure TObjectStoreContract.BeforeEach;
@@ -1396,6 +1453,7 @@ end;
 
 procedure TObjectStoreContract.SetupTests;
 begin
+  FDirectoryLinkSkipReason := DirectoryLinkSkipReason;
   Test('digest addresses are canonical and sharded',
     TestDigestAddressIsCanonicalAndSharded);
   Test('invalid digests are refused', TestInvalidDigestIsRefused);
@@ -1445,6 +1503,8 @@ begin
     TestShardLinkedBeforeMaterializeCopyIsNeverRead);
   LinkTest('discarding an object never deletes through a linked shard',
     TestDiscardNeverDeletesThroughALinkedShard);
+  LinkTest('admission refuses a store root linked after the store was created',
+    TestAdmissionRefusesAStoreRootLinkedAfterCreation);
 end;
 
 begin
