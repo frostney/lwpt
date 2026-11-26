@@ -42,6 +42,7 @@ uses
   LWPT.Command.Common,
   LWPT.CompilerDriver,
   LWPT.Core,
+  LWPT.GitIgnore,
   LWPT.Manifest,
   LWPT.Observability,
   LWPT.ProcessRunner,
@@ -240,23 +241,29 @@ begin
     and SameText(Copy(APath, Length(APath) - 8, 9), '.Test.pas');
 end;
 
-procedure CollectTestFiles(const ADir: string; AList: TStringList);
+{ Walks ADir for *.Test.pas files, pruning the built-in toolkit and Git
+  directories and every path the project's Git ignore rules ignore. }
+procedure CollectTestFiles(const ADir: string; AList: TStringList;
+  const AIgnore: TLWPTGitIgnore);
 var
   Search: TSearchRec;
-  Base: string;
+  Base, Path: string;
 begin
-  Base := IncludeTrailingPathDelimiter(ADir);
+  Base := IncludeTrailingPathDelimiter(ExpandFileName(ADir));
   if FindFirst(Base + '*', faAnyFile, Search) <> 0 then Exit;
   try
     repeat
       if (Search.Name = '.') or (Search.Name = '..') then Continue;
+      Path := Base + Search.Name;
       if (Search.Attr and faDirectory) <> 0 then
       begin
-        if not IsExcludedDir(Search.Name) then
-          CollectTestFiles(Base + Search.Name, AList);
+        if not IsExcludedDir(Search.Name)
+           and not AIgnore.IsIgnored(Path, True) then
+          CollectTestFiles(Path, AList, AIgnore);
       end
-      else if IsTestSourcePath(Search.Name) then
-        AList.Add(Base + Search.Name);
+      else if IsTestSourcePath(Search.Name)
+        and not AIgnore.IsIgnored(Path, False) then
+        AList.Add(Path);
     until FindNext(Search) <> 0;
   finally
     FindClose(Search);
@@ -277,8 +284,9 @@ end;
 
 procedure SelectTestFiles(const AProjectRoot: string;
   const ADiscovered: TStringList; const ASelectors: TStrings;
-  const ASelected: TStringList);
+  const ASelected: TStringList; const AIgnore: TLWPTGitIgnore);
 var
+  Rule: TLWPTIgnoreRule;
   Canonical, FullPath, RelativePath, Selector: string;
   i, j, MatchCount: Integer;
   IsDirectory, IsFile, IsGlob: Boolean;
@@ -337,6 +345,13 @@ begin
     end;
     if MatchCount = 0 then
     begin
+      { A selector narrows discovery and never widens it, so naming an
+        ignored path is refused with the pattern that ignores it. }
+      if not IsGlob and AIgnore.FindRule(FullPath, IsDirectory, Rule) then
+        raise ELWPTError.CreateFmt(
+          'test selector "%s" is ignored by %s:%d (%s); test discovery '
+          + 'skips Git-ignored paths', [Selector, Rule.Source, Rule.Line,
+          Rule.Pattern]);
       if IsGlob then
         raise ELWPTError.CreateFmt(
           'test selector "%s" matched no discovered test files', [Selector])
@@ -580,22 +595,27 @@ const
   CONFIGURATION_CAPTURE_ATTEMPTS = 3;
 var
   ConfigurationContent, ConfigurationState, Recorded, SourceDirectory: string;
-  Directories: TStringArray;
+  Directories, OptionFiles, OptionFileStates: TStringArray;
   Attempt, i: Integer;
+  Coherent: Boolean;
 begin
   { One read of the configuration file gives the bytes its search options
     come from and the state they hash to; the capture holds only when the
     snapshot recorded that same state, so the watched directories and the
-    recorded file always describe one version of it. Jobs then compile from
-    the run's copy of those bytes and never read the live file, which the
-    snapshot keeps watching. }
+    recorded file always describe one version of it. Option files that
+    those options name are held to the same rule. Jobs then compile from
+    the run's copy of the configuration bytes and never read the live file,
+    which the snapshot keeps watching. }
   for Attempt := 1 to CONFIGURATION_CAPTURE_ATTEMPTS do
   begin
     ConfigurationState := CaptureInputFile(FProjectRoot,
       FCacheContext.ConfigurationPath, ConfigurationContent);
     CollectOptions(ConfigurationContent);
     SetLength(Directories, 0);
-    AppendCompilerSearchDirectories(Options, Directories);
+    SetLength(OptionFiles, 0);
+    SetLength(OptionFileStates, 0);
+    AppendCompilerArgumentInputs(FProjectRoot, Options, Directories,
+      OptionFiles, OptionFileStates);
     SetLength(Paths, 0);
     AddPath(FCacheContext.ManifestPath);
     AddPath(FCacheContext.ConfigurationPath);
@@ -622,16 +642,20 @@ begin
       FCacheContext.ConfigurationPath);
     { A missing file is recorded as missing, or as excluded or a directory,
       none of which a compile reads as its configuration. }
-    if (Recorded = ConfigurationState)
-       or ((ConfigurationState = 'missing')
-         and (Copy(Recorded, 1, 5) <> 'file:')) then
+    Coherent := InputStateMatchesCapture(Recorded, ConfigurationState);
+    for i := 0 to High(OptionFiles) do
+      if not InputStateMatchesCapture(InputSnapshotState(FProjectRoot,
+           FRunInputs, OptionFiles[i]), OptionFileStates[i]) then
+        Coherent := False;
+    if Coherent then
     begin
       PublishRunConfiguration(ConfigurationState, ConfigurationContent);
       Exit;
     end;
   end;
-  raise ELWPTError.Create('the compiler configuration file kept changing '
-    + 'while this test run started; rerun ' + PROGRAM_NAME + ' test');
+  raise ELWPTError.Create('the compiler configuration or an option file it '
+    + 'names kept changing while this test run started; rerun '
+    + PROGRAM_NAME + ' test');
 end;
 
 { The first run input that differs from the snapshot, as a display path,
@@ -2130,6 +2154,7 @@ var
   StartedAt: QWord;
   Cache: TLWPTBuildCache;
   CacheContext: TLWPTTestCacheContext;
+  Ignore: TLWPTGitIgnore;
 begin
   StartedAt := GetTickCount64;
   Passed := 0;
@@ -2140,6 +2165,7 @@ begin
   VoidedInput := '';
   CompilerSelection := nil;
   DiscoveredTests := nil;
+  Ignore := nil;
   Tests := nil;
   Cache := nil;
   CacheContext := Default(TLWPTTestCacheContext);
@@ -2159,9 +2185,10 @@ begin
         invocation after the user-visible scope has been resolved. }
       DiscoveredTests := TStringList.Create;
       Tests := TStringList.Create;
+      Ignore := TLWPTGitIgnore.Create(ProjectRoot);
       for i := 0 to High(Man.Units) do
-        CollectTestFiles(Man.Units[i], DiscoveredTests);
-      CollectTestFiles('.', DiscoveredTests);
+        CollectTestFiles(Man.Units[i], DiscoveredTests, Ignore);
+      CollectTestFiles('.', DiscoveredTests, Ignore);
       for i := 0 to DiscoveredTests.Count - 1 do
         DiscoveredTests[i] := ExpandFileName(DiscoveredTests[i]);
       DiscoveredTests.Sort;
@@ -2172,7 +2199,8 @@ begin
           DiscoveredTests.Delete(i);
         Dec(i);
       end;
-      SelectTestFiles(ProjectRoot, DiscoveredTests, ASelectors, Tests);
+      SelectTestFiles(ProjectRoot, DiscoveredTests, ASelectors, Tests,
+        Ignore);
 
       CompilerSelection := TLWPTCompilerSelection.Create(Man, ProjectRoot,
         ACompilerHost);
@@ -2356,6 +2384,7 @@ begin
   finally
     Tests.Free;
     DiscoveredTests.Free;
+    Ignore.Free;
     Cache.Free;
     CompilerSelection.Free;
     if not AInventory then

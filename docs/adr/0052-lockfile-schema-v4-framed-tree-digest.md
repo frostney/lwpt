@@ -1,5 +1,7 @@
 # Lockfile schema v4: a framed, streamed tree digest
 
+> **Amended 2026-11-26, repair order and the agreement message:** `lwpt repair` upgrades a v3 lock right after the project's own recovery steps (install lock, transaction recovery, sessions, retired images) and before the per-user ones (workers, shared cache, registry document store). Re-verifying a large shared cache can take minutes, and the upgrade's verdict, above all a manifest or archive the user must restore, comes first. The install transaction needs none of the per-user recovery first, as no install does. A failed upgrade stops repair there, and running repair again after the restore also does the per-user recovery. When the manifest disagrees with the lock, the message states the disagreement without the online-install hint an ordinary `--offline` install gives, which would send the user to a command that refuses the v3 lock, and names, besides the manifest, every locked archive that neither the project nor the per-user cache holds, so one restore lets the next repair succeed. Before staging anything it checks each root dependency for a missing lock entry, a changed source or extraction policy, and a locked version its requirement no longer accepts, so a missing archive staged early never hides one of those, and it names several missing archives in one message. A changed requirement that still accepts the locked version is caught by the walk's constraint-fingerprint check, once the archives it stages are back. A lock key outside the package grammar never becomes an archive path, and a linked archive or archives directory is named as missing and never read. Because the upgrade now reads the per-user archive store before the shared-cache step, repair first recovers producer leases and removes linked and malformed entries from that store, as the shared-cache step does, so the upgrade never follows a link there. The rules of this record are unchanged: only repair upgrades v3, it never resolves or fetches, and it keeps every locked version.
+
 ## Status
 
 Accepted on 2026-09-29 by the maintainer, who settled the four decisions at
@@ -383,7 +385,7 @@ The program name in the message comes from `PROGRAM_NAME` (ADR-0001).
 | `lwpt install --frozen` | Refuses with the message before any verification. Changes nothing. It never verifies a legacy digest. |
 | `lwpt install --offline` | Refuses with the message before staging. Changes nothing, and the byte-identical promise holds. |
 | `lwpt outdated` | Refuses with the message, like every lock reader. |
-| `lwpt repair` | After its existing steps (stale install lock, transaction recovery, sessions, retired images, workers, shared cache), upgrades a v3 lock without network or version changes, as below. A v4 lock, or a project without a lock, is left alone. |
+| `lwpt repair` | After the project's own recovery steps (stale install lock, transaction recovery, sessions, retired images) and before the per-user ones (workers, shared cache, registry document store), upgrades a v3 lock without network or version changes, as below, so its verdict never waits on a shared-cache re-verification. A failed upgrade stops repair before the per-user steps. A v4 lock, or a project without a lock, is left alone. |
 | `lwpt build`, `lwpt test` | Do not read the lock's contents. The lock is part of their cache fingerprint, so the one-time upgrade causes one cache miss. |
 
 **`lwpt repair`'s upgrade** is the only reader that accepts a v3 lock. It
@@ -393,9 +395,22 @@ runs under the install lock as an install transaction (retention, rollback,
 1. **Check agreement.** The manifest and the v3 lock must agree as they must
    for `--offline`: source identity, constraint fingerprint, and a locked
    selection that still satisfies every requirement. If they disagree, the
-   command fails, and the lock stays v3. The message says to restore the
-   manifest the lock was written from, run `lwpt repair`, and then change
-   the manifest, or to delete the lock and run `lwpt install`.
+   command fails, and the lock stays v3. The message states the
+   disagreement and says to restore the manifest the lock was written from
+   and every locked archive that neither the project nor the per-user cache
+   holds, naming each, run `lwpt repair`, and then change the manifest and
+   run `lwpt install`, or to delete the lock and run `lwpt install`. For
+   the field case, a manifest bumped and its old archive deleted:
+
+   > `lwpt repair` cannot upgrade `lwpt.lock` from schema v3: the manifest
+   > does not agree with the lockfile: locked version "0.6.0" no longer
+   > satisfies the manifest requirements for "testing". Restore the
+   > lwpt.toml that `lwpt.lock` was written from and the missing locked
+   > archive `.lwpt/archives/testing-0.6.0.tar.gz`, for example from
+   > version control, run `lwpt repair`, and then change the manifest and
+   > run `lwpt install`. To give up the version-stable migration, delete
+   > `lwpt.lock` and run `lwpt install`; that needs network access and
+   > moves range dependencies to their newest matching versions.
 2. **Re-derive modules.** Each module is re-derived without network, from
    its anchor:
    - Git-host and URL modules come from the committed archive or the
@@ -432,6 +447,14 @@ runs under the install lock as an install transaction (retention, rollback,
 
    A missing or corrupt registry proof document gets the same message,
    naming the document's hash path instead of the archive.
+   When several locked archives are missing, one message names them all.
+   Before it stages anything, the upgrade checks each root dependency for
+   a missing lock entry, a changed source or extraction policy, and a
+   locked version its requirement no longer accepts, so a dependency
+   staged early whose archive is missing never hides one of those. A
+   changed requirement that still accepts the locked version, and
+   requirements that transitive manifests add, are checked as the graph is
+   walked, once the archives it stages are present.
 
 After the upgrade, decision 11 holds: an install that changes nothing leaves
 the v4 lock byte-identical on every platform.
@@ -524,7 +547,7 @@ The implementation PR applies these in the same change as the code.
 | Every command refuses v3 and changes nothing | Against a committed v3 fixture project (git-host, local, workspace, and registry entries, plus an interrupted transaction's rollback files): `install`, `add`, `remove`, `update`, `outdated`, `install --frozen`, and `install --offline` each fail with the `ELockfileError` message, which names `lwpt repair` and the delete-and-install alternative. The transport seam records zero requests. `lwpt.toml`, the lock, the cfg, modules, archives, proofs, and `.lwpt/tmp/` are byte-identical afterwards. |
 | `lwpt repair` upgrades without network and without moving versions | The fixture advertises a newer satisfying tag, and the transport seam records zero requests. Afterward: `resolvedRef` and `resolvedCommit` are unchanged; modules and archives are byte-identical; the lock diff contains only `version`, `computedHash`, and decision-11 accepted-state lines; `--frozen` passes. In a registry project, the selection proof is carried forward byte for byte. |
 | No churn after the upgrade (decision 11) | After `lwpt repair`, an online `install` with an unchanged selection and an `install --offline` both leave the v4 lock byte-identical. The same holds when the lock written on Linux is installed on the Windows and macOS legs. |
-| `lwpt repair` never trusts the v3 hash | A committed module altered by the #352 substitution under a v3 lock, with its `computedHash` recomputed to the matching legacy value, is replaced by the re-derived tree and named in the output. A missing archive and an archive with a flipped byte, with no copy in the per-user cache, each fail with the migration-specific message from section 5. The test asserts the full text: the archive path, "run `lwpt repair` again", and the delete-and-install alternative with its network and version warning. A deleted registry proof document fails with the same message naming its hash path. Each failure rolls back and leaves the lock v3 and every other file byte-identical. A manifest that disagrees with the lock fails with its hint and leaves the lock v3. A v4 lock is left untouched. |
+| `lwpt repair` never trusts the v3 hash | A committed module altered by the #352 substitution under a v3 lock, with its `computedHash` recomputed to the matching legacy value, is replaced by the re-derived tree and named in the output. A missing archive and an archive with a flipped byte, with no copy in the per-user cache, each fail with the migration-specific message from section 5. The test asserts the full text: the archive path, "run `lwpt repair` again", and the delete-and-install alternative with its network and version warning. A deleted registry proof document fails with the same message naming its hash path. Each failure rolls back and leaves the lock v3 and every other file byte-identical. A manifest that disagrees with the lock fails with its full message, before any per-user recovery, naming each locked archive the project and the per-user cache both lack, and leaves the lock v3; following the message upgrades the lock, and the changed manifest then installs. A v4 lock is left untouched. |
 | Downgrade | A v4 lock rewritten as v3 with legacy digests of a forged tree is refused by `--frozen` and every other reader, and `lwpt repair` replaces the forged tree. |
 | Legacy rollback files | A pending transaction whose rollback file holds `tree:sha256:` is recovered by `lwpt repair` on a v3 lock, and by `install` once the lock is v4. |
 | Existing behavior | The existing install, offline, frozen, commit-pin, and registry suites pass after their expected `computedHash` values are updated. The only golden-lock differences are `version` and `computedHash`. |

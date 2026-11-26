@@ -55,6 +55,7 @@ type
     procedure TestFlagMacroSearchDirectoryEditVoidsRun;
     procedure TestProfileIncludeDirectoryEditVoidsRun;
     procedure TestEqualsPrefixedSearchDirectoryEditVoidsRun;
+    procedure TestResponseFileIncludeDirectoryEditVoidsRun;
     {$IFDEF UNIX}
     procedure TestConfigurationSwappedForFifoVoidsRun;
     procedure TestConfigurationFifoFailsBeforeAnyJob;
@@ -638,6 +639,47 @@ begin
   Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'b-ran'))).ToBe(False);
 end;
 
+procedure TTestInputChange.TestResponseFileIncludeDirectoryEditVoidsRun;
+var
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/response-file-directory';
+  { The compiler profile passes a response file, and the include directory
+    is named only inside it. }
+  WriteProject(ProjectRoot, SHARED_ONE, 'const W = 2;', 'incs/Value.inc');
+  WriteTextFile(ProjectRoot + '/incs/Value.inc', 'const W = 1;'#10);
+  WriteTextFile(ProjectRoot + '/extra.rsp', '# fixture options'#10
+    + '-Fiincs'#10);
+  WriteTextFile(ProjectRoot + '/tests/B.Test.pas',
+      'program B;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses Classes;'#10
+    + '{$I Value.inc}'#10
+    + 'begin'#10
+    + '  WriteLn(''B W='', W);'#10
+    + MarkerStatements(MarkerPath(ProjectRoot, 'b-ran'))
+    + 'end.'#10);
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "test-input-change-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + '[compiler]'#10
+    + 'default = "pinned"'#10
+    + '[compiler.profiles.pinned]'#10
+    + 'driver = "fpc"'#10
+    + 'args = ["@extra.rsp"]'#10);
+  RequireStableB(ProjectRoot, 'response-file-directory-stable-cache');
+  Run := RunLwpt(['test', '--jobs=1', '--no-cache'], ProjectRoot,
+    Environment(FScratch + '/response-file-directory-cache'));
+  RequireExit('response file include directory run', Run, 1);
+  Expect<Boolean>(Contains('tests/B.Test.pas ... VOID (compiler inputs '
+    + 'changed after this test run started (incs/Value.inc)', Run.Stdout))
+    .ToBe(True);
+  Expect<Boolean>(FileExists(MarkerPath(ProjectRoot, 'b-ran'))).ToBe(False);
+end;
+
 {$IFDEF UNIX}
 procedure TTestInputChange.TestConfigurationSwappedForFifoVoidsRun;
 var
@@ -763,6 +805,8 @@ begin
     TestProfileIncludeDirectoryEditVoidsRun);
   Test('a search entry spelled as FPC resolves it is watched',
     TestEqualsPrefixedSearchDirectoryEditVoidsRun);
+  Test('an include directory named inside a response file is watched',
+    TestResponseFileIncludeDirectoryEditVoidsRun);
   {$IFDEF UNIX}
   Test('a configuration file swapped for a FIFO mid-run voids the run',
     TestConfigurationSwappedForFifoVoidsRun);

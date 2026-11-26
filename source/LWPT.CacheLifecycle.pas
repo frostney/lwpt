@@ -61,6 +61,16 @@ function ResolveCacheMaxBytesFromValue(const AValue: string): Int64;
 function CacheLowWaterBytes(const ABudget: Int64): Int64;
 function RepairSharedCache(const ACacheRoot: string):
   TLWPTCacheRepairReport;
+{ The link-safety step of RepairSharedCache for the dependency-archive
+  store alone, under the same mutation guard: linked and malformed entries
+  of the store are removed, and a link is never followed. It lists
+  directories and hashes nothing, so `lwpt repair` runs it before its schema-v3 upgrade
+  reads the store, keeping that upgrade on the safety the full repair
+  gives it. Producer-lease recovery, which the guard depends on, runs
+  first, as it does in RepairSharedCache; ALeasesReclaimed counts it.
+  Returns the number of entries removed. }
+function RemoveDependencyArchiveLinks(const ACacheRoot: string;
+  out ALeasesReclaimed: Integer): Integer;
 
 {$IFDEF OBJECTSTORE_TESTING}
 type
@@ -2095,6 +2105,40 @@ begin
     Exit(False);
   end;
   Result := True;
+end;
+
+function RemoveDependencyArchiveLinks(const ACacheRoot: string;
+  out ALeasesReclaimed: Integer): Integer;
+var
+  CacheRoot, DependencyRoot: string;
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Guard: TObject;
+  Report: TLWPTCacheRepairReport;
+  LivePreserved: Integer;
+begin
+  Result := 0;
+  ALeasesReclaimed := 0;
+  CacheRoot := ExcludeTrailingPathDelimiter(ExpandFileName(ACacheRoot));
+  DependencyRoot := IncludeTrailingPathDelimiter(CacheRoot)
+    + DEPENDENCY_NAMESPACE;
+  if not DirectoryExists(CacheRoot) then Exit;
+  ALeasesReclaimed := RepairProducerLeases(CacheRoot, LivePreserved);
+  Report := Default(TLWPTCacheRepairReport);
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(
+    ProducerLeaseRoot(CacheRoot));
+  Guard := nil;
+  try
+    repeat
+      Guard := Coordinator.TryAcquireGuard('cache-lifecycle:mutation');
+      if Guard = nil then Sleep(25);
+    until Guard <> nil;
+    if PrepareInternalRoot(DependencyRoot, Report) then
+      RemoveObjectStoreLinks(DependencyRoot, Report);
+    Result := Report.IncompleteEntriesRemoved;
+  finally
+    Guard.Free;
+    Coordinator.Free;
+  end;
 end;
 
 function RepairSharedCache(const ACacheRoot: string):

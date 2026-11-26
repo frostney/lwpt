@@ -150,9 +150,35 @@ Without `--clean` or `--no-cache`, LWPT first captures a versioned neutral
 cache fingerprint. It covers source and resource content, resolved lockfile and
 module state, workspace inputs, the compiler driver identity, executable and
 live version, the target tuple, effective translated arguments, hooks, and
-compiler-relevant environment. A verified hit is copied into the invocation's
-private session and follows the same postbuild, live-probe, fingerprint
-revalidation, and atomic-publication path as a newly compiled artifact.
+compiler-relevant environment. It also covers the content of every search
+directory the compile receives: the manifest's units and includes, and the
+unit, include, object, and library directories (`-Fu`, `-Fi`, `-Fo`, `-Fl`,
+`-I`) that the cfg file, `[build]` or `[test]` flags, and the selected compiler
+profile's `args` name, together with any response file (`@file`) among those
+arguments and the files it reads with `#INCLUDE`, whose lines count as
+arguments. These options and files are read as FPC 3.2 reads them, the same
+way the test run's input record below reads them. A response file's
+`#INCLUDE` looks in its `#CFGDIR` directories first, under the name as
+written, in lower case and in upper case, as FPC does on a case-sensitive
+system; every place it may be found is an input, and each one there is
+read, so a file that appears earlier in that order is seen. A file included
+again after a `#CFGDIR` is read again under the new directories, as FPC
+reads it. When no fixed directory is known to hold what an entry resolves to
+(a `..` after a `*` wildcard or an `$FPC*` macro, an option file named
+through an `$FPC*` macro, a `#CFGDIR` entry with a wildcard or such a macro,
+a chain of more than 64 environment-variable expansions, or option files
+nested past FPC's limit of 16), the compile does not use the cache: a test
+program reports `cache bypass: unavailable`, and a build entry reports
+`cache miss: unbounded-inputs` and stores nothing. A fingerprint whose option
+file changes between the read that names its directories and the hash steps
+aside the same way, because those directories and the hash would describe
+different versions. Every input is read without blocking, and only a regular file is hashed: a file of another
+kind, such as a FIFO, is recorded by its type and mode, so it can neither hang
+the fingerprint nor make it change from run to run. An input that cannot be
+read makes the cache step aside for that compile. A verified hit is copied into
+the invocation's private session and follows the same postbuild, live-probe,
+fingerprint revalidation, and atomic-publication path as a newly compiled
+artifact.
 
 Successful, current builds publish an immutable artifact object and result
 manifest only after public-output publication succeeds. Failed, cancelled,
@@ -296,7 +322,8 @@ v2 adds the `extra_arguments` array. The canonical TOML serialization is
 embedded in a separate publication fingerprint. That fingerprint also covers
 the selected compiler command, configured prefix arguments, and live version,
 the previous public-output content, the implicit source directory, declared
-unit/include/resource inputs,
+unit/include/resource inputs, the search directories and response files that
+the compile's arguments name (as the cache fingerprint above reads them),
 manifest, cfg, lockfile, and installed module contents. After compilation it
 reacquires machine-wide worker capacity and retains it through per-entry
 postbuild, live compiler refresh, fingerprint revalidation, and atomic
@@ -571,19 +598,78 @@ hook is not part of that invocation. With no selector every discovered program
 runs; with selectors every match runs, without path-derived groups or skips. See
 [ADR-0034](../adr/0034-freeze-test-selection-before-pretest.md).
 
+Discovery walks the manifest's unit roots and the project root for
+`*.Test.pas` files. It skips every `.lwpt/`, `build/` and `.git/` directory
+and every path that the project's Git ignore rules ignore, such as scratch
+reproductions under an ignored `.agent/`. LWPT reads those rules itself and
+never runs `git`, so they apply in a project that is not a Git checkout too:
+
+- every `.gitignore` from the enclosing worktree root down to the path's own
+  directory, each applying to its own subtree. The worktree root is the
+  nearest directory at or above the project root that holds a `.git`
+  directory or `.git` file. Without one, the project root is the top.
+- that worktree's `info/exclude`. For a linked worktree or a submodule, LWPT
+  finds it through the `.git` file and the Git directory's `commondir`.
+
+Patterns follow [gitignore(5)](https://git-scm.com/docs/gitignore) and Git's
+wildmatch: blank lines and `#` comments; unescaped trailing spaces are dropped;
+`\` escapes the next character; `!` negates; a trailing `/` matches
+directories only; a leading or middle `/` anchors the pattern to its file's
+directory; and `*`, `?`, `[...]` and `**` work as in Git. The last matching
+pattern wins, deeper `.gitignore` files win over shallower ones, and
+`info/exclude` loses to all of them. A file cannot be re-included once a
+directory above it is excluded, and `.gitignore` files inside an excluded
+directory are never read. As in Git, an in-tree `.gitignore` that is a symlink
+or a directory, and a pattern file larger than 100 MiB, contribute nothing.
+
+Discovery reads ignore files, not Git's index, so a tracked test program that
+matches an ignore pattern is skipped too. Per-user Git configuration is not
+read, so `core.excludesFile` does not apply and matching is case-sensitive
+whatever `core.ignorecase` says. The project root itself, and every directory
+above it, is never ignored: a project kept in an ignored folder still
+discovers its own tests, while patterns from the `.gitignore` files above it
+still apply to its contents. A unit root outside the project root but inside
+its worktree, such as `units = ["../shared"]`, is filtered by the same rules;
+a path outside the worktree (or, without one, outside the project root) has
+no rules. An ignore file that exists but cannot be read or inspected stops
+`lwpt test` before anything compiles, where Git would only warn, so ignored
+programs never start running because a rule went missing.
+
+Selectors narrow discovery and never widen it. A file or directory selector
+that names an ignored path fails before `[pretest]` and names the pattern:
+
+```text
+lwpt test: test selector ".agent/scratch/probe/tests/Ignored.Test.pas" is ignored by .gitignore:28 (.agent/); test discovery skips Git-ignored paths
+```
+
+To run such a program, re-include it with a negated pattern
+(`!scratch/Repro.Test.pas`, with `scratch/*` rather than `scratch/` above it)
+or move it. A test program that a generator writes into an ignored directory is
+not discovered either.
+
 Once `[pretest]` has finished, the invocation's compiler inputs must hold
 still. Before any program compiles or reuses a cached executable, `lwpt test`
 records the content of a fixed set of compiler inputs: the paths the test
 cache fingerprint covers (manifest, cfg, lockfile, installed modules, unit,
 include, and workspace paths, `LWPT_FPC_UNIT_PATHS`, project-root files, and
-each selected program's source file and directory), plus the unit, include,
-object, and library directories that the cfg file, `[test]` flags, or the
-selected compiler profile's `args` name. Those options are read as FPC 3.2
-reads them: entries split at `;`, and outside Windows also at `:`; Pascal
-quotes removed; and a leading `=` read against an empty sysroot, except in
+each selected program's source file and directory), including the unit,
+include, object, and library directories and the response files that the cfg
+file, `[test]` flags, or the selected compiler profile's `args` name. Those
+options are read as FPC 3.2 reads them: entries split at `;`, and outside
+Windows also at `:`; Pascal quotes removed; and a leading `=` read against an empty sysroot, except in
 `-Fl`, whose `=` entries are watched below every `-XR` sysroot those options
-set and below none. An entry with a `*` wildcard or a `$` macro is watched
-through its fixed leading directory. A file a program reads
+set and below none. Before that, FPC's macros are replaced: an environment
+variable written `$NAME$` that is set, even to nothing, becomes its value, which
+may name a directory outside the project, and on Windows `$APPDATA` and the
+other special-folder macros become those folders. An entry with a `*`
+wildcard or a `$FPC*` macro such as `$FPCTARGET`, whose value only the
+compiler knows, is watched through its fixed leading directory, also where
+a `..` after it can climb above that directory, which the record does not
+follow. Response files are read as FPC reads them: one option per line, `;`
+comments, and `#INCLUDE` and `#CFGDIR` followed, with every `#IFDEF` branch
+counted and every `#CFGDIR` candidate read. Each option file, and each
+candidate's absence, must still hold when the record is taken, or the record
+is taken again. A file a program reads
 from outside this set, such as `{$I ../elsewhere/Value.inc}`, is not watched.
 Session staging and declared build outputs, including outputs at the project
 root, are excluded, and each path is hashed once. A file that appears at the

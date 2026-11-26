@@ -46,6 +46,11 @@ type
     procedure WriteProject(const AProjectRoot, AProgramBody: string;
       const AUnitBody: string = '');
     procedure RequireSuccess(const ALabel: string; const ARun: TLwptResult);
+    procedure WriteSearchProject(const AProjectRoot, AManifestTail,
+      AProgramHead, AEditedPath, AInitial: string);
+    procedure RequireEditRecompiles(const ALabel, AProjectRoot,
+      AEditedPath, AEdited: string;
+      const AExtraEnvironment: array of string);
   protected
     procedure BeforeAll; override;
   public
@@ -61,7 +66,23 @@ type
     procedure TestFailingExecutionIsAlwaysFresh;
     procedure TestConcurrentMissCompilesOnce;
     procedure TestPassingRerunRemovesSupersededExecutable;
+    procedure TestFlagUnitDirectoryInvalidatesFingerprint;
+    procedure TestProfileIncludeDirectoryInvalidatesFingerprint;
+    procedure TestConfigurationIncludeDirectoryInvalidatesFingerprint;
+    procedure TestEnvironmentMacroDirectoryInvalidatesFingerprint;
+    procedure TestConfigurationDirectoryIncludeInvalidatesFingerprint;
+    procedure TestUnboundedSearchEntryIsNeverReused;
+    procedure TestExhaustedMacroExpansionIsNeverReused;
+    procedure TestRepeatedIncludeUnderNewDirectoryInvalidates;
+    {$IFDEF UNIX}
+    procedure TestFifoInUnitDirectoryDoesNotHangCachedRun;
+    procedure TestConfigurationSwappedForFifoDoesNotHangCachedRun;
+    {$ENDIF}
   end;
+
+const
+  { Bounds a run that a blocking open would otherwise hang. }
+  FIFO_RUN_TIMEOUT_MILLISECONDS = 120000;
 
 constructor TLWPTThreadRun.Create(const AProjectRoot: string;
   const AEnvironment: array of string);
@@ -759,6 +780,328 @@ begin
   end;
 end;
 
+{ A project whose only test program prints the constant V that it reads
+  through a search directory only AManifestTail (or a cfg file the caller
+  writes) names. AEditedPath starts with AInitial. }
+procedure TTestCache.WriteSearchProject(const AProjectRoot, AManifestTail,
+  AProgramHead, AEditedPath, AInitial: string);
+begin
+  RecursiveDelete(AProjectRoot);
+  WriteTextFile(AProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "search-directory-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10
+    + AManifestTail);
+  WriteTextFile(AProjectRoot + '/' + AEditedPath, AInitial);
+  WriteTextFile(AProjectRoot + '/tests/Search.Test.pas',
+      'program Search;'#10
+    + '{$mode delphi}{$H+}'#10
+    + AProgramHead
+    + 'begin'#10
+    + '  WriteLn(''SEARCH V='', V);'#10
+    + 'end.'#10);
+end;
+
+{ The stable rerun must be a cache hit that prints V=1, which proves the
+  compile read AEditedPath (a full path) through the search directory under
+  test. After AEditedPath changes to AEdited (V=2), the next run must
+  recompile, and the run after it hits the cache again: an unchanged tree
+  keeps its fingerprint. Every run adds AExtraEnvironment. }
+procedure TTestCache.RequireEditRecompiles(const ALabel, AProjectRoot,
+  AEditedPath, AEdited: string; const AExtraEnvironment: array of string);
+var
+  Environment: TStringArray;
+  Seed, Hit, Edited, Rerun: TLwptResult;
+  i: Integer;
+begin
+  RecursiveDelete(FScratch + '/' + ALabel + '-cache');
+  Environment := CacheEnvironment(FScratch + '/' + ALabel + '-cache',
+    FScratch + '/' + ALabel + '-marker');
+  for i := 0 to High(AExtraEnvironment) do
+  begin
+    SetLength(Environment, Length(Environment) + 1);
+    Environment[High(Environment)] := AExtraEnvironment[i];
+  end;
+  Seed := RunLwpt(['test', '--verbose', '--jobs=1'], AProjectRoot,
+    Environment);
+  RequireSuccess(ALabel + ' seed', Seed);
+  Expect<Boolean>(Pos('cache miss: no-result', Seed.Stdout) > 0).ToBe(True);
+  Hit := RunLwpt(['test', '--verbose', '--jobs=1'], AProjectRoot,
+    Environment);
+  RequireSuccess(ALabel + ' stable rerun', Hit);
+  Expect<Boolean>(Pos('cache hit:', Hit.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('SEARCH V=1', Hit.Stdout) > 0).ToBe(True);
+
+  WriteTextFile(AEditedPath, AEdited);
+  Edited := RunLwpt(['test', '--verbose', '--jobs=1'], AProjectRoot,
+    Environment);
+  RequireSuccess(ALabel + ' edited run', Edited);
+  Expect<Boolean>(Pos('cache hit:', Edited.Stdout) = 0).ToBe(True);
+  Expect<Boolean>(Pos('SEARCH V=2', Edited.Stdout) > 0).ToBe(True);
+
+  Rerun := RunLwpt(['test', '--verbose', '--jobs=1'], AProjectRoot,
+    Environment);
+  RequireSuccess(ALabel + ' edited rerun', Rerun);
+  Expect<Boolean>(Pos('cache hit:', Rerun.Stdout) > 0).ToBe(True);
+  Expect<Boolean>(Pos('SEARCH V=2', Rerun.Stdout) > 0).ToBe(True);
+end;
+
+procedure TTestCache.TestFlagUnitDirectoryInvalidatesFingerprint;
+var
+  ProjectRoot: string;
+begin
+  ProjectRoot := FScratch + '/flag-unit-directory';
+  { A unit directory that only a [test] flag names. }
+  WriteSearchProject(ProjectRoot,
+    '[test]'#10'flags = ["-Fuextra"]'#10, 'uses Extra;'#10,
+    'extra/Extra.pas',
+    'unit Extra; interface const V = 1; implementation end.'#10);
+  RequireEditRecompiles('flag-unit-directory', ProjectRoot,
+    ProjectRoot + '/extra/Extra.pas',
+    'unit Extra; interface const V = 2; implementation end.'#10, []);
+end;
+
+procedure TTestCache.TestProfileIncludeDirectoryInvalidatesFingerprint;
+var
+  ProjectRoot: string;
+begin
+  ProjectRoot := FScratch + '/profile-include-directory';
+  { An include directory that only the compiler profile's args name. }
+  WriteSearchProject(ProjectRoot,
+      '[compiler]'#10
+    + 'default = "pinned"'#10
+    + '[compiler.profiles.pinned]'#10
+    + 'driver = "fpc"'#10
+    + 'args = ["-Fiincs"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  RequireEditRecompiles('profile-include-directory', ProjectRoot,
+    ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10, []);
+end;
+
+procedure TTestCache.TestConfigurationIncludeDirectoryInvalidatesFingerprint;
+var
+  ProjectRoot: string;
+begin
+  ProjectRoot := FScratch + '/cfg-include-directory';
+  { An include directory that only the cfg file names: its -Fu lines reach
+    the request's unit paths, its -Fi lines do not. }
+  WriteSearchProject(ProjectRoot,
+    '[lwpt]'#10'cfg-file = "custom.cfg"'#10, '{$I Value.inc}'#10,
+    'incs/Value.inc', 'const V = 1;'#10);
+  WriteTextFile(ProjectRoot + '/custom.cfg', '-Fiincs'#10);
+  RequireEditRecompiles('cfg-include-directory', ProjectRoot,
+    ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10, []);
+end;
+
+procedure TTestCache.TestEnvironmentMacroDirectoryInvalidatesFingerprint;
+var
+  External, ProjectRoot: string;
+begin
+  ProjectRoot := FScratch + '/environment-macro-directory';
+  External := FScratch + '/environment-macro-includes';
+  { FPC replaces "$NAME$" in a search option with that environment
+    variable, a set but empty one included, so the include directory lies
+    outside the project. }
+  WriteSearchProject(ProjectRoot,
+    '[test]'#10
+    + 'flags = ["-Fi$LWPT_FIXTURE_EMPTY$$LWPT_FIXTURE_INCLUDES$"]'#10,
+    '{$I Value.inc}'#10, 'source/Unused.pas',
+    'unit Unused; interface implementation end.'#10);
+  RecursiveDelete(External);
+  WriteTextFile(External + '/Value.inc', 'const V = 1;'#10);
+  RequireEditRecompiles('environment-macro-directory', ProjectRoot,
+    External + '/Value.inc', 'const V = 2;'#10,
+    ['LWPT_FIXTURE_EMPTY=', 'LWPT_FIXTURE_INCLUDES=' + External]);
+end;
+
+procedure TTestCache.TestConfigurationDirectoryIncludeInvalidatesFingerprint;
+var
+  ProjectRoot: string;
+begin
+  ProjectRoot := FScratch + '/cfgdir-include';
+  { The profile passes a response file. It adds a #CFGDIR directory and
+    includes paths.cfg, which FPC finds there; only that file names the
+    include directory. }
+  WriteSearchProject(ProjectRoot,
+      '[compiler]'#10
+    + 'default = "pinned"'#10
+    + '[compiler.profiles.pinned]'#10
+    + 'driver = "fpc"'#10
+    + 'args = ["@opts.rsp"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  WriteTextFile(ProjectRoot + '/opts.rsp',
+    '#CFGDIR cfgs'#10'#INCLUDE paths.cfg'#10);
+  WriteTextFile(ProjectRoot + '/cfgs/paths.cfg', '-Fiincs'#10);
+  RequireEditRecompiles('cfgdir-include', ProjectRoot,
+    ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10, []);
+end;
+
+procedure TTestCache.TestUnboundedSearchEntryIsNeverReused;
+var
+  Environment: TStringArray;
+  ProjectRoot: string;
+  Run: TLwptResult;
+  Attempt: Integer;
+begin
+  ProjectRoot := FScratch + '/unbounded-search-entry';
+  { "incs/$FPCTARGET/../../incs" resolves to incs/ only once the compiler
+    names its target; no fixed directory is known to hold it, so the
+    program compiles every time, and sees each edit. }
+  WriteSearchProject(ProjectRoot,
+    '[test]'#10'flags = ["-Fiincs/$FPCTARGET/../../incs"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  RecursiveDelete(FScratch + '/unbounded-search-entry-cache');
+  Environment := CacheEnvironment(FScratch + '/unbounded-search-entry-cache',
+    FScratch + '/unbounded-search-entry-marker');
+  for Attempt := 1 to 3 do
+  begin
+    if Attempt = 3 then
+      WriteTextFile(ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10);
+    Run := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
+      Environment);
+    RequireSuccess('unbounded search entry run ' + IntToStr(Attempt), Run);
+    Expect<Boolean>(Pos('cache bypass: unavailable '
+      + '(ELWPTUnboundedCompilerInputs', Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('cache hit:', Run.Stdout) = 0).ToBe(True);
+    if Attempt = 3 then
+      Expect<Boolean>(Pos('SEARCH V=2', Run.Stdout) > 0).ToBe(True)
+    else
+      Expect<Boolean>(Pos('SEARCH V=1', Run.Stdout) > 0).ToBe(True);
+  end;
+end;
+
+procedure TTestCache.TestExhaustedMacroExpansionIsNeverReused;
+const
+  CHAIN_LENGTH = 70;
+var
+  Environment: TStringArray;
+  ProjectRoot: string;
+  Run: TLwptResult;
+  Attempt, i: Integer;
+begin
+  ProjectRoot := FScratch + '/macro-chain';
+  { FPC follows a chain of 70 "$NAME$" variables to the include directory;
+    LWPT stops expanding at its bound, so it cannot know the directory and
+    never reuses the result. }
+  WriteSearchProject(ProjectRoot,
+    '[test]'#10'flags = ["-Fi$LWPT_FIXTURE_CHAIN_0$"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  RecursiveDelete(FScratch + '/macro-chain-cache');
+  Environment := CacheEnvironment(FScratch + '/macro-chain-cache',
+    FScratch + '/macro-chain-marker');
+  for i := 0 to CHAIN_LENGTH - 1 do
+  begin
+    SetLength(Environment, Length(Environment) + 1);
+    Environment[High(Environment)] := 'LWPT_FIXTURE_CHAIN_' + IntToStr(i)
+      + '=$LWPT_FIXTURE_CHAIN_' + IntToStr(i + 1) + '$';
+  end;
+  SetLength(Environment, Length(Environment) + 1);
+  Environment[High(Environment)] := 'LWPT_FIXTURE_CHAIN_'
+    + IntToStr(CHAIN_LENGTH) + '=' + ProjectRoot + '/incs';
+  for Attempt := 1 to 2 do
+  begin
+    Run := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
+      Environment);
+    RequireSuccess('macro chain run ' + IntToStr(Attempt), Run);
+    Expect<Boolean>(Pos('SEARCH V=1', Run.Stdout) > 0).ToBe(True);
+    Expect<Boolean>(Pos('cache bypass: unavailable '
+      + '(ELWPTUnboundedCompilerInputs', Run.Stdout) > 0).ToBe(True);
+  end;
+end;
+
+procedure TTestCache.TestRepeatedIncludeUnderNewDirectoryInvalidates;
+var
+  ProjectRoot: string;
+begin
+  ProjectRoot := FScratch + '/repeated-include';
+  { The profile's response file includes wrapper.cfg twice; after the
+    #CFGDIR, FPC parses it again and its #INCLUDE finds later/paths.cfg,
+    the only file that names the include directory. }
+  WriteSearchProject(ProjectRoot,
+      '[compiler]'#10
+    + 'default = "pinned"'#10
+    + '[compiler.profiles.pinned]'#10
+    + 'driver = "fpc"'#10
+    + 'args = ["@opts.rsp"]'#10,
+    '{$I Value.inc}'#10, 'incs/Value.inc', 'const V = 1;'#10);
+  WriteTextFile(ProjectRoot + '/opts.rsp', '#INCLUDE wrapper.cfg'#10
+    + '#CFGDIR later'#10'#INCLUDE wrapper.cfg'#10);
+  WriteTextFile(ProjectRoot + '/wrapper.cfg', '#INCLUDE paths.cfg'#10);
+  WriteTextFile(ProjectRoot + '/paths.cfg', '-Fiunused'#10);
+  WriteTextFile(ProjectRoot + '/later/paths.cfg', '-Fiincs'#10);
+  RequireEditRecompiles('repeated-include', ProjectRoot,
+    ProjectRoot + '/incs/Value.inc', 'const V = 2;'#10, []);
+end;
+
+{$IFDEF UNIX}
+procedure TTestCache.TestFifoInUnitDirectoryDoesNotHangCachedRun;
+var
+  Environment: TStringArray;
+  ProjectRoot: string;
+  Seed, Hit: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/fifo-unit-directory';
+  { The fingerprint walks every file in a unit directory. A FIFO there has
+    no writer, so opening it with a blocking open would hang the run; the
+    fingerprint records it by type instead, and keeps doing so. }
+  WriteSearchProject(ProjectRoot, '', 'const V = 1;'#10, 'source/Unused.pas',
+    'unit Unused; interface implementation end.'#10);
+  Expect<Integer>(FpMkfifo(ProjectRoot + '/source/pipe', &600)).ToBe(0);
+  RecursiveDelete(FScratch + '/fifo-unit-directory-cache');
+  Environment := CacheEnvironment(FScratch + '/fifo-unit-directory-cache',
+    FScratch + '/fifo-unit-directory-marker');
+  Seed := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
+    Environment, FIFO_RUN_TIMEOUT_MILLISECONDS);
+  RequireSuccess('FIFO unit directory seed', Seed);
+  Expect<Boolean>(Pos('cache miss: no-result', Seed.Stdout) > 0).ToBe(True);
+  Hit := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
+    Environment, FIFO_RUN_TIMEOUT_MILLISECONDS);
+  RequireSuccess('FIFO unit directory rerun', Hit);
+  Expect<Boolean>(Pos('cache hit:', Hit.Stdout) > 0).ToBe(True);
+end;
+
+procedure TTestCache.TestConfigurationSwappedForFifoDoesNotHangCachedRun;
+var
+  Environment: TStringArray;
+  ProjectRoot: string;
+  Run: TLwptResult;
+begin
+  ProjectRoot := FScratch + '/cfg-fifo-cached';
+  { A replaces the cfg file with a FIFO that has no writer. B compiles from
+    the run's copy, but its cache fingerprint hashes the live cfg file; that
+    read must not block, and the run's input check then voids B. }
+  RecursiveDelete(ProjectRoot);
+  WriteTextFile(ProjectRoot + '/lwpt.toml',
+      '[package]'#10
+    + 'name = "cfg-fifo-fixture"'#10
+    + 'version = "0.0.0"'#10
+    + 'units = ["source"]'#10);
+  WriteTextFile(ProjectRoot + '/lwpt.cfg', '# fixture configuration'#10);
+  WriteTextFile(ProjectRoot + '/tests/A.Test.pas',
+      'program A;'#10
+    + '{$mode delphi}{$H+}'#10
+    + 'uses BaseUnix, SysUtils;'#10
+    + 'begin'#10
+    + '  if not DeleteFile(''' + ProjectRoot + '/lwpt.cfg'') then Halt(2);'#10
+    + '  if FpMkfifo(''' + ProjectRoot + '/lwpt.cfg'', &600) <> 0 then '
+    + 'Halt(3);'#10
+    + 'end.'#10);
+  WriteTextFile(ProjectRoot + '/tests/B.Test.pas',
+    'program B;'#10'begin'#10'end.'#10);
+  RecursiveDelete(FScratch + '/cfg-fifo-cached-cache');
+  Environment := CacheEnvironment(FScratch + '/cfg-fifo-cached-cache',
+    FScratch + '/cfg-fifo-cached-marker');
+  Run := RunLwpt(['test', '--verbose', '--jobs=1'], ProjectRoot,
+    Environment, FIFO_RUN_TIMEOUT_MILLISECONDS);
+  Expect<Integer>(Run.ExitCode).ToBe(1);
+  Expect<Boolean>(Pos('tests/A.Test.pas ... pass', Run.Stdout) > 0)
+    .ToBe(True);
+  Expect<Boolean>(Pos('tests/B.Test.pas ... VOID (compiler inputs changed '
+    + 'after this test run started (lwpt.cfg)', Run.Stdout) > 0).ToBe(True);
+end;
+{$ENDIF}
+
 procedure TTestCache.SetupTests;
 begin
   Test('equivalent worktrees compile once and execute every run',
@@ -783,6 +1126,28 @@ begin
     TestConcurrentMissCompilesOnce);
   Test('a passing rerun removes the superseded failed executable',
     TestPassingRerunRemovesSupersededExecutable);
+  Test('a unit directory named by a test flag invalidates the fingerprint',
+    TestFlagUnitDirectoryInvalidatesFingerprint);
+  Test('an include directory named by the compiler profile invalidates the '
+    + 'fingerprint', TestProfileIncludeDirectoryInvalidatesFingerprint);
+  Test('an include directory named only by the cfg file invalidates the '
+    + 'fingerprint', TestConfigurationIncludeDirectoryInvalidatesFingerprint);
+  Test('an include directory behind an environment macro invalidates the '
+    + 'fingerprint', TestEnvironmentMacroDirectoryInvalidatesFingerprint);
+  Test('an include directory named by a #CFGDIR-found file invalidates the '
+    + 'fingerprint', TestConfigurationDirectoryIncludeInvalidatesFingerprint);
+  Test('a search entry no fixed directory holds is never reused',
+    TestUnboundedSearchEntryIsNeverReused);
+  Test('a macro chain past the expansion bound is never reused',
+    TestExhaustedMacroExpansionIsNeverReused);
+  Test('a file included again after #CFGDIR invalidates the fingerprint',
+    TestRepeatedIncludeUnderNewDirectoryInvalidates);
+  {$IFDEF UNIX}
+  Test('a FIFO in a unit directory neither hangs nor defeats the cache',
+    TestFifoInUnitDirectoryDoesNotHangCachedRun);
+  Test('a cfg file swapped for a FIFO does not hang a cached run',
+    TestConfigurationSwappedForFifoDoesNotHangCachedRun);
+  {$ENDIF}
 end;
 
 begin
