@@ -6516,17 +6516,20 @@ end;
   from: those that neither the project (with the locked archiveHash) nor
   the per-user cache holds. Checked only once the upgrade has failed, so its
   message can name every file to restore. A lock key outside the package
-  grammar was not written by LWPT and never becomes a path, and an archive
-  that cannot be read counts as missing. }
+  grammar was not written by LWPT and never becomes a path. An archive
+  that cannot be read, or that is reached through a link (a linked archive
+  or archives directory), counts as missing and is never read. }
 function UpgradeMissingArchives(const AOldLock: TResolvedArray;
   const AArchivesRoot, AProjectRoot: string;
   AObjectStore: TLWPTImmutableObjectStore): TUpgradeMissingArchiveArray;
 var
   i: Integer;
   ArchivePath, CachedPath: string;
-  Present: Boolean;
+  Present, RootLinked: Boolean;
 begin
   Result := nil;
+  RootLinked := IsDirSymlinkOrJunction(
+    ExcludeTrailingPathDelimiter(AArchivesRoot));
   for i := 0 to High(AOldLock) do
   begin
     if not (AOldLock[i].SrcKind in [skGitHost, skURL, skRegistry]) then
@@ -6537,7 +6540,9 @@ begin
     ArchivePath := ArchivePathForRef(AArchivesRoot, AOldLock[i].Name,
       AOldLock[i].SrcKind, AOldLock[i].Version);
     try
-      Present := LongPathFileExists(ArchivePath)
+      Present := not RootLinked
+        and not IsDirSymlinkOrJunction(ArchivePath)
+        and LongPathFileExists(ArchivePath)
         and ('sha256:' + SHA256File(ArchivePath) = AOldLock[i].ArchiveHash);
     except
       on E: Exception do Present := False;

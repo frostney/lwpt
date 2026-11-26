@@ -95,7 +95,7 @@ end;
   or source through the install transaction. A v4 lock, or none, is left
   alone. Returns True when it upgraded. }
 function UpgradeLegacyLockfile(const ACtx: TManifestContext): Boolean;
-var LockfilePath: string; SchemaVersion, Removed: Integer;
+var LockfilePath: string; SchemaVersion, Removed, LeasesReclaimed: Integer;
 
   function Plural(ACount: Integer): string;
   begin
@@ -118,9 +118,11 @@ begin
       ' without network access or version changes');
     { The upgrade reads the per-user archive store before the shared-cache
       step below: give it the same link safety that step gives. }
-    Removed := RemoveDependencyArchiveLinks(ResolveCacheRoot);
-    if Removed > 0 then
-      WriteLn('repair: removed ', Removed, ' linked or malformed per-user ',
+    Removed := RemoveDependencyArchiveLinks(ResolveCacheRoot,
+      LeasesReclaimed);
+    if (Removed > 0) or (LeasesReclaimed > 0) then
+      WriteLn('repair: reclaimed ', LeasesReclaimed, ' abandoned producer ',
+        'lease(s) and removed ', Removed, ' linked or malformed per-user ',
         'archive-store entr', Plural(Removed), ' before the upgrade');
     RunInstallTransaction(ACtx, itmSchemaUpgrade);
     Result := True;

@@ -97,6 +97,8 @@ type
     procedure TestUnreadableArchiveKeepsTheMigrationMessage;
     procedure TestLocalPolicyChangeBehindAMissingArchiveNamesBoth;
     procedure TestUpgradeNeverReadsThroughALinkedCacheDirectory;
+    procedure TestLinkedProjectArchiveIsNamedNotRead;
+    procedure TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade;
     procedure TestRepairLeavesV4Alone;
     procedure TestLegacyRollbackRecoveredByRepairOnV3;
     procedure TestLegacyRollbackRecoveredByInstallOnV4;
@@ -993,6 +995,68 @@ begin
 end;
 {$ENDIF}
 
+{ Naming the archives to restore never reads through a link: a linked
+  archive, or a linked archives directory, is named as missing even when
+  its target holds the locked bytes. }
+{$IFDEF UNIX}
+procedure TLockSchemaUpgrade.TestLinkedProjectArchiveIsNamedNotRead;
+var Root, Outside, Expected: string;
+begin
+  Seed('linked-archive', Root);
+  DowngradeLockToV3(Root);
+  RecursiveDelete(FCacheRoot);
+  BumpShared(Root);
+  Expected := AgreementMessage(BumpFact, ManifestRestore
+    + ' and the missing locked archive `' + SHARED_ARCHIVE + '`');
+  Outside := Root + '-outside';
+  ForceDirectories(Outside);
+  { A linked archive. }
+  Expect<Boolean>(RenameFile(Root + '/' + SHARED_ARCHIVE,
+    Outside + '/archive.tar.gz')).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(Outside + '/archive.tar.gz'),
+    PChar(Root + '/' + SHARED_ARCHIVE))).ToBe(0);
+  ExpectFailureWith('repair with a linked archive', Run(Root, ['repair']),
+    Expected);
+  { A linked archives directory holding the real archive. }
+  Expect<Integer>(FpUnlink(PChar(Root + '/' + SHARED_ARCHIVE))).ToBe(0);
+  Expect<Boolean>(RenameFile(Outside + '/archive.tar.gz',
+    Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  Expect<Boolean>(RenameFile(Root + '/' + ARCHIVES_DIR,
+    Outside + '/archives')).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(Outside + '/archives'),
+    PChar(Root + '/' + ARCHIVES_DIR))).ToBe(0);
+  ExpectFailureWith('repair with a linked archives directory',
+    Run(Root, ['repair']), Expected);
+end;
+
+{ The guard the pre-upgrade cache cleanup takes depends on producer-lease
+  state that repair recovers; a linked lease root is recovered first, as
+  the shared-cache step would, and the upgrade then succeeds. }
+procedure TLockSchemaUpgrade.TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade;
+var Root, Leases, Outside: string; Outcome: TLwptResult;
+begin
+  Seed('linked-leases', Root);
+  DowngradeLockToV3(Root);
+  Leases := FCacheRoot + '/producer-leases';
+  RecursiveDelete(Leases);
+  Outside := Root + '-outside-leases';
+  WriteExactFile(Outside + '/kept', 'outside');
+  Expect<Integer>(FpSymlink(PChar(Outside), PChar(Leases))).ToBe(0);
+  Outcome := Run(Root, ['repair']);
+  ExpectSuccess('repair with a linked lease root', Outcome);
+  Expect<Boolean>(Pos('version = 4', LockText(Root)) > 0).ToBe(True);
+  Expect<string>(ReadBinaryFile(Outside + '/kept')).ToBe('outside');
+end;
+{$ELSE}
+procedure TLockSchemaUpgrade.TestLinkedProjectArchiveIsNamedNotRead;
+begin
+end;
+
+procedure TLockSchemaUpgrade.TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade;
+begin
+end;
+{$ENDIF}
+
 procedure TLockSchemaUpgrade.TestRepairLeavesV4Alone;
 var Root, V4, Before: string; Outcome: TLwptResult;
 begin
@@ -1197,7 +1261,16 @@ begin
   {$IFDEF UNIX}
   Test('repair''s upgrade never reads through a linked cache directory',
     TestUpgradeNeverReadsThroughALinkedCacheDirectory);
+  Test('repair names a linked archive or archives directory as missing',
+    TestLinkedProjectArchiveIsNamedNotRead);
+  Test('repair recovers a linked lease root before the upgrade',
+    TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade);
   {$ELSE}
+  Skip('repair names a linked archive or archives directory as missing',
+    TestLinkedProjectArchiveIsNamedNotRead, 'link fixtures need FpSymlink');
+  Skip('repair recovers a linked lease root before the upgrade',
+    TestLinkedLeaseRootIsRecoveredBeforeTheUpgrade,
+    'link fixtures need FpSymlink');
   Skip('repair''s upgrade never reads through a linked cache directory',
     TestUpgradeNeverReadsThroughALinkedCacheDirectory,
     'link fixtures need FpSymlink');
