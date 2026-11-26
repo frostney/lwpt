@@ -2047,6 +2047,18 @@ type
     property Fact: string read FFact;
   end;
 
+  { The v3-to-v4 upgrade found no usable copy of a locked archive while
+    staging. The transaction replaces it with one message naming every
+    missing archive, so one restore covers them all. }
+  EUpgradeArchiveMissing = class(ELockfileError);
+
+  { A locked archive the upgrade cannot re-derive a module from: Path is
+    project-relative, as the user sees it. }
+  TUpgradeMissingArchive = record
+    Name, Path: string;
+  end;
+  TUpgradeMissingArchiveArray = array of TUpgradeMissingArchive;
+
 constructor ELockDisagreement.CreateFact(const AMode, AFact, AHint: string);
 begin
   inherited Create(AMode + ' ' + AFact + '. ' + AHint);
@@ -2099,6 +2111,30 @@ begin
     + PROGRAM_NAME + ' repair` again.' + SCHEMA_UPGRADE_ALTERNATIVE;
 end;
 
+{ Every locked archive the upgrade lacks, in one message; a single one
+  keeps the message above. }
+function SchemaUpgradeArchivesMessage(
+  const AMissing: TUpgradeMissingArchiveArray): string;
+var Listed: string; i: Integer;
+begin
+  if Length(AMissing) = 1 then
+    Exit(SchemaUpgradeArchiveMessage(AMissing[0].Name, AMissing[0].Path));
+  Listed := '';
+  for i := 0 to High(AMissing) do
+  begin
+    if (i > 0) and (Length(AMissing) = 2) then Listed := Listed + ' and '
+    else if (i > 0) and (i = High(AMissing)) then Listed := Listed + ', and '
+    else if i > 0 then Listed := Listed + ', ';
+    Listed := Listed + 'for "' + AMissing[i].Name + '" at `'
+      + AMissing[i].Path + '`';
+  end;
+  Result := SchemaUpgradePrefix + 'the archives ' + Listed + ' are missing '
+    + 'or do not match their locked `archiveHash`, and the per-user cache '
+    + 'has no matching copy. Restore those exact archives, for example from '
+    + 'version control, and run `' + PROGRAM_NAME + ' repair` again.'
+    + SCHEMA_UPGRADE_ALTERNATIVE;
+end;
+
 function SchemaUpgradeProofMessage(const AName, ADisplayPath: string): string;
 begin
   Result := SchemaUpgradePrefix + 'the registry proof document for "' + AName
@@ -2113,23 +2149,23 @@ end;
   lock names. One message names all of them: the dependency that
   disagrees, and each locked archive that neither the project nor the
   per-user cache holds, so a single restore makes the next repair succeed.
-  AMissingArchives holds project-relative display paths. }
+  Each missing archive is named by its project-relative path. }
 function SchemaUpgradeAgreementMessage(const AFact: string;
-  const AMissingArchives: array of string): string;
+  const AMissingArchives: TUpgradeMissingArchiveArray): string;
 var Restore: string; i: Integer;
 begin
   Restore := 'the ' + MANIFEST_FILE + ' that `' + LWPT.Core.LOCKFILE
     + '` was written from';
   if Length(AMissingArchives) = 1 then
     Restore := Restore + ' and the missing locked archive `'
-      + AMissingArchives[0] + '`'
+      + AMissingArchives[0].Path + '`'
   else if Length(AMissingArchives) > 1 then
   begin
     Restore := Restore + ' and the missing locked archives ';
     for i := 0 to High(AMissingArchives) do
     begin
       if i > 0 then Restore := Restore + ', ';
-      Restore := Restore + '`' + AMissingArchives[i] + '`';
+      Restore := Restore + '`' + AMissingArchives[i].Path + '`';
     end;
   end;
   Result := SchemaUpgradePrefix + 'the manifest does not agree with the '
@@ -3620,8 +3656,8 @@ var
             [ANode.Name, E.Message]);
       end;
     if AUpgrade then
-      raise ELockfileError.Create(SchemaUpgradeArchiveMessage(ANode.Name,
-        ProjectDisplayPath(AProjectRoot, ProjectArchive)));
+      raise EUpgradeArchiveMissing.Create(SchemaUpgradeArchiveMessage(
+        ANode.Name, ProjectDisplayPath(AProjectRoot, ProjectArchive)));
     raise EFetchError.CreateFmt(
       '[offline] verified archive for "%s" is unavailable '
       + '(expected %s; cache result: %s). Restore the committed archive '
@@ -4557,6 +4593,49 @@ var
     end;
   end;
 
+  { The v3-to-v4 upgrade checks every root requirement against the lock
+    before it stages anything, with the checks selection itself applies.
+    Staging stops at the first missing archive, so without this a bumped
+    or added dependency later in the graph would be reported only once
+    that archive was back, one restore at a time (ADR-0052 section 5).
+    Requirements that transitive manifests add are still checked as the
+    graph is walked. }
+  procedure RequireRootAgreement;
+  var k, m: Integer; Facts: string; State: TSelectionState; Known: Boolean;
+
+    procedure AddFact(const AFact: string);
+    begin
+      if Facts <> '' then Facts := Facts + '; ';
+      Facts := Facts + AFact;
+    end;
+
+  begin
+    Facts := '';
+    for k := 0 to High(R.Nodes) do
+    begin
+      if NodeHasSourceConflict(R.Nodes[k]) then Continue;
+      Known := False;
+      for m := 0 to High(APriorLock) do
+        if SameText(APriorLock[m].Name, R.Nodes[k].Name) then Known := True;
+      if not Known then
+      begin
+        AddFact(Format('manifest graph reaches "%s" but the lockfile has '
+          + 'no entry', [R.Nodes[k].Name]));
+        Continue;
+      end;
+      if not IsNetworkBacked(R.Nodes[k]) then Continue;
+      try
+        State := Default(TSelectionState);
+        SelectLockedNode(R.Nodes[k], State);
+      except
+        on E: ELockDisagreement do AddFact(E.Fact);
+      end;
+    end;
+    if Facts <> '' then
+      raise ELockDisagreement.CreateFact('[offline]', Facts, 'Run `'
+        + PROGRAM_NAME + ' install` online to resolve the changed graph.');
+  end;
+
 begin
   PlanRoot := MakeTmpPath(ATmpRoot, 'resolver-plan');
   PlanModules := PlanRoot + '/modules';
@@ -4589,6 +4668,7 @@ begin
         AddRequirement(R, ARootMan.Deps[i], ARootMan.Name,
           ARootMan.CustomSources);
       for i := 0 to High(R.Nodes) do EnqueueNode(i);
+      if AUpgrade and (Round = 1) then RequireRootAgreement;
 
       Head := 0;
       while Head < Length(Queue) do
@@ -6418,11 +6498,13 @@ end;
 
 { The locked archives the v3-to-v4 upgrade could not re-derive a module
   from: those that neither the project (with the locked archiveHash) nor
-  the per-user cache holds. Checked only once the manifest has been found
-  to disagree, so the agreement message can name every file to restore. }
+  the per-user cache holds. Checked only once the upgrade has failed, so its
+  message can name every file to restore. A lock key outside the package
+  grammar was not written by LWPT and never becomes a path, and an archive
+  that cannot be read counts as missing. }
 function UpgradeMissingArchives(const AOldLock: TResolvedArray;
   const AArchivesRoot, AProjectRoot: string;
-  AObjectStore: TLWPTImmutableObjectStore): TStringArray;
+  AObjectStore: TLWPTImmutableObjectStore): TUpgradeMissingArchiveArray;
 var
   i: Integer;
   ArchivePath, CachedPath: string;
@@ -6433,11 +6515,17 @@ begin
   begin
     if not (AOldLock[i].SrcKind in [skGitHost, skURL, skRegistry]) then
       Continue;
-    if AOldLock[i].ArchiveHash = '' then Continue;
+    if (AOldLock[i].ArchiveHash = '')
+       or not ValidPackageName(AOldLock[i].Name) then
+      Continue;
     ArchivePath := ArchivePathForRef(AArchivesRoot, AOldLock[i].Name,
       AOldLock[i].SrcKind, AOldLock[i].Version);
-    Present := LongPathFileExists(ArchivePath)
-      and ('sha256:' + SHA256File(ArchivePath) = AOldLock[i].ArchiveHash);
+    try
+      Present := LongPathFileExists(ArchivePath)
+        and ('sha256:' + SHA256File(ArchivePath) = AOldLock[i].ArchiveHash);
+    except
+      on E: Exception do Present := False;
+    end;
     if not Present and (AObjectStore <> nil) then
       try
         Present := AObjectStore.Lookup(AOldLock[i].ArchiveHash, CachedPath);
@@ -6447,7 +6535,9 @@ begin
       end;
     if Present then Continue;
     SetLength(Result, Length(Result) + 1);
-    Result[High(Result)] := ProjectDisplayPath(AProjectRoot, ArchivePath);
+    Result[High(Result)].Name := AOldLock[i].Name;
+    Result[High(Result)].Path := ProjectDisplayPath(AProjectRoot,
+      ArchivePath);
   end;
 end;
 
@@ -6466,6 +6556,21 @@ begin
   Result := ELockfileError.Create(SchemaUpgradeAgreementMessage(Fact,
     UpgradeMissingArchives(AOldLock, AArchivesRoot, AProjectRoot,
       AObjectStore)));
+end;
+
+{ Staging stops at the first missing archive; the message names every
+  locked archive that is missing, so one restore covers them all. }
+function UpgradeArchivesError(AError: EUpgradeArchiveMissing;
+  const AOldLock: TResolvedArray; const AArchivesRoot, AProjectRoot: string;
+  AObjectStore: TLWPTImmutableObjectStore): ELockfileError;
+var Missing: TUpgradeMissingArchiveArray;
+begin
+  Missing := UpgradeMissingArchives(AOldLock, AArchivesRoot, AProjectRoot,
+    AObjectStore);
+  if Length(Missing) = 0 then
+    Result := ELockfileError.Create(AError.Message)
+  else
+    Result := ELockfileError.Create(SchemaUpgradeArchivesMessage(Missing));
 end;
 
 { The shared transaction body. AManifestLines <> nil is the manifest-
@@ -6653,6 +6758,9 @@ begin
               AContext.ProjectRoot, ObjectStore)
           else
             raise;
+        on E: EUpgradeArchiveMissing do
+          raise UpgradeArchivesError(E, OldLock, ArchivesRoot,
+            AContext.ProjectRoot, ObjectStore);
       end;
       PublicationPending := True;
     end;

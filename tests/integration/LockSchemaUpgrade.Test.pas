@@ -67,6 +67,8 @@ type
     function RunMerged(const ARoot: string;
       const AArguments: array of string): string;
     procedure BumpShared(const ARoot: string);
+    { Seed plus a git-host `early` that the graph stages before `shared`. }
+    function SeedWithEarly(const AName: string; out ARoot: string): string;
   protected
     procedure BeforeAll; override;
     procedure AfterAll; override;
@@ -88,6 +90,10 @@ type
     procedure TestBumpThenUpgradeNamesEveryRestore;
     procedure TestBumpWithCachedArchiveNamesOnlyTheManifest;
     procedure TestUpgradeFailureReadsWholeInMergedOutput;
+    procedure TestBumpBehindAMissingArchiveNamesBoth;
+    procedure TestEveryMissingArchiveIsNamedAtOnce;
+    procedure TestCraftedLockKeyNeverBecomesAnArchivePath;
+    procedure TestUnreadableArchiveKeepsTheMigrationMessage;
     procedure TestRepairLeavesV4Alone;
     procedure TestLegacyRollbackRecoveredByRepairOnV3;
     procedure TestLegacyRollbackRecoveredByInstallOnV4;
@@ -322,6 +328,19 @@ begin
   WriteExactFile(ARoot + '/lwpt.toml', StringReplace(
     ReadBinaryFile(ARoot + '/lwpt.toml'), 'fixture/shared@^1.0.0',
     'fixture/shared@^2.0.0', []));
+end;
+
+function TLockSchemaUpgrade.SeedWithEarly(const AName: string;
+  out ARoot: string): string;
+begin
+  Seed(AName, ARoot);
+  WriteRefs('early', 'tag|v1.0.0|' + OTHER_COMMIT + '|'#10);
+  WriteArchive('early', OTHER_COMMIT, '1.0.0');
+  WriteExactFile(ARoot + '/lwpt.toml', StringReplace(
+    ReadBinaryFile(ARoot + '/lwpt.toml'), '[dependencies]'#10,
+    '[dependencies]'#10 + 'early = "fixture/early@^1.0.0"'#10, []));
+  ExpectSuccess('seed early', Run(ARoot, ['install']));
+  Result := LockText(ARoot);
 end;
 
 { ---------------------------------------------------------------------------
@@ -828,6 +847,96 @@ begin
   Expect<Boolean>(Pos('resolving dependency graph', Output) > 0).ToBe(True);
 end;
 
+{ Staging stops at the first missing archive. An unchanged dependency
+  staged first must not hide a later bumped one: the root requirements are
+  checked before anything is staged, so one message names both. }
+procedure TLockSchemaUpgrade.TestBumpBehindAMissingArchiveNamesBoth;
+var Root, V3, Before: string;
+begin
+  SeedWithEarly('bump-behind', Root);
+  V3 := DowngradeLockToV3(Root);
+  Expect<Boolean>(DeleteFile(Root + '/.lwpt/archives/early-v1.0.0.tar.gz'))
+    .ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  BumpShared(Root);
+  Before := ProjectSnapshot(Root, REPAIR_OWNED);
+  ClearRequests;
+  ExpectFailureWith('repair behind a missing archive', Run(Root, ['repair']),
+    AgreementMessage(BumpFact, ManifestRestore
+      + ' and the missing locked archive `.lwpt/archives/early-v1.0.0.tar.gz`'));
+  Expect<string>(Requests).ToBe('');
+  Expect<string>(LockText(Root)).ToBe(V3);
+  Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
+end;
+
+{ With the manifest unchanged, every missing archive is named at once. }
+procedure TLockSchemaUpgrade.TestEveryMissingArchiveIsNamedAtOnce;
+var Root, V3: string;
+begin
+  SeedWithEarly('missing-both', Root);
+  V3 := DowngradeLockToV3(Root);
+  Expect<Boolean>(DeleteFile(Root + '/.lwpt/archives/early-v1.0.0.tar.gz'))
+    .ToBe(True);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  ExpectFailureWith('repair with two missing archives', Run(Root, ['repair']),
+    '`' + PROGRAM_NAME + ' repair` cannot upgrade `' + LOCKFILE + '` from '
+    + 'schema v3: the archives for "early" at '
+    + '`.lwpt/archives/early-v1.0.0.tar.gz` and for "shared" at `'
+    + SHARED_ARCHIVE + '` are missing or do not match their locked '
+    + '`archiveHash`, and the per-user cache has no matching copy. Restore '
+    + 'those exact archives, for example from version control, and run `'
+    + PROGRAM_NAME + ' repair` again. To give up the version-stable '
+    + 'migration, delete `' + LOCKFILE + '` and run `' + PROGRAM_NAME
+    + ' install`; that needs network access and moves range dependencies to '
+    + 'their newest matching versions.');
+  Expect<string>(LockText(Root)).ToBe(V3);
+end;
+
+{ A lock key outside the package grammar was not written by LWPT. Naming
+  missing archives must never turn it into a path, which could reach
+  outside the archives directory. }
+procedure TLockSchemaUpgrade.TestCraftedLockKeyNeverBecomesAnArchivePath;
+var Root, V3: string;
+begin
+  Seed('crafted-key', Root);
+  V3 := DowngradeLockToV3(Root);
+  WriteExactFile(Root + '/lwpt.lock', V3 + #10 + '[package."../../outside"]'
+    + #10 + 'source = "fixture/shared"' + #10 + 'resolvedRef = "v1.0.0"'
+    + #10 + 'resolvedURL = "https://github.com/fixture/shared/archive/'
+    + SHARED_COMMIT + '.tar.gz"' + #10 + 'computedHash = "sha256:'
+    + StringOfChar('0', 64) + '"' + #10 + 'archiveHash = "sha256:'
+    + StringOfChar('0', 64) + '"' + #10);
+  BumpShared(Root);
+  ExpectFailureWith('repair with a crafted key', Run(Root, ['repair']),
+    AgreementMessage(BumpFact, ManifestRestore));
+end;
+
+{ An archive that cannot be read must not replace the migration message
+  with a bare file error: it is named as one to restore. }
+{$IFDEF UNIX}
+procedure TLockSchemaUpgrade.TestUnreadableArchiveKeepsTheMigrationMessage;
+var Root: string;
+begin
+  Seed('unreadable', Root);
+  DowngradeLockToV3(Root);
+  RecursiveDelete(FCacheRoot);
+  BumpShared(Root);
+  Expect<Integer>(FpChmod(Root + '/' + SHARED_ARCHIVE, 0)).ToBe(0);
+  try
+    ExpectFailureWith('repair with an unreadable archive',
+      Run(Root, ['repair']), AgreementMessage(BumpFact, ManifestRestore
+        + ' and the missing locked archive `' + SHARED_ARCHIVE + '`'));
+  finally
+    FpChmod(Root + '/' + SHARED_ARCHIVE, &644);
+  end;
+end;
+{$ELSE}
+procedure TLockSchemaUpgrade.TestUnreadableArchiveKeepsTheMigrationMessage;
+begin
+end;
+{$ENDIF}
+
 procedure TLockSchemaUpgrade.TestRepairLeavesV4Alone;
 var Root, V4, Before: string; Outcome: TLwptResult;
 begin
@@ -1021,6 +1130,20 @@ begin
     TestBumpWithCachedArchiveNamesOnlyTheManifest);
   Test('repair''s failure reads whole and in order in merged output',
     TestUpgradeFailureReadsWholeInMergedOutput);
+  Test('repair names a bumped dependency behind a missing archive',
+    TestBumpBehindAMissingArchiveNamesBoth);
+  Test('repair names every missing archive at once',
+    TestEveryMissingArchiveIsNamedAtOnce);
+  Test('repair never turns a crafted lock key into an archive path',
+    TestCraftedLockKeyNeverBecomesAnArchivePath);
+  {$IFDEF UNIX}
+  Test('repair names an unreadable archive instead of failing on it',
+    TestUnreadableArchiveKeepsTheMigrationMessage);
+  {$ELSE}
+  Skip('repair names an unreadable archive instead of failing on it',
+    TestUnreadableArchiveKeepsTheMigrationMessage,
+    'file permissions that deny the owner need FpChmod');
+  {$ENDIF}
   Test('repair leaves a v4 lock alone', TestRepairLeavesV4Alone);
   Test('repair recovers a legacy rollback file on a v3 lock',
     TestLegacyRollbackRecoveredByRepairOnV3);
