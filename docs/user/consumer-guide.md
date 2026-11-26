@@ -257,7 +257,9 @@ If the manifest was already changed, or an archive the lock names was
 deleted, `lwpt repair` stops before its cache maintenance and names the
 dependency that disagrees and every file to restore. Restore them, for
 example with `git checkout -- lwpt.toml .lwpt/archives/<file>`, and continue
-from step 2.
+from step 2. A changed version requirement that the locked version still
+satisfies is reported only once the archives are back, so if `lwpt.toml`
+changed, restore it together with any archive the message names.
 
 ## Choose the existing capability
 

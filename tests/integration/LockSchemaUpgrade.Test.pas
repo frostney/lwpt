@@ -96,6 +96,7 @@ type
     procedure TestCraftedLockKeyNeverBecomesAnArchivePath;
     procedure TestUnreadableArchiveKeepsTheMigrationMessage;
     procedure TestLocalPolicyChangeBehindAMissingArchiveNamesBoth;
+    procedure TestUpgradeNeverReadsThroughALinkedCacheDirectory;
     procedure TestRepairLeavesV4Alone;
     procedure TestLegacyRollbackRecoveredByRepairOnV3;
     procedure TestLegacyRollbackRecoveredByInstallOnV4;
@@ -960,6 +961,38 @@ begin
   Expect<string>(LockText(Root)).ToBe(V3);
 end;
 
+{ The upgrade reads the per-user archive store before repair's shared-cache
+  step, so it must not follow a link there: a corrupt "object" reached
+  through a linked directory would otherwise be hashed and moved into the
+  cache's quarantine from outside the cache. }
+{$IFDEF UNIX}
+procedure TLockSchemaUpgrade.TestUpgradeNeverReadsThroughALinkedCacheDirectory;
+var Root, V3, Hex, Prefix, Outside: string;
+begin
+  Seed('linked-cache', Root);
+  V3 := DowngradeLockToV3(Root);
+  Hex := Copy(LockEntryField(V3, 'shared', 'archiveHash'), 8, MaxInt);
+  Expect<Integer>(Length(Hex)).ToBe(64);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  Prefix := FCacheRoot + '/dependency-archives/sha256/' + Copy(Hex, 1, 2);
+  Expect<Boolean>(DirectoryExists(Prefix)).ToBe(True);
+  RecursiveDelete(Prefix);
+  Outside := Root + '-outside';
+  WriteExactFile(Outside + '/' + Copy(Hex, 3, MaxInt), 'outside bytes');
+  Expect<Integer>(FpSymlink(PChar(Outside), PChar(Prefix))).ToBe(0);
+  ExpectFailureWith('repair with a linked cache directory',
+    Run(Root, ['repair']), ArchiveMessage);
+  Expect<string>(ReadBinaryFile(Outside + '/' + Copy(Hex, 3, MaxInt)))
+    .ToBe('outside bytes');
+  Expect<Boolean>(FpReadLink(Prefix) = '').ToBe(True);
+  Expect<string>(LockText(Root)).ToBe(V3);
+end;
+{$ELSE}
+procedure TLockSchemaUpgrade.TestUpgradeNeverReadsThroughALinkedCacheDirectory;
+begin
+end;
+{$ENDIF}
+
 procedure TLockSchemaUpgrade.TestRepairLeavesV4Alone;
 var Root, V4, Before: string; Outcome: TLwptResult;
 begin
@@ -1161,6 +1194,14 @@ begin
     TestCraftedLockKeyNeverBecomesAnArchivePath);
   Test('repair names a changed local source behind a missing archive',
     TestLocalPolicyChangeBehindAMissingArchiveNamesBoth);
+  {$IFDEF UNIX}
+  Test('repair''s upgrade never reads through a linked cache directory',
+    TestUpgradeNeverReadsThroughALinkedCacheDirectory);
+  {$ELSE}
+  Skip('repair''s upgrade never reads through a linked cache directory',
+    TestUpgradeNeverReadsThroughALinkedCacheDirectory,
+    'link fixtures need FpSymlink');
+  {$ENDIF}
   {$IFDEF UNIX}
   Test('repair names an unreadable archive instead of failing on it',
     TestUnreadableArchiveKeepsTheMigrationMessage);

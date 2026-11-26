@@ -1,6 +1,6 @@
 # Lockfile schema v4: a framed, streamed tree digest
 
-> **Amended 2026-11-26, repair order and the agreement message:** `lwpt repair` upgrades a v3 lock right after the project's own recovery steps (install lock, transaction recovery, sessions, retired images) and before the per-user ones (workers, shared cache, registry document store). Re-verifying a large shared cache can take minutes, and the upgrade's verdict, above all a manifest or archive the user must restore, comes first. The install transaction needs none of the per-user recovery first, as no install does. A failed upgrade stops repair there, and running repair again after the restore also does the per-user recovery. When the manifest disagrees with the lock, the message states the disagreement without the online-install hint an ordinary `--offline` install gives, which would send the user to a command that refuses the v3 lock, and names, besides the manifest, every locked archive that neither the project nor the per-user cache holds, so one restore lets the next repair succeed. It checks every root requirement before staging, so a missing archive staged early never hides a later disagreement, and names several missing archives in one message. A lock key outside the package grammar never becomes an archive path. The rules of this record are unchanged: only repair upgrades v3, it never resolves or fetches, and it keeps every locked version.
+> **Amended 2026-11-26, repair order and the agreement message:** `lwpt repair` upgrades a v3 lock right after the project's own recovery steps (install lock, transaction recovery, sessions, retired images) and before the per-user ones (workers, shared cache, registry document store). Re-verifying a large shared cache can take minutes, and the upgrade's verdict, above all a manifest or archive the user must restore, comes first. The install transaction needs none of the per-user recovery first, as no install does. A failed upgrade stops repair there, and running repair again after the restore also does the per-user recovery. When the manifest disagrees with the lock, the message states the disagreement without the online-install hint an ordinary `--offline` install gives, which would send the user to a command that refuses the v3 lock, and names, besides the manifest, every locked archive that neither the project nor the per-user cache holds, so one restore lets the next repair succeed. Before staging anything it checks each root dependency for a missing lock entry, a changed source or extraction policy, and a locked version its requirement no longer accepts, so a missing archive staged early never hides one of those, and it names several missing archives in one message. A changed requirement that still accepts the locked version is caught by the walk's constraint-fingerprint check, once the archives it stages are back. A lock key outside the package grammar never becomes an archive path. Because the upgrade now reads the per-user archive store before the shared-cache step, repair first removes linked and malformed entries from that store, as the shared-cache step does, so the upgrade never follows a link there. The rules of this record are unchanged: only repair upgrades v3, it never resolves or fetches, and it keeps every locked version.
 
 ## Status
 
@@ -448,10 +448,13 @@ runs under the install lock as an install transaction (retention, rollback,
    A missing or corrupt registry proof document gets the same message,
    naming the document's hash path instead of the archive.
    When several locked archives are missing, one message names them all.
-   The upgrade checks every root requirement against the lock before it
-   stages anything, so a dependency staged early whose archive is missing
-   never hides a later disagreement; requirements that transitive
-   manifests add are checked as the graph is walked.
+   Before it stages anything, the upgrade checks each root dependency for
+   a missing lock entry, a changed source or extraction policy, and a
+   locked version its requirement no longer accepts, so a dependency
+   staged early whose archive is missing never hides one of those. A
+   changed requirement that still accepts the locked version, and
+   requirements that transitive manifests add, are checked as the graph is
+   walked, once the archives it stages are present.
 
 After the upgrade, decision 11 holds: an install that changes nothing leaves
 the v4 lock byte-identical on every platform.
