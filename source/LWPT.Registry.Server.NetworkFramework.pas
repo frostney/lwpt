@@ -37,6 +37,9 @@ uses
   SysUtils,
 
   LWPT.Core,
+  {$IFDEF REGISTRY_TESTING}
+  LWPT.ProcessTree,
+  {$ENDIF}
   LWPT.Registry.Crypto,
   LWPT.Registry.Filesystem;
 
@@ -1185,6 +1188,8 @@ begin
 end;
 
 function NetworkFrameworkRecoveryConcurrentUnlinkIsSafeForTesting: Boolean;
+const
+  RecoveryChildExitMilliseconds = 10000;
 var
   Child: TProcess;
   DeadPID: LongInt;
@@ -1195,8 +1200,17 @@ begin
   Child := TProcess.Create(nil);
   try
     Child.Executable := '/usr/bin/true';
-    Child.Options := [poWaitOnExit];
-    Child.Execute;
+    { Spawned under the inheritance guard like every LWPT child, and reaped
+      outside it. }
+    ExecuteUnmanagedProcess(Child);
+    if not Child.WaitOnExit(RecoveryChildExitMilliseconds) then
+    begin
+      { TProcess.Terminate ends in an unbounded wait; kill and reap within
+        the same bound instead. }
+      FpKill(Child.ProcessID, SIGKILL);
+      Child.WaitOnExit(RecoveryChildExitMilliseconds);
+      Exit;
+    end;
     DeadPID := Child.ProcessID;
   finally
     Child.Free;

@@ -91,8 +91,14 @@ type
   end;
 
 procedure InstallProcessTreeSignalForwarding;
-{ Spawns under LWPT.Core's process-handle inheritance guard. }
+{ Spawns under LWPT.Core's process-handle inheritance guard. Like
+  TLWPTProcessTree.Execute, it makes the parent's ends of the child's pipes
+  close-on-exec before releasing the guard, so no later spawn inherits them. }
 procedure ExecuteUnmanagedProcess(const AProcess: TProcess);
+{ Duplicates the parent's end of a started child's pipe. The copy is
+  close-on-exec on Unix and non-inheritable on Windows, so no later spawn can
+  hold the child's pipe open. }
+function DuplicateParentPipeHandle(const AHandle: THandle): THandle;
 function FeedProcessTreeProtocol(var ABuffer: string;
   const ABytes: string; out ALine: string): TLWPTProtocolReadResult;
 
@@ -191,6 +197,9 @@ type
 var
   ProcessTreeChildGroupScript: TLWPTProcessGroupScript;
   ProcessTreeParentGroupScript: TLWPTProcessGroupScript;
+  { When non-zero, marking a parent pipe end close-on-exec fails with this
+    errno instead of calling fcntl(2). }
+  ProcessTreePipeProtectionErrorForTesting: Integer;
 
 { The child's pre-exec side of group setup, applied to the calling process. }
 function LeadOwnProcessGroupAfterFork: Boolean;
@@ -1140,7 +1149,95 @@ begin
 end;
 {$ENDIF}
 
+const
+  PipeProtectionFailure = 'could not protect child process pipes: %s';
+
+{$IFDEF UNIX}
+{ Marks one parent-side pipe end close-on-exec; a closed end (-1) needs
+  nothing. FPC 3.2.2's TProcess creates its pipes without FD_CLOEXEC, and a
+  forked child closes only its own pipes' parent ends. Without this, every
+  later fork copies the descriptor, and a child's standard input never
+  reaches end-of-file while the copy lives (#448). }
+function ProtectParentPipeEnd(const AHandle: THandle;
+  var AErrorCode: Integer): Boolean;
+begin
+  Result := True;
+  if AHandle < 0 then Exit;
+  {$IFDEF PROCESSTREE_TESTING}
+  if ProcessTreePipeProtectionErrorForTesting <> 0 then
+  begin
+    AErrorCode := ProcessTreePipeProtectionErrorForTesting;
+    Exit(False);
+  end;
+  {$ENDIF}
+  if FpFcntl(AHandle, F_SetFD, FD_CLOEXEC) = 0 then Exit;
+  AErrorCode := FpGetErrNo;
+  Result := False;
+end;
+{$ENDIF}
+
+{ Runs under the process-handle setup guard, right after AProcess.Execute,
+  so no other spawn can fork while the parent's pipe ends are inheritable.
+  On Windows there is nothing to change: FPC 3.2.2 creates every pipe with
+  non-inheritable handles and makes only the child's ends inheritable, which
+  it closes once CreateProcess returns. }
+function ProtectParentPipeEnds(const AProcess: TProcess;
+  out AErrorCode: Integer): Boolean;
+begin
+  AErrorCode := 0;
+  Result := True;
+  {$IFDEF UNIX}
+  if not (poUsePipes in AProcess.Options) then Exit;
+  if Assigned(AProcess.Input) then
+    Result := ProtectParentPipeEnd(AProcess.Input.Handle, AErrorCode);
+  if Result and Assigned(AProcess.Output) then
+    Result := ProtectParentPipeEnd(AProcess.Output.Handle, AErrorCode);
+  if Result and Assigned(AProcess.Stderr) then
+    Result := ProtectParentPipeEnd(AProcess.Stderr.Handle, AErrorCode);
+  {$ENDIF}
+end;
+
+function DuplicateParentPipeHandle(const AHandle: THandle): THandle;
+{$IFDEF UNIX}
+var
+  ErrorCode: Integer;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+var
+  Duplicated: THandle;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  { dup(2) clears close-on-exec, so the copy is made and marked under the
+    guard every spawn holds: no fork can copy it in between. }
+  BeginProcessHandleSetup;
+  try
+    Result := FpDup(AHandle);
+    if Result < 0 then RaiseLastOSError;
+    ErrorCode := 0;
+    if not ProtectParentPipeEnd(Result, ErrorCode) then
+    begin
+      FpClose(Result);
+      raise EOSError.CreateFmt(PipeProtectionFailure,
+        [SysErrorMessage(ErrorCode)]);
+    end;
+  finally
+    EndProcessHandleSetup;
+  end;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Duplicated := 0;
+  if not Windows.DuplicateHandle(Windows.GetCurrentProcess, AHandle,
+    Windows.GetCurrentProcess, @Duplicated, 0, False,
+    DUPLICATE_SAME_ACCESS) then
+    RaiseLastOSError;
+  Result := Duplicated;
+  {$ENDIF}
+end;
+
 procedure ExecuteUnmanagedProcess(const AProcess: TProcess);
+var
+  ErrorCode: Integer;
 begin
   if not Assigned(AProcess) then
     raise EArgumentNilException.Create('process');
@@ -1154,18 +1251,25 @@ begin
   BeginProcessHandleSetup;
   try
     AProcess.Execute;
+    if not ProtectParentPipeEnds(AProcess, ErrorCode) then
+    begin
+      AProcess.Terminate(ProcessTreeSetupExitCode);
+      AProcess.WaitOnExit;
+      raise EOSError.CreateFmt(PipeProtectionFailure,
+        [SysErrorMessage(ErrorCode)]);
+    end;
   finally
     EndProcessHandleSetup;
   end;
 end;
 
 procedure TLWPTProcessTree.Execute;
-{$IFDEF UNIX}
 var
+  PipeErrorCode: Integer;
+{$IFDEF UNIX}
   ErrorCode: Integer;
 {$ENDIF}
 {$IFDEF MSWINDOWS}
-var
   ErrorCode: DWORD;
   ErrorSuffix: string;
 {$ENDIF}
@@ -1189,6 +1293,13 @@ begin
           FProcess.Options := FProcess.Options + [poRunSuspended];
           {$ENDIF}
           FProcess.Execute;
+          if not ProtectParentPipeEnds(FProcess, PipeErrorCode) then
+          begin
+            FProcess.Terminate(ProcessTreeSetupExitCode);
+            FProcess.WaitOnExit;
+            raise EOSError.CreateFmt(PipeProtectionFailure,
+              [SysErrorMessage(PipeErrorCode)]);
+          end;
           CloseChildAcknowledgementHandles;
           {$IFDEF UNIX}
           { Close the parent/child race: this call or the child's pre-exec
