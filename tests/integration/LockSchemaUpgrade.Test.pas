@@ -38,6 +38,7 @@ const
   ARCHIVE_ORIGIN_ENV = PROJECT_NAME + '_TEST_ARCHIVE_ORIGIN';
   ARCHIVE_TIMEOUT_ENV = PROJECT_NAME + '_TEST_ARCHIVE_TIMEOUT_MS';
   SHARED_ARCHIVE = '.lwpt/archives/shared-v1.0.0.tar.gz';
+  EARLY_ARCHIVE = ARCHIVES_DIR + '/early-v1.0.0.tar.gz';
   { A refused or failed command may not touch these; repair's own recovery
     steps own .lwpt/tmp and build sessions. }
   REPAIR_OWNED: array[0..1] of string = ('.lwpt/tmp', '.lwpt/sessions');
@@ -94,6 +95,7 @@ type
     procedure TestEveryMissingArchiveIsNamedAtOnce;
     procedure TestCraftedLockKeyNeverBecomesAnArchivePath;
     procedure TestUnreadableArchiveKeepsTheMigrationMessage;
+    procedure TestLocalPolicyChangeBehindAMissingArchiveNamesBoth;
     procedure TestRepairLeavesV4Alone;
     procedure TestLegacyRollbackRecoveredByRepairOnV3;
     procedure TestLegacyRollbackRecoveredByInstallOnV4;
@@ -325,8 +327,8 @@ begin
   WriteRefs('shared', 'tag|v1.0.0|' + SHARED_COMMIT + '|'#10
     + 'tag|v2.0.0|' + NEWER_COMMIT + '|'#10);
   WriteArchive('shared', NEWER_COMMIT, '2.0.0');
-  WriteExactFile(ARoot + '/lwpt.toml', StringReplace(
-    ReadBinaryFile(ARoot + '/lwpt.toml'), 'fixture/shared@^1.0.0',
+  WriteExactFile(ARoot + '/' + MANIFEST_FILE, StringReplace(
+    ReadBinaryFile(ARoot + '/' + MANIFEST_FILE), 'fixture/shared@^1.0.0',
     'fixture/shared@^2.0.0', []));
 end;
 
@@ -336,8 +338,8 @@ begin
   Seed(AName, ARoot);
   WriteRefs('early', 'tag|v1.0.0|' + OTHER_COMMIT + '|'#10);
   WriteArchive('early', OTHER_COMMIT, '1.0.0');
-  WriteExactFile(ARoot + '/lwpt.toml', StringReplace(
-    ReadBinaryFile(ARoot + '/lwpt.toml'), '[dependencies]'#10,
+  WriteExactFile(ARoot + '/' + MANIFEST_FILE, StringReplace(
+    ReadBinaryFile(ARoot + '/' + MANIFEST_FILE), '[dependencies]'#10,
     '[dependencies]'#10 + 'early = "fixture/early@^1.0.0"'#10, []));
   ExpectSuccess('seed early', Run(ARoot, ['install']));
   Result := LockText(ARoot);
@@ -775,7 +777,7 @@ var Root, V3, Manifest, Archive, Before, Lock: string;
 begin
   Seed('bump-then-upgrade', Root);
   V3 := DowngradeLockToV3(Root);
-  Manifest := ReadBinaryFile(Root + '/lwpt.toml');
+  Manifest := ReadBinaryFile(Root + '/' + MANIFEST_FILE);
   Archive := ReadBinaryFile(Root + '/' + SHARED_ARCHIVE);
   BumpShared(Root);
   Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
@@ -792,7 +794,7 @@ begin
   Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
 
   { Do what the message says. }
-  WriteExactFile(Root + '/lwpt.toml', Manifest);
+  WriteExactFile(Root + '/' + MANIFEST_FILE, Manifest);
   WriteExactFile(Root + '/' + SHARED_ARCHIVE, Archive);
   ExpectSuccess('repair after the restore', Run(Root, ['repair']));
   Expect<string>(Requests).ToBe('');
@@ -814,12 +816,12 @@ var Root, Manifest: string;
 begin
   Seed('bump-cached', Root);
   DowngradeLockToV3(Root);
-  Manifest := ReadBinaryFile(Root + '/lwpt.toml');
+  Manifest := ReadBinaryFile(Root + '/' + MANIFEST_FILE);
   BumpShared(Root);
   Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
   ExpectFailureWith('repair with a cached archive', Run(Root, ['repair']),
     AgreementMessage(BumpFact, ManifestRestore));
-  WriteExactFile(Root + '/lwpt.toml', Manifest);
+  WriteExactFile(Root + '/' + MANIFEST_FILE, Manifest);
   ExpectSuccess('repair after restoring the manifest',
     Run(Root, ['repair']));
   Expect<Boolean>(Pos('version = 4', LockText(Root)) > 0).ToBe(True);
@@ -855,7 +857,7 @@ var Root, V3, Before: string;
 begin
   SeedWithEarly('bump-behind', Root);
   V3 := DowngradeLockToV3(Root);
-  Expect<Boolean>(DeleteFile(Root + '/.lwpt/archives/early-v1.0.0.tar.gz'))
+  Expect<Boolean>(DeleteFile(Root + '/' + EARLY_ARCHIVE))
     .ToBe(True);
   RecursiveDelete(FCacheRoot);
   BumpShared(Root);
@@ -863,7 +865,7 @@ begin
   ClearRequests;
   ExpectFailureWith('repair behind a missing archive', Run(Root, ['repair']),
     AgreementMessage(BumpFact, ManifestRestore
-      + ' and the missing locked archive `.lwpt/archives/early-v1.0.0.tar.gz`'));
+      + ' and the missing locked archive `' + EARLY_ARCHIVE + '`'));
   Expect<string>(Requests).ToBe('');
   Expect<string>(LockText(Root)).ToBe(V3);
   Expect<string>(ProjectSnapshot(Root, REPAIR_OWNED)).ToBe(Before);
@@ -875,14 +877,14 @@ var Root, V3: string;
 begin
   SeedWithEarly('missing-both', Root);
   V3 := DowngradeLockToV3(Root);
-  Expect<Boolean>(DeleteFile(Root + '/.lwpt/archives/early-v1.0.0.tar.gz'))
+  Expect<Boolean>(DeleteFile(Root + '/' + EARLY_ARCHIVE))
     .ToBe(True);
   Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
   RecursiveDelete(FCacheRoot);
   ExpectFailureWith('repair with two missing archives', Run(Root, ['repair']),
     '`' + PROGRAM_NAME + ' repair` cannot upgrade `' + LOCKFILE + '` from '
     + 'schema v3: the archives for "early" at '
-    + '`.lwpt/archives/early-v1.0.0.tar.gz` and for "shared" at `'
+    + '`' + EARLY_ARCHIVE + '` and for "shared" at `'
     + SHARED_ARCHIVE + '` are missing or do not match their locked '
     + '`archiveHash`, and the per-user cache has no matching copy. Restore '
     + 'those exact archives, for example from version control, and run `'
@@ -901,7 +903,7 @@ var Root, V3: string;
 begin
   Seed('crafted-key', Root);
   V3 := DowngradeLockToV3(Root);
-  WriteExactFile(Root + '/lwpt.lock', V3 + #10 + '[package."../../outside"]'
+  WriteExactFile(Root + '/' + LOCKFILE, V3 + #10 + '[package."../../outside"]'
     + #10 + 'source = "fixture/shared"' + #10 + 'resolvedRef = "v1.0.0"'
     + #10 + 'resolvedURL = "https://github.com/fixture/shared/archive/'
     + SHARED_COMMIT + '.tar.gz"' + #10 + 'computedHash = "sha256:'
@@ -936,6 +938,27 @@ procedure TLockSchemaUpgrade.TestUnreadableArchiveKeepsTheMigrationMessage;
 begin
 end;
 {$ENDIF}
+
+{ A local or workspace dependency is read live, so its changed source or
+  extraction policy is checked before anything is staged too. }
+procedure TLockSchemaUpgrade.TestLocalPolicyChangeBehindAMissingArchiveNamesBoth;
+var Root, V3: string;
+begin
+  Seed('local-policy', Root);
+  V3 := DowngradeLockToV3(Root);
+  Expect<Boolean>(DeleteFile(Root + '/' + SHARED_ARCHIVE)).ToBe(True);
+  RecursiveDelete(FCacheRoot);
+  WriteExactFile(Root + '/' + MANIFEST_FILE, StringReplace(
+    ReadBinaryFile(Root + '/' + MANIFEST_FILE),
+    'local-dep = "./local-dep"',
+    'local-dep = { source = "./local-dep", exclude = ["**/*.Test.pas"] }',
+    []));
+  ExpectFailureWith('repair with a changed local policy',
+    Run(Root, ['repair']), AgreementMessage(
+      'source or extraction policy changed for "local-dep"', ManifestRestore
+      + ' and the missing locked archive `' + SHARED_ARCHIVE + '`'));
+  Expect<string>(LockText(Root)).ToBe(V3);
+end;
 
 procedure TLockSchemaUpgrade.TestRepairLeavesV4Alone;
 var Root, V4, Before: string; Outcome: TLwptResult;
@@ -1136,6 +1159,8 @@ begin
     TestEveryMissingArchiveIsNamedAtOnce);
   Test('repair never turns a crafted lock key into an archive path',
     TestCraftedLockKeyNeverBecomesAnArchivePath);
+  Test('repair names a changed local source behind a missing archive',
+    TestLocalPolicyChangeBehindAMissingArchiveNamesBoth);
   {$IFDEF UNIX}
   Test('repair names an unreadable archive instead of failing on it',
     TestUnreadableArchiveKeepsTheMigrationMessage);

@@ -4601,7 +4601,8 @@ var
     Requirements that transitive manifests add are still checked as the
     graph is walked. }
   procedure RequireRootAgreement;
-  var k, m: Integer; Facts: string; State: TSelectionState; Known: Boolean;
+  var k, m: Integer; Facts: string; State: TSelectionState;
+    Known, SourceMatches: Boolean;
 
     procedure AddFact(const AFact: string);
     begin
@@ -4615,15 +4616,30 @@ var
     begin
       if NodeHasSourceConflict(R.Nodes[k]) then Continue;
       Known := False;
+      SourceMatches := False;
       for m := 0 to High(APriorLock) do
-        if SameText(APriorLock[m].Name, R.Nodes[k].Name) then Known := True;
+        if SameText(APriorLock[m].Name, R.Nodes[k].Name) then
+        begin
+          Known := True;
+          if LockSourceMatches(R.Nodes[k], APriorLock[m]) then
+            SourceMatches := True;
+        end;
       if not Known then
       begin
         AddFact(Format('manifest graph reaches "%s" but the lockfile has '
           + 'no entry', [R.Nodes[k].Name]));
         Continue;
       end;
-      if not IsNetworkBacked(R.Nodes[k]) then Continue;
+      { A local or workspace source is read live, so only its identity can
+        disagree before the walk: the same check the end of the walk
+        applies (VerifyOfflineAgainstLockfile). }
+      if not IsNetworkBacked(R.Nodes[k]) then
+      begin
+        if not SourceMatches then
+          AddFact(Format('source or extraction policy changed for "%s"',
+            [R.Nodes[k].Name]));
+        Continue;
+      end;
       try
         State := Default(TSelectionState);
         SelectLockedNode(R.Nodes[k], State);
