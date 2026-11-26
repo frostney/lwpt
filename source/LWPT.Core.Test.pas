@@ -668,11 +668,20 @@ const
 var
   Bytes: TBytes;
   Stream: TBytesStream;
+  {$IFDEF DARWIN}
+  NativeCount: SizeInt;
+  {$ENDIF}
 begin
   { 1,000,000 repetitions of "a" — the standard "long message" NIST
     vector. Exercises the multi-block iteration path proper. }
   Bytes := RepeatBytes(Ord('a'), 1000000);
+  {$IFDEF DARWIN}
+  NativeCount := NativeSHA256Count;
+  {$ENDIF}
   Expect<string>(SHA256Hex(Bytes)).ToBe(EXPECTED);
+  {$IFDEF DARWIN}
+  Expect<SizeInt>(NativeSHA256Count - NativeCount).ToBe(1);
+  {$ENDIF}
   Stream := TBytesStream.Create(Bytes);
   try
     Stream.Position := Stream.Size;
@@ -1192,12 +1201,21 @@ end;
 procedure TTreeDigestV2.TestRecordEncoding;
 var Expected: TBytes; Stream: string; Size: Int64; Digest: TSHA256Digest;
   Bytes: TBytesStream;
+  {$IFDEF DARWIN}
+  NativeCount: SizeInt;
+  {$ENDIF}
 begin
   { One file `alpha.txt` holding `alpha`: magic, then 01, 00000009, the
     path, 0000000000000005, and SHA-256("alpha"). }
   Bytes := TBytesStream.Create(StringAsBytes('alpha'));
   try
+    {$IFDEF DARWIN}
+    NativeCount := NativeSHA256Count;
+    {$ENDIF}
     Digest := TreeContentDigest(Bytes, Size);
+    {$IFDEF DARWIN}
+    Expect<Boolean>(NativeSHA256Count > NativeCount).ToBe(True);
+    {$ENDIF}
   finally
     Bytes.Free;
   end;
