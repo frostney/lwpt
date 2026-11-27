@@ -501,6 +501,10 @@ jobs:
         if: runner.os != 'Windows'
         run: chmod +x build/lwpt
 
+      - name: Verify the Windows SHA-256 regression detects the portable backend
+        if: runner.os == 'Windows' && needs.validate-inputs.outputs.diagnostic == 'true'
+        run: bash .github/ci/prove-windows-sha256-regression.sh
+
       - name: Sanity check — lwpt --help
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
