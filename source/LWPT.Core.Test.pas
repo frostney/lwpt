@@ -42,12 +42,23 @@ uses
 
 type
   TSHA256NISTVectors = class(TTestSuite)
+  {$IFDEF MSWINDOWS}
+  private
+    FProgressCalls: Integer;
+    procedure AbortHashAfterFirstRead;
+  {$ENDIF}
   public
     procedure SetupTests; override;
     procedure TestEmptyString;
     procedure TestAbc;
     procedure TestExactlyOneBlock;
     procedure TestSpansTwoBlocks;
+    {$IFDEF MSWINDOWS}
+    procedure TestStreamAbortReleasesHash;
+    {$IFDEF CPU64}
+    procedure TestUpdateOverWindowsCountLimit;
+    {$ENDIF}
+    {$ENDIF}
     procedure TestLongLength;
     {$IFDEF TEST_SHA256_INSTRUCTIONS}
     procedure TestInstructionDispatch;
@@ -679,18 +690,18 @@ const
 var
   Bytes: TBytes;
   Stream: TBytesStream;
-  {$IFDEF DARWIN}
+  {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
   NativeCount: SizeInt;
   {$ENDIF}
 begin
   { 1,000,000 repetitions of "a" — the standard "long message" NIST
     vector. Exercises the multi-block iteration path proper. }
   Bytes := RepeatBytes(Ord('a'), 1000000);
-  {$IFDEF DARWIN}
+  {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
   NativeCount := NativeSHA256Count;
   {$ENDIF}
   Expect<string>(SHA256Hex(Bytes)).ToBe(EXPECTED);
-  {$IFDEF DARWIN}
+  {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
   Expect<SizeInt>(NativeSHA256Count - NativeCount).ToBe(1);
   {$ENDIF}
   Stream := TBytesStream.Create(Bytes);
@@ -702,6 +713,74 @@ begin
     Stream.Free;
   end;
 end;
+
+{$IFDEF MSWINDOWS}
+procedure TSHA256NISTVectors.AbortHashAfterFirstRead;
+begin
+  Inc(FProgressCalls);
+  if FProgressCalls = 2 then
+    raise EAbort.Create('stop after the first SHA-256 read');
+end;
+
+procedure TSHA256NISTVectors.TestStreamAbortReleasesHash;
+var
+  Stream: TBytesStream;
+  Aborted: Boolean;
+  ActiveCount: LongInt;
+  CompletedCount: SizeInt;
+begin
+  Stream := TBytesStream.Create(StringAsBytes('abc'));
+  try
+    FProgressCalls := 0;
+    ActiveCount := NativeSHA256ActiveCount;
+    CompletedCount := NativeSHA256StreamCount;
+    Aborted := False;
+    try
+      SHA256Stream(Stream, AbortHashAfterFirstRead);
+    except
+      on E: EAbort do Aborted := True;
+    end;
+    Expect<Boolean>(Aborted).ToBe(True);
+    Expect<Int64>(Stream.Position).ToBe(0);
+    Expect<LongInt>(NativeSHA256ActiveCount).ToBe(ActiveCount);
+    Expect<SizeInt>(NativeSHA256StreamCount).ToBe(CompletedCount);
+  finally
+    Stream.Free;
+  end;
+end;
+
+{$IFDEF CPU64}
+procedure TSHA256NISTVectors.TestUpdateOverWindowsCountLimit;
+const
+  INPUT_SIZE = (SizeInt(1) shl 32) + 19;
+  EXPECTED = '0f5106db209170f5ace30065ff93658678b899ffd5712b6e62f49558ffc30d9f';
+var
+  Bytes: PByte;
+  Context: TSHA256Context;
+  Digest: TSHA256Digest;
+begin
+  { Demand-zero pages avoid allocating and first writing a second copy.
+    Two distinct bytes in the tail catch truncation or a wrong split offset. }
+  Bytes := VirtualAlloc(nil, INPUT_SIZE, MEM_RESERVE or MEM_COMMIT,
+    PAGE_READWRITE);
+  if Bytes = nil then RaiseLastOSError;
+  try
+    PByte(PtrUInt(Bytes) + High(LongWord))^ := $A5;
+    PByte(PtrUInt(Bytes) + INPUT_SIZE - 1)^ := $5A;
+    SHA256Init(Context);
+    try
+      SHA256Update(Context, Bytes^, INPUT_SIZE);
+      SHA256Final(Context, Digest);
+      Expect<string>(SHA256DigestHex(Digest)).ToBe(EXPECTED);
+    finally
+      SHA256Discard(Context);
+    end;
+  finally
+    VirtualFree(Bytes, 0, MEM_RELEASE);
+  end;
+end;
+{$ENDIF}
+{$ENDIF}
 
 procedure TSHA256NISTVectors.TestLongLength;
 const
@@ -840,6 +919,14 @@ begin
   Test('"abc" vector',                         TestAbc);
   Test('56-byte vector (block-boundary pad)',  TestExactlyOneBlock);
   Test('1,000,000 "a" vector (multi-block)',   TestSpansTwoBlocks);
+  {$IFDEF MSWINDOWS}
+  Test('aborting a hash rewinds the stream and releases its Windows handle',
+    TestStreamAbortReleasesHash);
+  {$IFDEF CPU64}
+  Test('an incremental update crosses the Windows hash count limit',
+    TestUpdateOverWindowsCountLimit);
+  {$ENDIF}
+  {$ENDIF}
   Test('length exceeds 4 GiB', TestLongLength);
   {$IFDEF TEST_SHA256_INSTRUCTIONS}
   Test('a capable CPU handles a complete SHA-256 block', TestInstructionDispatch);
@@ -1349,7 +1436,7 @@ end;
 procedure TTreeDigestV2.TestRecordEncoding;
 var Expected: TBytes; Stream: string; Size: Int64; Digest: TSHA256Digest;
   Bytes: TBytesStream;
-  {$IFDEF DARWIN}
+  {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
   NativeCount: SizeInt;
   {$ENDIF}
 begin
@@ -1357,11 +1444,11 @@ begin
     path, 0000000000000005, and SHA-256("alpha"). }
   Bytes := TBytesStream.Create(StringAsBytes('alpha'));
   try
-    {$IFDEF DARWIN}
+    {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
     NativeCount := NativeSHA256Count;
     {$ENDIF}
     Digest := TreeContentDigest(Bytes, Size);
-    {$IFDEF DARWIN}
+    {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
     Expect<Boolean>(NativeSHA256Count > NativeCount).ToBe(True);
     {$ENDIF}
   finally

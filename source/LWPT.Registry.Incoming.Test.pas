@@ -317,7 +317,13 @@ var
   Upload: TLWPTRegistryUpload;
   Bytes: Int64;
   Entries: Integer;
+  {$IFDEF MSWINDOWS}
+  ActiveHashCount: LongInt;
+  {$ENDIF}
 begin
+  {$IFDEF MSWINDOWS}
+  ActiveHashCount := NativeSHA256ActiveCount;
+  {$ENDIF}
   Incoming := NewIncoming;
   try
     Upload := Incoming.Admit(5);
@@ -334,13 +340,25 @@ begin
     try
       WriteAll(Upload, 'he');
       Expect<Boolean>(Upload.Abandon).ToBe(True);
+      {$IFDEF MSWINDOWS}
+      Expect<LongInt>(NativeSHA256ActiveCount).ToBe(ActiveHashCount);
+      {$ENDIF}
     finally
       Upload.Free;
     end;
     { A dropped connection that never reaches Complete or Abandon. }
     Upload := Incoming.Admit(5);
-    WriteAll(Upload, 'h');
-    Upload.Free;
+    try
+      WriteAll(Upload, 'h');
+      {$IFDEF MSWINDOWS}
+      Expect<LongInt>(NativeSHA256ActiveCount).ToBe(ActiveHashCount + 1);
+      {$ENDIF}
+    finally
+      Upload.Free;
+    end;
+    {$IFDEF MSWINDOWS}
+    Expect<LongInt>(NativeSHA256ActiveCount).ToBe(ActiveHashCount);
+    {$ENDIF}
     Incoming.Usage(Bytes, Entries);
     Expect<Int64>(Bytes).ToBe(0);
     Expect<Integer>(Entries).ToBe(0);

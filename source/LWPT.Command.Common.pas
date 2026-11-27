@@ -585,6 +585,9 @@ begin
     SHA256Final(Context, Digest);
     Result := SHA256DigestHex(Digest);
   finally
+    {$IFDEF MSWINDOWS}
+    SHA256Discard(Context);
+    {$ENDIF}
     CloseHookRegularFile(HookFile);
   end;
 end;

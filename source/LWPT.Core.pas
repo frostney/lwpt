@@ -312,13 +312,16 @@ function  ObserveProcessHandleSetup(
 
 type
   TSHA256Digest = array[0..31] of Byte;
-  { Incremental SHA-256 state for callers that hash bytes as they arrive. }
+  { Incremental SHA-256 state. On Windows the context owns a native handle,
+    so do not copy it and discard any initialized context left unfinished. }
   TSHA256Context = record
-    {$IFDEF DARWIN}
+    {$IF DEFINED(DARWIN)}
     { CC_SHA256_CTX from <CommonCrypto/CommonDigest.h>. }
     Count: array[0..1] of UInt32;
     Hash: array[0..7] of UInt32;
     Words: array[0..15] of UInt32;
+    {$ELSEIF DEFINED(MSWINDOWS)}
+    Hash: Pointer;
     {$ELSE}
     State: array[0..7] of Cardinal;
     Buffer: array[0..63] of Byte;
@@ -330,6 +333,10 @@ type
     {$ENDIF}
   end;
 
+{$IFDEF MSWINDOWS}
+{ Releases an initialized or zeroed context without producing a digest. }
+procedure SHA256Discard(var AContext: TSHA256Context);
+{$ENDIF}
 procedure SHA256Init(var AContext: TSHA256Context);
 procedure SHA256Update(var AContext: TSHA256Context; const AData;
   const ACount: SizeInt);
@@ -341,11 +348,16 @@ function  SHA256Hex(const AData: TBytes): string;
 function  SHA256Stream(AStream: TStream;
   AProgress: TSHA256Progress = nil): string;
 function  SHA256File(const APath: string): string;
-{$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+{$IF (DEFINED(DARWIN) OR DEFINED(MSWINDOWS)) AND DEFINED(OBJECTSTORE_TESTING)}
 threadvar
-  { Completed CommonCrypto hashes on the calling test thread. }
+  { Native hashes on the calling test thread. }
   NativeSHA256Count: SizeInt;
   NativeSHA256StreamCount: SizeInt;
+  {$IFDEF MSWINDOWS}
+var
+  { Live Windows handles across threads, including handed-off uploads. }
+  NativeSHA256ActiveCount: LongInt;
+  {$ENDIF}
 {$ENDIF}
 {$IF DEFINED(LWPT_SHA256_INSTRUCTIONS) AND DEFINED(OBJECTSTORE_TESTING)}
 threadvar
@@ -2628,7 +2640,7 @@ begin
   Result := 'sha256:' + SHA256Hex(ABytes);
 end;
 
-{$IFDEF DARWIN}
+{$IF DEFINED(DARWIN)}
 { These symbols are exported by the libSystem LWPT already links. }
 function CommonCryptoSHA256Init(var AContext: TSHA256Context): LongInt;
   cdecl; external 'c' name 'CC_SHA256_Init';
@@ -2672,6 +2684,139 @@ begin
   if CommonCryptoSHA256Final(@ADigest[0], AContext) <> 1 then
     raise EVerifyError.Create('CommonCrypto SHA-256 finalization failed');
   FillChar(AContext, SizeOf(AContext), 0);
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(NativeSHA256Count);
+  {$ENDIF}
+end;
+{$ELSEIF DEFINED(MSWINDOWS)}
+type
+  TBCryptOpenAlgorithmProvider = function(out AHandle: Pointer;
+    AAlgorithm, AImplementation: PWideChar; AFlags: LongWord): LongInt; stdcall;
+  TBCryptCreateHash = function(AProvider: Pointer; out AHash: Pointer;
+    AObject: Pointer; AObjectSize: LongWord; ASecret: Pointer;
+    ASecretSize, AFlags: LongWord): LongInt; stdcall;
+  TBCryptHashData = function(AHash, AData: Pointer;
+    ACount, AFlags: LongWord): LongInt; stdcall;
+  TBCryptFinishHash = function(AHash, ADigest: Pointer;
+    ADigestSize, AFlags: LongWord): LongInt; stdcall;
+  TBCryptDestroyHash = function(AHash: Pointer): LongInt; stdcall;
+  TBCryptCloseAlgorithmProvider = function(AProvider: Pointer;
+    AFlags: LongWord): LongInt; stdcall;
+
+var
+  BCryptCreateHash: TBCryptCreateHash;
+  BCryptHashData: TBCryptHashData;
+  BCryptFinishHash: TBCryptFinishHash;
+  BCryptDestroyHash: TBCryptDestroyHash;
+  BCryptCloseAlgorithmProvider: TBCryptCloseAlgorithmProvider;
+  SHA256Provider: Pointer;
+  SHA256Module: THandle;
+
+procedure InitWindowsSHA256;
+var
+  SystemPath: array[0..MAX_PATH] of WideChar;
+  PathLength: UInt32;
+  DLLPath: UnicodeString;
+  Module: THandle;
+  OpenProvider: TBCryptOpenAlgorithmProvider;
+begin
+  { Resolve the system DLL by its full path. The CLI already imports it for
+    BCryptGenRandom, but programs that only use this unit may not. }
+  PathLength := GetSystemDirectoryW(@SystemPath[0], Length(SystemPath));
+  if (PathLength = 0) or (PathLength >= Length(SystemPath)) then Exit;
+  SetString(DLLPath, PWideChar(@SystemPath[0]), PathLength);
+  DLLPath := DLLPath + '\bcrypt.dll';
+  Module := LoadLibraryW(PWideChar(DLLPath));
+  if Module = 0 then Exit;
+  OpenProvider := TBCryptOpenAlgorithmProvider(GetProcAddress(Module,
+    'BCryptOpenAlgorithmProvider'));
+  BCryptCreateHash := TBCryptCreateHash(GetProcAddress(Module,
+    'BCryptCreateHash'));
+  BCryptHashData := TBCryptHashData(GetProcAddress(Module, 'BCryptHashData'));
+  BCryptFinishHash := TBCryptFinishHash(GetProcAddress(Module,
+    'BCryptFinishHash'));
+  BCryptDestroyHash := TBCryptDestroyHash(GetProcAddress(Module,
+    'BCryptDestroyHash'));
+  BCryptCloseAlgorithmProvider := TBCryptCloseAlgorithmProvider(
+    GetProcAddress(Module, 'BCryptCloseAlgorithmProvider'));
+  if Assigned(OpenProvider) and Assigned(BCryptCreateHash)
+    and Assigned(BCryptHashData) and Assigned(BCryptFinishHash)
+    and Assigned(BCryptDestroyHash) and Assigned(BCryptCloseAlgorithmProvider) then
+  begin
+    if OpenProvider(SHA256Provider, 'SHA256', nil, 0) >= 0 then
+    begin
+      SHA256Module := Module;
+      Exit;
+    end;
+    SHA256Provider := nil;
+  end;
+  Windows.FreeLibrary(Module);
+end;
+
+procedure SHA256Discard(var AContext: TSHA256Context);
+begin
+  if AContext.Hash <> nil then
+  begin
+    BCryptDestroyHash(AContext.Hash);
+    AContext.Hash := nil;
+    {$IFDEF OBJECTSTORE_TESTING}
+    System.InterlockedDecrement(NativeSHA256ActiveCount);
+    {$ENDIF}
+  end;
+end;
+
+procedure SHA256Init(var AContext: TSHA256Context);
+begin
+  AContext.Hash := nil;
+  if SHA256Provider = nil then
+    raise EVerifyError.Create('CNG SHA-256 provider unavailable');
+  { Windows 7 and newer allocate the hash object for a nil object buffer.
+    BCryptDestroyHash also frees that storage. }
+  if BCryptCreateHash(SHA256Provider, AContext.Hash, nil, 0, nil, 0, 0) < 0 then
+  begin
+    AContext.Hash := nil;
+    raise EVerifyError.Create('CNG SHA-256 hash creation failed');
+  end;
+  {$IFDEF OBJECTSTORE_TESTING}
+  System.InterlockedIncrement(NativeSHA256ActiveCount);
+  {$ENDIF}
+end;
+
+procedure SHA256Update(var AContext: TSHA256Context; const AData;
+  const ACount: SizeInt);
+var
+  Cursor: PByte;
+  Remaining: SizeInt;
+  Count: LongWord;
+begin
+  Cursor := @AData;
+  Remaining := ACount;
+  while Remaining > 0 do
+  begin
+    {$IFDEF CPU64}
+    if Remaining > High(LongWord) then Count := High(LongWord)
+    else
+    {$ENDIF}
+      Count := LongWord(Remaining);
+    if BCryptHashData(AContext.Hash, Cursor, Count, 0) < 0 then
+    begin
+      SHA256Discard(AContext);
+      raise EVerifyError.Create('CNG SHA-256 update failed');
+    end;
+    Inc(Cursor, Count);
+    Dec(Remaining, Count);
+  end;
+end;
+
+procedure SHA256Final(var AContext: TSHA256Context;
+  out ADigest: TSHA256Digest);
+begin
+  try
+    if BCryptFinishHash(AContext.Hash, @ADigest[0], SizeOf(ADigest), 0) < 0 then
+      raise EVerifyError.Create('CNG SHA-256 finalization failed');
+  finally
+    SHA256Discard(AContext);
+  end;
   {$IFDEF OBJECTSTORE_TESTING}
   Inc(NativeSHA256Count);
   {$ENDIF}
@@ -2866,7 +3011,7 @@ var
   Context: TSHA256Context;
   Digest: TSHA256Digest;
   ReadCount: Integer;
-  {$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+  {$IF (DEFINED(DARWIN) OR DEFINED(MSWINDOWS)) AND DEFINED(OBJECTSTORE_TESTING)}
   NativeCount: SizeInt;
   {$ENDIF}
 begin
@@ -2880,15 +3025,18 @@ begin
         SHA256Update(Context, Buffer[0], ReadCount);
     until ReadCount = 0;
     if Assigned(AProgress) then AProgress;
-    {$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+    {$IF (DEFINED(DARWIN) OR DEFINED(MSWINDOWS)) AND DEFINED(OBJECTSTORE_TESTING)}
     NativeCount := NativeSHA256Count;
     {$ENDIF}
     SHA256Final(Context, Digest);
-    {$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+    {$IF (DEFINED(DARWIN) OR DEFINED(MSWINDOWS)) AND DEFINED(OBJECTSTORE_TESTING)}
     Inc(NativeSHA256StreamCount, NativeSHA256Count - NativeCount);
     {$ENDIF}
     Result := SHA256DigestHex(Digest);
   finally
+    {$IFDEF MSWINDOWS}
+    SHA256Discard(Context);
+    {$ENDIF}
     AStream.Position := 0;
   end;
 end;
@@ -3493,70 +3641,81 @@ var
   Value: Byte;
   NormalizedDigest: TSHA256Digest;
 begin
-  SHA256Init(RawContext);
-  SHA256Init(NormalizedContext);
-  RawSize := 0;
-  NormalizedSize := 0;
-  Binary := False;
-  HeldCR := False;
-  repeat
-    Count := AStream.Read(ARaw[0], TREE_DIGEST_CHUNK_BYTES);
-    if Count <= 0 then Break;
-    { FS.Size is never trusted: the length is what was read. }
-    SHA256Update(RawContext, ARaw[0], Count);
-    Inc(RawSize, Count);
-    if Binary then Continue;
-    Written := 0;
-    for i := 0 to Count - 1 do
-    begin
-      Value := ARaw[i];
-      if Value = TREE_HASH_BYTE_NUL then
+  {$IFDEF MSWINDOWS}
+  RawContext := Default(TSHA256Context);
+  NormalizedContext := Default(TSHA256Context);
+  try
+  {$ENDIF}
+    SHA256Init(RawContext);
+    SHA256Init(NormalizedContext);
+    RawSize := 0;
+    NormalizedSize := 0;
+    Binary := False;
+    HeldCR := False;
+    repeat
+      Count := AStream.Read(ARaw[0], TREE_DIGEST_CHUNK_BYTES);
+      if Count <= 0 then Break;
+      { FS.Size is never trusted: the length is what was read. }
+      SHA256Update(RawContext, ARaw[0], Count);
+      Inc(RawSize, Count);
+      if Binary then Continue;
+      Written := 0;
+      for i := 0 to Count - 1 do
       begin
-        { Binary: hashed verbatim; the normalized context is abandoned. }
-        Binary := True;
-        Break;
-      end;
-      if HeldCR then
-      begin
-        HeldCR := False;
-        { CRLF drops the CR; a lone CR is kept. }
-        if Value <> TREE_HASH_BYTE_LF then
+        Value := ARaw[i];
+        if Value = TREE_HASH_BYTE_NUL then
         begin
-          ANormalized[Written] := TREE_HASH_BYTE_CR;
+          { Binary: hashed verbatim; the normalized context is abandoned. }
+          Binary := True;
+          Break;
+        end;
+        if HeldCR then
+        begin
+          HeldCR := False;
+          { CRLF drops the CR; a lone CR is kept. }
+          if Value <> TREE_HASH_BYTE_LF then
+          begin
+            ANormalized[Written] := TREE_HASH_BYTE_CR;
+            Inc(Written);
+          end;
+        end;
+        if Value = TREE_HASH_BYTE_CR then
+          { Held until the next byte, possibly in the next chunk. }
+          HeldCR := True
+        else
+        begin
+          ANormalized[Written] := Value;
           Inc(Written);
         end;
       end;
-      if Value = TREE_HASH_BYTE_CR then
-        { Held until the next byte, possibly in the next chunk. }
-        HeldCR := True
-      else
+      if (not Binary) and (Written > 0) then
       begin
-        ANormalized[Written] := Value;
-        Inc(Written);
+        SHA256Update(NormalizedContext, ANormalized[0], Written);
+        Inc(NormalizedSize, Written);
       end;
-    end;
-    if (not Binary) and (Written > 0) then
+    until False;
+    if Binary then
     begin
-      SHA256Update(NormalizedContext, ANormalized[0], Written);
-      Inc(NormalizedSize, Written);
+      SHA256Final(RawContext, Result);
+      SHA256Final(NormalizedContext, NormalizedDigest);
+      ASize := RawSize;
+      Exit;
     end;
-  until False;
-  if Binary then
-  begin
-    SHA256Final(RawContext, Result);
-    SHA256Final(NormalizedContext, NormalizedDigest);
-    ASize := RawSize;
-    Exit;
+    if HeldCR then
+    begin
+      ANormalized[0] := TREE_HASH_BYTE_CR;
+      SHA256Update(NormalizedContext, ANormalized[0], 1);
+      Inc(NormalizedSize);
+    end;
+    SHA256Final(NormalizedContext, Result);
+    SHA256Final(RawContext, NormalizedDigest);
+    ASize := NormalizedSize;
+  {$IFDEF MSWINDOWS}
+  finally
+    SHA256Discard(NormalizedContext);
+    SHA256Discard(RawContext);
   end;
-  if HeldCR then
-  begin
-    ANormalized[0] := TREE_HASH_BYTE_CR;
-    SHA256Update(NormalizedContext, ANormalized[0], 1);
-    Inc(NormalizedSize);
-  end;
-  SHA256Final(NormalizedContext, Result);
-  SHA256Final(RawContext, NormalizedDigest);
-  ASize := NormalizedSize;
+  {$ENDIF}
 end;
 
 function TreeContentDigest(AStream: TStream; out ASize: Int64): TSHA256Digest;
@@ -3600,6 +3759,9 @@ var
 begin
   Entries := TStringList.Create;
   Files := TStringList.Create;
+  {$IFDEF MSWINDOWS}
+  Outer := Default(TSHA256Context);
+  {$ENDIF}
   try
     CollectTreeEntries(ADirectory, Entries);
     for i := 0 to Entries.Count - 1 do
@@ -3631,6 +3793,9 @@ begin
     SHA256Final(Outer, TreeDigest);
     Result := TREE_DIGEST_PREFIX + SHA256DigestHex(TreeDigest);
   finally
+    {$IFDEF MSWINDOWS}
+    SHA256Discard(Outer);
+    {$ENDIF}
     Files.Free;
     Entries.Free;
   end;
@@ -3670,6 +3835,16 @@ initialization
   InitCriticalSection(ProcessHandleSetupCriticalSection);
   {$IFDEF OBJECTSTORE_TESTING}
   InitCriticalSection(ProcessHandleSetupObservationCriticalSection);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  InitWindowsSHA256;
+
+finalization
+  if SHA256Module <> 0 then
+  begin
+    BCryptCloseAlgorithmProvider(SHA256Provider, 0);
+    Windows.FreeLibrary(SHA256Module);
+  end;
   {$ENDIF}
 
 end.

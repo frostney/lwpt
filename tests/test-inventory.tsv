@@ -47,7 +47,8 @@ program	*	source/LWPT.CompilerRegistry.Test.pas	1	11
 program	*	source/LWPT.Core.Test.pas	24	185
 program	linux/aarch64	source/LWPT.Core.Test.pas	24	188
 program	linux/x86_64	source/LWPT.Core.Test.pas	24	188
-program	windows/*	source/LWPT.Core.Test.pas	24	194
+program	windows/*	source/LWPT.Core.Test.pas	24	195
+program	windows/x86_64	source/LWPT.Core.Test.pas	24	196
 program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10
