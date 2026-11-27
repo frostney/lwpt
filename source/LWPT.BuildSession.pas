@@ -76,7 +76,9 @@ type
     FProgramJobs: TStringList;
     FProjectIdentity: string;
     FCleanupWarnings: TStringList;
+    FCompilerProbeCount: LongInt;
     function JobLogPath(const AName: string): string;
+    procedure WriteLog(const APath, AOutput: string);
     procedure WriteState(const AState: string);
     procedure PruneSupersededJobs;
     procedure ReleaseOwnerGuard;
@@ -95,6 +97,7 @@ type
     function JobLogReference(const AName: string): string;
     function SessionReference: string;
     procedure WriteJobLog(const AName, AOutput: string);
+    procedure WriteCompilerProbeLog(const ARecord: string);
     procedure Finish(ASuccess: Boolean; const ADetail: string = '');
     { Superseded staging this session could not remove when it finished,
       one line each, for the command to report. Empty on a clean sweep. }
@@ -2638,23 +2641,42 @@ begin
     Result := FSessionRoot;
 end;
 
-procedure TLWPTBuildSession.WriteJobLog(const AName, AOutput: string);
+procedure TLWPTBuildSession.WriteLog(const APath, AOutput: string);
 var
-  LogPath: string;
+  LogDirectory: string;
   Bytes: TBytes;
 begin
-  LogPath := JobLogPath(AName);
-  if not LongPathForceDirectories(ExtractFileDir(LogPath)) then
+  LogDirectory := ExtractFileDir(APath);
+  if not LongPathForceDirectories(LogDirectory)
+    and not LongPathDirectoryExists(LogDirectory) then
     raise ELWPTError.CreateFmt('could not create session log directory %s',
-      [ExtractFileDir(LogPath)]);
+      [LogDirectory]);
   { Committed-path write goes through the atomic helper (staged under the
     session root, atomic rename) — never a raw TFileStream — so an
-    interrupted write cannot leave a truncated log behind JobLogReference.
+    interrupted write cannot leave a truncated log.
     Byte-exact copy: the captured output must not be re-encoded. }
   SetLength(Bytes, Length(AOutput));
   if Length(AOutput) > 0 then
     Move(AOutput[1], Bytes[0], Length(AOutput));
-  AtomicWriteBytes(LogPath, FSessionRoot, Bytes);
+  AtomicWriteBytes(APath, FSessionRoot, Bytes);
+end;
+
+procedure TLWPTBuildSession.WriteJobLog(const AName, AOutput: string);
+begin
+  WriteLog(JobLogPath(AName), AOutput);
+end;
+
+procedure TLWPTBuildSession.WriteCompilerProbeLog(const ARecord: string);
+var
+  Index: LongInt;
+begin
+  Index := InterlockedIncrement(FCompilerProbeCount);
+  try
+    WriteLog(FSessionRoot + ObservabilityLogsDirectory + 'probes/'
+      + IntToStr(Index) + ObservabilityLogExtension, ARecord);
+  except
+    { Auxiliary diagnostics must preserve the probe's result and exception. }
+  end;
 end;
 
 { A job unit is what a later session supersedes: one build job's directory
