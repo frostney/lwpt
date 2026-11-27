@@ -40,6 +40,11 @@ const
   ChildMilliseconds = 120000;
   PollMilliseconds = 10;
   NoMarker = '-';
+  { Explicit times keep the time rule out of every check below: the input
+    two whole seconds older than the output is older at any timestamp
+    precision, so only the run record decides whether a run is skipped. }
+  OutputStampSeconds = 1700000000;
+  InputStampSeconds = OutputStampSeconds - 2;
 
 type
   TChild = class
@@ -61,6 +66,7 @@ type
   private
     FScratch, FProject, FControl, FWorkerState: string;
     procedure WriteProject(const ABody: string);
+    procedure DateInputBeforeOutput;
     function ReadOutput: string;
     function RunCount: Integer;
     function ChildEnvironment(const ARole: string): TStringArray;
@@ -310,6 +316,13 @@ begin
   WriteWholeFile(FProject + '/in.txt', 'v1');
 end;
 
+{ Dates the input older than the output, as an untouched checkout would. }
+procedure THookRunOverlap.DateInputBeforeOutput;
+begin
+  SetFileModificationTime(FProject + '/in.txt', InputStampSeconds, 0);
+  SetFileModificationTime(FProject + '/out.txt', OutputStampSeconds, 0);
+end;
+
 function THookRunOverlap.ReadOutput: string;
 begin
   if not FileExists(FProject + '/out.txt') then Exit('');
@@ -400,9 +413,10 @@ begin
     Second.Free;
     First.Free;
   end;
-  { The interleaving happened: v1's output is newer than the v2 input. }
+  { The interleaving happened: the output is v1's, the input v2. }
   Expect<string>(ReadOutput).ToBe('generated from v1');
   Expect<Integer>(RunCount).ToBe(2);
+  DateInputBeforeOutput;
 
   Third := RunLwpt(['run', 'gen'], FProject, ChildEnvironment(''));
   DumpRunFailure('third run', Third, 0);
@@ -440,6 +454,7 @@ begin
   Expect<Integer>(Run.ExitCode).ToBe(0);
   Expect<string>(ReadOutput).ToBe('generated from v1');
   Expect<Integer>(RunCount).ToBe(1);
+  DateInputBeforeOutput;
 
   Run := RunLwpt(['run', 'outer'], FProject, ChildEnvironment(''),
     ChildMilliseconds);

@@ -22,7 +22,9 @@
 
   A run exports its marker ID, after those of the runs it is nested in, to
   its command's environment. A nested LWPT run for the same output is part
-  of its ancestor's run: neither flags the other. }
+  of its ancestor's run: neither flags the other, and the nested run keeps
+  no record while that ancestor still runs, because the ancestor's command
+  may write the output after it. The ancestor's own record covers both. }
 unit LWPT.HookRuns;
 
 {$I Shared.inc}
@@ -53,7 +55,7 @@ type
     FDirectory, FGuardPath, FId, FMarkerPath: string;
     FAncestors: TStringList;
     FOwner: TObject;
-    FOverlapped, FFinished, FRegistered: Boolean;
+    FOverlapped, FNested, FFinished, FRegistered: Boolean;
     function IsAncestor(const AId: string): Boolean;
     procedure Register;
     procedure Release;
@@ -62,9 +64,11 @@ type
     constructor Create(const ADirectory, AGuardPath,
       AAncestors: string); overload;
     destructor Destroy; override;
-    { True when no other run of this output overlapped this one, apart from
-      its ancestors and descendants. Never raises: a failure counts as an
-      overlap, which only keeps the output stale. }
+    { True when this run may be recorded: no other run of this output
+      overlapped it, apart from its ancestors and descendants, and no
+      ancestor run of this output was still running when it registered.
+      Never raises: a failure counts as an overlap, which only keeps the
+      output stale. }
     function Finish: Boolean;
     { NAME=value for the command's environment. }
     function ChildEnvironment: string;
@@ -213,6 +217,16 @@ var
   Name, OtherId, OtherMarker: string;
   i: Integer;
 begin
+  { The short lock writes to its file, so neither it nor the directory
+    holding it may lead elsewhere. }
+  if IsDirSymlinkOrJunction(ExtractFileDir(FGuardPath))
+     or IsDirSymlinkOrJunction(FGuardPath) then
+    raise ELWPTError.CreateFmt('hook run state must not be a link: %s',
+      [FGuardPath]);
+  if not ForceDirectories(ExtractFileDir(FGuardPath))
+     and not DirectoryExists(ExtractFileDir(FGuardPath)) then
+    raise ELWPTError.CreateFmt('could not create hook run directory %s',
+      [ExtractFileDir(FGuardPath)]);
   Guard := AcquireShortLock(FGuardPath);
   try
     if IsDirSymlinkOrJunction(FDirectory) then
@@ -224,8 +238,13 @@ begin
         [FDirectory]);
     Entries := TStringList.Create;
     try
-      if FindFirst(FDirectory + '/*', faAnyFile or faSymLink, Search) = 0
+      { A directory lists at least its own '.' entry, so a failure here is
+        a listing that did not happen. A run that cannot see the others
+        must not run unseen. }
+      if FindFirst(FDirectory + '/*', faAnyFile or faSymLink, Search) <> 0
       then
+        raise ELWPTError.CreateFmt('could not list hook run directory %s',
+          [FDirectory]);
       try
         repeat
           { A link is never probed: the probe opens what it names. }
@@ -246,7 +265,9 @@ begin
           OtherMarker := FDirectory + '/' + Name;
           if IsLocalMarker(OtherMarker) or OwnerGuardHeld(OtherMarker) then
           begin
-            if not IsAncestor(OtherId) then
+            if IsAncestor(OtherId) then
+              FNested := True
+            else
             begin
               FOverlapped := True;
               CreateFlag(FDirectory + '/' + OtherId + OVERLAP_EXTENSION);
@@ -299,7 +320,8 @@ begin
   try
     Guard := AcquireShortLock(FGuardPath);
     try
-      Result := not FOverlapped and not FileExists(OverlapPath);
+      Result := not FOverlapped and not FNested
+        and not FileExists(OverlapPath);
       Release;
       RemoveState(FMarkerPath);
       RemoveState(OverlapPath);

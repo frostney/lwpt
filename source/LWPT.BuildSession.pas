@@ -208,6 +208,11 @@ function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
 procedure EnsureCompilerPathBudget(const AUnitDirectory,
   AExecutableDirectory: string; ALongestBaseNameLength: Integer);
 function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
+{ The identity of the file at AOutput that every spelling of it shares: its
+  parent directory's filesystem identity and its name, folded to lower case
+  where the filesystem usually ignores case. Creates the parent directory,
+  so the identity stays the same once the file exists. }
+function BuildOutputIdentity(const AOutput: string): string;
 { Take the project's build-coordination lock, the session-root ledger lock
   that every build's publication already shares across processes, threads
   and relocated session roots, for a short project-wide critical section.
@@ -2926,7 +2931,7 @@ begin
   end;
 end;
 
-function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
+function BuildOutputIdentity(const AOutput: string): string;
 var
   OutputIdentity, ParentPath, ParentIdentity, OutputName: string;
 begin
@@ -2944,9 +2949,14 @@ begin
   {$IFDEF DARWIN}
   OutputName := LowerCase(OutputName);
   {$ENDIF}
+  Result := ParentIdentity + '/' + OutputName;
+end;
+
+function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
+begin
   Result := ExcludeTrailingPathDelimiter(ASessionsRoot)
-    + '/locks/' + Copy(TextHash(ParentIdentity + '/' + OutputName),
-      8, 64) + '.lock';
+    + '/locks/' + Copy(TextHash(BuildOutputIdentity(AOutput)), 8, 64)
+    + '.lock';
 end;
 
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,

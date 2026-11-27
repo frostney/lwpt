@@ -464,16 +464,22 @@ begin
   Result := HookRunStatePrefix(AHook, AProjectRoot) + '.record';
 end;
 
-{ The output's in-flight runs live beside its record, in <key>.runs/,
-  registered under the short lock <key>.lock (see LWPT.HookRuns). }
+{ The output's in-flight runs live in hook-runs/active/<key>.runs/,
+  registered under the short lock <key>.lock (see LWPT.HookRuns). Unlike the
+  record's key, which follows the declared spelling, this key follows the
+  file itself, so hooks that spell one output differently (out.inc,
+  ./out.inc) see each other's runs. }
 function BeginHookRun(const AHook: THook;
   const AProjectRoot: string): TLWPTHookRun;
 var
-  Prefix: string;
+  Key, Prefix: string;
 begin
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
     or AHook.SessionPrivateOutput then Exit(nil);
-  Prefix := HookRunStatePrefix(AHook, AProjectRoot);
+  Key := HookTextDigest(BuildOutputIdentity(
+    ResolveProjectPath(AProjectRoot, AHook.Output)));
+  Prefix := ResolveProjectPath(AProjectRoot, HOOK_RUN_RECORD_DIR)
+    + '/active/' + Copy(Key, Length('sha256:') + 1, 32);
   Result := TLWPTHookRun.Create(Prefix + '.runs', Prefix + '.lock');
 end;
 

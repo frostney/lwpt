@@ -75,6 +75,7 @@ type
     procedure TestRegisteredRunIsRecorded;
     procedure TestOverlappedRunIsNotRecorded;
     procedure TestUnrecordedHooksRegisterNoRun;
+    procedure TestEquivalentOutputSpellingsShareRuns;
     {$IFDEF UNIX}
     procedure TestFifoInputIsStaleWithoutBlocking;
     {$ENDIF}
@@ -339,7 +340,8 @@ var
   Hook: THook;
   InputDigest, Runs: string;
   Run: TLWPTHookRun;
-  Search: TSearchRec;
+  Search, Entry: TSearchRec;
+  RunsDirectories: Integer;
 begin
   Hook := GatedHook(['lwpt.toml']);
   WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
@@ -355,10 +357,54 @@ begin
     Run.Free;
   end;
   Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
-  Runs := IncludeTrailingPathDelimiter(FRoot) + '.lwpt/sessions/hook-runs';
-  Expect<Boolean>(FindFirst(Runs + '/*.runs/*.*', faAnyFile, Search) = 0)
-    .ToBe(False);
-  FindClose(Search);
+  { Every runs directory is empty again, apart from its own entries. }
+  Runs := IncludeTrailingPathDelimiter(FRoot)
+    + '.lwpt/sessions/hook-runs/active';
+  RunsDirectories := 0;
+  if FindFirst(Runs + '/*.runs', faDirectory, Search) = 0 then
+  try
+    repeat
+      if (Search.Attr and faDirectory) = 0 then Continue;
+      Inc(RunsDirectories);
+      if FindFirst(Runs + '/' + Search.Name + '/*', faAnyFile, Entry) = 0
+      then
+      try
+        repeat
+          if (Entry.Name <> '.') and (Entry.Name <> '..') then
+            Expect<string>(Entry.Name).ToBe('');
+        until FindNext(Entry) <> 0;
+      finally
+        FindClose(Entry);
+      end;
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+  Expect<Integer>(RunsDirectories).ToBe(1);
+end;
+
+{ The record follows the declared spelling, but the runs follow the file:
+  two hooks that spell one output differently see each other's runs. }
+procedure THookStalenessTests.TestEquivalentOutputSpellingsShareRuns;
+var
+  Plain, Dotted: THook;
+  First, Second: TLWPTHookRun;
+begin
+  Plain := GatedHook(['lwpt.toml']);
+  Dotted := GatedHook(['lwpt.toml']);
+  Dotted.Output := './' + OutputName;
+  First := BeginHookRun(Plain, FRoot);
+  try
+    Second := BeginHookRun(Dotted, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
 end;
 
 { A second run of the same output registers while the first is still
@@ -569,6 +615,8 @@ begin
     TestOverlappedRunIsNotRecorded);
   Test('ungated and session-private hooks register no run',
     TestUnrecordedHooksRegisterNoRun);
+  Test('equivalent spellings of one output share its runs',
+    TestEquivalentOutputSpellingsShareRuns);
   {$IFDEF UNIX}
   Test('a matched FIFO is stale, unhashed and never blocks the gate',
     TestFifoInputIsStaleWithoutBlocking);

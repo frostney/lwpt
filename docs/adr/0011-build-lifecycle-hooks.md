@@ -181,9 +181,14 @@ record, so the output stays stale and the next invocation runs it again.
 Every overlapping pair meets this way, because the later run registers
 while the earlier run's marker is live. A run's command receives the IDs of
 its enclosing runs in `LWPT_HOOK_RUN_ANCESTORS`, so a nested LWPT run for
-the same output and its ancestor do not flag each other. Because no run
+the same output and its ancestor do not flag each other; the nested run
+keeps no record while that ancestor still runs, since the ancestor's
+command may write the output after it. Runs are matched by the output
+file's identity (its parent directory's filesystem identity and its name),
+not by its declared spelling. Because no run
 waits for another, the deadlocks that ruled out a per-output lock across
 the command, a nested delegation and a build holding the only worker,
 cannot occur. A run that cannot register fails rather than run unseen by
-the others. If the LWPT process is killed while its command keeps running,
+the others, and so does one that cannot list the other runs or whose
+coordination state is a link. If the LWPT process is killed while its command keeps running,
 its marker dies with it, and other runs no longer see that command.

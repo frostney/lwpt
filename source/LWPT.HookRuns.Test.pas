@@ -47,6 +47,8 @@ type
     procedure TestUnfinishedRunLeavesNoMarker;
     {$IFDEF UNIX}
     procedure TestLinkedMarkerIsRemovedUnprobed;
+    procedure TestLinkedLockIsRefused;
+    procedure TestUnlistableDirectoryIsRefused;
     {$ENDIF}
   end;
 
@@ -158,6 +160,8 @@ begin
   end;
 end;
 
+{ Nested runs do not flag their ancestor, and while it runs they keep no
+  record: its command may still write the output after them. }
 procedure THookRunTests.TestAncestorDoesNotOverlap;
 var
   Parent, Child, Grandchild: TLWPTHookRun;
@@ -175,17 +179,24 @@ begin
       Grandchild := TLWPTHookRun.Create(FRuns, FGuard,
         Parent.Id + ',' + Child.Id);
       try
-        Expect<Boolean>(Grandchild.Finish).ToBe(True);
+        Expect<Boolean>(Grandchild.Finish).ToBe(False);
       finally
         Grandchild.Free;
       end;
-      Expect<Boolean>(Child.Finish).ToBe(True);
+      Expect<Boolean>(Child.Finish).ToBe(False);
     finally
       Child.Free;
     end;
     Expect<Boolean>(Parent.Finish).ToBe(True);
   finally
     Parent.Free;
+  end;
+  { An ancestor that has finished no longer holds a nested run back. }
+  Child := TLWPTHookRun.Create(FRuns, FGuard, Ancestry);
+  try
+    Expect<Boolean>(Child.Finish).ToBe(True);
+  finally
+    Child.Free;
   end;
 end;
 
@@ -271,10 +282,13 @@ begin
       finally
         Run.Free;
       end;
-      { The holder as an ancestor overlaps nothing. }
+      { With the holder as its ancestor, a run flags nothing, and keeps no
+        record while the holder runs. }
+      DeleteFile(FRuns + '/7-8-9.overlapped');
       Run := TLWPTHookRun.Create(FRuns, FGuard, '7-8-9');
       try
-        Expect<Boolean>(Run.Finish).ToBe(True);
+        Expect<Boolean>(FileExists(FRuns + '/7-8-9.overlapped')).ToBe(False);
+        Expect<Boolean>(Run.Finish).ToBe(False);
       finally
         Run.Free;
       end;
@@ -328,6 +342,49 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF UNIX}
+{ The short lock writes its holder's PID into its file, so a lock path that
+  is a link is refused before anything is written through it. }
+procedure THookRunTests.TestLinkedLockIsRefused;
+var
+  Target: string;
+  Refused: Boolean;
+begin
+  Target := FRoot + '/target';
+  WriteTextFile(Target, 'kept');
+  Expect<Integer>(FpSymlink(PChar(Target), PChar(FGuard))).ToBe(0);
+  Refused := False;
+  try
+    TLWPTHookRun.Create(FRuns, FGuard, '').Free;
+  except
+    on E: ELWPTError do Refused := True;
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+  Expect<string>(Trim(ReadBinaryFile(Target))).ToBe('kept');
+end;
+
+{ A directory that can be written but not listed would hide the other
+  runs, so registration fails rather than run unseen. }
+procedure THookRunTests.TestUnlistableDirectoryIsRefused;
+var
+  Refused: Boolean;
+begin
+  ForceDirectories(FRuns);
+  Expect<Integer>(FpChmod(PChar(FRuns), &300)).ToBe(0);
+  Refused := False;
+  try
+    try
+      TLWPTHookRun.Create(FRuns, FGuard, '').Free;
+    except
+      on E: ELWPTError do Refused := True;
+    end;
+  finally
+    FpChmod(PChar(FRuns), &700);
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+end;
+{$ENDIF}
+
 procedure THookRunTests.SetupTests;
 begin
   Test('a run that overlaps no other may record', TestSoleRunMayRecord);
@@ -335,7 +392,7 @@ begin
     TestOverlappingRunsMayNotRecord);
   Test('a later run flags an earlier run that is still going',
     TestLaterRunFlagsEarlierRun);
-  Test('an ancestor run does not overlap its nested runs',
+  Test('nested runs flag no ancestor and record only after it finished',
     TestAncestorDoesNotOverlap);
   Test('malformed ancestor IDs are ignored',
     TestMalformedAncestorsAreIgnored);
@@ -346,6 +403,14 @@ begin
   {$IFDEF UNIX}
   Test('a linked marker is removed without being probed',
     TestLinkedMarkerIsRemovedUnprobed);
+  Test('a linked lock path is refused', TestLinkedLockIsRefused);
+  { Permission bits do not restrict the superuser. }
+  if FpGetEUID = 0 then
+    Skip('a directory that cannot be listed is refused',
+      TestUnlistableDirectoryIsRefused, 'running as the superuser')
+  else
+    Test('a directory that cannot be listed is refused',
+      TestUnlistableDirectoryIsRefused);
   {$ENDIF}
 end;
 
