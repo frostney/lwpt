@@ -2205,17 +2205,19 @@ begin
       CompilerSelection := TLWPTCompilerSelection.Create(Man, ProjectRoot,
         ACompilerHost);
       CompilerDriver := CompilerSelection.DriverFor('');
-      TestTarget := CompilerDriver.DefaultTarget;
-      if not TestTargetIsHost(TestTarget) then
-        raise ELWPTError.CreateFmt(
-          'generic test runner requires a host artifact; selected compiler '
-          + 'target is "%s/%s" but host is "%s/%s"',
-          [TestTarget.OS, TestTarget.Architecture, Platform.GetBuildOS,
-           Platform.GetBuildArch]);
       Session := TLWPTBuildSession.Create(ProjectRoot,
         ResolveBuildSessionsRoot(ProjectRoot, ResolveSessionsDir(Man),
           GetCurrentDir));
       try
+        if not AInventory then
+          CompilerDriver.ProbeLogger := Session.WriteCompilerProbeLog;
+        TestTarget := CompilerDriver.DefaultTarget;
+        if not TestTargetIsHost(TestTarget) then
+          raise ELWPTError.CreateFmt(
+            'generic test runner requires a host artifact; selected compiler '
+            + 'target is "%s/%s" but host is "%s/%s"',
+            [TestTarget.OS, TestTarget.Architecture, Platform.GetBuildOS,
+             Platform.GetBuildArch]);
         if not AInventory then
         begin
           WriteLn('test session: ', Session.SessionID, ' (',

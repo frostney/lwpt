@@ -13,6 +13,11 @@ program LWPT.Core.Test;
 {$mode delphi}{$H+}
 {$modeswitch nestedcomments+}
 
+{$IF DEFINED(LINUX) AND DEFINED(ENDIAN_LITTLE) AND
+  (DEFINED(CPUAARCH64) OR DEFINED(CPUX86_64))}
+  {$DEFINE TEST_SHA256_INSTRUCTIONS}
+{$ENDIF}
+
 uses
   {$IFDEF UNIX}
   cthreads,
@@ -53,6 +58,12 @@ type
     {$IFDEF CPU64}
     procedure TestUpdateOverWindowsCountLimit;
     {$ENDIF}
+    {$ENDIF}
+    procedure TestLongLength;
+    {$IFDEF TEST_SHA256_INSTRUCTIONS}
+    procedure TestInstructionDispatch;
+    procedure TestForcedPortableVectors;
+    procedure TestVariedStreamingUpdates;
     {$ENDIF}
   end;
 
@@ -771,6 +782,137 @@ end;
 {$ENDIF}
 {$ENDIF}
 
+procedure TSHA256NISTVectors.TestLongLength;
+const
+  EXPECTED = '3c9b75a36d169a01e7de8f7892f948dbc31147fd84a3538e195190e2f21c8507';
+var
+  Context: TSHA256Context;
+  Digest: TSHA256Digest;
+  Bytes: array[0..65535] of Byte;
+  Chunk: Integer;
+begin
+  { 4 GiB plus 19 zero bytes. Feed it incrementally to check the length
+    counter and final padding with bounded memory, including on 32-bit. }
+  FillChar(Bytes, SizeOf(Bytes), 0);
+  SHA256Init(Context);
+  for Chunk := 1 to 65536 do
+    SHA256Update(Context, Bytes[0], SizeOf(Bytes));
+  SHA256Update(Context, Bytes[0], 19);
+  SHA256Final(Context, Digest);
+  Expect<string>(SHA256DigestHex(Digest)).ToBe(EXPECTED);
+end;
+
+{$IFDEF TEST_SHA256_INSTRUCTIONS}
+function LinuxReportsSHA256Instructions: Boolean;
+var
+  CPUInfo: TextFile;
+  Line, Features: string;
+  Delimiter: SizeInt;
+begin
+  { Cross-check LWPT's CPUID or auxiliary-vector probe with the kernel's
+    documented /proc feature names. In a chroot without procfs, the
+    capability can still be exercised by the digest comparison below. }
+  if not FileExists('/proc/cpuinfo') then
+    Exit(False);
+  AssignFile(CPUInfo, '/proc/cpuinfo');
+  Reset(CPUInfo);
+  try
+    while not EOF(CPUInfo) do
+    begin
+      ReadLn(CPUInfo, Line);
+      Delimiter := Pos(':', Line);
+      Features := ' ' + Trim(Copy(Line, Delimiter + 1, MaxInt)) + ' ';
+      {$IFDEF CPUAARCH64}
+      if Trim(Copy(Line, 1, Delimiter - 1)) = 'Features' then
+        Exit(Pos(' sha2 ', Features) > 0);
+      {$ELSE}
+      if Trim(Copy(Line, 1, Delimiter - 1)) = 'flags' then
+        Exit((Pos(' sha_ni ', Features) > 0) and
+          (Pos(' ssse3 ', Features) > 0) and (Pos(' sse4_1 ', Features) > 0));
+      {$ENDIF}
+    end;
+    Result := False;
+  finally
+    CloseFile(CPUInfo);
+  end;
+end;
+
+procedure TSHA256NISTVectors.TestInstructionDispatch;
+var
+  BeforeCount: SizeInt;
+begin
+  BeforeCount := SHA256InstructionBlocks;
+  TestAbc;
+  if LinuxReportsSHA256Instructions then
+    Expect<SizeInt>(SHA256InstructionBlocks - BeforeCount).ToBe(1);
+end;
+
+procedure TSHA256NISTVectors.TestForcedPortableVectors;
+var
+  BeforeCount: SizeInt;
+begin
+  BeforeCount := SHA256InstructionBlocks;
+  SHA256ForcePortable := True;
+  try
+    TestEmptyString;
+    TestAbc;
+    TestExactlyOneBlock;
+    TestSpansTwoBlocks;
+    TestLongLength;
+    Expect<SizeInt>(SHA256InstructionBlocks - BeforeCount).ToBe(0);
+  finally
+    SHA256ForcePortable := False;
+  end;
+end;
+
+procedure TSHA256NISTVectors.TestVariedStreamingUpdates;
+var
+  Context: TSHA256Context;
+  Digest: TSHA256Digest;
+  Bytes: TBytes;
+  Expected: string;
+  Sample, Index, Offset, Take: Integer;
+  Seed: Cardinal;
+
+  function NextRandom(const AUpperBound: Cardinal): Cardinal;
+  begin
+    Seed := Seed xor (Seed shl 13);
+    Seed := Seed xor (Seed shr 17);
+    Seed := Seed xor (Seed shl 5);
+    Result := Seed mod AUpperBound;
+  end;
+
+begin
+  Seed := $e551f96c;
+  for Sample := 0 to 511 do
+  begin
+    if Sample < 256 then SetLength(Bytes, Sample)
+    else SetLength(Bytes, NextRandom(65537));
+    for Index := 0 to High(Bytes) do
+      Bytes[Index] := Byte(NextRandom(256));
+
+    SHA256ForcePortable := True;
+    try
+      Expected := SHA256Hex(Bytes);
+    finally
+      SHA256ForcePortable := False;
+    end;
+
+    SHA256Init(Context);
+    Offset := 0;
+    while Offset < Length(Bytes) do
+    begin
+      Take := 1 + NextRandom(257);
+      if Take > Length(Bytes) - Offset then Take := Length(Bytes) - Offset;
+      SHA256Update(Context, Bytes[Offset], Take);
+      Inc(Offset, Take);
+    end;
+    SHA256Final(Context, Digest);
+    Expect<string>(SHA256DigestHex(Digest)).ToBe(Expected);
+  end;
+end;
+{$ENDIF}
+
 procedure TSHA256NISTVectors.SetupTests;
 begin
   Test('empty string vector',                  TestEmptyString);
@@ -784,6 +926,12 @@ begin
   Test('an incremental update crosses the Windows hash count limit',
     TestUpdateOverWindowsCountLimit);
   {$ENDIF}
+  {$ENDIF}
+  Test('length exceeds 4 GiB', TestLongLength);
+  {$IFDEF TEST_SHA256_INSTRUCTIONS}
+  Test('a capable CPU handles a complete SHA-256 block', TestInstructionDispatch);
+  Test('known answers with forced portable compression', TestForcedPortableVectors);
+  Test('varied streaming updates match the portable digest', TestVariedStreamingUpdates);
   {$ENDIF}
 end;
 

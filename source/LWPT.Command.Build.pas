@@ -1689,6 +1689,9 @@ begin
     ResolveBuildSessionsRoot(ProjectRoot, ResolveSessionsDir(Man),
       GetCurrentDir));
   try
+    for i := 0 to High(EntryDrivers) do
+      if Assigned(EntryDrivers[i]) then
+        EntryDrivers[i].ProbeLogger := Session.WriteCompilerProbeLog;
     Reporter := TLWPTProgressReporter.Create(Session, lpsBuild, AVerbose);
     if AVerbose then
       WriteLn('build session: ', Session.SessionID, ' (',

@@ -27,6 +27,7 @@ uses
   {$IFDEF MSWINDOWS}
   WinSock2,
   {$ENDIF}
+  Process,
   base64,
   HTTPClient,
   TestingPascalLibrary,
@@ -90,6 +91,10 @@ const
   STEP_TIMEOUT_MILLISECONDS = 10000;
   SERVER_JOIN_MILLISECONDS = 15000;
   RECEIVE_CHUNK_SIZE = 4096;
+  FAILED_SERVER_CONSTRUCTION_PROBE = '--failed-server-construction-probe';
+  IDENTITY_OPEN_FAILURE_EXIT_CODE = 1;
+  FAILED_SERVER_CONSTRUCTION_TIMEOUT_MILLISECONDS = 5000;
+  CHILD_CLEANUP_TIMEOUT_MILLISECONDS = 2000;
 
 type
   TServedConnection = record
@@ -108,6 +113,7 @@ type
     FResponses: array of AnsiString;
     FResults: array of TServedConnection;
     FServed: Integer;
+    FStarted: Boolean;
     procedure Flush(const ASocket: TSocket;
       var AConnection: TTransportSecurityConnection);
     function Receive(const ASocket: TSocket;
@@ -131,6 +137,7 @@ type
   TTransportSecurityClientOptionsE2ETests = class(TTestSuite)
   public
     procedure SetupTests; override;
+    procedure TestFailedServerConstructionReportsError;
     procedure TestAnchorsOnlyVerifiesConfiguredCA;
     procedure TestAnchorsOnlyRejectsUnrelatedCA;
     procedure TestAnchorsOnlyNeverFetchesUnreachableURLs;
@@ -454,9 +461,9 @@ constructor TLoopbackTLSServer.Create(const APkcs12Path: string;
 var
   I: Integer;
 begin
+  FListenSocket := INVALID_TEST_SOCKET;
   inherited Create(True);
   FreeOnTerminate := False;
-  FListenSocket := INVALID_TEST_SOCKET;
   FClientAnchors := nil;
   if ARequireClientCertificate then
     FClientAnchors := LoadFileBytes(CLIENT_ROOT_PATH);
@@ -466,19 +473,19 @@ begin
   SetLength(FResults, Length(AResponses));
   FContext := TTransportSecurityServerContext.Create(
     LoadFileBytes(APkcs12Path), PKCS12_PASSPHRASE, AValidation);
-  try
-    FListenSocket := CreateLoopbackListener(FPort);
-  except
-    CloseTransportSecurityServerContext(FContext);
-    raise;
-  end;
+  FListenSocket := CreateLoopbackListener(FPort);
   Start;
+  FStarted := True;
 end;
 
 destructor TLoopbackTLSServer.Destroy;
 begin
-  Terminate;
-  WaitFor;
+  { TThread.Destroy handles a worker still suspended at construction. }
+  if FStarted then
+  begin
+    Terminate;
+    WaitFor;
+  end;
   CloseTestSocket(FListenSocket);
   CloseTransportSecurityServerContext(FContext);
   inherited Destroy;
@@ -1576,8 +1583,73 @@ begin
   end;
 end;
 
+procedure RunFailedServerConstructionProbe;
+begin
+  try
+    { The empty path fails while opening the identity, after the suspended
+      worker was created and before it can start. }
+    TLoopbackTLSServer.Create('', tsivStrict, [OK_RESPONSE]).Free;
+  except
+    on E: EFOpenError do
+    begin
+      WriteLn(ErrOutput, E.ClassName, ': ', E.Message);
+      ExitCode := IDENTITY_OPEN_FAILURE_EXIT_CODE;
+    end;
+  end;
+end;
+
+{$IFDEF MSWINDOWS}
+function TerminateChildHandle(AProcess: THandle;
+  AExitCode: LongWord): LongBool; stdcall;
+  external 'kernel32.dll' name 'TerminateProcess';
+{$ENDIF}
+
+function ChildExitedWithin(AChild: TProcess;
+  const ATimeoutMilliseconds: QWord): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while AChild.Running and
+        (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
+    Sleep(10);
+  Result := not AChild.Running;
+end;
+
+procedure TTransportSecurityClientOptionsE2ETests.
+  TestFailedServerConstructionReportsError;
+var
+  Child: TProcess;
+begin
+  Child := TProcess.Create(nil);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    Child.Parameters.Add(FAILED_SERVER_CONSTRUCTION_PROBE);
+    Child.Execute;
+    if not ChildExitedWithin(Child,
+      FAILED_SERVER_CONSTRUCTION_TIMEOUT_MILLISECONDS) then
+    begin
+      {$IFDEF UNIX}
+      FpKill(Child.ProcessID, SIGKILL);
+      {$ENDIF}
+      {$IFDEF MSWINDOWS}
+      TerminateChildHandle(Child.ProcessHandle, 1);
+      {$ENDIF}
+      if not ChildExitedWithin(Child, CHILD_CLEANUP_TIMEOUT_MILLISECONDS) then
+        raise Exception.Create('Failed to stop the TLS fixture probe child');
+      raise Exception.CreateFmt('TLS fixture probe exceeded its %d ms deadline',
+        [FAILED_SERVER_CONSTRUCTION_TIMEOUT_MILLISECONDS]);
+    end;
+    Expect<Integer>(Child.ExitCode).ToBe(IDENTITY_OPEN_FAILURE_EXIT_CODE);
+  finally
+    Child.Free;
+  end;
+end;
+
 procedure TTransportSecurityClientOptionsE2ETests.SetupTests;
 begin
+  Test('a failed loopback server constructor reports its identity open error',
+    TestFailedServerConstructionReportsError);
   Test('anchors-only trust verifies a server issued by the configured CA',
     TestAnchorsOnlyVerifiesConfiguredCA);
   Test('anchors-only trust rejects an unrelated CA as a verification failure',
@@ -1665,6 +1737,11 @@ begin
   if WinSock2.WSAStartup($0202, WSAData) <> 0 then
     raise Exception.Create('WSAStartup failed');
   {$ENDIF}
+  if (ParamCount = 1) and (ParamStr(1) = FAILED_SERVER_CONSTRUCTION_PROBE) then
+  begin
+    RunFailedServerConstructionProbe;
+    Exit;
+  end;
   TestRunnerProgram.AddSuite(TTransportSecurityClientOptionsE2ETests.Create(
     'TransportSecurity: client options E2E'));
   TestRunnerProgram.Run;

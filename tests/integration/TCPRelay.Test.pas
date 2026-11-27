@@ -20,6 +20,7 @@ uses
   SysUtils,
 
   TestingPascalLibrary,
+  Tests.ProcessSupport,
   Tests.RegistryHTTP,
   Tests.RegistryServer,
   Tests.TCPRelay;
@@ -29,11 +30,17 @@ const
     without a route, fails at once). }
   UNROUTED_HOST = '192.0.2.1';
   TEARDOWN_BOUND_MILLISECONDS = 2000;
+  FAILED_LISTENER_PROBE = '--failed-listener-probe';
+  FAILED_LISTENER_TIMEOUT_MILLISECONDS = 5000;
 
 type
   TTCPRelayTests = class(TTestSuite)
+  private
+    procedure CheckFailedListenerConstruction(const AFixture: string);
   public
     procedure SetupTests; override;
+    procedure TestFailedRelayConstructionReportsError;
+    procedure TestFailedFlooderConstructionReportsError;
     procedure TestRelaysAndCountsConnections;
     procedure TestIdleTeardownNeedsNoWakeConnection;
     procedure TestTeardownDuringAStalledBackendConnection;
@@ -49,10 +56,14 @@ type
   private
     FListen, FClient: TSocket;
     FPort: Word;
+    FStarted: Boolean;
+    {$IFDEF MSWINDOWS}
+    FWinSockStarted: Boolean;
+    {$ENDIF}
   protected
     procedure Execute; override;
   public
-    constructor Create;
+    constructor Create(const AListenPort: Word = 0);
     destructor Destroy; override;
     property Port: Word read FPort;
   end;
@@ -256,7 +267,7 @@ begin
   {$ENDIF}
 end;
 
-constructor TFlooder.Create;
+constructor TFlooder.Create(const AListenPort: Word);
 var
   Address: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
   Length_: {$IFDEF UNIX}TSockLen{$ELSE}LongInt{$ENDIF};
@@ -265,15 +276,21 @@ var
   {$ENDIF}
 begin
   FreeOnTerminate := False;
+  {$IFDEF UNIX}
+  FClient := -1;
+  {$ELSE}
+  FClient := INVALID_SOCKET;
+  {$ENDIF}
+  FListen := FClient;
+  inherited Create(True);
   {$IFDEF MSWINDOWS}
   if WSAStartup($0202, Data) <> 0 then
     raise Exception.Create('flooder WSAStartup failed');
+  FWinSockStarted := True;
   {$ENDIF}
   {$IFDEF UNIX}
-  FClient := -1;
   FListen := fpSocket(AF_INET, SOCK_STREAM, 0);
   {$ELSE}
-  FClient := INVALID_SOCKET;
   FListen := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
   {$ENDIF}
   FillChar(Address, SizeOf(Address), 0);
@@ -281,6 +298,7 @@ begin
   Length_ := SizeOf(Address);
   {$IFDEF UNIX}
   Address.sin_addr := StrToNetAddr('127.0.0.1');
+  Address.sin_port := htons(AListenPort);
   if (fpBind(FListen, @Address, SizeOf(Address)) <> 0)
     or (fpListen(FListen, 4) <> 0)
     or (fpGetSockName(FListen, @Address, @Length_) <> 0) then
@@ -288,6 +306,7 @@ begin
   FPort := ntohs(Address.sin_port);
   {$ELSE}
   Address.sin_addr.S_addr := WinSock2.inet_addr('127.0.0.1');
+  Address.sin_port := WinSock2.htons(AListenPort);
   if (WinSock2.bind(FListen, PSockAddr(@Address), SizeOf(Address)) <> 0)
     or (WinSock2.listen(FListen, 4) <> 0)
     or (WinSock2.getsockname(FListen, Address, Length_) <> 0) then
@@ -296,7 +315,8 @@ begin
   {$ENDIF}
   PreventSigPipe(FListen);
   SetNonblocking(FListen);
-  inherited Create(False);
+  Start;
+  FStarted := True;
 end;
 
 procedure TFlooder.Execute;
@@ -343,12 +363,15 @@ end;
 
 destructor TFlooder.Destroy;
 begin
-  Terminate;
-  WaitFor;
+  if FStarted then
+  begin
+    Terminate;
+    WaitFor;
+  end;
   CloseTestSocket(FClient);
   CloseTestSocket(FListen);
   {$IFDEF MSWINDOWS}
-  WSACleanup;
+  if FWinSockStarted then WSACleanup;
   {$ENDIF}
   inherited Destroy;
 end;
@@ -429,8 +452,54 @@ begin
   end;
 end;
 
+procedure RunFailedListenerProbe(const AFixture: string; const APort: Word);
+begin
+  try
+    if AFixture = 'relay' then TTCPRelay.Create(1, '127.0.0.1', APort).Free
+    else TFlooder.Create(APort).Free;
+  except
+    on E: Exception do
+    begin
+      WriteLn(ErrOutput, E.Message);
+      ExitCode := 1;
+    end;
+  end;
+end;
+
+procedure TTCPRelayTests.CheckFailedListenerConstruction(const AFixture: string);
+var
+  Code: Integer;
+  Output: string;
+  Relay: TTCPRelay;
+begin
+  Relay := TTCPRelay.Create(1);
+  try
+    Code := RunChildCommand('', ExpandFileName(ParamStr(0)),
+      [FAILED_LISTENER_PROBE, AFixture, IntToStr(Relay.Port)], Output,
+      FAILED_LISTENER_TIMEOUT_MILLISECONDS);
+    Expect<string>(Trim(Output)).ToBe(AFixture + ' listen failed');
+    Expect<Integer>(Code).ToBe(1);
+  finally
+    Relay.Free;
+  end;
+end;
+
+procedure TTCPRelayTests.TestFailedRelayConstructionReportsError;
+begin
+  CheckFailedListenerConstruction('relay');
+end;
+
+procedure TTCPRelayTests.TestFailedFlooderConstructionReportsError;
+begin
+  CheckFailedListenerConstruction('flooder');
+end;
+
 procedure TTCPRelayTests.SetupTests;
 begin
+  Test('a relay constructor reports its occupied-port error',
+    TestFailedRelayConstructionReportsError);
+  Test('a flooder constructor reports its occupied-port error',
+    TestFailedFlooderConstructionReportsError);
   Test('relays bytes unchanged and counts connections', TestRelaysAndCountsConnections);
   Test('idle teardown needs no wake-up connection', TestIdleTeardownNeedsNoWakeConnection);
   Test('teardown does not wait for a stalled backend connection',
@@ -446,6 +515,12 @@ begin
 end;
 
 begin
+  if (ParamCount = 3) and (ParamStr(1) = FAILED_LISTENER_PROBE) then
+  begin
+    RunFailedListenerProbe(ParamStr(2), StrToInt(ParamStr(3)));
+    Exit;
+  end;
   TestRunnerProgram.AddSuite(TTCPRelayTests.Create('e2e tcp relay'));
   TestRunnerProgram.Run;
+  ExitCode := TestResultToExitCode;
 end.
