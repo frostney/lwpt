@@ -95,6 +95,8 @@ var
   ObjectStoreBeforeQuarantineTestHook:
     TLWPTObjectStoreBeforeQuarantineHook;
   ObjectStoreBeforeRestoreTestHook: TLWPTObjectStoreBeforeQuarantineHook;
+  ObjectStoreAfterQuarantineTestHook: TLWPTObjectStoreBeforeQuarantineHook;
+  ObjectStoreBeforeStageTestHook: TLWPTObjectStoreAfterStageHook;
   ObjectStoreAfterStageTestHook: TLWPTObjectStoreAfterStageHook;
   ObjectStoreBeforePublicationTestHook: TLWPTObjectStorePublicationHook;
   ObjectStoreAfterPublicationTestHook: TLWPTObjectStorePublicationHook;
@@ -450,13 +452,24 @@ begin
   if not Quarantine(APath, Expected, QuarantinePath) then
     raise ELWPTObjectStoreError.CreateFmt(
       'corrupt object %s could not be quarantined', [Expected]);
+  {$IFDEF OBJECTSTORE_TESTING}
+  if (QuarantinePath <> '') and Assigned(ObjectStoreAfterQuarantineTestHook)
+  then
+    ObjectStoreAfterQuarantineTestHook(QuarantinePath);
+  {$ENDIF}
+  { A link anywhere on the quarantine path, including a link swapped in for
+    the object and moved as a link, makes the entry linked, not corrupt: it
+    is a miss, stays in quarantine, and nothing is read through it. }
+  if (QuarantinePath <> '') and QuarantinePathHasLink(QuarantinePath) then
+  begin
+    APath := '';
+    AFailure := omfObjectMissing;
+    Exit(False);
+  end;
   { A verified replacement may have won the pathname after the stale hash
     above. Hash the object actually moved, and restore that proven winner
-    atomically instead of leaving the content-addressed entry missing. A
-    moved link stays in quarantine unread, and nothing is restored through a
-    link. }
+    atomically instead of leaving the content-addressed entry missing. }
   if (QuarantinePath <> '')
-     and not QuarantinePathHasLink(QuarantinePath)
      and (('sha256:' + SHA256File(QuarantinePath)) = Expected) then
   begin
     {$IFDEF OBJECTSTORE_TESTING}
@@ -478,10 +491,6 @@ begin
     AFailure := omfNone;
     Exit(True);
   end;
-  { A link swapped in for the object itself was moved as a link: the entry
-    was linked, not corrupt. }
-  if (QuarantinePath <> '') and IsDirSymlinkOrJunction(QuarantinePath) then
-    AFailure := omfObjectMissing;
   APath := '';
   Result := False;
 end;
@@ -587,9 +596,15 @@ begin
         'object staging root');
       EnsureUnlinkedDirectory(TmpRoot, 'object staging directory');
       Staged := MakeTmpPath(TmpRoot, 'object');
-      if StagingPathHasLink(TmpRoot) then
+      {$IFDEF OBJECTSTORE_TESTING}
+      if Assigned(ObjectStoreBeforeStageTestHook) then
+        ObjectStoreBeforeStageTestHook(Staged);
+      {$ENDIF}
+      { The copy creates the staged file by path; a dangling link there would
+        make it create and write the link's target instead. }
+      if StagingPathHasLink(TmpRoot) or IsDirSymlinkOrJunction(Staged) then
         raise ELWPTObjectStoreError.CreateFmt(
-          'object staging path must not contain a link: %s', [TmpRoot]);
+          'object staging path must not contain a link: %s', [Staged]);
       if not CopyFileContent(ASourcePath, Staged) then
         raise ELWPTObjectStoreError.CreateFmt(
           'failed to stage object %s', [Expected]);

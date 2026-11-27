@@ -157,6 +157,8 @@ type
     procedure TestPublicationRefusesAStoreRootLinkedAfterStaging;
     procedure TestRestoreRefusesAQuarantineDirectoryLinkedAfterHashing;
     procedure TestBuildDiscardNeverRemovesThroughLinkedReferences;
+    procedure TestStagingNeverWritesThroughALinkedStagedFile;
+    procedure TestQuarantineDirectoryLinkedAfterTheMoveIsAMiss;
   end;
 
 procedure WriteSignal(const APath: string);
@@ -629,6 +631,27 @@ begin
   ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
 end;
 
+var
+  DanglingStageTarget: string;
+
+{$IFDEF UNIX}
+procedure PlantDanglingStagedFileLink(const APath: string);
+begin
+  ObjectStoreBeforeStageTestHook := nil;
+  if FpSymlink(PChar(DanglingStageTarget), PChar(APath)) <> 0 then
+    raise Exception.Create('failed to plant the staged-file link');
+end;
+{$ENDIF}
+
+procedure SwapQuarantineAfterMove(const APath: string);
+begin
+  ObjectStoreAfterQuarantineTestHook := nil;
+  if not CopyFileContent(APath, IncludeTrailingPathDelimiter(SwapShardTarget)
+    + ExtractFileName(APath)) then
+    raise Exception.Create('failed to copy the quarantined object outside');
+  ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
+end;
+
 procedure SwapShardBeforeMaterializeCopy(const ADigest, APath: string);
 begin
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
@@ -667,6 +690,9 @@ end;
 
 procedure TObjectStoreContract.ResetScratch;
 begin
+  ObjectStoreBeforeStageTestHook := nil;
+  ObjectStoreAfterQuarantineTestHook := nil;
+  DanglingStageTarget := '';
   ObjectStoreBeforeQuarantineTestHook := nil;
   ObjectStoreBeforeRestoreTestHook := nil;
   ObjectStoreAfterStageTestHook := nil;
@@ -1082,6 +1108,74 @@ begin
     end;
     Expect<string>(ReadBytes(OutsideFile)).ToBe('outside bytes');
   finally
+    Store.Free;
+  end;
+end;
+
+{ A dangling link sits at the staged file's name before the copy: staging
+  must refuse instead of creating and writing the link's target. }
+{$IFDEF UNIX}
+procedure TObjectStoreContract.TestStagingNeverWritesThroughALinkedStagedFile;
+var
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    DanglingStageTarget := FOutside + '/target';
+    ObjectStoreBeforeStageTestHook := PlantDanglingStagedFileLink;
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('object staging path must not contain a link',
+          E.Message) > 0;
+    end;
+    Expect<Boolean>(Assigned(ObjectStoreBeforeStageTestHook)).ToBe(False);
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(FileExists(DanglingStageTarget)).ToBe(False);
+    Expect<Integer>(CountEntries(FOutside)).ToBe(0);
+  finally
+    ObjectStoreBeforeStageTestHook := nil;
+    Store.Free;
+  end;
+end;
+{$ELSE}
+procedure TObjectStoreContract.TestStagingNeverWritesThroughALinkedStagedFile;
+begin
+end;
+{$ENDIF}
+
+{ The quarantine directory becomes a link right after a corrupt object moved
+  into it: the entry is a miss, reported as object-missing, and is not read
+  or restored. }
+procedure TObjectStoreContract.
+  TestQuarantineDirectoryLinkedAfterTheMoveIsAMiss;
+var
+  Destination, ObjectPath: string;
+  Failure: TLWPTObjectMaterializeFailure;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.Admit(FSource, FDigest);
+    WriteBytes(ObjectPath, 'corrupt');
+    SwapShardTarget := FOutside;
+    ObjectStoreAfterQuarantineTestHook := SwapQuarantineAfterMove;
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Boolean>(Assigned(ObjectStoreAfterQuarantineTestHook))
+      .ToBe(False);
+    Expect<string>(ObjectMaterializeFailureName(Failure))
+      .ToBe(ObjectMaterializeFailureName(omfObjectMissing));
+    Expect<Integer>(CountEntries(FOutside)).ToBe(1);
+    Expect<Boolean>(FileExists(ObjectPath)).ToBe(False);
+  finally
+    ObjectStoreAfterQuarantineTestHook := nil;
     Store.Free;
   end;
 end;
@@ -1689,6 +1783,16 @@ begin
     TestRestoreRefusesAQuarantineDirectoryLinkedAfterHashing);
   LinkTest('build-result discard never removes through linked references',
     TestBuildDiscardNeverRemovesThroughLinkedReferences);
+  {$IFDEF UNIX}
+  Test('staging never creates a file through a linked staged-file name',
+    TestStagingNeverWritesThroughALinkedStagedFile);
+  {$ELSE}
+  Skip('staging never creates a file through a linked staged-file name',
+    TestStagingNeverWritesThroughALinkedStagedFile,
+    'file symbolic links need a privilege Windows does not grant by default');
+  {$ENDIF}
+  LinkTest('a quarantine directory linked after the move is an object miss',
+    TestQuarantineDirectoryLinkedAfterTheMoveIsAMiss);
 end;
 
 begin
