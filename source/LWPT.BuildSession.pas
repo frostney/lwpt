@@ -211,11 +211,32 @@ function LongestCompiledBaseNameLength(const ADirectories: TStringArray;
 procedure EnsureCompilerPathBudget(const AUnitDirectory,
   AExecutableDirectory: string; ALongestBaseNameLength: Integer);
 function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
+{ The identity of the file at AOutput that every spelling of it shares: its
+  parent directory's filesystem identity and its name, folded to lower case
+  where the filesystem usually ignores case. Creates the parent directory,
+  so the identity stays the same once the file exists. }
+function BuildOutputIdentity(const AOutput: string): string;
 { Take the project's build-coordination lock, the session-root ledger lock
   that every build's publication already shares across processes, threads
   and relocated session roots, for a short project-wide critical section.
   Free the result to release it. }
 function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
+{ The primitives behind build sessions, for other per-project coordination
+  state. AcquireOwnerGuard creates APath and holds it under a
+  non-inherited operating-system lock (fcntl on Unix, LockFileEx on Windows)
+  until the result is freed or the process exits; it raises when the guard
+  cannot be taken. OwnerGuardHeld probes another process's guard: it opens
+  and closes APath, so a process must never probe a guard it holds itself.
+  AcquireShortLock takes the advisory lock at APath for a short critical
+  section, waiting at most as long as a build publication does, and raises
+  EConcurrencyError when that wait runs out or when APath is a link, which
+  it never opens through. Free its result to release it. }
+function AcquireOwnerGuard(const APath, ADescription: string): TObject;
+function OwnerGuardHeld(const APath: string): Boolean;
+function AcquireShortLock(const APath: string): TObject;
+{ Creates APath and its parents, retrying while concurrent processes create
+  the same components; True when the directory exists afterwards. }
+function EnsureSharedDirectory(const APath: string): Boolean;
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTSessionFinishTestHook = procedure(const ASessionRoot: string);
@@ -272,9 +293,27 @@ const
   F_UNLCK_LWPT = F_UNLCK;
   {$ENDIF}
   {$ENDIF}
+  {$IFDEF UNIX}
+  { FPC's BaseUnix has no O_NOFOLLOW on Darwin; values as in
+    LWPT.Registry.Filesystem. }
+  {$IFDEF LINUX}
+  {$IFDEF CPUAARCH64}
+  O_NOFOLLOW_LWPT = $00008000;
+  {$ELSE}
+  O_NOFOLLOW_LWPT = $00020000;
+  {$ENDIF}
+  {$ELSE}
+  {$IFDEF DARWIN}
+  O_NOFOLLOW_LWPT = $00000100;
+  {$ELSE}
+  O_NOFOLLOW_LWPT = O_NOFOLLOW;
+  {$ENDIF}
+  {$ENDIF}
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   LOCKFILE_EXCLUSIVE_LOCK_LWPT = $00000002;
   LOCKFILE_FAIL_IMMEDIATELY_LWPT = $00000001;
+  FILE_FLAG_OPEN_REPARSE_POINT_SESSION_LWPT = $00200000;
   {$ENDIF}
 
 var
@@ -302,6 +341,7 @@ type
   TLWPTPublicationLock = class
   private
     FPath: string;
+    FRefuseLinks: Boolean;
     FCriticalSectionIndex: Integer;
     FCriticalSectionEntered: Boolean;
     {$IFDEF UNIX}
@@ -311,7 +351,8 @@ type
     FHandle: THandle;
     {$ENDIF}
   public
-    constructor Create(const APath: string);
+    constructor Create(const APath: string;
+      const ARefuseLinks: Boolean = False);
     destructor Destroy; override;
   end;
 
@@ -326,7 +367,8 @@ type
     FHandle: THandle;
     {$ENDIF}
   public
-    constructor Create(const APath: string);
+    constructor Create(const APath: string;
+      const ADescription: string = 'build session owner guard');
     destructor Destroy; override;
   end;
 
@@ -1869,7 +1911,8 @@ begin
   end;
 end;
 
-constructor TLWPTSessionOwnerGuard.Create(const APath: string);
+constructor TLWPTSessionOwnerGuard.Create(const APath: string;
+  const ADescription: string);
 {$IFDEF UNIX}
 var
   LockSpec: TLWPTFlock;
@@ -1883,9 +1926,8 @@ begin
   FPath := APath;
   FLocked := False;
   if not EnsureDirectory(ExtractFileDir(FPath)) then
-    raise ELWPTError.CreateFmt(
-      'could not create build session owner guard directory %s',
-      [ExtractFileDir(FPath)]);
+    raise ELWPTError.CreateFmt('could not create %s directory %s',
+      [ADescription, ExtractFileDir(FPath)]);
   {$IFDEF UNIX}
   FDescriptor := -1;
   {$ENDIF}
@@ -1895,8 +1937,8 @@ begin
   {$IFDEF UNIX}
   FDescriptor := OpenProtectedDescriptor(FPath, O_RDWR or O_CREAT);
   if FDescriptor < 0 then
-    raise ELWPTError.CreateFmt(
-      'could not open build session owner guard %s', [FPath]);
+    raise ELWPTError.CreateFmt('could not open %s %s',
+      [ADescription, FPath]);
   FillChar(LockSpec, SizeOf(LockSpec), 0);
   LockSpec.l_type := F_WRLCK_LWPT;
   LockSpec.l_whence := SEEK_SET;
@@ -1906,8 +1948,8 @@ begin
   begin
     FpClose(FDescriptor);
     FDescriptor := -1;
-    raise ELWPTError.CreateFmt(
-      'build session owner guard is already held %s', [FPath]);
+    raise ELWPTError.CreateFmt('%s is already held %s',
+      [ADescription, FPath]);
   end;
   FLocked := True;
   {$ENDIF}
@@ -1918,8 +1960,8 @@ begin
       or Windows.FILE_SHARE_DELETE,
     nil, Windows.OPEN_ALWAYS, Windows.FILE_ATTRIBUTE_NORMAL, 0);
   if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
-    raise ELWPTError.CreateFmt(
-      'could not open build session owner guard %s', [FPath]);
+    raise ELWPTError.CreateFmt('could not open %s %s',
+      [ADescription, FPath]);
   FillChar(Overlapped, SizeOf(Overlapped), 0);
   if not Windows.LockFileEx(FHandle,
     LOCKFILE_EXCLUSIVE_LOCK_LWPT or LOCKFILE_FAIL_IMMEDIATELY_LWPT,
@@ -1927,8 +1969,8 @@ begin
   begin
     Windows.CloseHandle(FHandle);
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    raise ELWPTError.CreateFmt(
-      'build session owner guard is already held %s', [FPath]);
+    raise ELWPTError.CreateFmt('%s is already held %s',
+      [ADescription, FPath]);
   end;
   FLocked := True;
   {$ENDIF}
@@ -2040,7 +2082,8 @@ begin
 end;
 {$ENDIF}
 
-constructor TLWPTPublicationLock.Create(const APath: string);
+constructor TLWPTPublicationLock.Create(const APath: string;
+  const ARefuseLinks: Boolean);
 var
   Started: TDateTime;
   PIDLine: AnsiString;
@@ -2048,14 +2091,18 @@ var
   i: Integer;
   {$IFDEF UNIX}
   LockSpec: TLWPTFlock;
+  OpenFlags: LongInt;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Written: DWORD;
   Overlapped: TOverlapped;
+  OpenAttributes: DWORD;
+  Information: TByHandleFileInformation;
   {$ENDIF}
 begin
   inherited Create;
   FPath := APath;
+  FRefuseLinks := ARefuseLinks;
   FCriticalSectionIndex := 0;
   for i := 1 to Length(FPath) do
     FCriticalSectionIndex :=
@@ -2076,7 +2123,10 @@ begin
     Started := Now;
     Acquired := False;
     {$IFDEF UNIX}
-    FDescriptor := OpenProtectedDescriptor(FPath, O_RDWR or O_CREAT, &644);
+    OpenFlags := O_RDWR or O_CREAT;
+    { A refused link fails the open (ELOOP) before anything is written. }
+    if FRefuseLinks then OpenFlags := OpenFlags or O_NOFOLLOW_LWPT;
+    FDescriptor := OpenProtectedDescriptor(FPath, OpenFlags, &644);
     if FDescriptor < 0 then
       raise EConcurrencyError.CreateFmt(
         'could not open build publication lock %s', [FPath]);
@@ -2100,13 +2150,24 @@ begin
       FpWrite(FDescriptor, PIDLine[1], Length(PIDLine));
     {$ENDIF}
     {$IFDEF MSWINDOWS}
+    OpenAttributes := Windows.FILE_ATTRIBUTE_NORMAL;
+    { Opening the reparse point itself, rather than what it names, lets a
+      refused link be recognised before anything is written. }
+    if FRefuseLinks then
+      OpenAttributes := OpenAttributes
+        or FILE_FLAG_OPEN_REPARSE_POINT_SESSION_LWPT;
     FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(FPath)),
       Windows.GENERIC_READ or Windows.GENERIC_WRITE,
       Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE, nil,
-      Windows.OPEN_ALWAYS, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+      Windows.OPEN_ALWAYS, OpenAttributes, 0);
     if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
       raise EConcurrencyError.CreateFmt(
         'could not open build publication lock %s', [FPath]);
+    if FRefuseLinks and (not Windows.GetFileInformationByHandle(FHandle,
+      Information) or ((Information.dwFileAttributes
+        and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0)) then
+      raise EConcurrencyError.CreateFmt(
+        'build publication lock must not be a link: %s', [FPath]);
     repeat
       FillChar(Overlapped, SizeOf(Overlapped), 0);
       Acquired := Windows.LockFileEx(FHandle,
@@ -2218,6 +2279,26 @@ function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
 begin
   Result := TLWPTPublicationLock.Create(
     BuildSessionLedgerLockPath(AProjectRoot));
+end;
+
+function AcquireOwnerGuard(const APath, ADescription: string): TObject;
+begin
+  Result := TLWPTSessionOwnerGuard.Create(APath, ADescription);
+end;
+
+function OwnerGuardHeld(const APath: string): Boolean;
+begin
+  Result := SessionOwnerGuardHeld(APath);
+end;
+
+function AcquireShortLock(const APath: string): TObject;
+begin
+  Result := TLWPTPublicationLock.Create(APath, True);
+end;
+
+function EnsureSharedDirectory(const APath: string): Boolean;
+begin
+  Result := EnsureDirectory(APath);
 end;
 
 function BuildSessionsProjectRoot(const AProjectRoot,
@@ -2920,7 +3001,7 @@ begin
   end;
 end;
 
-function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
+function BuildOutputIdentity(const AOutput: string): string;
 var
   OutputIdentity, ParentPath, ParentIdentity, OutputName: string;
 begin
@@ -2938,9 +3019,14 @@ begin
   {$IFDEF DARWIN}
   OutputName := LowerCase(OutputName);
   {$ENDIF}
+  Result := ParentIdentity + '/' + OutputName;
+end;
+
+function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
+begin
   Result := ExcludeTrailingPathDelimiter(ASessionsRoot)
-    + '/locks/' + Copy(TextHash(ParentIdentity + '/' + OutputName),
-      8, 64) + '.lock';
+    + '/locks/' + Copy(TextHash(BuildOutputIdentity(AOutput)), 8, 64)
+    + '.lock';
 end;
 
 function PublishBuildArtifact(const AProjectRoot, ACandidatePath,

@@ -163,3 +163,38 @@ command and the record was considered and rejected: hook commands have no
 deadline, so it must wait without bound. A gated hook that delegates to a
 nested LWPT command for the same output would then deadlock, and so would a
 build holding the only worker slot while it waited.
+
+## Amendment — 2026-11-27: overlapping runs of one output keep no record
+
+Concurrent invocations in one checkout no longer certify an output from
+another generation. A run records the inputs it read before its command
+with the output it finds after it; when another run of the same output
+writes in between, that output is the other run's, possibly from other
+inputs, and the record made it look fresh. Each gated run of a hook or run
+task now registers a marker below `.lwpt/sessions/hook-runs/` for as long as
+it runs, held under an operating-system owner guard (`fcntl` on Unix,
+`LockFileEx` on Windows) so that a crashed run's marker is visibly dead.
+Registering and finishing take a short per-output lock, the bounded wait of
+a build publication, and nothing is held while a command runs. A run that
+registers beside a live marker flags both runs, and a flagged run keeps no
+record, so the output stays stale and the next invocation runs it again.
+Every overlapping pair meets this way, because the later run registers
+while the earlier run's marker is live. A run's command receives the IDs of
+its enclosing runs in `LWPT_HOOK_RUN_ANCESTORS`, so a nested LWPT run for
+the same output and its ancestor do not flag each other; the nested run
+keeps no record while that ancestor still runs, since the ancestor's
+command may write the output after it. Each run registers under two keys,
+neither of them the declared spelling: the output's normalised path, which
+survives a command that replaces the output's directory or link, and the
+file's identity (its parent directory's filesystem identity and its name,
+after following a symbolic link in the last component on Unix), which
+reaches the same file through another path. Runs that share either key see
+each other; Windows refuses a gated output that is a link, and an
+output with more than one hard link keeps no record. Because no run
+waits for another, the deadlocks that ruled out a per-output lock across
+the command, a nested delegation and a build holding the only worker,
+cannot occur. A run that cannot register fails rather than run unseen by
+the others, and so does one that cannot list the other runs or whose
+coordination state is a link; the short lock is opened without following
+links. If the LWPT process is killed while its command keeps running,
+its marker dies with it, and other runs no longer see that command.

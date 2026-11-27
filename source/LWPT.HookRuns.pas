@@ -1,0 +1,428 @@
+{ LWPT.HookRuns — in-flight runs of one staleness-gated output (#442).
+
+  A gated hook or run task records its run after the command returns:
+  the inputs it read before the command and the output it finds after.
+  When two LWPT processes in one checkout run the same output at once, the
+  output one of them finds may be the other's, generated from other
+  inputs, and its record would then make that output look fresh.
+
+  Nothing here waits across a command: a lock held from the gate through
+  the command deadlocks a hook that delegates to a nested LWPT command for
+  the same output, and a build that holds the only worker. Instead, every
+  gated run of an output registers a marker for as long as it runs, and a
+  run that overlapped another run of the same output records nothing, so
+  the output stays stale and the next invocation runs it again.
+
+  A run may register in several registries, one per key its output is
+  known by; runs that share any registry see each other.
+
+  Each marker is a file held under an operating-system owner guard, so a
+  crashed run's marker is visibly dead. Registering and finishing take a
+  short per-output lock that is never held while a command runs. A run
+  registering beside a live marker flags both runs as overlapped. Every
+  pair of overlapping runs meets this way, because the later of the two
+  registers while the earlier one's marker is live.
+
+  A run exports its marker ID, after those of the runs it is nested in, to
+  its command's environment. A nested LWPT run for the same output is part
+  of its ancestor's run: neither flags the other, and the nested run keeps
+  no record while that ancestor still runs, because the ancestor's command
+  may write the output after it. The ancestor's own record covers both. }
+unit LWPT.HookRuns;
+
+{$I Shared.inc}
+{$J-}
+
+interface
+
+uses
+  Classes,
+  SysUtils,
+
+  LWPT.Core;
+
+const
+  { The IDs of the gated runs a command is nested in, comma-separated. }
+  HOOK_RUN_ANCESTORS_ENV = PROJECT_NAME + '_HOOK_RUN_ANCESTORS';
+
+type
+  { One registry a run is registered in: a runs directory and its short
+    lock. }
+  TLWPTHookRunRegistry = record
+    Directory, GuardPath, MarkerPath: string;
+    Owner: TObject;
+    Registered, Overlapped, Nested: Boolean;
+  end;
+
+  { One registered gated run. Create registers it, under one ID, in every
+    registry given (a runs directory and the short lock beside it), and
+    raises when it cannot: running unregistered would hide this run from
+    the others. A run that overlaps another in any of its registries
+    overlaps it. Its ancestors are the comma-separated IDs in AAncestors,
+    or in HOOK_RUN_ANCESTORS_ENV; malformed IDs are ignored. Finish
+    unregisters it and says whether its record may be written. Freeing an
+    unfinished run unregisters it without a record. }
+  TLWPTHookRun = class
+  private
+    FId: string;
+    FRegistries: array of TLWPTHookRunRegistry;
+    FAncestors: TStringList;
+    FFinished: Boolean;
+    function IsAncestor(const AId: string): Boolean;
+    procedure Register(var ARegistry: TLWPTHookRunRegistry);
+    procedure Release(var ARegistry: TLWPTHookRunRegistry);
+    function FinishRegistry(var ARegistry: TLWPTHookRunRegistry): Boolean;
+  public
+    constructor Create(const ADirectory, AGuardPath: string); overload;
+    constructor Create(const ADirectory, AGuardPath,
+      AAncestors: string); overload;
+    constructor Create(const ADirectories, AGuardPaths: array of string;
+      const AAncestors: string); overload;
+    destructor Destroy; override;
+    { True when this run may be recorded: in none of its registries did
+      another run overlap it, apart from its ancestors and descendants, or
+      an ancestor run still run when it registered. Never raises: a failure
+      counts as an overlap, which only keeps the output stale. }
+    function Finish: Boolean;
+    { NAME=value for the command's environment. }
+    function ChildEnvironment: string;
+    property Id: string read FId;
+  end;
+
+implementation
+
+uses
+  DateUtils,
+
+  LWPT.BuildSession;
+
+const
+  MARKER_EXTENSION = '.run';
+  OVERLAP_EXTENSION = '.overlapped';
+  MAX_RUN_ID_LENGTH = 64;
+
+var
+  LocalMarkersCriticalSection: TRTLCriticalSection;
+  LocalMarkers: TStringList;
+  RunCounter: LongInt = 0;
+
+function NewRunId: string;
+var
+  Current: TDateTime;
+begin
+  Current := Now;
+  Result := IntToStr(GetProcessID) + '-'
+    + IntToStr(DateTimeToUnix(Current, False) * 1000
+      + MilliSecondOfTheSecond(Current))
+    + '-' + IntToStr(InterlockedIncrement(RunCounter));
+end;
+
+function ValidRunId(const AId: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := (AId <> '') and (Length(AId) <= MAX_RUN_ID_LENGTH);
+  if not Result then Exit;
+  for i := 1 to Length(AId) do
+    if not (AId[i] in ['0'..'9', '-']) then Exit(False);
+end;
+
+{ A marker this process holds is never probed: closing any descriptor of a
+  file drops every fcntl lock the process holds on it. }
+function IsLocalMarker(const APath: string): Boolean;
+begin
+  EnterCriticalSection(LocalMarkersCriticalSection);
+  try
+    Result := LocalMarkers.IndexOf(APath) >= 0;
+  finally
+    LeaveCriticalSection(LocalMarkersCriticalSection);
+  end;
+end;
+
+procedure AddLocalMarker(const APath: string);
+begin
+  EnterCriticalSection(LocalMarkersCriticalSection);
+  try
+    LocalMarkers.Add(APath);
+  finally
+    LeaveCriticalSection(LocalMarkersCriticalSection);
+  end;
+end;
+
+procedure RemoveLocalMarker(const APath: string);
+var
+  Index: Integer;
+begin
+  EnterCriticalSection(LocalMarkersCriticalSection);
+  try
+    Index := LocalMarkers.IndexOf(APath);
+    if Index >= 0 then LocalMarkers.Delete(Index);
+  finally
+    LeaveCriticalSection(LocalMarkersCriticalSection);
+  end;
+end;
+
+{ An empty flag file, opened without being inheritable by a child that
+  another thread starts meanwhile. }
+procedure CreateFlag(const APath: string);
+begin
+  if FileExists(APath) then Exit;
+  OpenProtectedFileStream(APath, fmCreate).Free;
+end;
+
+{ Cleanup is best effort: what it removes is a finished or dead run's
+  state, which no registration counts, so a file that cannot be removed
+  now is removed by a later registration. }
+procedure RemoveState(const APath: string);
+begin
+  DeleteFile(APath);
+end;
+
+constructor TLWPTHookRun.Create(const ADirectory, AGuardPath: string);
+begin
+  Create([ADirectory], [AGuardPath],
+    GetEnvironmentVariable(HOOK_RUN_ANCESTORS_ENV));
+end;
+
+constructor TLWPTHookRun.Create(const ADirectory, AGuardPath,
+  AAncestors: string);
+begin
+  Create([ADirectory], [AGuardPath], AAncestors);
+end;
+
+constructor TLWPTHookRun.Create(const ADirectories,
+  AGuardPaths: array of string; const AAncestors: string);
+var
+  Ancestors: TStringList;
+  i, j, Count: Integer;
+  Directory: string;
+  Duplicate: Boolean;
+begin
+  inherited Create;
+  if (Length(ADirectories) = 0)
+     or (Length(ADirectories) <> Length(AGuardPaths)) then
+    raise ELWPTError.Create('a hook run needs one lock per registry');
+  FAncestors := TStringList.Create;
+  FAncestors.CaseSensitive := True;
+  Ancestors := TStringList.Create;
+  try
+    Ancestors.Delimiter := ',';
+    Ancestors.StrictDelimiter := True;
+    Ancestors.DelimitedText := AAncestors;
+    for i := 0 to Ancestors.Count - 1 do
+      if ValidRunId(Ancestors[i]) then FAncestors.Add(Ancestors[i]);
+  finally
+    Ancestors.Free;
+  end;
+  FId := NewRunId;
+  Count := 0;
+  SetLength(FRegistries, Length(ADirectories));
+  for i := 0 to High(ADirectories) do
+  begin
+    Directory := ExcludeTrailingPathDelimiter(ADirectories[i]);
+    Duplicate := False;
+    for j := 0 to Count - 1 do
+      if FRegistries[j].Directory = Directory then Duplicate := True;
+    if Duplicate then Continue;
+    FRegistries[Count] := Default(TLWPTHookRunRegistry);
+    FRegistries[Count].Directory := Directory;
+    FRegistries[Count].GuardPath := AGuardPaths[i];
+    FRegistries[Count].MarkerPath := Directory + '/' + FId
+      + MARKER_EXTENSION;
+    Inc(Count);
+  end;
+  SetLength(FRegistries, Count);
+  { One registry at a time: no short lock is held while another is taken. }
+  for i := 0 to High(FRegistries) do Register(FRegistries[i]);
+end;
+
+destructor TLWPTHookRun.Destroy;
+var
+  i: Integer;
+begin
+  if not FFinished then Finish;
+  for i := 0 to High(FRegistries) do Release(FRegistries[i]);
+  FAncestors.Free;
+  inherited Destroy;
+end;
+
+function TLWPTHookRun.IsAncestor(const AId: string): Boolean;
+begin
+  Result := FAncestors.IndexOf(AId) >= 0;
+end;
+
+{ The short lock writes to its file and the runs live beside it, so
+  neither the lock, its directory nor the one above (hook-runs) may lead
+  elsewhere. The lock itself is also opened without following a link. }
+procedure RequireUnlinkedState(const ARegistry: TLWPTHookRunRegistry);
+var
+  Directory: string;
+begin
+  Directory := ExtractFileDir(ARegistry.GuardPath);
+  if IsDirSymlinkOrJunction(ARegistry.GuardPath)
+     or IsDirSymlinkOrJunction(Directory)
+     or IsDirSymlinkOrJunction(ExtractFileDir(Directory))
+     or IsDirSymlinkOrJunction(ARegistry.Directory) then
+    raise ELWPTError.CreateFmt('hook run state must not be a link: %s',
+      [ARegistry.GuardPath]);
+end;
+
+procedure TLWPTHookRun.Register(var ARegistry: TLWPTHookRunRegistry);
+var
+  Guard: TObject;
+  Search: TSearchRec;
+  Entries: TStringList;
+  Directory, Name, OtherId, OtherMarker: string;
+  i: Integer;
+begin
+  Directory := ARegistry.Directory;
+  RequireUnlinkedState(ARegistry);
+  if not EnsureSharedDirectory(ExtractFileDir(ARegistry.GuardPath)) then
+    raise ELWPTError.CreateFmt('could not create hook run directory %s',
+      [ExtractFileDir(ARegistry.GuardPath)]);
+  RequireUnlinkedState(ARegistry);
+  Guard := AcquireShortLock(ARegistry.GuardPath);
+  try
+    if IsDirSymlinkOrJunction(Directory) then
+      raise ELWPTError.CreateFmt('hook run directory must not be a link: %s',
+        [Directory]);
+    if not EnsureSharedDirectory(Directory) then
+      raise ELWPTError.CreateFmt('could not create hook run directory %s',
+        [Directory]);
+    Entries := TStringList.Create;
+    try
+      { A directory lists at least its own '.' entry, so a failure here is
+        a listing that did not happen. A run that cannot see the others
+        must not run unseen. }
+      if FindFirst(Directory + '/*', faAnyFile or faSymLink, Search) <> 0
+      then
+        raise ELWPTError.CreateFmt('could not list hook run directory %s',
+          [Directory]);
+      try
+        repeat
+          { A link is never probed: the probe opens what it names. }
+          if (Search.Attr and faSymLink) <> 0 then
+            RemoveState(Directory + '/' + Search.Name)
+          else if (Search.Attr and faDirectory) = 0 then
+            Entries.Add(Search.Name);
+        until FindNext(Search) <> 0;
+      finally
+        SysUtils.FindClose(Search);
+      end;
+      for i := 0 to Entries.Count - 1 do
+      begin
+        Name := Entries[i];
+        if ExtractFileExt(Name) = MARKER_EXTENSION then
+        begin
+          OtherId := ChangeFileExt(Name, '');
+          OtherMarker := Directory + '/' + Name;
+          if IsLocalMarker(OtherMarker) or OwnerGuardHeld(OtherMarker) then
+          begin
+            if IsAncestor(OtherId) then
+              ARegistry.Nested := True
+            else
+            begin
+              ARegistry.Overlapped := True;
+              CreateFlag(Directory + '/' + OtherId + OVERLAP_EXTENSION);
+            end;
+          end
+          else
+          begin
+            { Its owner exited without finishing. }
+            RemoveState(OtherMarker);
+            RemoveState(Directory + '/' + OtherId + OVERLAP_EXTENSION);
+          end;
+        end
+        else if (ExtractFileExt(Name) = OVERLAP_EXTENSION)
+          and not FileExists(Directory + '/' + ChangeFileExt(Name, '')
+            + MARKER_EXTENSION) then
+          RemoveState(Directory + '/' + Name);
+      end;
+    finally
+      Entries.Free;
+    end;
+    AddLocalMarker(ARegistry.MarkerPath);
+    ARegistry.Registered := True;
+    ARegistry.Owner := AcquireOwnerGuard(ARegistry.MarkerPath,
+      'hook run marker');
+  finally
+    Guard.Free;
+  end;
+end;
+
+procedure TLWPTHookRun.Release(var ARegistry: TLWPTHookRunRegistry);
+begin
+  FreeAndNil(ARegistry.Owner);
+  if ARegistry.Registered then RemoveLocalMarker(ARegistry.MarkerPath);
+  ARegistry.Registered := False;
+end;
+
+function TLWPTHookRun.FinishRegistry(
+  var ARegistry: TLWPTHookRunRegistry): Boolean;
+var
+  Guard: TObject;
+  OverlapPath: string;
+begin
+  Result := False;
+  if ARegistry.Owner = nil then
+  begin
+    Release(ARegistry);
+    Exit;
+  end;
+  OverlapPath := ARegistry.Directory + '/' + FId + OVERLAP_EXTENSION;
+  try
+    RequireUnlinkedState(ARegistry);
+    Guard := AcquireShortLock(ARegistry.GuardPath);
+    try
+      Result := not ARegistry.Overlapped and not ARegistry.Nested
+        and not FileExists(OverlapPath);
+      Release(ARegistry);
+      RemoveState(ARegistry.MarkerPath);
+      RemoveState(OverlapPath);
+    finally
+      Guard.Free;
+    end;
+  except
+    { The marker's guard is released either way, so the next registration
+      removes what is left. }
+    on E: Exception do
+    begin
+      Release(ARegistry);
+      Result := False;
+    end;
+  end;
+end;
+
+function TLWPTHookRun.Finish: Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if FFinished then Exit;
+  FFinished := True;
+  Result := Length(FRegistries) > 0;
+  { Every registry is finished, even after one has refused the record. }
+  for i := 0 to High(FRegistries) do
+    if not FinishRegistry(FRegistries[i]) then Result := False;
+end;
+
+function TLWPTHookRun.ChildEnvironment: string;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 0 to FAncestors.Count - 1 do
+    Result := Result + FAncestors[i] + ',';
+  Result := HOOK_RUN_ANCESTORS_ENV + '=' + Result + FId;
+end;
+
+initialization
+  InitCriticalSection(LocalMarkersCriticalSection);
+  LocalMarkers := TStringList.Create;
+  LocalMarkers.CaseSensitive := {$IFDEF MSWINDOWS}False{$ELSE}True{$ENDIF};
+
+finalization
+  LocalMarkers.Free;
+  DoneCriticalSection(LocalMarkersCriticalSection);
+
+end.

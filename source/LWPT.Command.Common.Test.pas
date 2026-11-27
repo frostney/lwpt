@@ -23,6 +23,7 @@ uses
 
   LWPT.Command.Common,
   LWPT.Core,
+  LWPT.HookRuns,
   LWPT.Manifest,
   TestingPascalLibrary,
   Tests.ProcessSupport,
@@ -71,6 +72,16 @@ type
     procedure TestInputEditedDuringRunIsNotRecorded;
     procedure TestSessionPrivateOutputKeepsNoRecord;
     procedure TestUnreadableOutputSkipsRecord;
+    procedure TestRegisteredRunIsRecorded;
+    procedure TestOverlappedRunIsNotRecorded;
+    procedure TestUnrecordedHooksRegisterNoRun;
+    procedure TestEquivalentOutputSpellingsShareRuns;
+    {$IFDEF UNIX}
+    procedure TestLinkedOutputSharesRunsWithItsTarget;
+    procedure TestHardLinkedOutputIsNotRecorded;
+    procedure TestRemovedOutputLinkKeepsRunsTogether;
+    {$ENDIF}
+    procedure TestReplacedOutputDirectoryKeepsRunsTogether;
     {$IFDEF UNIX}
     procedure TestFifoInputIsStaleWithoutBlocking;
     {$ENDIF}
@@ -327,6 +338,235 @@ end;
 
 { A per-entry postbuild output retargeted to a session's private candidate
   changes path with every session, so it never gets a record. }
+{ What RunHooks and RunUserTask do around the command (#442): register the
+  run, then record after it. A run no other run overlapped is recorded and
+  leaves no in-flight state behind. }
+procedure THookStalenessTests.TestRegisteredRunIsRecorded;
+var
+  Hook: THook;
+  InputDigest, Runs: string;
+  Run: TLWPTHookRun;
+  Search, Entry: TSearchRec;
+  RunsDirectories: Integer;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  HookIsStale(Hook, FRoot, InputDigest);
+  Run := BeginHookRun(Hook, FRoot);
+  try
+    Expect<Boolean>(Run <> nil).ToBe(True);
+    Expect<Boolean>(Pos(HOOK_RUN_ANCESTORS_ENV + '=', Run.ChildEnvironment)
+      = 1).ToBe(True);
+    WriteStamped(OutputName, OutputNanoseconds);
+    RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest, Run);
+  finally
+    Run.Free;
+  end;
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  { Every runs directory is empty again, apart from its own entries. }
+  Runs := IncludeTrailingPathDelimiter(FRoot)
+    + '.lwpt/sessions/hook-runs/active';
+  RunsDirectories := 0;
+  if FindFirst(Runs + '/*.runs', faDirectory, Search) = 0 then
+  try
+    repeat
+      if (Search.Attr and faDirectory) = 0 then Continue;
+      Inc(RunsDirectories);
+      if FindFirst(Runs + '/' + Search.Name + '/*', faAnyFile, Entry) = 0
+      then
+      try
+        repeat
+          if (Entry.Name <> '.') and (Entry.Name <> '..') then
+            Expect<string>(Entry.Name).ToBe('');
+        until FindNext(Entry) <> 0;
+      finally
+        FindClose(Entry);
+      end;
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+  { One registry for the output's path and one for its file identity. }
+  Expect<Integer>(RunsDirectories).ToBe(2);
+end;
+
+{ The record follows the declared spelling, but the runs follow the file:
+  two hooks that spell one output differently see each other's runs. }
+procedure THookStalenessTests.TestEquivalentOutputSpellingsShareRuns;
+var
+  Plain, Dotted: THook;
+  First, Second: TLWPTHookRun;
+begin
+  Plain := GatedHook(['lwpt.toml']);
+  Dotted := GatedHook(['lwpt.toml']);
+  Dotted.Output := './' + OutputName;
+  First := BeginHookRun(Plain, FRoot);
+  try
+    Second := BeginHookRun(Dotted, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
+{ A second run of the same output registers while the first is still
+  going, writes the output and finishes first. The first run then finds
+  that output, which may be the second run's generation from other inputs,
+  so it records nothing and the output stays stale. }
+procedure THookStalenessTests.TestOverlappedRunIsNotRecorded;
+var
+  Hook: THook;
+  InputDigest: string;
+  First, Second: TLWPTHookRun;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  HookIsStale(Hook, FRoot, InputDigest);
+  First := BeginHookRun(Hook, FRoot);
+  try
+    Second := BeginHookRun(Hook, FRoot);
+    try
+      WriteStamped(OutputName, OutputNanoseconds);
+      RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest, Second);
+    finally
+      Second.Free;
+    end;
+    RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest, First);
+  finally
+    First.Free;
+  end;
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  { Overlap is per run, not sticky: the next lone run records again. }
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+end;
+
+procedure THookStalenessTests.TestUnrecordedHooksRegisterNoRun;
+var
+  Hook: THook;
+begin
+  Hook := Default(THook);
+  Hook.Name := 'always';
+  Expect<Boolean>(BeginHookRun(Hook, FRoot) = nil).ToBe(True);
+  Hook := GatedHook(['lwpt.toml']);
+  Hook.SessionPrivateOutput := True;
+  Expect<Boolean>(BeginHookRun(Hook, FRoot) = nil).ToBe(True);
+end;
+
+{ A command may delete and recreate its output's directory. A run that
+  registers after that, under the new directory's identity, still meets the
+  run that registered before it, through the output's path. }
+procedure THookStalenessTests.TestReplacedOutputDirectoryKeepsRunsTogether;
+var
+  Hook: THook;
+  First, Second: TLWPTHookRun;
+  Generated: string;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  Hook.Output := 'generated/' + OutputName;
+  Generated := IncludeTrailingPathDelimiter(FRoot) + 'generated';
+  ForceDirectories(Generated);
+  First := BeginHookRun(Hook, FRoot);
+  try
+    { Renamed away rather than removed, so the new directory cannot reuse
+      the old one's identity. }
+    Expect<Boolean>(RenameFile(Generated, Generated + '.old')).ToBe(True);
+    Expect<Boolean>(CreateDir(Generated)).ToBe(True);
+    Second := BeginHookRun(Hook, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
+{$IFDEF UNIX}
+{ A command may remove an output that is a link and write a plain file in
+  its place: runs before and after still meet through the output's path. }
+procedure THookStalenessTests.TestRemovedOutputLinkKeepsRunsTogether;
+var
+  Linked: THook;
+  First, Second: TLWPTHookRun;
+  LinkPath: string;
+begin
+  Linked := GatedHook(['lwpt.toml']);
+  Linked.Output := 'alias.out';
+  LinkPath := IncludeTrailingPathDelimiter(FRoot) + 'alias.out';
+  Expect<Integer>(FpSymlink(PChar(OutputName), PChar(LinkPath))).ToBe(0);
+  First := BeginHookRun(Linked, FRoot);
+  try
+    Expect<Boolean>(DeleteFile(LinkPath)).ToBe(True);
+    Second := BeginHookRun(Linked, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
+{ An output that is a symbolic link to another hook's output is written
+  through to that file, so the two share runs, even before the file
+  exists. }
+procedure THookStalenessTests.TestLinkedOutputSharesRunsWithItsTarget;
+var
+  Target, Linked: THook;
+  First, Second: TLWPTHookRun;
+begin
+  Target := GatedHook(['lwpt.toml']);
+  Linked := GatedHook(['lwpt.toml']);
+  Linked.Output := 'alias.out';
+  Expect<Integer>(FpSymlink(PChar(OutputName),
+    PChar(IncludeTrailingPathDelimiter(FRoot) + 'alias.out'))).ToBe(0);
+  First := BeginHookRun(Target, FRoot);
+  try
+    Second := BeginHookRun(Linked, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
+{ A file with a second name can be written through that name by a run
+  registered under it, which this output's runs do not see; such an output
+  is never recorded. }
+procedure THookStalenessTests.TestHardLinkedOutputIsNotRecorded;
+var
+  Hook: THook;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  Expect<Integer>(FpLink(PChar(IncludeTrailingPathDelimiter(FRoot)
+    + OutputName), PChar(IncludeTrailingPathDelimiter(FRoot)
+    + 'second-name.out'))).ToBe(0);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  { Once the file has one name again, a run is recorded as usual. }
+  Expect<Boolean>(DeleteFile(IncludeTrailingPathDelimiter(FRoot)
+    + 'second-name.out')).ToBe(True);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+end;
+{$ENDIF}
+
 procedure THookStalenessTests.TestSessionPrivateOutputKeepsNoRecord;
 var
   Hook: THook;
@@ -485,6 +725,24 @@ begin
     TestSessionPrivateOutputKeepsNoRecord);
   Test('an output that cannot be read after the run leaves no record',
     TestUnreadableOutputSkipsRecord);
+  Test('a registered run no other run overlapped is recorded',
+    TestRegisteredRunIsRecorded);
+  Test('a run another run of the same output overlapped is not recorded',
+    TestOverlappedRunIsNotRecorded);
+  Test('ungated and session-private hooks register no run',
+    TestUnrecordedHooksRegisterNoRun);
+  Test('equivalent spellings of one output share its runs',
+    TestEquivalentOutputSpellingsShareRuns);
+  {$IFDEF UNIX}
+  Test('an output linked to another output shares its runs',
+    TestLinkedOutputSharesRunsWithItsTarget);
+  Test('a hard-linked output is not recorded',
+    TestHardLinkedOutputIsNotRecorded);
+  Test('removing an output link mid-run keeps runs together',
+    TestRemovedOutputLinkKeepsRunsTogether);
+  {$ENDIF}
+  Test('replacing the output directory mid-run keeps runs together',
+    TestReplacedOutputDirectoryKeepsRunsTogether);
   {$IFDEF UNIX}
   Test('a matched FIFO is stale, unhashed and never blocks the gate',
     TestFifoInputIsStaleWithoutBlocking);
