@@ -308,15 +308,22 @@ type
   TSHA256Digest = array[0..31] of Byte;
   { Incremental SHA-256 state for callers that hash bytes as they arrive. }
   TSHA256Context = record
+    {$IFDEF DARWIN}
+    { CC_SHA256_CTX from <CommonCrypto/CommonDigest.h>. }
+    Count: array[0..1] of UInt32;
+    Hash: array[0..7] of UInt32;
+    Words: array[0..15] of UInt32;
+    {$ELSE}
     State: array[0..7] of Cardinal;
     Buffer: array[0..63] of Byte;
     BufferLength: Integer;
     TotalLength: QWord;
+    {$ENDIF}
   end;
 
 procedure SHA256Init(var AContext: TSHA256Context);
 procedure SHA256Update(var AContext: TSHA256Context; const AData;
-  const ACount: Integer);
+  const ACount: SizeInt);
 procedure SHA256Final(var AContext: TSHA256Context;
   out ADigest: TSHA256Digest);
 function  SHA256DigestHex(const ADigest: TSHA256Digest): string;
@@ -327,7 +334,8 @@ function  SHA256Stream(AStream: TStream;
 function  SHA256File(const APath: string): string;
 {$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
 threadvar
-  { Completed CommonCrypto stream hashes on the calling test thread. }
+  { Completed CommonCrypto hashes on the calling test thread. }
+  NativeSHA256Count: SizeInt;
   NativeSHA256StreamCount: SizeInt;
 {$ENDIF}
 function  CanonicalTreeHashPath(const APath: string;
@@ -2605,6 +2613,55 @@ begin
   Result := 'sha256:' + SHA256Hex(ABytes);
 end;
 
+{$IFDEF DARWIN}
+{ These symbols are exported by the libSystem LWPT already links. }
+function CommonCryptoSHA256Init(var AContext: TSHA256Context): LongInt;
+  cdecl; external 'c' name 'CC_SHA256_Init';
+function CommonCryptoSHA256Update(var AContext: TSHA256Context;
+  AData: Pointer; ACount: UInt32): LongInt;
+  cdecl; external 'c' name 'CC_SHA256_Update';
+function CommonCryptoSHA256Final(ADigest: PByte;
+  var AContext: TSHA256Context): LongInt;
+  cdecl; external 'c' name 'CC_SHA256_Final';
+
+procedure SHA256Init(var AContext: TSHA256Context);
+begin
+  if CommonCryptoSHA256Init(AContext) <> 1 then
+    raise EVerifyError.Create('CommonCrypto SHA-256 initialization failed');
+end;
+
+procedure SHA256Update(var AContext: TSHA256Context; const AData;
+  const ACount: SizeInt);
+var
+  Cursor: PByte;
+  Remaining: SizeInt;
+  Count: UInt32;
+begin
+  Cursor := @AData;
+  Remaining := ACount;
+  while Remaining > 0 do
+  begin
+    { CommonCrypto takes a 32-bit count even on a 64-bit host. }
+    if Remaining > High(UInt32) then Count := High(UInt32)
+    else Count := UInt32(Remaining);
+    if CommonCryptoSHA256Update(AContext, Cursor, Count) <> 1 then
+      raise EVerifyError.Create('CommonCrypto SHA-256 update failed');
+    Inc(Cursor, Count);
+    Dec(Remaining, Count);
+  end;
+end;
+
+procedure SHA256Final(var AContext: TSHA256Context;
+  out ADigest: TSHA256Digest);
+begin
+  if CommonCryptoSHA256Final(@ADigest[0], AContext) <> 1 then
+    raise EVerifyError.Create('CommonCrypto SHA-256 finalization failed');
+  FillChar(AContext, SizeOf(AContext), 0);
+  {$IFDEF OBJECTSTORE_TESTING}
+  Inc(NativeSHA256Count);
+  {$ENDIF}
+end;
+{$ELSE}
 { SHA-256 performs intentional modular arithmetic on 32-bit values
   (Cardinals): the compression loop's `temp1 := h + s1 + ch + K[t] + W[t]`
   and `W[t] := W[t-16] + s0 + W[t-7] + s1` deliberately wrap on
@@ -2685,9 +2742,10 @@ begin
 end;
 
 procedure SHA256Update(var AContext: TSHA256Context; const AData;
-  const ACount: Integer);
+  const ACount: SizeInt);
 var
-  Count, Take: Integer;
+  Count: SizeInt;
+  Take: Integer;
   Cursor: PByte;
 begin
   if ACount <= 0 then Exit;
@@ -2741,6 +2799,8 @@ begin
   end;
   FillChar(AContext, SizeOf(AContext), 0);
 end;
+{$POP}
+{$ENDIF}
 
 function SHA256Bytes(const AData: TBytes): TSHA256Digest;
 var
@@ -2750,7 +2810,6 @@ begin
   if Length(AData) > 0 then SHA256Update(Context, AData[0], Length(AData));
   SHA256Final(Context, Result);
 end;
-{$POP}
 
 function SHA256DigestHex(const ADigest: TSHA256Digest): string;
 var
@@ -2766,68 +2825,33 @@ begin
   Result := SHA256DigestHex(SHA256Bytes(AData));
 end;
 
-{$IFDEF DARWIN}
-type
-  { CC_SHA256_CTX from <CommonCrypto/CommonDigest.h>. The CommonCrypto
-    symbols are exported by the libSystem LWPT already links on Darwin. }
-  TCommonCryptoSHA256Context = record
-    Count: array[0..1] of UInt32;
-    Hash: array[0..7] of UInt32;
-    Words: array[0..15] of UInt32;
-  end;
-
-function CommonCryptoSHA256Init(var AContext: TCommonCryptoSHA256Context):
-  LongInt; cdecl; external 'c' name 'CC_SHA256_Init';
-function CommonCryptoSHA256Update(var AContext: TCommonCryptoSHA256Context;
-  AData: Pointer; ACount: UInt32): LongInt;
-  cdecl; external 'c' name 'CC_SHA256_Update';
-function CommonCryptoSHA256Final(ADigest: PByte;
-  var AContext: TCommonCryptoSHA256Context): LongInt;
-  cdecl; external 'c' name 'CC_SHA256_Final';
-{$ENDIF}
-
 function SHA256Stream(AStream: TStream;
   AProgress: TSHA256Progress): string;
 var
   Buffer: array[0..65535] of Byte;
-  {$IFDEF DARWIN}
-  Context: TCommonCryptoSHA256Context;
-  {$ELSE}
   Context: TSHA256Context;
-  {$ENDIF}
   Digest: TSHA256Digest;
   ReadCount: Integer;
+  {$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+  NativeCount: SizeInt;
+  {$ENDIF}
 begin
   AStream.Position := 0;
   try
-    {$IFDEF DARWIN}
-    if CommonCryptoSHA256Init(Context) <> 1 then
-      raise EVerifyError.Create('CommonCrypto SHA-256 initialization failed');
-    {$ELSE}
     SHA256Init(Context);
-    {$ENDIF}
     repeat
       if Assigned(AProgress) then AProgress;
       ReadCount := AStream.Read(Buffer[0], SizeOf(Buffer));
       if ReadCount > 0 then
-      begin
-        {$IFDEF DARWIN}
-        if CommonCryptoSHA256Update(Context, @Buffer[0], UInt32(ReadCount)) <> 1 then
-          raise EVerifyError.Create('CommonCrypto SHA-256 update failed');
-        {$ELSE}
         SHA256Update(Context, Buffer[0], ReadCount);
-        {$ENDIF}
-      end;
     until ReadCount = 0;
     if Assigned(AProgress) then AProgress;
-    {$IFDEF DARWIN}
-    if CommonCryptoSHA256Final(@Digest[0], Context) <> 1 then
-      raise EVerifyError.Create('CommonCrypto SHA-256 finalization failed');
-    {$IFDEF OBJECTSTORE_TESTING}
-    Inc(NativeSHA256StreamCount);
+    {$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+    NativeCount := NativeSHA256Count;
     {$ENDIF}
-    {$ELSE}
     SHA256Final(Context, Digest);
+    {$IF DEFINED(DARWIN) AND DEFINED(OBJECTSTORE_TESTING)}
+    Inc(NativeSHA256StreamCount, NativeSHA256Count - NativeCount);
     {$ENDIF}
     Result := SHA256DigestHex(Digest);
   finally
