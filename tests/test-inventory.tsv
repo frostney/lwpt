@@ -111,7 +111,7 @@ program	*	tests/integration/BuildEntries.Test.pas	1	14
 program	darwin/*	tests/integration/BuildEntries.Test.pas	1	15
 program	windows/*	tests/integration/BuildEntries.Test.pas	1	13
 program	*	tests/integration/BuildFairness.Test.pas	1	2
-program	*	tests/integration/BuildSessions.Test.pas	1	16
+program	*	tests/integration/BuildSessions.Test.pas	1	17
 program	*	tests/integration/ChildWaitGuard.Test.pas	1	12
 program	*	tests/integration/CLIOptions.Test.pas	1	42
 program	*	tests/integration/CLIUnitClosure.Test.pas	1	2
