@@ -39,6 +39,7 @@ type
     FLock: TRTLCriticalSection;
     FSockets: array of TSocket;
     FPumps: TList;
+    FWorkerCreated: Boolean;
     {$IFDEF MSWINDOWS}
     FWinSockStarted: Boolean;
     {$ENDIF}
@@ -54,7 +55,8 @@ type
   public
     { Bound on establishing one backend connection. }
     ConnectTimeoutMilliseconds: Cardinal;
-    constructor Create(const ABackend: Word; const ABackendHost: string = '127.0.0.1');
+    constructor Create(const ABackend: Word;
+      const ABackendHost: string = '127.0.0.1'; const AListenPort: Word = 0);
     destructor Destroy; override;
     property Port: Word read FPort;
     { The listening socket, for BeforeAccept only. }
@@ -83,6 +85,11 @@ const
   {$ENDIF}
   {$IFDEF DARWIN}
   RELAY_SO_NOSIGPIPE = $1022;
+  {$ENDIF}
+  {$IFDEF UNIX}
+  INVALID_RELAY_SOCKET = TSocket(-1);
+  {$ELSE}
+  INVALID_RELAY_SOCKET = TSocket(INVALID_SOCKET);
   {$ENDIF}
 
 type
@@ -130,8 +137,13 @@ begin
   {$ELSE}
   Result := WinSock2.socket(AF_INET, SOCK_STREAM, 0);
   {$ENDIF}
+  {$IFDEF DARWIN}
   if RelaySocketValid(Result) and not PreventRelaySigPipe(Result) then
+  begin
+    CloseSocket(Result);
     raise Exception.Create('relay socket cannot suppress SIGPIPE');
+  end;
+  {$ENDIF}
 end;
 
 function SetRelayBlocking(const ASocket: TSocket; const ABlocking: Boolean): Boolean;
@@ -288,7 +300,8 @@ begin
   {$ENDIF}
 end;
 
-constructor TTCPRelay.Create(const ABackend: Word; const ABackendHost: string);
+constructor TTCPRelay.Create(const ABackend: Word; const ABackendHost: string;
+  const AListenPort: Word);
 var
   Address: {$IFDEF UNIX}TInetSockAddr{$ELSE}TSockAddrIn{$ENDIF};
   Length_: {$IFDEF UNIX}TSockLen{$ELSE}LongInt{$ENDIF};
@@ -296,6 +309,7 @@ var
   Data: TWSAData;
   {$ENDIF}
 begin
+  FListen := INVALID_RELAY_SOCKET;
   FBackend := ABackend;
   FBackendHost := ABackendHost;
   ConnectTimeoutMilliseconds := 5000;
@@ -310,7 +324,7 @@ begin
   FListen := NewRelaySocket;
   if not RelaySocketValid(FListen) then
     raise Exception.Create('relay socket failed');
-  Address := RelayAddress('127.0.0.1', 0);
+  Address := RelayAddress('127.0.0.1', AListenPort);
   Length_ := SizeOf(Address);
   {$IFDEF UNIX}
   if (fpBind(FListen, @Address, SizeOf(Address)) <> 0)
@@ -328,6 +342,7 @@ begin
   if not SetRelayBlocking(FListen, False) then
     raise Exception.Create('relay listener cannot be made nonblocking');
   inherited Create(False);
+  FWorkerCreated := True;
 end;
 
 procedure TTCPRelay.Track(const ASocket: TSocket);
@@ -444,27 +459,30 @@ begin
     and a pending backend connection notice Terminated within one poll
     slice, and shut-down sockets end every copy. The listener is closed
     only after the join, so no thread uses a closed handle. }
-  Terminate;
-  ShutdownRelaySocket(FListen);
-  EnterCriticalSection(FLock);
-  try
-    for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
-  finally
-    LeaveCriticalSection(FLock);
-  end;
-  WaitFor;
-  { Sockets added after the first sweep; the copies, now that the relay
-    thread no longer adds any, end within one poll slice. }
-  for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
-  for Index := 0 to FPumps.Count - 1 do
+  if FWorkerCreated then
   begin
-    TRelayPump(FPumps[Index]).Terminate;
-    TRelayPump(FPumps[Index]).WaitFor;
-    TRelayPump(FPumps[Index]).Free;
+    Terminate;
+    ShutdownRelaySocket(FListen);
+    EnterCriticalSection(FLock);
+    try
+      for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
+    finally
+      LeaveCriticalSection(FLock);
+    end;
+    WaitFor;
+    { Sockets added after the first sweep; the copies, now that the relay
+      thread no longer adds any, end within one poll slice. }
+    for Index := 0 to High(FSockets) do ShutdownRelaySocket(FSockets[Index]);
+    for Index := 0 to FPumps.Count - 1 do
+    begin
+      TRelayPump(FPumps[Index]).Terminate;
+      TRelayPump(FPumps[Index]).WaitFor;
+      TRelayPump(FPumps[Index]).Free;
+    end;
   end;
   FPumps.Free;
   for Index := 0 to High(FSockets) do CloseRelaySocket(FSockets[Index]);
-  CloseRelaySocket(FListen);
+  if RelaySocketValid(FListen) then CloseRelaySocket(FListen);
   DoneCriticalSection(FLock);
   {$IFDEF MSWINDOWS}
   if FWinSockStarted then WSACleanup;
