@@ -187,6 +187,11 @@ The judgement is that the user base in v1 is small enough that the quarantine wo
 
 ### Linux: system OpenSSL
 
+For archive, tree and cache verification, LWPT uses CPU SHA-256 instructions
+when Linux exposes ARM64 SHA2 or the x86-64 CPU exposes SHA-NI, SSSE3 and
+SSE4.1. The portable Pascal implementation handles other CPUs. Both paths
+produce the same hashes and require no cryptographic library for hashing.
+
 The `Unix`-and-not-`Darwin` branch of `TransportSecurity.pas` loads the system shared object at runtime via `DynLibs.LoadLibrary` against standard names (`libssl.so.3` / `libcrypto.so.3` and client-compatible fallbacks). The same loaded interface serves outbound clients and the socket-independent memory-BIO server API, but server context construction rejects a runtime older than OpenSSL 3. Users need their distro's libssl package:
 
 - Debian / Ubuntu: `apt install libssl3`
