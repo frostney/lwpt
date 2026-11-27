@@ -12,6 +12,7 @@ uses
   SysUtils,
 
   LWPT.BuildSession,
+  LWPT.CompilerDriver,
   LWPT.Core,
   LWPT.ObjectStore,
   LWPT.Observability,
@@ -32,6 +33,8 @@ const
   TEST_FPC_FAIL_ENTRY_ENV = PROJECT_NAME + '_TEST_FPC_FAIL_ENTRY';
   TestFPCDelayMillisecondsEnvironment = PROJECT_NAME
     + '_TEST_FPC_DELAY_MS';
+  TestFPCProbeModeEnvironment = PROJECT_NAME + '_TEST_FPC_PROBE_MODE';
+  TestProbeTimeoutMilliseconds = 3000;
   TestFPCOutputEnvironment = PROJECT_NAME + '_TEST_FPC_OUTPUT';
   TestWorkerHolderEnvironment = PROJECT_NAME + '_TEST_WORKER_HOLDER';
   TestWorkerHolderReadyEnvironment = PROJECT_NAME
@@ -103,6 +106,7 @@ type
     procedure TestFullyContendedBuildEmitsHeartbeat;
     procedure TestWaitHeartbeatResetsSharedCadence;
     procedure TestBuildFailureReplaysAndPreservesIsolatedLog;
+    procedure TestCompilerProbeTimings;
     procedure TestLostProxyGuardFailsClosed;
   end;
 
@@ -1589,6 +1593,88 @@ begin
   end;
 end;
 
+procedure TBuildSessions.TestCompilerProbeTimings;
+var
+  Project, SessionPath, LogPath: string;
+  Run: TLwptResult;
+  Session, Probe: TSearchRec;
+  Fields: TStringList;
+
+  procedure CheckLog(const ACommand, AMode, AStatus, AExitCode: string);
+  var
+    SpawnStarted, Spawned, FirstByte, Exited, DeadlineReached: Int64;
+  begin
+    Project := FScratch + '/probe-timing-' + ACommand;
+    WriteGraphProject(Project);
+    try
+      Run := RunLwptWithWorkerEnv([ACommand, '--no-cache', '--jobs=1'], Project,
+        [FPC_ENV + '=' + ExpandFileName(ParamStr(0)),
+         TEST_FPC_PROXY_ENV + '=1', TestFPCProbeModeEnvironment + '=' + AMode,
+         COMPILER_TIMEOUT_ENVIRONMENT + '=' + IntToStr(TestProbeTimeoutMilliseconds)]);
+      Expect<Integer>(Run.ExitCode).ToBe(1);
+      if AStatus = 'timeout' then
+        Expect<Boolean>(Pos('probe timed out', Run.Stdout + Run.Stderr) > 0)
+          .ToBe(True)
+      else
+        Expect<Boolean>(Pos('failed (exit ' + AExitCode + ')',
+          Run.Stdout + Run.Stderr) > 0).ToBe(True);
+
+      if FindFirst(Project + '/.lwpt/sessions/s-*', faDirectory, Session) <> 0
+        then raise Exception.Create('missing probe timing session after ' + ACommand);
+      try
+        SessionPath := Project + '/.lwpt/sessions/' + Session.Name;
+      finally
+        FindClose(Session);
+      end;
+      if FindFirst(SessionPath + '/logs/probes/*.log', faAnyFile, Probe) <> 0
+        then raise Exception.Create('missing compiler probe timing after ' + ACommand);
+      try
+        LogPath := SessionPath + '/logs/probes/' + Probe.Name;
+        Expect<Boolean>(FindNext(Probe) <> 0).ToBe(True);
+      finally
+        FindClose(Probe);
+      end;
+      Fields := TStringList.Create;
+      try
+        Fields.Text := ReadBinaryFile(LogPath);
+        Expect<string>(Fields.Values['status']).ToBe(AStatus);
+        Expect<string>(Fields.Values['exit_code']).ToBe(AExitCode);
+        Expect<string>(Fields.Values['timeout_ms'])
+          .ToBe(IntToStr(TestProbeTimeoutMilliseconds));
+        Expect<Boolean>(StrToIntDef(Fields.Values['pid'], 0) > 0).ToBe(True);
+        Expect<Boolean>(Fields.Values['spawn_started_utc'] <> '').ToBe(True);
+        SpawnStarted := StrToInt64Def(Fields.Values['spawn_started_ms'], -1);
+        Spawned := StrToInt64Def(Fields.Values['spawn_returned_ms'], -1);
+        FirstByte := StrToInt64Def(Fields.Values['first_output_ms'], -1);
+        Exited := StrToInt64Def(Fields.Values['exit_observed_ms'], -1);
+        Expect<Boolean>(SpawnStarted >= 0).ToBe(True);
+        Expect<Boolean>(Spawned >= SpawnStarted).ToBe(True);
+        Expect<Boolean>(Exited >= Spawned).ToBe(True);
+        if AMode = 'silent-failure' then
+        begin
+          Expect<string>(Fields.Values['first_output_ms']).ToBe('-');
+          Expect<string>(Fields.Values['deadline_reached_ms']).ToBe('-');
+        end
+        else
+        begin
+          DeadlineReached := StrToInt64Def(Fields.Values['deadline_reached_ms'],
+            -1);
+          Expect<Boolean>((FirstByte >= Spawned) and (FirstByte < DeadlineReached)
+            and (DeadlineReached <= Exited)).ToBe(True);
+        end;
+      finally
+        Fields.Free;
+      end;
+    finally
+      RecursiveDelete(Project);
+    end;
+  end;
+
+begin
+  CheckLog('build', 'silent-failure', 'exit', '17');
+  CheckLog('test', 'output-then-stall', 'timeout', '124');
+end;
+
 procedure TBuildSessions.SetupTests;
 begin
   Test('concurrent builds use distinct private sessions',
@@ -1621,6 +1707,8 @@ begin
     TestWaitHeartbeatResetsSharedCadence);
   Test('build failures replay and preserve isolated logs',
     TestBuildFailureReplaysAndPreservesIsolatedLog);
+  Test('compiler probe timings survive an early failure or timeout',
+    TestCompilerProbeTimings);
   Test('lost proxy environment fails closed with a redacted dump',
     TestLostProxyGuardFailsClosed);
 end;
@@ -1657,7 +1745,7 @@ end;
 function RunCompilerProxy: Integer;
 var
   Compiler, ReadyDir, ReleasePath, ReleaseDir, EntryName,
-    FailEntry: string;
+    FailEntry, ProbeMode: string;
   IsVersionQuery: Boolean;
   Process: TProcess;
   Started: TDateTime;
@@ -1673,6 +1761,18 @@ begin
   IsVersionQuery := False;
   for i := 1 to ParamCount do
     if ParamStr(i) = VersionQueryArgument then IsVersionQuery := True;
+  ProbeMode := GetEnvironmentVariable(TestFPCProbeModeEnvironment);
+  if IsVersionQuery then
+  begin
+    if ProbeMode = 'silent-failure' then Exit(17);
+    if ProbeMode = 'output-then-stall' then
+    begin
+      WriteLn('probe-output');
+      Flush(Output);
+      Sleep(30000);
+      Exit(18);
+    end;
+  end;
   if not IsVersionQuery then
   begin
     EntryName := ChangeFileExt(ExtractFileName(ParamStr(ParamCount)), '');
