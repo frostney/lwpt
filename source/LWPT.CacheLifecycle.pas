@@ -1038,6 +1038,33 @@ begin
     + '/' + Copy(Hex, 3, MaxInt);
 end;
 
+{ True when the build-reference tree is reached through a symlink or
+  junction: the namespace root, its refs directory or refs/sha256. }
+function BuildReferencePathHasLink(const ACacheRoot: string): Boolean;
+var
+  NamespaceRoot: string;
+begin
+  NamespaceRoot := IncludeTrailingPathDelimiter(ACacheRoot) + BUILD_NAMESPACE;
+  Result := IsDirSymlinkOrJunction(NamespaceRoot)
+    or IsDirSymlinkOrJunction(NamespaceRoot + '/refs')
+    or IsDirSymlinkOrJunction(BuildReferenceSHA256Root(ACacheRoot));
+end;
+
+{ True when anything from the build namespace root down to the object entry
+  is a symlink or junction, so reading the object could leave the cache. }
+function BuildObjectPathHasLink(const ACacheRoot, ADigest: string): Boolean;
+var
+  NamespaceRoot, ObjectPath: string;
+begin
+  NamespaceRoot := IncludeTrailingPathDelimiter(ACacheRoot) + BUILD_NAMESPACE;
+  ObjectPath := BuildObjectPath(ACacheRoot, ADigest);
+  Result := IsDirSymlinkOrJunction(NamespaceRoot)
+    or IsDirSymlinkOrJunction(NamespaceRoot + '/objects')
+    or IsDirSymlinkOrJunction(NamespaceRoot + '/objects/sha256')
+    or IsDirSymlinkOrJunction(ExtractFileDir(ObjectPath))
+    or IsDirSymlinkOrJunction(ObjectPath);
+end;
+
 function ReadCanonicalBuildReference(const APath: string;
   out ADigest: string): Boolean;
 var
@@ -1202,7 +1229,9 @@ begin
   Inc(CacheLifecycleReferenceCollectionCount);
   {$ENDIF}
   Root := BuildReferenceSHA256Root(FCacheRoot);
-  if IsDirSymlinkOrJunction(Root) then
+  { A linked reference tree is left whole for repair: removing a malformed
+    "reference" through it would delete a file outside the cache. }
+  if BuildReferencePathHasLink(FCacheRoot) then
   begin
     FComplete := False;
     Exit;
@@ -1256,6 +1285,12 @@ begin
             AddReference(EntryPath, EntrySearch.Attr, EntrySearch.Size, []);
             SetLength(Malformed, Length(Malformed) + 1);
             Malformed[High(Malformed)] := High(FReferences);
+            Continue;
+          end;
+          { Never read a manifest through a link; the edge stays unknown. }
+          if BuildObjectPathHasLink(FCacheRoot, ManifestDigest) then
+          begin
+            FComplete := False;
             Continue;
           end;
           if ReadVerifiedBuildResultManifest(BuildObjectPath(FCacheRoot,

@@ -213,10 +213,14 @@ installs are not supported.
 - **Fetch:** Before HTTPS, a prior authoritative lock entry can address the
   per-user dependency archive store by raw SHA-256. Every hit and staged copy
   is re-hashed before atomic project publication; corruption is quarantined and
-  becomes a miss. Identical known-hash misses share a local producer guard;
-  waiters recheck the desired hash after publication or crash takeover. A first
-  fetch without an authoritative content hash does not coordinate by mutable
-  provenance. Otherwise HTTPS GET uses the LWPT-canonical `HTTPClient`
+  becomes a miss. A symlink or junction from the namespace root down (the
+  store root, the digest directory, a shard directory, or the object itself)
+  is a miss as well: the store checks the path right before each read, move,
+  publication or deletion and never acts through a link it finds there, and
+  `lwpt repair` removes it. Identical known-hash misses share a local
+  producer guard; waiters recheck the desired hash after publication or crash
+  takeover. A first fetch without an authoritative content hash does not
+  coordinate by mutable provenance. Otherwise HTTPS GET uses the LWPT-canonical `HTTPClient`
   package (raw sockets + SChannel on Windows / SecureTransport on macOS /
   OpenSSL on Linux per [ADR-0016](../adr/0016-tls-backend-per-platform.md)). The
   byte-safe `AppendRawBytes` accumulator fixes a header-recv truncation bug that
