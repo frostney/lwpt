@@ -110,7 +110,7 @@ begin
     if NeedManifestWrite then
       RunManifestMutationTransaction(Ctx, Lines)
     else
-      RunInstallTransaction(Ctx, itmMaterialize);
+      RunManifestMutationTransaction(Ctx, nil);
     RunHooks('postinstall', Ctx.Manifest.PostInstall, Ctx.ProjectRoot,
       ResolveTmpDir(Ctx.Manifest));
     WriteLn('updated ', IntToStr(Length(Planned)), ' dependenc',
