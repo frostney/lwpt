@@ -354,6 +354,16 @@ publication; its whole-build postbuild consequently runs once after all
 selected outputs publish. Artifact transformations therefore belong in the
 per-entry hook. See ADR-0023.
 
+Build and test sessions record each FPC capability probe under
+`logs/probes/`. Each record includes the child PID, the UTC spawn start, and
+the clock readings in milliseconds before spawn, after spawn returns, at the
+first observed output byte, and when the child exits. A timeout records the
+deadline observation as well as the exit after cleanup. A dash marks an
+unobserved stage or unavailable exit code. Subtract the readings to compare
+stages within a record. On macOS the readings use the monotonic clock, so you
+can compare them with the UTC timestamp and system logs when investigating a
+slow probe.
+
 Successful sessions remove compiler jobs but retain stable
 job logs and completed state for diagnosis. Failed, stale, or interrupted
 sessions retain their private diagnostics until a later `lwpt build` or

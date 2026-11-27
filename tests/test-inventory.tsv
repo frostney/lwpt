@@ -44,8 +44,10 @@ program	*	source/LWPT.CompilerDriver.FPC.Test.pas	1	24
 program	windows/*	source/LWPT.CompilerDriver.FPC.Test.pas	1	23
 program	*	source/LWPT.CompilerDriver.Lakon.Test.pas	1	17
 program	*	source/LWPT.CompilerRegistry.Test.pas	1	11
-program	*	source/LWPT.Core.Test.pas	24	184
-program	windows/*	source/LWPT.Core.Test.pas	24	193
+program	*	source/LWPT.Core.Test.pas	24	185
+program	linux/aarch64	source/LWPT.Core.Test.pas	24	188
+program	linux/x86_64	source/LWPT.Core.Test.pas	24	188
+program	windows/*	source/LWPT.Core.Test.pas	24	194
 program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10
@@ -111,7 +113,7 @@ program	*	tests/integration/BuildEntries.Test.pas	1	14
 program	darwin/*	tests/integration/BuildEntries.Test.pas	1	15
 program	windows/*	tests/integration/BuildEntries.Test.pas	1	13
 program	*	tests/integration/BuildFairness.Test.pas	1	2
-program	*	tests/integration/BuildSessions.Test.pas	1	16
+program	*	tests/integration/BuildSessions.Test.pas	1	17
 program	*	tests/integration/ChildWaitGuard.Test.pas	1	12
 program	*	tests/integration/CLIOptions.Test.pas	1	42
 program	*	tests/integration/CLIUnitClosure.Test.pas	1	2
