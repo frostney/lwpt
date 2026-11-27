@@ -2868,19 +2868,20 @@ var
   CheckpointHash, CheckpointText, ExpiresAt, KeyID, RenewalPath: string;
   Coordinator: TLWPTProducerLeaseCoordinator;
   ExpiresDate, NowDate: TDateTime;
-  Lease: TLWPTProducerLease;
+  Guard: TObject;
   Seed: TLWPTEd25519Seed;
   State: TLWPTRegistryState;
 begin
   if FConfig.Role = rrMirror then Exit;
   CheckpointExpiry(ANow);
   Coordinator := TLWPTProducerLeaseCoordinator.Create(RootPath('locks'));
-  Lease := nil;
+  Guard := nil;
   try
-    Lease := Coordinator.TryAcquire('registry-publication',
-      'registry checkpoint renewal');
-    if not Assigned(Lease) then Exit;
-    { A renewal holds the publication lease on a read path, so it sweeps
+    { The guard serializes renewal with publication. Reads can release it
+      directly without waiting for the producer lease's heartbeat thread. }
+    Guard := Coordinator.TryAcquireGuard(REGISTRY_PUBLICATION_LEASE);
+    if not Assigned(Guard) then Exit;
+    { A renewal holds the publication guard on a read path, so it sweeps
       only when the staging guard is immediately free. }
     SweepIncoming(False, False);
     State := ReadCurrentState(AProgress);
@@ -2920,7 +2921,7 @@ begin
     AtomicWriteBytes(RootPath(CURRENT_STATE_FILE), TmpRoot,
       Bytes(RegistryStateDocument(State)));
   finally
-    Lease.Free;
+    Guard.Free;
     Coordinator.Free;
   end;
 end;

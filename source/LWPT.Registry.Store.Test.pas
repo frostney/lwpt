@@ -179,8 +179,10 @@ type
   private
     FScratch: string;
     FResourceProgressCalls: Integer;
+    FObservedRenewalGuard: Boolean;
     procedure CheckResourceProgress;
     procedure CheckStateProgress;
+    procedure CheckRenewalGuard;
     function DefaultConfig: TLWPTRegistryConfig;
     function IndexPath(const AName: string): string;
     function InitializeStore: TLWPTRegistryStore;
@@ -363,6 +365,29 @@ begin
       'test deadline expired during committed-state verification');
 end;
 
+procedure TRegistryStoreContract.CheckRenewalGuard;
+var
+  Coordinator: TLWPTProducerLeaseCoordinator;
+  Guard: TObject;
+  Snapshot: TLWPTProducerLeaseSnapshot;
+begin
+  if FObservedRenewalGuard then Exit;
+  Coordinator := TLWPTProducerLeaseCoordinator.Create(FScratch + '/locks');
+  try
+    Guard := Coordinator.TryAcquireGuard('registry-publication');
+    try
+      if Assigned(Guard) then Fail('checkpoint renewal must hold the publication guard');
+    finally
+      Guard.Free;
+    end;
+    if Coordinator.Snapshot('registry-publication', Snapshot) then
+      Fail('checkpoint renewal must not start a producer heartbeat');
+    FObservedRenewalGuard := True;
+  finally
+    Coordinator.Free;
+  end;
+end;
+
 procedure TPublisherThread.Execute;
 var
   Publication: TLWPTRegistryPublication;
@@ -435,6 +460,7 @@ procedure TRegistryStoreContract.BeforeEach;
 begin
   if FScratch <> '' then RecursiveDelete(FScratch);
   FScratch := CreateScratchRoot('registry-store');
+  FObservedRenewalGuard := False;
 end;
 
 procedure TRegistryStoreContract.AfterAll;
@@ -839,7 +865,8 @@ begin
   Store := InitializeStore;
   try
     Historical := ReadBinaryFile(FScratch + '/checkpoints/1.toml');
-    Store.EnsureFreshCheckpoint('2026-08-29T11:00:00Z');
+    Store.EnsureFreshCheckpoint('2026-08-29T11:00:00Z', CheckRenewalGuard);
+    Expect<Boolean>(FObservedRenewalGuard).ToBe(True);
     State := Store.LoadCurrentState;
     Expect<Int64>(State.Sequence).ToBe(1);
     Expect<Boolean>(Pos('checkpoints/renewals/sha256/',
@@ -1485,6 +1512,17 @@ var
 begin
   Store := InitializeStore;
   try
+    SetRegistryClockForTesting(INITIAL_TIME);
+    try
+      Response := RegistryHTTPResponse(Store, 'GET',
+        '/v1/rotations?after=0&limit=1', CheckRenewalGuard);
+    finally
+      SetRegistryClockForTesting('');
+    end;
+    Expect<Integer>(Response.Status).ToBe(200);
+    Expect<Boolean>(FObservedRenewalGuard).ToBe(True);
+    Expect<string>(Store.LoadCurrentState.CheckpointPath).ToBe('checkpoints/1.toml');
+
     Response := RegistryHTTPResponse(Store, 'GET', '/v1/capabilities');
     Body := TEncoding.UTF8.GetString(Response.Body);
     { Package lists derive from accepted snapshots; publication stays off
@@ -1499,7 +1537,6 @@ begin
       '/.well-known/' + PROGRAM_NAME + '-registry');
     Body := TEncoding.UTF8.GetString(Response.Body);
     Expect<Boolean>(Pos('rotations =', Body) > 0).ToBe(True);
-    Expect<Integer>(RegistryHTTPResponse(Store, 'GET', '/v1/rotations?after=0&limit=1').Status).ToBe(200);
   finally
     Store.Free;
   end;

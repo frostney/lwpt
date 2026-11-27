@@ -70,7 +70,12 @@ var
 begin
   Options := DefaultHTTPRequestOptions;
   Options.RequestTimeoutMilliseconds := 1000;
-  Response := HTTPGet(AURL, nil, Options);
+  try
+    Response := HTTPGet(AURL, nil, Options);
+  except
+    on E: EHTTPError do
+      raise EHTTPError.CreateFmt('GET %s: %s', [AURL, E.Message]);
+  end;
   if Response.StatusCode <> 200 then
     raise Exception.CreateFmt('HTTP %d for %s', [Response.StatusCode, AURL]);
   Result := Response.Body;
