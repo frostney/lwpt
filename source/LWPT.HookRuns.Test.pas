@@ -48,6 +48,8 @@ type
     {$IFDEF UNIX}
     procedure TestLinkedMarkerIsRemovedUnprobed;
     procedure TestLinkedLockIsRefused;
+    procedure TestLockRedirectedBeforeFinishIsRefused;
+    procedure TestLinkedStateDirectoryIsRefused;
     procedure TestUnlistableDirectoryIsRefused;
     {$ENDIF}
   end;
@@ -363,6 +365,47 @@ begin
   Expect<string>(Trim(ReadBinaryFile(Target))).ToBe('kept');
 end;
 
+{ A lock path redirected while the command ran is not written through when
+  the run finishes, and the run keeps no record. }
+procedure THookRunTests.TestLockRedirectedBeforeFinishIsRefused;
+var
+  Run: TLWPTHookRun;
+  Target: string;
+begin
+  Target := FRoot + '/target';
+  WriteTextFile(Target, 'kept');
+  Run := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Expect<Boolean>(DeleteFile(FGuard)).ToBe(True);
+    Expect<Integer>(FpSymlink(PChar(Target), PChar(FGuard))).ToBe(0);
+    Expect<Boolean>(Run.Finish).ToBe(False);
+  finally
+    Run.Free;
+  end;
+  Expect<string>(Trim(ReadBinaryFile(Target))).ToBe('kept');
+end;
+
+{ The directory above the lock's (hook-runs) may not be a link either. }
+procedure THookRunTests.TestLinkedStateDirectoryIsRefused;
+var
+  Real, Linked: string;
+  Refused: Boolean;
+begin
+  Real := FRoot + '/real';
+  Linked := FRoot + '/linked';
+  ForceDirectories(Real + '/active');
+  Expect<Integer>(FpSymlink(PChar(Real), PChar(Linked))).ToBe(0);
+  Refused := False;
+  try
+    TLWPTHookRun.Create(Linked + '/active/out.runs',
+      Linked + '/active/out.lock', '').Free;
+  except
+    on E: ELWPTError do Refused := True;
+  end;
+  Expect<Boolean>(Refused).ToBe(True);
+  Expect<Boolean>(FileExists(Real + '/active/out.lock')).ToBe(False);
+end;
+
 { A directory that can be written but not listed would hide the other
   runs, so registration fails rather than run unseen. }
 procedure THookRunTests.TestUnlistableDirectoryIsRefused;
@@ -404,6 +447,10 @@ begin
   Test('a linked marker is removed without being probed',
     TestLinkedMarkerIsRemovedUnprobed);
   Test('a linked lock path is refused', TestLinkedLockIsRefused);
+  Test('a lock redirected before the run finishes is not written through',
+    TestLockRedirectedBeforeFinishIsRefused);
+  Test('a linked state directory above the lock is refused',
+    TestLinkedStateDirectoryIsRefused);
   { Permission bits do not restrict the superuser. }
   if FpGetEUID = 0 then
     Skip('a directory that cannot be listed is refused',

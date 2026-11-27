@@ -469,6 +469,45 @@ end;
   record's key, which follows the declared spelling, this key follows the
   file itself, so hooks that spell one output differently (out.inc,
   ./out.inc) see each other's runs. }
+{ The path a write to APath reaches: a symbolic link in the last component
+  is followed to what it names, even when that does not exist yet, so a
+  hook whose output is a link to another hook's output shares its runs.
+  Links in the directories above are covered by the directory identity.
+  On Windows a linked output is refused instead. }
+function HookOutputCoordinationPath(const APath: string): string;
+{$IFDEF UNIX}
+const
+  MAX_LINKS = 32;
+var
+  Buffer: array[0..4095] of Char;
+  Count: ssize_t;
+  Hops: Integer;
+  Target: string;
+begin
+  Result := APath;
+  for Hops := 1 to MAX_LINKS do
+  begin
+    if not IsDirSymlinkOrJunction(Result) then Exit;
+    Count := FpReadLink(PChar(Result), @Buffer[0], SizeOf(Buffer));
+    if (Count <= 0) or (Count = SizeOf(Buffer)) then Break;
+    SetString(Target, PAnsiChar(@Buffer[0]), Count);
+    if not IsAbsoluteFilesystemPath(Target) then
+      Target := IncludeTrailingPathDelimiter(ExtractFileDir(Result)) + Target;
+    Result := ExpandFileName(Target);
+  end;
+  raise ELWPTError.CreateFmt('could not follow the links of output %s',
+    [APath]);
+end;
+{$ENDIF}
+{$IFDEF MSWINDOWS}
+begin
+  if IsDirSymlinkOrJunction(APath) then
+    raise ELWPTError.CreateFmt(
+      'a staleness-gated output must not be a link: %s', [APath]);
+  Result := APath;
+end;
+{$ENDIF}
+
 function BeginHookRun(const AHook: THook;
   const AProjectRoot: string): TLWPTHookRun;
 var
@@ -476,8 +515,8 @@ var
 begin
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
     or AHook.SessionPrivateOutput then Exit(nil);
-  Key := HookTextDigest(BuildOutputIdentity(
-    ResolveProjectPath(AProjectRoot, AHook.Output)));
+  Key := HookTextDigest(BuildOutputIdentity(HookOutputCoordinationPath(
+    ResolveProjectPath(AProjectRoot, AHook.Output))));
   Prefix := ResolveProjectPath(AProjectRoot, HOOK_RUN_RECORD_DIR)
     + '/active/' + Copy(Key, Length('sha256:') + 1, 32);
   Result := TLWPTHookRun.Create(Prefix + '.runs', Prefix + '.lock');
@@ -524,6 +563,19 @@ function HookGetFileType(AHandle: THandle): LongWord; stdcall;
 
 const
   HOOK_FILE_TYPE_DISK = 1;
+
+type
+  { BY_HANDLE_FILE_INFORMATION; FILETIME fields are two DWORDs each. }
+  THookFileInformation = packed record
+    FileAttributes: LongWord;
+    CreationTime, LastAccessTime, LastWriteTime: QWord;
+    VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks,
+      FileIndexHigh, FileIndexLow: LongWord;
+  end;
+
+function HookGetFileInformationByHandle(AHandle: THandle;
+  out AInformation: THookFileInformation): LongBool; stdcall;
+  external 'kernel32' name 'GetFileInformationByHandle';
 {$ENDIF}
 
 type
@@ -620,6 +672,36 @@ begin
     until Count = 0;
     SHA256Final(Context, Digest);
     Result := SHA256DigestHex(Digest);
+  finally
+    CloseHookRegularFile(HookFile);
+  end;
+end;
+
+{ True when the regular file at APath has more than one name (hard link),
+  or when that cannot be established. Another name can be another hook's
+  output, whose runs this output's runs do not see. }
+function HookFileHasOtherNames(const APath: string): Boolean;
+var
+  HookFile: THookRegularFile;
+  {$IFDEF UNIX}
+  Info: Stat;
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Information: THookFileInformation;
+  {$ENDIF}
+begin
+  Result := True;
+  if not OpenHookRegularFile(APath, HookFile) then Exit;
+  try
+    {$IFDEF UNIX}
+    if FpFStat(HookFile.Descriptor, Info) = 0 then
+      Result := Info.st_nlink > 1;
+    {$ENDIF}
+    {$IFDEF MSWINDOWS}
+    if HookGetFileInformationByHandle(HookFile.Stream.Handle, Information)
+    then
+      Result := Information.NumberOfLinks > 1;
+    {$ENDIF}
   finally
     CloseHookRegularFile(HookFile);
   end;
@@ -835,7 +917,11 @@ begin
     before it may or may not have reached the output, so nothing is
     recorded. Two snapshots cannot see a change that was reverted while
     the command ran. }
+  { An output with another name may be written through it by a run that
+    registered under that name, unseen by this one. }
   InputsUnchanged := (OutputDigest <> '')
+    and not HookFileHasOtherNames(
+      ResolveProjectPath(AProjectRoot, AHook.Output))
     and (CurrentHookInputsDigest(AHook, AProjectRoot) = AInputDigest);
   { The run finishes only after the output is read: another run of this
     output that wrote it before then has overlapped this one, and the

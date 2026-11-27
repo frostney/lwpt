@@ -226,7 +226,8 @@ function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
   and closes APath, so a process must never probe a guard it holds itself.
   AcquireShortLock takes the advisory lock at APath for a short critical
   section, waiting at most as long as a build publication does, and raises
-  EConcurrencyError when that wait runs out. Free its result to release it. }
+  EConcurrencyError when that wait runs out or when APath is a link, which
+  it never opens through. Free its result to release it. }
 function AcquireOwnerGuard(const APath, ADescription: string): TObject;
 function OwnerGuardHeld(const APath: string): Boolean;
 function AcquireShortLock(const APath: string): TObject;
@@ -286,9 +287,27 @@ const
   F_UNLCK_LWPT = F_UNLCK;
   {$ENDIF}
   {$ENDIF}
+  {$IFDEF UNIX}
+  { FPC's BaseUnix has no O_NOFOLLOW on Darwin; values as in
+    LWPT.Registry.Filesystem. }
+  {$IFDEF LINUX}
+  {$IFDEF CPUAARCH64}
+  O_NOFOLLOW_LWPT = $00008000;
+  {$ELSE}
+  O_NOFOLLOW_LWPT = $00020000;
+  {$ENDIF}
+  {$ELSE}
+  {$IFDEF DARWIN}
+  O_NOFOLLOW_LWPT = $00000100;
+  {$ELSE}
+  O_NOFOLLOW_LWPT = O_NOFOLLOW;
+  {$ENDIF}
+  {$ENDIF}
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   LOCKFILE_EXCLUSIVE_LOCK_LWPT = $00000002;
   LOCKFILE_FAIL_IMMEDIATELY_LWPT = $00000001;
+  FILE_FLAG_OPEN_REPARSE_POINT_SESSION_LWPT = $00200000;
   {$ENDIF}
 
 var
@@ -316,6 +335,7 @@ type
   TLWPTPublicationLock = class
   private
     FPath: string;
+    FRefuseLinks: Boolean;
     FCriticalSectionIndex: Integer;
     FCriticalSectionEntered: Boolean;
     {$IFDEF UNIX}
@@ -325,7 +345,8 @@ type
     FHandle: THandle;
     {$ENDIF}
   public
-    constructor Create(const APath: string);
+    constructor Create(const APath: string;
+      const ARefuseLinks: Boolean = False);
     destructor Destroy; override;
   end;
 
@@ -2055,7 +2076,8 @@ begin
 end;
 {$ENDIF}
 
-constructor TLWPTPublicationLock.Create(const APath: string);
+constructor TLWPTPublicationLock.Create(const APath: string;
+  const ARefuseLinks: Boolean);
 var
   Started: TDateTime;
   PIDLine: AnsiString;
@@ -2063,14 +2085,18 @@ var
   i: Integer;
   {$IFDEF UNIX}
   LockSpec: TLWPTFlock;
+  OpenFlags: LongInt;
   {$ENDIF}
   {$IFDEF MSWINDOWS}
   Written: DWORD;
   Overlapped: TOverlapped;
+  OpenAttributes: DWORD;
+  Information: TByHandleFileInformation;
   {$ENDIF}
 begin
   inherited Create;
   FPath := APath;
+  FRefuseLinks := ARefuseLinks;
   FCriticalSectionIndex := 0;
   for i := 1 to Length(FPath) do
     FCriticalSectionIndex :=
@@ -2091,7 +2117,10 @@ begin
     Started := Now;
     Acquired := False;
     {$IFDEF UNIX}
-    FDescriptor := OpenProtectedDescriptor(FPath, O_RDWR or O_CREAT, &644);
+    OpenFlags := O_RDWR or O_CREAT;
+    { A refused link fails the open (ELOOP) before anything is written. }
+    if FRefuseLinks then OpenFlags := OpenFlags or O_NOFOLLOW_LWPT;
+    FDescriptor := OpenProtectedDescriptor(FPath, OpenFlags, &644);
     if FDescriptor < 0 then
       raise EConcurrencyError.CreateFmt(
         'could not open build publication lock %s', [FPath]);
@@ -2115,13 +2144,24 @@ begin
       FpWrite(FDescriptor, PIDLine[1], Length(PIDLine));
     {$ENDIF}
     {$IFDEF MSWINDOWS}
+    OpenAttributes := Windows.FILE_ATTRIBUTE_NORMAL;
+    { Opening the reparse point itself, rather than what it names, lets a
+      refused link be recognised before anything is written. }
+    if FRefuseLinks then
+      OpenAttributes := OpenAttributes
+        or FILE_FLAG_OPEN_REPARSE_POINT_SESSION_LWPT;
     FHandle := Windows.CreateFileW(PWideChar(WindowsExtendedPath(FPath)),
       Windows.GENERIC_READ or Windows.GENERIC_WRITE,
       Windows.FILE_SHARE_READ or Windows.FILE_SHARE_WRITE, nil,
-      Windows.OPEN_ALWAYS, Windows.FILE_ATTRIBUTE_NORMAL, 0);
+      Windows.OPEN_ALWAYS, OpenAttributes, 0);
     if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
       raise EConcurrencyError.CreateFmt(
         'could not open build publication lock %s', [FPath]);
+    if FRefuseLinks and (not Windows.GetFileInformationByHandle(FHandle,
+      Information) or ((Information.dwFileAttributes
+        and Windows.FILE_ATTRIBUTE_REPARSE_POINT) <> 0)) then
+      raise EConcurrencyError.CreateFmt(
+        'build publication lock must not be a link: %s', [FPath]);
     repeat
       FillChar(Overlapped, SizeOf(Overlapped), 0);
       Acquired := Windows.LockFileEx(FHandle,
@@ -2247,7 +2287,7 @@ end;
 
 function AcquireShortLock(const APath: string): TObject;
 begin
-  Result := TLWPTPublicationLock.Create(APath);
+  Result := TLWPTPublicationLock.Create(APath, True);
 end;
 
 function BuildSessionsProjectRoot(const AProjectRoot,

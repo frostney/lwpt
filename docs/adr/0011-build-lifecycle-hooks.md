@@ -184,11 +184,14 @@ its enclosing runs in `LWPT_HOOK_RUN_ANCESTORS`, so a nested LWPT run for
 the same output and its ancestor do not flag each other; the nested run
 keeps no record while that ancestor still runs, since the ancestor's
 command may write the output after it. Runs are matched by the output
-file's identity (its parent directory's filesystem identity and its name),
-not by its declared spelling. Because no run
+file's identity (its parent directory's filesystem identity and its name,
+after following a symbolic link in the last component on Unix), not by its
+declared spelling; Windows refuses a gated output that is a link, and an
+output with more than one hard link keeps no record. Because no run
 waits for another, the deadlocks that ruled out a per-output lock across
 the command, a nested delegation and a build holding the only worker,
 cannot occur. A run that cannot register fails rather than run unseen by
 the others, and so does one that cannot list the other runs or whose
-coordination state is a link. If the LWPT process is killed while its command keeps running,
+coordination state is a link; the short lock is opened without following
+links. If the LWPT process is killed while its command keeps running,
 its marker dies with it, and other runs no longer see that command.

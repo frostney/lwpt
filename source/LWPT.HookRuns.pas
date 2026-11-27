@@ -59,6 +59,7 @@ type
     function IsAncestor(const AId: string): Boolean;
     procedure Register;
     procedure Release;
+    procedure RequireUnlinkedState;
   public
     constructor Create(const ADirectory, AGuardPath: string); overload;
     constructor Create(const ADirectory, AGuardPath,
@@ -209,6 +210,21 @@ begin
   Result := FAncestors.IndexOf(AId) >= 0;
 end;
 
+{ The short lock writes to its file and the runs live beside it, so
+  neither the lock, its directory nor the one above (hook-runs) may lead
+  elsewhere. The lock itself is also opened without following a link. }
+procedure TLWPTHookRun.RequireUnlinkedState;
+var
+  Directory: string;
+begin
+  Directory := ExtractFileDir(FGuardPath);
+  if IsDirSymlinkOrJunction(FGuardPath) or IsDirSymlinkOrJunction(Directory)
+     or IsDirSymlinkOrJunction(ExtractFileDir(Directory))
+     or IsDirSymlinkOrJunction(FDirectory) then
+    raise ELWPTError.CreateFmt('hook run state must not be a link: %s',
+      [FGuardPath]);
+end;
+
 procedure TLWPTHookRun.Register;
 var
   Guard: TObject;
@@ -217,16 +233,12 @@ var
   Name, OtherId, OtherMarker: string;
   i: Integer;
 begin
-  { The short lock writes to its file, so neither it nor the directory
-    holding it may lead elsewhere. }
-  if IsDirSymlinkOrJunction(ExtractFileDir(FGuardPath))
-     or IsDirSymlinkOrJunction(FGuardPath) then
-    raise ELWPTError.CreateFmt('hook run state must not be a link: %s',
-      [FGuardPath]);
+  RequireUnlinkedState;
   if not ForceDirectories(ExtractFileDir(FGuardPath))
      and not DirectoryExists(ExtractFileDir(FGuardPath)) then
     raise ELWPTError.CreateFmt('could not create hook run directory %s',
       [ExtractFileDir(FGuardPath)]);
+  RequireUnlinkedState;
   Guard := AcquireShortLock(FGuardPath);
   try
     if IsDirSymlinkOrJunction(FDirectory) then
@@ -318,6 +330,7 @@ begin
   end;
   OverlapPath := FDirectory + '/' + FId + OVERLAP_EXTENSION;
   try
+    RequireUnlinkedState;
     Guard := AcquireShortLock(FGuardPath);
     try
       Result := not FOverlapped and not FNested

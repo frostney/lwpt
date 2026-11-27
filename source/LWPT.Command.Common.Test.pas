@@ -77,6 +77,10 @@ type
     procedure TestUnrecordedHooksRegisterNoRun;
     procedure TestEquivalentOutputSpellingsShareRuns;
     {$IFDEF UNIX}
+    procedure TestLinkedOutputSharesRunsWithItsTarget;
+    procedure TestHardLinkedOutputIsNotRecorded;
+    {$ENDIF}
+    {$IFDEF UNIX}
     procedure TestFifoInputIsStaleWithoutBlocking;
     {$ENDIF}
     procedure TestCaseDistinctInputsAreBothHashed;
@@ -451,6 +455,57 @@ begin
   Expect<Boolean>(BeginHookRun(Hook, FRoot) = nil).ToBe(True);
 end;
 
+{$IFDEF UNIX}
+{ An output that is a symbolic link to another hook's output is written
+  through to that file, so the two share runs, even before the file
+  exists. }
+procedure THookStalenessTests.TestLinkedOutputSharesRunsWithItsTarget;
+var
+  Target, Linked: THook;
+  First, Second: TLWPTHookRun;
+begin
+  Target := GatedHook(['lwpt.toml']);
+  Linked := GatedHook(['lwpt.toml']);
+  Linked.Output := 'alias.out';
+  Expect<Integer>(FpSymlink(PChar(OutputName),
+    PChar(IncludeTrailingPathDelimiter(FRoot) + 'alias.out'))).ToBe(0);
+  First := BeginHookRun(Target, FRoot);
+  try
+    Second := BeginHookRun(Linked, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
+{ A file with a second name can be written through that name by a run
+  registered under it, which this output's runs do not see; such an output
+  is never recorded. }
+procedure THookStalenessTests.TestHardLinkedOutputIsNotRecorded;
+var
+  Hook: THook;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped(OutputName, OutputNanoseconds);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  Expect<Integer>(FpLink(PChar(IncludeTrailingPathDelimiter(FRoot)
+    + OutputName), PChar(IncludeTrailingPathDelimiter(FRoot)
+    + 'second-name.out'))).ToBe(0);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  { Once the file has one name again, a run is recorded as usual. }
+  Expect<Boolean>(DeleteFile(IncludeTrailingPathDelimiter(FRoot)
+    + 'second-name.out')).ToBe(True);
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+end;
+{$ENDIF}
+
 procedure THookStalenessTests.TestSessionPrivateOutputKeepsNoRecord;
 var
   Hook: THook;
@@ -617,6 +672,12 @@ begin
     TestUnrecordedHooksRegisterNoRun);
   Test('equivalent spellings of one output share its runs',
     TestEquivalentOutputSpellingsShareRuns);
+  {$IFDEF UNIX}
+  Test('an output linked to another output shares its runs',
+    TestLinkedOutputSharesRunsWithItsTarget);
+  Test('a hard-linked output is not recorded',
+    TestHardLinkedOutputIsNotRecorded);
+  {$ENDIF}
   {$IFDEF UNIX}
   Test('a matched FIFO is stale, unhashed and never blocks the gate',
     TestFifoInputIsStaleWithoutBlocking);
