@@ -244,11 +244,11 @@ from. Upgrade in this order, in one commit:
 3. Move dependency versions, for example LWPT's own packages to the new
    release. `lwpt update <name>` moves a git-host dependency to its newest
    tag, keeping an exact pin exact and an inline table's `include` and
-   `exclude`; `lwpt add <source>@<version>` sets a bare-string entry to a
-   chosen version. A command that rewrites the entry also removes the old
-   version's module and archive. Editing `lwpt.toml` by hand and running
-   `lwpt install` also works, but leaves the old archive in
-   `.lwpt/archives/`, as does an update that stays inside its range.
+   `exclude`. `lwpt add <source>@<version>` sets a bare-string entry to a
+   chosen version. Both commands replace the installed module and remove
+   the superseded archive. If the newer tag fits the existing constraint,
+   `lwpt update` leaves `lwpt.toml` untouched. A plain `lwpt install` after
+   editing `lwpt.toml` by hand keeps the old archive in `.lwpt/archives/`.
 4. Run `lwpt install --frozen`, and `lwpt agents` if the project keeps the
    generated `AGENTS.md` block, then commit `lwpt.toml`, `lwpt.lock`,
    `lwpt.cfg`, and `.lwpt/`.
