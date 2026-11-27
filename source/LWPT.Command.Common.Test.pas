@@ -79,7 +79,9 @@ type
     {$IFDEF UNIX}
     procedure TestLinkedOutputSharesRunsWithItsTarget;
     procedure TestHardLinkedOutputIsNotRecorded;
+    procedure TestRemovedOutputLinkKeepsRunsTogether;
     {$ENDIF}
+    procedure TestReplacedOutputDirectoryKeepsRunsTogether;
     {$IFDEF UNIX}
     procedure TestFifoInputIsStaleWithoutBlocking;
     {$ENDIF}
@@ -384,7 +386,8 @@ begin
   finally
     FindClose(Search);
   end;
-  Expect<Integer>(RunsDirectories).ToBe(1);
+  { One registry for the output's path and one for its file identity. }
+  Expect<Integer>(RunsDirectories).ToBe(2);
 end;
 
 { The record follows the declared spelling, but the runs follow the file:
@@ -455,7 +458,65 @@ begin
   Expect<Boolean>(BeginHookRun(Hook, FRoot) = nil).ToBe(True);
 end;
 
+{ A command may delete and recreate its output's directory. A run that
+  registers after that, under the new directory's identity, still meets the
+  run that registered before it, through the output's path. }
+procedure THookStalenessTests.TestReplacedOutputDirectoryKeepsRunsTogether;
+var
+  Hook: THook;
+  First, Second: TLWPTHookRun;
+  Generated: string;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  Hook.Output := 'generated/' + OutputName;
+  Generated := IncludeTrailingPathDelimiter(FRoot) + 'generated';
+  ForceDirectories(Generated);
+  First := BeginHookRun(Hook, FRoot);
+  try
+    { Renamed away rather than removed, so the new directory cannot reuse
+      the old one's identity. }
+    Expect<Boolean>(RenameFile(Generated, Generated + '.old')).ToBe(True);
+    Expect<Boolean>(CreateDir(Generated)).ToBe(True);
+    Second := BeginHookRun(Hook, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
 {$IFDEF UNIX}
+{ A command may remove an output that is a link and write a plain file in
+  its place: runs before and after still meet through the output's path. }
+procedure THookStalenessTests.TestRemovedOutputLinkKeepsRunsTogether;
+var
+  Linked: THook;
+  First, Second: TLWPTHookRun;
+  LinkPath: string;
+begin
+  Linked := GatedHook(['lwpt.toml']);
+  Linked.Output := 'alias.out';
+  LinkPath := IncludeTrailingPathDelimiter(FRoot) + 'alias.out';
+  Expect<Integer>(FpSymlink(PChar(OutputName), PChar(LinkPath))).ToBe(0);
+  First := BeginHookRun(Linked, FRoot);
+  try
+    Expect<Boolean>(DeleteFile(LinkPath)).ToBe(True);
+    Second := BeginHookRun(Linked, FRoot);
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
 { An output that is a symbolic link to another hook's output is written
   through to that file, so the two share runs, even before the file
   exists. }
@@ -677,7 +738,11 @@ begin
     TestLinkedOutputSharesRunsWithItsTarget);
   Test('a hard-linked output is not recorded',
     TestHardLinkedOutputIsNotRecorded);
+  Test('removing an output link mid-run keeps runs together',
+    TestRemovedOutputLinkKeepsRunsTogether);
   {$ENDIF}
+  Test('replacing the output directory mid-run keeps runs together',
+    TestReplacedOutputDirectoryKeepsRunsTogether);
   {$IFDEF UNIX}
   Test('a matched FIFO is stale, unhashed and never blocks the gate',
     TestFifoInputIsStaleWithoutBlocking);

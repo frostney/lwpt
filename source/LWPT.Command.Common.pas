@@ -466,9 +466,12 @@ end;
 
 { The output's in-flight runs live in hook-runs/active/<key>.runs/,
   registered under the short lock <key>.lock (see LWPT.HookRuns). Unlike the
-  record's key, which follows the declared spelling, this key follows the
-  file itself, so hooks that spell one output differently (out.inc,
-  ./out.inc) see each other's runs. }
+  record's key, which follows the declared spelling, each run registers
+  under two keys: the output's normalised path, so spellings such as
+  out.inc and ./out.inc meet even while a command replaces the output's
+  directory or link, and the file's identity, so a path through a linked
+  directory or a linked output meets the file it reaches. Runs that share
+  either key see each other. }
 { The path a write to APath reaches: a symbolic link in the last component
   is followed to what it names, even when that does not exist yet, so a
   hook whose output is a link to another hook's output shares its runs.
@@ -508,18 +511,42 @@ begin
 end;
 {$ENDIF}
 
+{ A key for the run registry: the first 32 hex digits of its digest. }
+function HookRunRegistryKey(const AText: string): string;
+begin
+  Result := Copy(HookTextDigest(AText), Length('sha256:') + 1, 32);
+end;
+
 function BeginHookRun(const AHook: THook;
   const AProjectRoot: string): TLWPTHookRun;
 var
-  Key, Prefix: string;
+  Active, OutputPath, PathName: string;
+  Keys: array[0..1] of string;
+  Directories, Guards: array[0..1] of string;
+  i: Integer;
 begin
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
     or AHook.SessionPrivateOutput then Exit(nil);
-  Key := HookTextDigest(BuildOutputIdentity(HookOutputCoordinationPath(
-    ResolveProjectPath(AProjectRoot, AHook.Output))));
-  Prefix := ResolveProjectPath(AProjectRoot, HOOK_RUN_RECORD_DIR)
-    + '/active/' + Copy(Key, Length('sha256:') + 1, 32);
-  Result := TLWPTHookRun.Create(Prefix + '.runs', Prefix + '.lock');
+  Active := ResolveProjectPath(AProjectRoot, HOOK_RUN_RECORD_DIR)
+    + '/active/';
+  OutputPath := ResolveProjectPath(AProjectRoot, AHook.Output);
+  { The normalised path stays the same while a command replaces the
+    output's directory or link; the file identity reaches the same file
+    through another path. }
+  PathName := ExpandFileName(OutputPath);
+  {$IF DEFINED(MSWINDOWS) OR DEFINED(DARWIN)}
+  PathName := LowerCase(PathName);
+  {$ENDIF}
+  Keys[0] := 'path-' + HookRunRegistryKey(PathName);
+  Keys[1] := 'file-' + HookRunRegistryKey(BuildOutputIdentity(
+    HookOutputCoordinationPath(OutputPath)));
+  for i := 0 to High(Keys) do
+  begin
+    Directories[i] := Active + Keys[i] + '.runs';
+    Guards[i] := Active + Keys[i] + '.lock';
+  end;
+  Result := TLWPTHookRun.Create(Directories, Guards,
+    GetEnvironmentVariable(HOOK_RUN_ANCESTORS_ENV));
 end;
 
 { The declaration the record was made for. A changed command, argument,

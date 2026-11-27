@@ -183,10 +183,13 @@ while the earlier run's marker is live. A run's command receives the IDs of
 its enclosing runs in `LWPT_HOOK_RUN_ANCESTORS`, so a nested LWPT run for
 the same output and its ancestor do not flag each other; the nested run
 keeps no record while that ancestor still runs, since the ancestor's
-command may write the output after it. Runs are matched by the output
+command may write the output after it. Each run registers under two keys,
+neither of them the declared spelling: the output's normalised path, which
+survives a command that replaces the output's directory or link, and the
 file's identity (its parent directory's filesystem identity and its name,
-after following a symbolic link in the last component on Unix), not by its
-declared spelling; Windows refuses a gated output that is a link, and an
+after following a symbolic link in the last component on Unix), which
+reaches the same file through another path. Runs that share either key see
+each other; Windows refuses a gated output that is a link, and an
 output with more than one hard link keeps no record. Because no run
 waits for another, the deadlocks that ruled out a per-output lock across
 the command, a nested delegation and a build holding the only worker,
