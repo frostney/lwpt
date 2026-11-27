@@ -49,6 +49,7 @@ type
     function CanonicalDigest(const ADigest: string): string;
     function StoreRootsHaveLink: Boolean;
     function StagingPathHasLink(const AStagingDirectory: string): Boolean;
+    function QuarantinePathHasLink(const APath: string): Boolean;
     function ObjectPathHasLink(const APath: string): Boolean;
     procedure DiscardObjectLocked(const ADigest, APath: string);
     function VerifyObject(const ADigest: string; out APath: string;
@@ -93,6 +94,7 @@ function ObjectMaterializeFailureName(
 var
   ObjectStoreBeforeQuarantineTestHook:
     TLWPTObjectStoreBeforeQuarantineHook;
+  ObjectStoreBeforeRestoreTestHook: TLWPTObjectStoreBeforeQuarantineHook;
   ObjectStoreAfterStageTestHook: TLWPTObjectStoreAfterStageHook;
   ObjectStoreBeforePublicationTestHook: TLWPTObjectStorePublicationHook;
   ObjectStoreAfterPublicationTestHook: TLWPTObjectStorePublicationHook;
@@ -353,6 +355,16 @@ begin
     or IsDirSymlinkOrJunction(AStagingDirectory);
 end;
 
+{ True when a quarantined entry, the quarantine directory, or a root above
+  them is a symlink or junction. }
+function TLWPTImmutableObjectStore.QuarantinePathHasLink(
+  const APath: string): Boolean;
+begin
+  Result := StoreRootsHaveLink
+    or IsDirSymlinkOrJunction(ExtractFileDir(APath))
+    or IsDirSymlinkOrJunction(APath);
+end;
+
 { True when anything from the namespace root down to the object entry, the
   object itself included, is a symlink or junction. The store never reads,
   moves or deletes through such an entry: its target may lie outside the
@@ -444,11 +456,21 @@ begin
     moved link stays in quarantine unread, and nothing is restored through a
     link. }
   if (QuarantinePath <> '')
-     and not IsDirSymlinkOrJunction(ExtractFileDir(QuarantinePath))
-     and not IsDirSymlinkOrJunction(QuarantinePath)
-     and (('sha256:' + SHA256File(QuarantinePath)) = Expected)
-     and not ObjectPathHasLink(APath) then
+     and not QuarantinePathHasLink(QuarantinePath)
+     and (('sha256:' + SHA256File(QuarantinePath)) = Expected) then
   begin
+    {$IFDEF OBJECTSTORE_TESTING}
+    if Assigned(ObjectStoreBeforeRestoreTestHook) then
+      ObjectStoreBeforeRestoreTestHook(QuarantinePath);
+    {$ENDIF}
+    { The move reads the source and writes the destination by path, so both
+      must still be free of links after the hash. }
+    if QuarantinePathHasLink(QuarantinePath) or ObjectPathHasLink(APath) then
+    begin
+      APath := '';
+      AFailure := omfObjectMissing;
+      Exit(False);
+    end;
     if not AtomicMoveFile(QuarantinePath, APath) then
       raise ELWPTObjectStoreError.CreateFmt(
         'verified object %s could not be restored after quarantine',
@@ -586,6 +608,11 @@ begin
 
       MutationLease := FCacheLifecycle.AcquireMutation;
       try
+        { The roots are checked before creating anything below them, so a
+          root that became a link cannot get directories made through it. }
+        if StoreRootsHaveLink then
+          raise ELWPTObjectStoreError.Create(
+            'shared-cache namespace roots must not be links');
         EnsureUnlinkedDirectory(IncludeTrailingPathDelimiter(FRoot)
           + 'sha256', 'object digest root');
         EnsureUnlinkedDirectory(ExtractFileDir(Result),
