@@ -5,6 +5,12 @@ unit LWPT.Core;
 {$J-}
 {$modeswitch nestedcomments+}
 
+{$IF DEFINED(ENDIAN_LITTLE) AND
+  ((DEFINED(LINUX) AND DEFINED(CPUAARCH64)) OR
+   (DEFINED(UNIX) AND NOT DEFINED(DARWIN) AND DEFINED(CPUX86_64)))}
+  {$DEFINE LWPT_SHA256_INSTRUCTIONS}
+{$ENDIF}
+
 interface
 
 uses
@@ -318,6 +324,9 @@ type
     Buffer: array[0..63] of Byte;
     BufferLength: Integer;
     TotalLength: QWord;
+    {$IFDEF LWPT_SHA256_INSTRUCTIONS}
+    UseInstructions: Boolean;
+    {$ENDIF}
     {$ENDIF}
   end;
 
@@ -337,6 +346,12 @@ threadvar
   { Completed CommonCrypto hashes on the calling test thread. }
   NativeSHA256Count: SizeInt;
   NativeSHA256StreamCount: SizeInt;
+{$ENDIF}
+{$IF DEFINED(LWPT_SHA256_INSTRUCTIONS) AND DEFINED(OBJECTSTORE_TESTING)}
+threadvar
+  { Test-only override for newly initialized contexts on the calling thread. }
+  SHA256ForcePortable: Boolean;
+  SHA256InstructionBlocks: SizeInt;
 {$ENDIF}
 function  CanonicalTreeHashPath(const APath: string;
   const ASourceDelimiter: Char): string;
@@ -2662,6 +2677,10 @@ begin
   {$ENDIF}
 end;
 {$ELSE}
+{$IFDEF LWPT_SHA256_INSTRUCTIONS}
+  {$I LWPT.SHA256.Instructions.inc}
+{$ENDIF}
+
 { SHA-256 performs intentional modular arithmetic on 32-bit values
   (Cardinals): the compression loop's `temp1 := h + s1 + ch + K[t] + W[t]`
   and `W[t] := W[t-16] + s0 + W[t-7] + s1` deliberately wrap on
@@ -2697,6 +2716,17 @@ var
   end;
 
 begin
+    {$IFDEF LWPT_SHA256_INSTRUCTIONS}
+    if AContext.UseInstructions then
+    begin
+      SHA256CompressInstructions(@AContext.State, @ABlock[0], @K
+        {$IFDEF CPUX86_64}, @SHA256_BYTE_SHUFFLE{$ENDIF});
+      {$IFDEF OBJECTSTORE_TESTING}
+      Inc(SHA256InstructionBlocks);
+      {$ENDIF}
+      Exit;
+    end;
+    {$ENDIF}
     for t := 0 to 15 do
       W[t] := (Cardinal(ABlock[t*4    ]) shl 24) or
               (Cardinal(ABlock[t*4 + 1]) shl 16) or
@@ -2735,6 +2765,10 @@ end;
 procedure SHA256Init(var AContext: TSHA256Context);
 begin
   FillChar(AContext, SizeOf(AContext), 0);
+  {$IFDEF LWPT_SHA256_INSTRUCTIONS}
+  AContext.UseInstructions := SHA256InstructionsAvailable
+    {$IFDEF OBJECTSTORE_TESTING}and not SHA256ForcePortable{$ENDIF};
+  {$ENDIF}
   AContext.State[0]:=$6a09e667; AContext.State[1]:=$bb67ae85;
   AContext.State[2]:=$3c6ef372; AContext.State[3]:=$a54ff53a;
   AContext.State[4]:=$510e527f; AContext.State[5]:=$9b05688c;
@@ -3625,6 +3659,9 @@ begin
 end;
 
 initialization
+  {$IFDEF LWPT_SHA256_INSTRUCTIONS}
+  SHA256InstructionsAvailable := SHA256CPUAvailable;
+  {$ENDIF}
   { Record a millisecond-resolution TDateTime stamp once per process.
     PID + atomic sequence provide uniqueness; the existence retry
     defends against a stale path from PID/stamp reuse. }

@@ -63,6 +63,7 @@ function CreateFPCBuildRequest(const ASource, AArtifact: string;
 implementation
 
 uses
+  DateUtils,
   Process,
   StrUtils,
   SysUtils,
@@ -619,6 +620,34 @@ begin
   end;
 end;
 
+{$IFDEF DARWIN}
+const
+  DARWIN_CLOCK_MONOTONIC = 6;
+  FPC_PROBE_TIMING_CLOCK = 'CLOCK_MONOTONIC';
+
+function DarwinClockNanoseconds(AClockID: Integer): QWord; cdecl;
+  external 'c' name 'clock_gettime_nsec_np';
+{$ELSE}
+const
+  FPC_PROBE_TIMING_CLOCK = 'GetTickCount64';
+{$ENDIF}
+
+function ProbeTimingMilliseconds: QWord; inline;
+begin
+  {$IFDEF DARWIN}
+  { The FPC RTL's deadline clock on macOS can move when wall time changes. }
+  Result := DarwinClockNanoseconds(DARWIN_CLOCK_MONOTONIC) div 1000000;
+  {$ELSE}
+  Result := GetTickCount64;
+  {$ENDIF}
+end;
+
+function ProbeTimeField(const ATime: QWord): string;
+begin
+  if ATime = 0 then Result := '-'
+  else Result := IntToStr(ATime);
+end;
+
 function TLWPTFPCCompilerDriver.ExecuteProbe(
   const AArguments: LWPT.Core.TStringArray; out AOutput: string): Integer;
 var
@@ -629,6 +658,12 @@ var
   StartedAt, TimeoutMilliseconds: QWord;
   TerminationThread: TLWPTFPCProbeTerminationThread;
   OutputOverflowed, TimedOut: Boolean;
+  LogTiming: Boolean;
+  ProbePID: Integer;
+  SpawnStarted, SpawnReturned, FirstOutput, ExitObserved, DeadlineReached:
+    QWord;
+  SpawnStartedUTC: TDateTime;
+  ProbeStatus, ProbeExitCode: string;
 
   { Probe output is a single short line. Retain at most the shared capture
     budget and keep draining past it, so a stalled wrapper that floods the
@@ -637,6 +672,8 @@ var
   var
     Room: Int64;
   begin
+    if LogTiming and (FirstOutput = 0) then
+      FirstOutput := ProbeTimingMilliseconds;
     Room := Int64(PROCESS_RUNNER_DEFAULT_CAPTURE_BYTES) - Length(AOutput);
     if ACount > Room then OutputOverflowed := True;
     if Room <= 0 then Exit;
@@ -649,6 +686,15 @@ begin
   CompilerProcess := TProcess.Create(nil);
   ProcessTree := nil;
   TerminationThread := nil;
+  LogTiming := Assigned(ProbeLogger);
+  ProbePID := 0;
+  SpawnStarted := 0;
+  SpawnReturned := 0;
+  FirstOutput := 0;
+  ExitObserved := 0;
+  DeadlineReached := 0;
+  ProbeStatus := 'error';
+  ProbeExitCode := '-';
   try
     CompilerProcess.Executable := ConfiguredCommand(FExecutableName);
     if WorkingDirectory <> '' then
@@ -659,8 +705,18 @@ begin
     CompilerProcess.Options := [poUsePipes, poStderrToOutPut];
     TimeoutMilliseconds := ProbeTimeoutMilliseconds;
     ProcessTree := TLWPTProcessTree.Create(CompilerProcess);
+    if LogTiming then
+    begin
+      SpawnStartedUTC := LocalTimeToUniversal(Now);
+      SpawnStarted := ProbeTimingMilliseconds;
+    end;
     ProcessTree.Execute;
     StartedAt := GetTickCount64;
+    if LogTiming then
+    begin
+      SpawnReturned := ProbeTimingMilliseconds;
+      ProbePID := CompilerProcess.ProcessID;
+    end;
     TimedOut := False;
     repeat
       BytesRead := 0;
@@ -673,11 +729,14 @@ begin
       if not CompilerProcess.Running then Break;
       if GetTickCount64 - StartedAt >= TimeoutMilliseconds then
       begin
+        if LogTiming then DeadlineReached := ProbeTimingMilliseconds;
         TimedOut := True;
         Break;
       end;
       if BytesRead = 0 then Sleep(FPC_PROBE_POLL_MILLISECONDS);
     until False;
+    if LogTiming and not TimedOut then
+      ExitObserved := ProbeTimingMilliseconds;
     if TimedOut then
     begin
       TerminationThread := TLWPTFPCProbeTerminationThread.Create(ProcessTree);
@@ -696,6 +755,7 @@ begin
           if BytesRead = 0 then Sleep(FPC_PROBE_POLL_MILLISECONDS);
         end;
         CompilerProcess.WaitOnExit;
+        if LogTiming then ExitObserved := ProbeTimingMilliseconds;
       finally
         TerminationThread.WaitFor;
       end;
@@ -718,6 +778,7 @@ begin
       AOutput := 'probe timed out after ' + IntToStr(TimeoutMilliseconds)
         + ' ms' + LineEnding + AOutput;
       Result := FPC_PROBE_TIMEOUT_EXIT_CODE;
+      ProbeStatus := 'timeout';
     end
     else
     begin
@@ -733,11 +794,26 @@ begin
           + LineEnding + AOutput;
         if Result = 0 then Result := 1;
       end;
+      ProbeStatus := 'exit';
     end;
+    if LogTiming then ProbeExitCode := IntToStr(Result);
   finally
     TerminationThread.Free;
     ProcessTree.Free;
     CompilerProcess.Free;
+    if LogTiming and (SpawnStarted <> 0) then
+      ProbeLogger('compiler=' + CompilerID + LineEnding
+        + 'pid=' + IntToStr(ProbePID) + LineEnding
+        + 'clock=' + FPC_PROBE_TIMING_CLOCK + LineEnding
+        + 'spawn_started_utc=' + DateToISO8601(SpawnStartedUTC) + LineEnding
+        + 'spawn_started_ms=' + ProbeTimeField(SpawnStarted) + LineEnding
+        + 'spawn_returned_ms=' + ProbeTimeField(SpawnReturned) + LineEnding
+        + 'first_output_ms=' + ProbeTimeField(FirstOutput) + LineEnding
+        + 'exit_observed_ms=' + ProbeTimeField(ExitObserved) + LineEnding
+        + 'timeout_ms=' + IntToStr(TimeoutMilliseconds) + LineEnding
+        + 'deadline_reached_ms=' + ProbeTimeField(DeadlineReached) + LineEnding
+        + 'status=' + ProbeStatus + LineEnding
+        + 'exit_code=' + ProbeExitCode + LineEnding);
   end;
 end;
 

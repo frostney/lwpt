@@ -37,6 +37,8 @@ type
     RebuildPolicy: TLWPTCompilerRebuildPolicy;
   end;
 
+  TLWPTCompilerProbeLogger = procedure(const ARecord: string) of object;
+
   { Implementations are shared across build/test workers. Every operation,
     including capability probing and cache publication, must be safe for
     concurrent calls on one driver instance. }
@@ -45,6 +47,7 @@ type
     FCommandArguments: LWPT.Core.TStringArray;
     FCommandOverride: string;
     FCommandWorkingDirectory: string;
+    FProbeLogger: TLWPTCompilerProbeLogger;
   protected
     function ConfiguredCommand(const ADefault: string): string;
     function CommandArgumentCount: Integer;
@@ -56,6 +59,9 @@ type
     procedure ConfigureCommand(const ACommand: string;
       const AArguments: array of string;
       const AWorkingDirectory: string = '');
+    { Set before probing or sharing this driver with workers. }
+    property ProbeLogger: TLWPTCompilerProbeLogger read FProbeLogger
+      write FProbeLogger;
     function InvocationArguments(
       const AArguments: LWPT.Core.TStringArray): LWPT.Core.TStringArray;
     function WorkingDirectory: string;
