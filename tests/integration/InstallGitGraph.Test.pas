@@ -5,6 +5,7 @@ program InstallGitGraph.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   SysUtils,
@@ -70,6 +71,7 @@ type
     procedure TestSurvivingTagWinsOverSameNamedBranch;
     procedure TestOfflineSharedCandidateIsCheckedBeforeExtraction;
     procedure TestDeepProjectRootExtractsArchive;
+    procedure TestLinkedCacheEntriesAreNeverFollowed;
   end;
 
 const
@@ -332,6 +334,85 @@ begin
   Run := RunInstall(SecondRoot, ['install', '--frozen']);
   Expect<Integer>(Run.ExitCode).ToBe(0);
 end;
+
+function QuarantineEntryCount(const ACacheRoot: string): Integer;
+var SR: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(ACacheRoot + '/dependency-archives/quarantine/*',
+    faAnyFile or faSymLink, SR) <> 0 then Exit;
+  try
+    repeat
+      if (SR.Name <> '.') and (SR.Name <> '..') then Inc(Result);
+    until FindNext(SR) <> 0;
+  finally
+    FindClose(SR);
+  end;
+end;
+
+{ A link below the per-user cache root is a cache miss for install: its
+  target outside the cache is never read, moved into quarantine, or used as
+  the locked archive. Object-store tests cover Windows junctions. }
+{$IFDEF UNIX}
+procedure TInstallGitGraph.TestLinkedCacheEntriesAreNeverFollowed;
+var
+  Root, LockText, ArchivePath, ArchiveBytes, Hex, Shard, Outside,
+    OutsideFile, OutsideBytes, Combined: string;
+  HashAt: Integer;
+  Run: TLwptResult;
+begin
+  PrepareOfflineSeed('linked-cache', Root, LockText);
+  HashAt := Pos('archiveHash = "sha256:', LockText);
+  Expect<Boolean>(HashAt > 0).ToBe(True);
+  Hex := Copy(LockText, HashAt + Length('archiveHash = "sha256:'), 64);
+  ArchivePath := Root + '/.lwpt/archives/shared-v1.0.0.tar.gz';
+  ArchiveBytes := ReadBinaryFile(ArchivePath);
+  Shard := FCacheRoot + '/dependency-archives/sha256/' + Copy(Hex, 1, 2);
+  Expect<Boolean>(FileExists(Shard + '/' + Copy(Hex, 3, MaxInt)))
+    .ToBe(True);
+  Outside := FScratch + '/linked-cache-outside';
+  RecursiveDelete(Outside);
+
+  { An ordinary install whose archive is missing reads the cache first. A
+    linked shard reaching a file with other bytes would have it moved into
+    the cache's quarantine. }
+  OutsideFile := Outside + '/' + Copy(Hex, 3, MaxInt);
+  WriteTextFile(OutsideFile, 'outside bytes');
+  OutsideBytes := ReadBinaryFile(OutsideFile);
+  RecursiveDelete(Shard);
+  Expect<Integer>(FpSymlink(PChar(Outside), PChar(Shard))).ToBe(0);
+  Expect<Boolean>(DeleteFile(ArchivePath)).ToBe(True);
+  Run := RunInstall(Root, ['install']);
+  DumpRunFailure('install with a linked cache shard', Run, 0);
+  Expect<Integer>(Run.ExitCode).ToBe(0);
+  Expect<string>(ReadBinaryFile(OutsideFile)).ToBe(OutsideBytes);
+  Expect<Integer>(QuarantineEntryCount(FCacheRoot)).ToBe(0);
+  Expect<Boolean>(fpReadLink(Shard) <> '').ToBe(True);
+  Expect<string>(ReadBinaryFile(ArchivePath)).ToBe(ArchiveBytes);
+
+  { A linked object file whose target holds the locked bytes is still a
+    miss: offline install fails instead of restoring from outside. }
+  RecursiveDelete(Shard);
+  ForceDirectories(Shard);
+  OutsideFile := Outside + '/target';
+  Expect<Boolean>(CopyFileContent(ArchivePath, OutsideFile)).ToBe(True);
+  Expect<Integer>(FpSymlink(PChar(OutsideFile),
+    PChar(Shard + '/' + Copy(Hex, 3, MaxInt)))).ToBe(0);
+  Expect<Boolean>(DeleteFile(ArchivePath)).ToBe(True);
+  Run := RunInstall(Root, ['install', '--offline']);
+  Combined := Run.Stdout + Run.Stderr;
+  Expect<Boolean>(Run.ExitCode <> 0).ToBe(True);
+  Expect<Boolean>(Pos('cache result: object-missing', Combined) > 0)
+    .ToBe(True);
+  Expect<Boolean>(FileExists(ArchivePath)).ToBe(False);
+  Expect<string>(ReadBinaryFile(OutsideFile)).ToBe(ArchiveBytes);
+  Expect<Integer>(QuarantineEntryCount(FCacheRoot)).ToBe(0);
+end;
+{$ELSE}
+procedure TInstallGitGraph.TestLinkedCacheEntriesAreNeverFollowed;
+begin
+end;
+{$ENDIF}
 
 procedure TInstallGitGraph.TestOfflineCommittedArchiveRestoresProjectState;
 var Root, LockText, ArchivePath: string; Run: TLwptResult;
@@ -1674,6 +1755,17 @@ begin
   Test('offline reuse of another dependency''s staged archive is checked '
     + 'against the lock before extraction',
     TestOfflineSharedCandidateIsCheckedBeforeExtraction);
+  {$IFDEF UNIX}
+  Test('install treats links below the per-user cache root as misses and '
+    + 'never reads or moves their targets',
+    TestLinkedCacheEntriesAreNeverFollowed);
+  {$ELSE}
+  Skip('install treats links below the per-user cache root as misses and '
+    + 'never reads or moves their targets',
+    TestLinkedCacheEntriesAreNeverFollowed,
+    'the fixture uses Unix symbolic links; object-store tests cover '
+    + 'junctions');
+  {$ENDIF}
   {$IFDEF MSWINDOWS}
   Skip('a project root whose archive path exceeds 255 characters installs '
     + 'the same tree as a shallow root', TestDeepProjectRootExtractsArchive,

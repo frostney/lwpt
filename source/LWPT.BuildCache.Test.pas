@@ -7,6 +7,7 @@ program LWPT.BuildCache.Test;
 uses
   {$IFDEF UNIX}
   cthreads,
+  BaseUnix,
   {$ENDIF}
   Classes,
   Process,
@@ -72,6 +73,7 @@ type
     procedure TestConcurrentRepublishSurvivesStaleInvalidation;
     procedure TestBudgetRefusalLeavesNoPartialResult;
     procedure TestLowBudgetArtifactEvictionInvalidatesResult;
+    procedure TestLinkedReferenceTreeIsNeverReadWrittenOrInvalidated;
   end;
 
 {$IFDEF UNIX}
@@ -804,6 +806,63 @@ begin
   end;
 end;
 
+{ A linked refs directory reaches reference files outside the cache. One of
+  them names a manifest the store does not hold, which would make
+  materialization invalidate, that is delete, the outside file. The link is
+  a miss: nothing is read or deleted through it, and a store does not
+  publish a reference through it. }
+{$IFDEF UNIX}
+procedure TBuildCacheContract.
+  TestLinkedReferenceTreeIsNeverReadWrittenOrInvalidated;
+var
+  Cache: TLWPTBuildCache;
+  Cached: TLWPTCachedBuildResult;
+  Destination, Hex, Outside, OutsideReference, Reason: string;
+  Raised: Boolean;
+begin
+  Outside := FScratch + '/outside';
+  Hex := Copy(TEST_FINGERPRINT, 8, MaxInt);
+  OutsideReference := Outside + '/sha256/' + Copy(Hex, 1, 2) + '/'
+    + Copy(Hex, 3, MaxInt);
+  WriteBytes(OutsideReference, SECOND_TEST_FINGERPRINT + #10);
+  ForceDirectories(BuildResultCacheRoot(FCacheRoot));
+  Expect<Integer>(FpSymlink(PChar(Outside),
+    PChar(BuildResultCacheRoot(FCacheRoot) + '/refs'))).ToBe(0);
+  Cache := TLWPTBuildCache.Create(FCacheRoot);
+  try
+    Destination := FScratch + '/linked-refs/bin/app';
+    Expect<Boolean>(Cache.Materialize(TEST_FINGERPRINT, Destination,
+      FScratch + '/linked-refs/tmp', Cached, Reason)).ToBe(False);
+    Expect<string>(Reason).ToBe('no-result');
+    Expect<string>(ReadBytes(OutsideReference))
+      .ToBe(SECOND_TEST_FINGERPRINT + #10);
+    Raised := False;
+    { The store refuses the linked reference path; its rollback then
+      refuses to discard through the linked reference tree, which is the
+      error that surfaces. Either way nothing is written outside. }
+    try
+      Cache.Store(SECOND_TEST_FINGERPRINT, FArtifact, TEST_ARTIFACT_KIND);
+    except
+      on E: ELWPTBuildCacheError do
+        Raised := Pos('must not contain a link', E.Message) > 0;
+      on E: ELWPTCacheLifecycleError do
+        Raised := Pos('failed to discard', E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Hex := Copy(SECOND_TEST_FINGERPRINT, 8, MaxInt);
+    Expect<Boolean>(FileExists(Outside + '/sha256/' + Copy(Hex, 1, 2) + '/'
+      + Copy(Hex, 3, MaxInt))).ToBe(False);
+  finally
+    Cache.Free;
+  end;
+end;
+{$ELSE}
+procedure TBuildCacheContract.
+  TestLinkedReferenceTreeIsNeverReadWrittenOrInvalidated;
+begin
+end;
+{$ENDIF}
+
 procedure TBuildCacheContract.SetupTests;
 begin
   Test('store and materialize preserve the verified result',
@@ -830,6 +889,15 @@ begin
     TestBudgetRefusalLeavesNoPartialResult);
   Test('low-budget artifact eviction invalidates its logical result',
     TestLowBudgetArtifactEvictionInvalidatesResult);
+  {$IFDEF UNIX}
+  Test('a linked reference tree is never read, written or invalidated',
+    TestLinkedReferenceTreeIsNeverReadWrittenOrInvalidated);
+  {$ELSE}
+  Skip('a linked reference tree is never read, written or invalidated',
+    TestLinkedReferenceTreeIsNeverReadWrittenOrInvalidated,
+    'the fixture uses Unix symbolic links; object-store tests cover '
+    + 'junctions');
+  {$ENDIF}
 end;
 
 var

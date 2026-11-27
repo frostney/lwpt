@@ -44,12 +44,19 @@ type
   TLWPTImmutableObjectStore = class
   private
     FCacheLifecycle: TLWPTCacheLifecycle;
+    FNamespaceRoot: string;
     FRoot: string;
     function CanonicalDigest(const ADigest: string): string;
+    function StoreRootsHaveLink: Boolean;
+    function StagingPathHasLink(const AStagingDirectory: string): Boolean;
+    function QuarantinePathHasLink(const APath: string): Boolean;
+    function ObjectPathHasLink(const APath: string): Boolean;
+    procedure DiscardObjectLocked(const ADigest, APath: string);
     function VerifyObject(const ADigest: string; out APath: string;
       out ACorrupt: Boolean): Boolean;
     function RepairCorruptObjectLocked(const ADigest: string;
-      out APath: string): Boolean;
+      out APath: string; out AFailure:
+      TLWPTObjectMaterializeFailure): Boolean;
     function LookupWithObjectGuard(const ADigest: string;
       out APath: string; out AFailure:
       TLWPTObjectMaterializeFailure): Boolean;
@@ -87,6 +94,9 @@ function ObjectMaterializeFailureName(
 var
   ObjectStoreBeforeQuarantineTestHook:
     TLWPTObjectStoreBeforeQuarantineHook;
+  ObjectStoreBeforeRestoreTestHook: TLWPTObjectStoreBeforeQuarantineHook;
+  ObjectStoreAfterQuarantineTestHook: TLWPTObjectStoreBeforeQuarantineHook;
+  ObjectStoreBeforeStageTestHook: TLWPTObjectStoreAfterStageHook;
   ObjectStoreAfterStageTestHook: TLWPTObjectStoreAfterStageHook;
   ObjectStoreBeforePublicationTestHook: TLWPTObjectStorePublicationHook;
   ObjectStoreAfterPublicationTestHook: TLWPTObjectStorePublicationHook;
@@ -287,6 +297,7 @@ begin
      or IsDirSymlinkOrJunction(FRoot) then
     raise ELWPTObjectStoreError.Create(
       'shared-cache namespace roots must not be links');
+  FNamespaceRoot := NamespaceRoot;
   FCacheLifecycle := TLWPTCacheLifecycle.Create(ACacheRoot, ANamespace);
 end;
 
@@ -329,6 +340,62 @@ begin
     + Copy(Hex, 1, 2) + '/' + Copy(Hex, 3, MaxInt);
 end;
 
+function TLWPTImmutableObjectStore.StoreRootsHaveLink: Boolean;
+begin
+  Result := IsDirSymlinkOrJunction(FNamespaceRoot)
+    or IsDirSymlinkOrJunction(FRoot);
+end;
+
+{ True when a digest's staging directory, the staging root, or a root above
+  them is a symlink or junction. Staged bytes are written, hashed, published
+  and removed through this path, so each of those steps checks it first. }
+function TLWPTImmutableObjectStore.StagingPathHasLink(
+  const AStagingDirectory: string): Boolean;
+begin
+  Result := StoreRootsHaveLink
+    or IsDirSymlinkOrJunction(IncludeTrailingPathDelimiter(FRoot) + 'tmp')
+    or IsDirSymlinkOrJunction(AStagingDirectory);
+end;
+
+{ True when a quarantined entry, the quarantine directory, or a root above
+  them is a symlink or junction. }
+function TLWPTImmutableObjectStore.QuarantinePathHasLink(
+  const APath: string): Boolean;
+begin
+  Result := StoreRootsHaveLink
+    or IsDirSymlinkOrJunction(ExtractFileDir(APath))
+    or IsDirSymlinkOrJunction(APath);
+end;
+
+{ True when anything from the namespace root down to the object entry, the
+  object itself included, is a symlink or junction. The store never reads,
+  moves or deletes through such an entry: its target may lie outside the
+  cache. The object counts as missing, and `lwpt repair` removes the link
+  (ADR-0040). Callers check again right before each read or move, because the
+  answer is only as current as the check: like the other link checks on
+  per-user cache and project state, this does not bind the later pathname
+  operation to the checked directories, so a process that can already write
+  the cache and swaps a component in between is not stopped. }
+function TLWPTImmutableObjectStore.ObjectPathHasLink(
+  const APath: string): Boolean;
+begin
+  Result := StoreRootsHaveLink
+    or IsDirSymlinkOrJunction(IncludeTrailingPathDelimiter(FRoot) + 'sha256')
+    or IsDirSymlinkOrJunction(ExtractFileDir(APath))
+    or IsDirSymlinkOrJunction(APath);
+end;
+
+{ Drops an object's index entry and control manifest, and its payload only
+  while no link leads to it; a linked entry is left for repair. }
+procedure TLWPTImmutableObjectStore.DiscardObjectLocked(const ADigest,
+  APath: string);
+begin
+  if ObjectPathHasLink(APath) then
+    FCacheLifecycle.DiscardObjectLocked(ADigest, '')
+  else
+    FCacheLifecycle.DiscardObjectLocked(ADigest, APath);
+end;
+
 function TLWPTImmutableObjectStore.Quarantine(const APath,
   ADigest: string; out AQuarantinePath: string): Boolean;
 var
@@ -353,6 +420,7 @@ begin
   Expected := CanonicalDigest(ADigest);
   ACorrupt := False;
   APath := ObjectPath(Expected);
+  if ObjectPathHasLink(APath) then Exit(False);
   if not FileExists(APath) then Exit(False);
   Actual := 'sha256:' + SHA256File(APath);
   if Actual = Expected then Exit(True);
@@ -361,29 +429,66 @@ begin
 end;
 
 function TLWPTImmutableObjectStore.RepairCorruptObjectLocked(
-  const ADigest: string; out APath: string): Boolean;
+  const ADigest: string; out APath: string; out AFailure:
+  TLWPTObjectMaterializeFailure): Boolean;
 var
   Expected, QuarantinePath: string;
 begin
   Expected := CanonicalDigest(ADigest);
   APath := ObjectPath(Expected);
+  AFailure := omfVerificationFailed;
   {$IFDEF OBJECTSTORE_TESTING}
   if Assigned(ObjectStoreBeforeQuarantineTestHook) then
     ObjectStoreBeforeQuarantineTestHook(APath);
   {$ENDIF}
+  { A link that appeared since verification is a miss, never moved: a rename
+    through a linked directory would move the file it points at. }
+  if ObjectPathHasLink(APath) then
+  begin
+    APath := '';
+    AFailure := omfObjectMissing;
+    Exit(False);
+  end;
   if not Quarantine(APath, Expected, QuarantinePath) then
     raise ELWPTObjectStoreError.CreateFmt(
       'corrupt object %s could not be quarantined', [Expected]);
+  {$IFDEF OBJECTSTORE_TESTING}
+  if (QuarantinePath <> '') and Assigned(ObjectStoreAfterQuarantineTestHook)
+  then
+    ObjectStoreAfterQuarantineTestHook(QuarantinePath);
+  {$ENDIF}
+  { A link anywhere on the quarantine path, including a link swapped in for
+    the object and moved as a link, makes the entry linked, not corrupt: it
+    is a miss, stays in quarantine, and nothing is read through it. }
+  if (QuarantinePath <> '') and QuarantinePathHasLink(QuarantinePath) then
+  begin
+    APath := '';
+    AFailure := omfObjectMissing;
+    Exit(False);
+  end;
   { A verified replacement may have won the pathname after the stale hash
     above. Hash the object actually moved, and restore that proven winner
     atomically instead of leaving the content-addressed entry missing. }
   if (QuarantinePath <> '')
      and (('sha256:' + SHA256File(QuarantinePath)) = Expected) then
   begin
+    {$IFDEF OBJECTSTORE_TESTING}
+    if Assigned(ObjectStoreBeforeRestoreTestHook) then
+      ObjectStoreBeforeRestoreTestHook(QuarantinePath);
+    {$ENDIF}
+    { The move reads the source and writes the destination by path, so both
+      must still be free of links after the hash. }
+    if QuarantinePathHasLink(QuarantinePath) or ObjectPathHasLink(APath) then
+    begin
+      APath := '';
+      AFailure := omfObjectMissing;
+      Exit(False);
+    end;
     if not AtomicMoveFile(QuarantinePath, APath) then
       raise ELWPTObjectStoreError.CreateFmt(
         'verified object %s could not be restored after quarantine',
         [Expected]);
+    AFailure := omfNone;
     Exit(True);
   end;
   APath := '';
@@ -407,11 +512,7 @@ begin
   MutationLease := FCacheLifecycle.AcquireMutation;
   try
     if Corrupt then
-    begin
-      Result := RepairCorruptObjectLocked(ADigest, APath);
-      if not Result then
-        AFailure := omfVerificationFailed;
-    end;
+      Result := RepairCorruptObjectLocked(ADigest, APath, AFailure);
     if Result then FCacheLifecycle.TouchObjectLocked(ADigest);
   finally
     MutationLease.Free;
@@ -486,15 +587,30 @@ begin
       { Each digest owns a staging directory under its object-use guard.
         Repair can reclaim abandoned directories while skipping this one,
         without serializing unrelated large copies behind the index guard. }
+      if StoreRootsHaveLink then
+        raise ELWPTObjectStoreError.Create(
+          'shared-cache namespace roots must not be links');
       TmpRoot := IncludeTrailingPathDelimiter(FRoot) + 'tmp/'
         + Copy(Expected, 8, MaxInt);
       EnsureUnlinkedDirectory(IncludeTrailingPathDelimiter(FRoot) + 'tmp',
         'object staging root');
       EnsureUnlinkedDirectory(TmpRoot, 'object staging directory');
       Staged := MakeTmpPath(TmpRoot, 'object');
+      {$IFDEF OBJECTSTORE_TESTING}
+      if Assigned(ObjectStoreBeforeStageTestHook) then
+        ObjectStoreBeforeStageTestHook(Staged);
+      {$ENDIF}
+      { The copy creates the staged file by path; a dangling link there would
+        make it create and write the link's target instead. }
+      if StagingPathHasLink(TmpRoot) or IsDirSymlinkOrJunction(Staged) then
+        raise ELWPTObjectStoreError.CreateFmt(
+          'object staging path must not contain a link: %s', [Staged]);
       if not CopyFileContent(ASourcePath, Staged) then
         raise ELWPTObjectStoreError.CreateFmt(
           'failed to stage object %s', [Expected]);
+      if StagingPathHasLink(TmpRoot) or IsDirSymlinkOrJunction(Staged) then
+        raise ELWPTObjectStoreError.CreateFmt(
+          'object staging path must not contain a link: %s', [Staged]);
       Actual := 'sha256:' + SHA256File(Staged);
       if Actual <> Expected then
         raise ELWPTObjectStoreError.CreateFmt(
@@ -507,10 +623,25 @@ begin
 
       MutationLease := FCacheLifecycle.AcquireMutation;
       try
+        { The roots are checked before creating anything below them, so a
+          root that became a link cannot get directories made through it. }
+        if StoreRootsHaveLink then
+          raise ELWPTObjectStoreError.Create(
+            'shared-cache namespace roots must not be links');
         EnsureUnlinkedDirectory(IncludeTrailingPathDelimiter(FRoot)
           + 'sha256', 'object digest root');
         EnsureUnlinkedDirectory(ExtractFileDir(Result),
           'object digest shard');
+        { Publication renames into this path, so every directory from the
+          namespace root down, and the entry it replaces, must be real. }
+        if ObjectPathHasLink(Result) then
+          raise ELWPTObjectStoreError.CreateFmt(
+            'object path must not contain a link: %s', [Result]);
+        { The rename's source is reached through the staging path, which
+          must still be the verified staged file. }
+        if StagingPathHasLink(TmpRoot) or IsDirSymlinkOrJunction(Staged) then
+          raise ELWPTObjectStoreError.CreateFmt(
+            'object staging path must not contain a link: %s', [Staged]);
         {$IFDEF OBJECTSTORE_TESTING}
         if Assigned(ObjectStoreBeforePublicationTestHook) then
           ObjectStoreBeforePublicationTestHook(Staged, Result);
@@ -533,7 +664,7 @@ begin
         FCacheLifecycle.RecordObjectLocked(Expected, Result);
         if not FCacheLifecycle.MakeRoomLocked(0) then
         begin
-          FCacheLifecycle.DiscardObjectLocked(Expected, Result);
+          DiscardObjectLocked(Expected, Result);
           Published := False;
           Result := '';
           Exit;
@@ -546,14 +677,15 @@ begin
         MutationLease := nil;
       end;
     except
-      if (Staged <> '') and FileExists(Staged) then
+      if (Staged <> '') and not StagingPathHasLink(TmpRoot)
+         and FileExists(Staged) then
         SysUtils.DeleteFile(Staged);
       if Published then
       begin
         try
           MutationLease := FCacheLifecycle.AcquireMutation;
           try
-            FCacheLifecycle.DiscardObjectLocked(Expected, Result);
+            DiscardObjectLocked(Expected, Result);
             Published := False;
           finally
             MutationLease.Free;
@@ -566,11 +698,15 @@ begin
           Published := True;
         end;
       end;
-      if (TmpRoot <> '') and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+      if (TmpRoot <> '') and not StagingPathHasLink(TmpRoot)
+         and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
       raise;
     end;
   finally
-    if (TmpRoot <> '') and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
+    { A linked ancestor would make the wipe empty a directory outside the
+      cache; repair removes such residue instead. }
+    if (TmpRoot <> '') and not StagingPathHasLink(TmpRoot)
+       and DirectoryExists(TmpRoot) then WipeDir(TmpRoot);
     ObjectLease.Free;
   end;
 end;
@@ -584,7 +720,7 @@ begin
   Digest := CanonicalDigest(ADigest);
   MutationLease := FCacheLifecycle.AcquireMutation;
   try
-    FCacheLifecycle.DiscardObjectLocked(Digest, ObjectPath(Digest));
+    DiscardObjectLocked(Digest, ObjectPath(Digest));
   finally
     MutationLease.Free;
   end;
@@ -635,6 +771,11 @@ begin
         if Assigned(ObjectStoreBeforeMaterializeCopyTestHook) then
           ObjectStoreBeforeMaterializeCopyTestHook(Expected, SourcePath);
         {$ENDIF}
+        if ObjectPathHasLink(SourcePath) then
+        begin
+          AFailure := omfObjectMissing;
+          Exit;
+        end;
         try
           if not CopyFileContentAndHash(SourcePath, Staged, Expected,
             Actual) then

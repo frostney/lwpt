@@ -18,6 +18,7 @@ uses
   Process,
   SysUtils,
 
+  LWPT.BuildCache,
   LWPT.CacheLifecycle,
   LWPT.Core,
   LWPT.ObjectStore,
@@ -109,7 +110,14 @@ type
     FStoreRoot: string;
     FSource: string;
     FDigest: string;
+    FDirectoryLinkSkipReason: string;
+    FOutside: string;
+    procedure LinkTest(const AName: string; const AMethod: TTestMethod);
     procedure ResetScratch;
+    function QuarantineEntryCount: Integer;
+    procedure ExpectLinkedObjectMisses(const AStore:
+      TLWPTImmutableObjectStore; const AOutsideFile, AOutsideBytes,
+      ALink: string);
     procedure WriteBytes(const APath, AText: string);
     function ReadBytes(const APath: string): string;
     function StartAdmitter(const AReadyPath, AReleasePath: string;
@@ -138,6 +146,19 @@ type
     procedure TestRepairPreservesActiveCrossProcessAdmission;
     procedure TestCacheRootOverrideIsAbsoluteAndNormalized;
     procedure TestPlatformDefaultUsesPerUserCacheLocation;
+    procedure TestLinkedDigestRootIsNeverFollowed;
+    procedure TestLinkedShardIsNeverFollowed;
+    procedure TestLinkedObjectFileIsNeverFollowed;
+    procedure TestShardLinkedBeforeQuarantineIsNeverFollowed;
+    procedure TestShardLinkedBeforeMaterializeCopyIsNeverRead;
+    procedure TestDiscardNeverDeletesThroughALinkedShard;
+    procedure TestAdmissionRefusesAStoreRootLinkedAfterCreation;
+    procedure TestPublicationRefusesAStagingDirectoryLinkedAfterStaging;
+    procedure TestPublicationRefusesAStoreRootLinkedAfterStaging;
+    procedure TestRestoreRefusesAQuarantineDirectoryLinkedAfterHashing;
+    procedure TestBuildDiscardNeverRemovesThroughLinkedReferences;
+    procedure TestStagingNeverWritesThroughALinkedStagedFile;
+    procedure TestQuarantineDirectoryLinkedAfterTheMoveIsAMiss;
   end;
 
 procedure WriteSignal(const APath: string);
@@ -508,6 +529,135 @@ begin
     raise Exception.Create('failed to publish object-store test replacement');
 end;
 
+{ A directory symlink on Unix; a directory junction on Windows, which needs
+  no privilege. mklink /J reports success under Wine without creating
+  anything, so the result is the link's presence, not the exit status. }
+function TryCreateDirectoryLink(const ALink, ATarget: string): Boolean;
+{$IFDEF MSWINDOWS}
+var
+  Command: TProcess;
+{$ENDIF}
+begin
+  {$IFDEF UNIX}
+  Result := (FpSymlink(PChar(ExpandFileName(ATarget)), PChar(ALink)) = 0)
+    and IsDirSymlinkOrJunction(ALink);
+  {$ENDIF}
+  {$IFDEF MSWINDOWS}
+  Command := TProcess.Create(nil);
+  try
+    Command.Executable := SysUtils.GetEnvironmentVariable('COMSPEC');
+    if Command.Executable = '' then Command.Executable := 'cmd.exe';
+    Command.Parameters.Add('/C');
+    Command.Parameters.Add('mklink /J "' + StringReplace(ExpandFileName(ALink),
+      '/', '\', [rfReplaceAll]) + '" "' + StringReplace(
+      ExpandFileName(ATarget), '/', '\', [rfReplaceAll]) + '"');
+    Command.Options := [poNoConsole];
+    try
+      Command.Execute;
+      FinishChild(Command, CHILD_COMPLETION_TIMEOUT_MILLISECONDS, 'mklink');
+    except
+      Exit(False);
+    end;
+  finally
+    Command.Free;
+  end;
+  Result := IsDirSymlinkOrJunction(ALink);
+  {$ENDIF}
+end;
+
+{ Runs while tests register, before any suite's BeforeAll. }
+function DirectoryLinkSkipReason: string;
+var
+  Probe: string;
+begin
+  Probe := CreateScratchRoot('object-store-link-probe');
+  ForceDirectories(Probe + '/target');
+  try
+    if TryCreateDirectoryLink(Probe + '/link', Probe + '/target') then
+      Result := ''
+    else
+      Result := 'directory links cannot be created on this host';
+  finally
+    WipeDir(Probe);
+  end;
+end;
+
+{ Replaces a real directory of the store with a link to ATarget. }
+procedure ReplaceWithDirectoryLink(const ADirectory, ATarget: string);
+begin
+  WipeDir(ADirectory);
+  if not TryCreateDirectoryLink(ADirectory, ATarget) then
+    raise Exception.CreateFmt('failed to link %s to %s',
+      [ADirectory, ATarget]);
+end;
+
+var
+  SwapShardTarget: string;
+
+procedure SwapShardBeforeQuarantine(const APath: string);
+begin
+  ObjectStoreBeforeQuarantineTestHook := nil;
+  ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
+end;
+
+{ Puts a copy of the staged file outside the cache under the same name, then
+  replaces the staging directory with a link to that copy's directory. }
+procedure SwapStagingDirectoryAfterStage(const APath: string);
+begin
+  ObjectStoreAfterStageTestHook := nil;
+  if not CopyFileContent(APath, IncludeTrailingPathDelimiter(SwapShardTarget)
+    + ExtractFileName(APath)) then
+    raise Exception.Create('failed to copy the staged object outside');
+  ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
+end;
+
+var
+  SwapStoreRoot: string;
+
+procedure SwapStoreRootAfterStage(const APath: string);
+begin
+  ObjectStoreAfterStageTestHook := nil;
+  ReplaceWithDirectoryLink(SwapStoreRoot, SwapShardTarget);
+end;
+
+{ Puts a copy of the hashed quarantined object outside the cache under the
+  same name, then replaces the quarantine directory with a link to it. }
+procedure SwapQuarantineBeforeRestore(const APath: string);
+begin
+  ObjectStoreBeforeRestoreTestHook := nil;
+  if not CopyFileContent(APath, IncludeTrailingPathDelimiter(SwapShardTarget)
+    + ExtractFileName(APath)) then
+    raise Exception.Create('failed to copy the quarantined object outside');
+  ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
+end;
+
+var
+  DanglingStageTarget: string;
+
+{$IFDEF UNIX}
+procedure PlantDanglingStagedFileLink(const APath: string);
+begin
+  ObjectStoreBeforeStageTestHook := nil;
+  if FpSymlink(PChar(DanglingStageTarget), PChar(APath)) <> 0 then
+    raise Exception.Create('failed to plant the staged-file link');
+end;
+{$ENDIF}
+
+procedure SwapQuarantineAfterMove(const APath: string);
+begin
+  ObjectStoreAfterQuarantineTestHook := nil;
+  if not CopyFileContent(APath, IncludeTrailingPathDelimiter(SwapShardTarget)
+    + ExtractFileName(APath)) then
+    raise Exception.Create('failed to copy the quarantined object outside');
+  ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
+end;
+
+procedure SwapShardBeforeMaterializeCopy(const ADigest, APath: string);
+begin
+  ObjectStoreBeforeMaterializeCopyTestHook := nil;
+  ReplaceWithDirectoryLink(ExtractFileDir(APath), SwapShardTarget);
+end;
+
 procedure TObjectStoreContract.WriteBytes(const APath, AText: string);
 var
   Stream: TFileStream;
@@ -540,6 +690,15 @@ end;
 
 procedure TObjectStoreContract.ResetScratch;
 begin
+  ObjectStoreBeforeStageTestHook := nil;
+  ObjectStoreAfterQuarantineTestHook := nil;
+  DanglingStageTarget := '';
+  ObjectStoreBeforeQuarantineTestHook := nil;
+  ObjectStoreBeforeRestoreTestHook := nil;
+  ObjectStoreAfterStageTestHook := nil;
+  SwapStoreRoot := '';
+  ReplacementSource := '';
+  SwapShardTarget := '';
   ObjectStoreBeforeMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyTestHook := nil;
   ObjectStoreAfterMaterializeCopyStreamTestHook := nil;
@@ -557,6 +716,494 @@ begin
   FSource := FScratch + '/source/archive.tar.gz';
   WriteBytes(FSource, 'immutable archive bytes'#0'with binary tail');
   FDigest := 'sha256:' + SHA256File(FSource);
+  FOutside := FScratch + '/outside';
+  ForceDirectories(FOutside);
+end;
+
+{ Registers a test that needs directory links, or skips it with the reason
+  the probe found. }
+procedure TObjectStoreContract.LinkTest(const AName: string;
+  const AMethod: TTestMethod);
+begin
+  if FDirectoryLinkSkipReason = '' then Test(AName, AMethod)
+  else Skip(AName, AMethod, FDirectoryLinkSkipReason);
+end;
+
+function TObjectStoreContract.QuarantineEntryCount: Integer;
+var
+  SR: TSearchRec;
+begin
+  Result := 0;
+  if SysUtils.FindFirst(FStoreRoot + '/quarantine/*',
+    faAnyFile or faSymLink, SR) <> 0 then Exit;
+  try
+    repeat
+      if (SR.Name <> '.') and (SR.Name <> '..') then Inc(Result);
+    until SysUtils.FindNext(SR) <> 0;
+  finally
+    SysUtils.FindClose(SR);
+  end;
+end;
+
+{ A link below the store makes the object a miss for lookup and
+  materialization, and its target is neither moved, changed nor copied. The
+  link itself stays for repair to remove. }
+procedure TObjectStoreContract.ExpectLinkedObjectMisses(const AStore:
+  TLWPTImmutableObjectStore; const AOutsideFile, AOutsideBytes,
+  ALink: string);
+var
+  Destination, HitPath: string;
+  Failure: TLWPTObjectMaterializeFailure;
+begin
+  Expect<Boolean>(AStore.Lookup(FDigest, HitPath)).ToBe(False);
+  Destination := FScratch + '/project/materialized';
+  Expect<Boolean>(AStore.Materialize(FDigest, Destination,
+    FScratch + '/project/tmp', Failure)).ToBe(False);
+  Expect<string>(ObjectMaterializeFailureName(Failure))
+    .ToBe(ObjectMaterializeFailureName(omfObjectMissing));
+  Expect<Boolean>(FileExists(Destination)).ToBe(False);
+  Expect<Boolean>(FileExists(AOutsideFile)).ToBe(True);
+  Expect<string>(ReadBytes(AOutsideFile)).ToBe(AOutsideBytes);
+  Expect<Integer>(QuarantineEntryCount).ToBe(0);
+  Expect<Boolean>(IsDirSymlinkOrJunction(ALink)).ToBe(True);
+end;
+
+{ Outside bytes that differ from the object would be quarantined, which
+  moves the outside file into the cache. }
+procedure TObjectStoreContract.TestLinkedDigestRootIsNeverFollowed;
+var
+  DigestRoot, Hex, OutsideFile: string;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    Store.Admit(FSource, FDigest);
+    Hex := Copy(FDigest, 8, MaxInt);
+    OutsideFile := FOutside + '/' + Copy(Hex, 1, 2) + '/'
+      + Copy(Hex, 3, MaxInt);
+    WriteBytes(OutsideFile, 'outside bytes');
+    DigestRoot := FStoreRoot + '/sha256';
+    ReplaceWithDirectoryLink(DigestRoot, FOutside);
+    ExpectLinkedObjectMisses(Store, OutsideFile, 'outside bytes',
+      DigestRoot);
+  finally
+    Store.Free;
+  end;
+end;
+
+{ Outside bytes that match the object would be served as a hit. Admission
+  refuses to publish through the link instead of writing outside. }
+procedure TObjectStoreContract.TestLinkedShardIsNeverFollowed;
+var
+  OutsideFile, Shard: string;
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    Shard := ExtractFileDir(Store.Admit(FSource, FDigest));
+    OutsideFile := FOutside + '/' + Copy(FDigest, 10, MaxInt);
+    WriteBytes(OutsideFile, ReadBytes(FSource));
+    ReplaceWithDirectoryLink(Shard, FOutside);
+    ExpectLinkedObjectMisses(Store, OutsideFile, ReadBytes(FSource), Shard);
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('must not be a link', E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<string>(ReadBytes(OutsideFile)).ToBe(ReadBytes(FSource));
+  finally
+    Store.Free;
+  end;
+end;
+
+{$IFDEF UNIX}
+procedure TObjectStoreContract.TestLinkedObjectFileIsNeverFollowed;
+var
+  ObjectPath, OutsideFile: string;
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.Admit(FSource, FDigest);
+    OutsideFile := FOutside + '/target';
+    WriteBytes(OutsideFile, ReadBytes(FSource));
+    Expect<Boolean>(SysUtils.DeleteFile(ObjectPath)).ToBe(True);
+    Expect<Integer>(FpSymlink(PChar(OutsideFile), PChar(ObjectPath)))
+      .ToBe(0);
+    ExpectLinkedObjectMisses(Store, OutsideFile, ReadBytes(FSource),
+      ObjectPath);
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('object path must not contain a link', E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(IsDirSymlinkOrJunction(ObjectPath)).ToBe(True);
+    Expect<string>(ReadBytes(OutsideFile)).ToBe(ReadBytes(FSource));
+  finally
+    Store.Free;
+  end;
+end;
+{$ELSE}
+procedure TObjectStoreContract.TestLinkedObjectFileIsNeverFollowed;
+begin
+end;
+{$ENDIF}
+
+{ The shard becomes a link after verification found the object corrupt:
+  quarantine must not rename the outside file it now reaches. }
+procedure TObjectStoreContract.
+  TestShardLinkedBeforeQuarantineIsNeverFollowed;
+var
+  Destination, ObjectPath, OutsideFile: string;
+  Failure: TLWPTObjectMaterializeFailure;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.Admit(FSource, FDigest);
+    WriteBytes(ObjectPath, 'corrupt');
+    OutsideFile := FOutside + '/' + ExtractFileName(ObjectPath);
+    WriteBytes(OutsideFile, 'outside bytes');
+    SwapShardTarget := FOutside;
+    ObjectStoreBeforeQuarantineTestHook := SwapShardBeforeQuarantine;
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Boolean>(Assigned(ObjectStoreBeforeQuarantineTestHook))
+      .ToBe(False);
+    Expect<string>(ObjectMaterializeFailureName(Failure))
+      .ToBe(ObjectMaterializeFailureName(omfObjectMissing));
+    Expect<Boolean>(FileExists(Destination)).ToBe(False);
+    Expect<string>(ReadBytes(OutsideFile)).ToBe('outside bytes');
+    Expect<Integer>(QuarantineEntryCount).ToBe(0);
+  finally
+    ObjectStoreBeforeQuarantineTestHook := nil;
+    Store.Free;
+  end;
+end;
+
+{ The shard becomes a link after a verified lookup and before the copy, and
+  the outside file holds the object's bytes: the copy must not read it. }
+procedure TObjectStoreContract.
+  TestShardLinkedBeforeMaterializeCopyIsNeverRead;
+var
+  Destination, ObjectPath, OutsideFile: string;
+  Failure: TLWPTObjectMaterializeFailure;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.Admit(FSource, FDigest);
+    OutsideFile := FOutside + '/' + ExtractFileName(ObjectPath);
+    WriteBytes(OutsideFile, ReadBytes(FSource));
+    SwapShardTarget := FOutside;
+    ObjectStoreBeforeMaterializeCopyTestHook := SwapShardBeforeMaterializeCopy;
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Boolean>(Assigned(ObjectStoreBeforeMaterializeCopyTestHook))
+      .ToBe(False);
+    Expect<string>(ObjectMaterializeFailureName(Failure))
+      .ToBe(ObjectMaterializeFailureName(omfObjectMissing));
+    Expect<Boolean>(FileExists(Destination)).ToBe(False);
+    Expect<string>(ReadBytes(OutsideFile)).ToBe(ReadBytes(FSource));
+  finally
+    ObjectStoreBeforeMaterializeCopyTestHook := nil;
+    Store.Free;
+  end;
+end;
+
+{ Every file, directory and link below ARoot, links not followed. }
+function CountEntries(const ARoot: string): Integer;
+var
+  SR: TSearchRec;
+begin
+  Result := 0;
+  if SysUtils.FindFirst(IncludeTrailingPathDelimiter(ARoot) + '*',
+    faAnyFile or faSymLink, SR) <> 0 then Exit;
+  try
+    repeat
+      if (SR.Name = '.') or (SR.Name = '..') then Continue;
+      Inc(Result);
+      if ((SR.Attr and faDirectory) <> 0)
+         and ((SR.Attr and faSymLink) = 0) then
+        Inc(Result, CountEntries(IncludeTrailingPathDelimiter(ARoot)
+          + SR.Name));
+    until SysUtils.FindNext(SR) <> 0;
+  finally
+    SysUtils.FindClose(SR);
+  end;
+end;
+
+{ The store root becomes a link after the store was created. Admission stages
+  and publishes below that root, so it must refuse instead of writing into,
+  or wiping, the directory the link reaches. }
+procedure TObjectStoreContract.
+  TestAdmissionRefusesAStoreRootLinkedAfterCreation;
+var
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  ForceDirectories(FStoreRoot);
+  WriteBytes(FOutside + '/tmp/keep', 'outside bytes');
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ReplaceWithDirectoryLink(FStoreRoot, FOutside);
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('must not be links', E.Message) > 0;
+    end;
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(CountEntries(FOutside)).ToBe(2);
+    Expect<string>(ReadBytes(FOutside + '/tmp/keep')).ToBe('outside bytes');
+  finally
+    Store.Free;
+  end;
+end;
+
+{ The digest's staging directory becomes a link after the staged bytes were
+  verified: publication must not rename the file the link reaches into the
+  store. }
+procedure TObjectStoreContract.
+  TestPublicationRefusesAStagingDirectoryLinkedAfterStaging;
+var
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    SwapShardTarget := FOutside;
+    ObjectStoreAfterStageTestHook := SwapStagingDirectoryAfterStage;
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('object staging path must not contain a link',
+          E.Message) > 0;
+    end;
+    Expect<Boolean>(Assigned(ObjectStoreAfterStageTestHook)).ToBe(False);
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(CountEntries(FOutside)).ToBe(1);
+    Expect<Boolean>(FileExists(Store.ObjectPath(FDigest))).ToBe(False);
+  finally
+    ObjectStoreAfterStageTestHook := nil;
+    Store.Free;
+  end;
+end;
+
+{ The store root becomes a link after staging: publication must refuse before
+  it creates the digest and shard directories through that link. }
+procedure TObjectStoreContract.
+  TestPublicationRefusesAStoreRootLinkedAfterStaging;
+var
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    SwapStoreRoot := FStoreRoot;
+    SwapShardTarget := FOutside;
+    ObjectStoreAfterStageTestHook := SwapStoreRootAfterStage;
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('must not be links', E.Message) > 0;
+    end;
+    Expect<Boolean>(Assigned(ObjectStoreAfterStageTestHook)).ToBe(False);
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Integer>(CountEntries(FOutside)).ToBe(0);
+  finally
+    ObjectStoreAfterStageTestHook := nil;
+    Store.Free;
+  end;
+end;
+
+{ A valid object reaches quarantine through a concurrent replacement, and the
+  quarantine directory becomes a link after its hash: the restore must not
+  move the file the link reaches into the store. }
+procedure TObjectStoreContract.
+  TestRestoreRefusesAQuarantineDirectoryLinkedAfterHashing;
+var
+  Destination, ObjectPath: string;
+  Failure: TLWPTObjectMaterializeFailure;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.Admit(FSource, FDigest);
+    WriteBytes(ObjectPath, 'corrupt');
+    ReplacementSource := FSource;
+    ObjectStoreBeforeQuarantineTestHook := PublishValidReplacement;
+    SwapShardTarget := FOutside;
+    ObjectStoreBeforeRestoreTestHook := SwapQuarantineBeforeRestore;
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Boolean>(Assigned(ObjectStoreBeforeRestoreTestHook)).ToBe(False);
+    Expect<string>(ObjectMaterializeFailureName(Failure))
+      .ToBe(ObjectMaterializeFailureName(omfObjectMissing));
+    Expect<Integer>(CountEntries(FOutside)).ToBe(1);
+    Expect<Boolean>(FileExists(ObjectPath)).ToBe(False);
+    Expect<Boolean>(FileExists(Destination)).ToBe(False);
+  finally
+    ObjectStoreBeforeQuarantineTestHook := nil;
+    ObjectStoreBeforeRestoreTestHook := nil;
+    ReplacementSource := '';
+    Store.Free;
+  end;
+end;
+
+{ Discarding a build-result object invalidates the references to it. A
+  linked reference tree is left alone: a malformed "reference" reached
+  through it is a file outside the cache and is not deleted. }
+procedure TObjectStoreContract.
+  TestBuildDiscardNeverRemovesThroughLinkedReferences;
+var
+  BuildRoot, Hex, OutsideFile: string;
+  Inserted: Boolean;
+  Lease: TObject;
+  Store: TLWPTImmutableObjectStore;
+begin
+  BuildRoot := FScratch + '/cache/' + BUILD_RESULT_NAMESPACE;
+  Store := TLWPTImmutableObjectStore.Create(BuildRoot + '/objects',
+    FScratch + '/cache', BUILD_RESULT_NAMESPACE);
+  try
+    Store.AdmitRetained(FSource, FDigest, Lease, Inserted);
+    Lease.Free;
+    Expect<Boolean>(Inserted).ToBe(True);
+    Hex := Copy(FDigest, 8, MaxInt);
+    OutsideFile := FOutside + '/sha256/' + Copy(Hex, 1, 2) + '/'
+      + Copy(Hex, 3, MaxInt);
+    WriteBytes(OutsideFile, 'outside bytes');
+    Expect<Boolean>(TryCreateDirectoryLink(BuildRoot + '/refs', FOutside))
+      .ToBe(True);
+    try
+      Store.DiscardRetained(FDigest);
+    except
+      { An incomplete reference walk refuses the discard; repair owns it. }
+      on E: ELWPTCacheLifecycleError do;
+    end;
+    Expect<string>(ReadBytes(OutsideFile)).ToBe('outside bytes');
+  finally
+    Store.Free;
+  end;
+end;
+
+{ A dangling link sits at the staged file's name before the copy: staging
+  must refuse instead of creating and writing the link's target. }
+{$IFDEF UNIX}
+procedure TObjectStoreContract.TestStagingNeverWritesThroughALinkedStagedFile;
+var
+  Raised: Boolean;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    DanglingStageTarget := FOutside + '/target';
+    ObjectStoreBeforeStageTestHook := PlantDanglingStagedFileLink;
+    Raised := False;
+    try
+      Store.Admit(FSource, FDigest);
+    except
+      on E: ELWPTObjectStoreError do
+        Raised := Pos('object staging path must not contain a link',
+          E.Message) > 0;
+    end;
+    Expect<Boolean>(Assigned(ObjectStoreBeforeStageTestHook)).ToBe(False);
+    Expect<Boolean>(Raised).ToBe(True);
+    Expect<Boolean>(FileExists(DanglingStageTarget)).ToBe(False);
+    Expect<Integer>(CountEntries(FOutside)).ToBe(0);
+  finally
+    ObjectStoreBeforeStageTestHook := nil;
+    Store.Free;
+  end;
+end;
+{$ELSE}
+procedure TObjectStoreContract.TestStagingNeverWritesThroughALinkedStagedFile;
+begin
+end;
+{$ENDIF}
+
+{ The quarantine directory becomes a link right after a corrupt object moved
+  into it: the entry is a miss, reported as object-missing, and is not read
+  or restored. }
+procedure TObjectStoreContract.
+  TestQuarantineDirectoryLinkedAfterTheMoveIsAMiss;
+var
+  Destination, ObjectPath: string;
+  Failure: TLWPTObjectMaterializeFailure;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.Admit(FSource, FDigest);
+    WriteBytes(ObjectPath, 'corrupt');
+    SwapShardTarget := FOutside;
+    ObjectStoreAfterQuarantineTestHook := SwapQuarantineAfterMove;
+    Destination := FScratch + '/project/materialized';
+    Expect<Boolean>(Store.Materialize(FDigest, Destination,
+      FScratch + '/project/tmp', Failure)).ToBe(False);
+    Expect<Boolean>(Assigned(ObjectStoreAfterQuarantineTestHook))
+      .ToBe(False);
+    Expect<string>(ObjectMaterializeFailureName(Failure))
+      .ToBe(ObjectMaterializeFailureName(omfObjectMissing));
+    Expect<Integer>(CountEntries(FOutside)).ToBe(1);
+    Expect<Boolean>(FileExists(ObjectPath)).ToBe(False);
+  finally
+    ObjectStoreAfterQuarantineTestHook := nil;
+    Store.Free;
+  end;
+end;
+
+{ Rolling back an admission deletes the payload only while no link leads to
+  it; the index entry still goes. }
+procedure TObjectStoreContract.TestDiscardNeverDeletesThroughALinkedShard;
+var
+  Inserted: Boolean;
+  Lease: TObject;
+  ObjectPath, OutsideFile: string;
+  Store: TLWPTImmutableObjectStore;
+begin
+  Store := TLWPTImmutableObjectStore.Create(FStoreRoot,
+    FScratch + '/cache', DEPENDENCY_ARCHIVE_NAMESPACE);
+  try
+    ObjectPath := Store.AdmitRetained(FSource, FDigest, Lease, Inserted);
+    Lease.Free;
+    Expect<Boolean>(Inserted).ToBe(True);
+    OutsideFile := FOutside + '/' + ExtractFileName(ObjectPath);
+    WriteBytes(OutsideFile, ReadBytes(FSource));
+    ReplaceWithDirectoryLink(ExtractFileDir(ObjectPath), FOutside);
+    Store.DiscardRetained(FDigest);
+    Expect<Boolean>(FileExists(OutsideFile)).ToBe(True);
+    Expect<string>(ReadBytes(OutsideFile)).ToBe(ReadBytes(FSource));
+  finally
+    Store.Free;
+  end;
 end;
 
 {$IFDEF UNIX}
@@ -1076,6 +1723,7 @@ end;
 
 procedure TObjectStoreContract.SetupTests;
 begin
+  FDirectoryLinkSkipReason := DirectoryLinkSkipReason;
   Test('digest addresses are canonical and sharded',
     TestDigestAddressIsCanonicalAndSharded);
   Test('invalid digests are refused', TestInvalidDigestIsRefused);
@@ -1107,6 +1755,44 @@ begin
     TestCacheRootOverrideIsAbsoluteAndNormalized);
   Test('platform default uses the per-user cache location',
     TestPlatformDefaultUsesPerUserCacheLocation);
+  LinkTest('a linked digest root is a miss whose target is never moved',
+    TestLinkedDigestRootIsNeverFollowed);
+  LinkTest('a linked shard is a miss whose target is never read or written',
+    TestLinkedShardIsNeverFollowed);
+  {$IFDEF UNIX}
+  Test('a linked object file is a miss whose target is never read',
+    TestLinkedObjectFileIsNeverFollowed);
+  {$ELSE}
+  Skip('a linked object file is a miss whose target is never read',
+    TestLinkedObjectFileIsNeverFollowed,
+    'file symbolic links need a privilege Windows does not grant by default');
+  {$ENDIF}
+  LinkTest('a shard linked before quarantine is never followed',
+    TestShardLinkedBeforeQuarantineIsNeverFollowed);
+  LinkTest('a shard linked before the materialization copy is never read',
+    TestShardLinkedBeforeMaterializeCopyIsNeverRead);
+  LinkTest('discarding an object never deletes through a linked shard',
+    TestDiscardNeverDeletesThroughALinkedShard);
+  LinkTest('admission refuses a store root linked after the store was created',
+    TestAdmissionRefusesAStoreRootLinkedAfterCreation);
+  LinkTest('publication refuses a staging directory linked after staging',
+    TestPublicationRefusesAStagingDirectoryLinkedAfterStaging);
+  LinkTest('publication refuses a store root linked after staging before '
+    + 'creating directories', TestPublicationRefusesAStoreRootLinkedAfterStaging);
+  LinkTest('restore refuses a quarantine directory linked after hashing',
+    TestRestoreRefusesAQuarantineDirectoryLinkedAfterHashing);
+  LinkTest('build-result discard never removes through linked references',
+    TestBuildDiscardNeverRemovesThroughLinkedReferences);
+  {$IFDEF UNIX}
+  Test('staging never creates a file through a linked staged-file name',
+    TestStagingNeverWritesThroughALinkedStagedFile);
+  {$ELSE}
+  Skip('staging never creates a file through a linked staged-file name',
+    TestStagingNeverWritesThroughALinkedStagedFile,
+    'file symbolic links need a privilege Windows does not grant by default');
+  {$ENDIF}
+  LinkTest('a quarantine directory linked after the move is an object miss',
+    TestQuarantineDirectoryLinkedAfterTheMoveIsAMiss);
 end;
 
 begin
