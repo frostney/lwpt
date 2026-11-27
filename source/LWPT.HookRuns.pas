@@ -234,8 +234,7 @@ var
   i: Integer;
 begin
   RequireUnlinkedState;
-  if not ForceDirectories(ExtractFileDir(FGuardPath))
-     and not DirectoryExists(ExtractFileDir(FGuardPath)) then
+  if not EnsureSharedDirectory(ExtractFileDir(FGuardPath)) then
     raise ELWPTError.CreateFmt('could not create hook run directory %s',
       [ExtractFileDir(FGuardPath)]);
   RequireUnlinkedState;
@@ -244,8 +243,7 @@ begin
     if IsDirSymlinkOrJunction(FDirectory) then
       raise ELWPTError.CreateFmt('hook run directory must not be a link: %s',
         [FDirectory]);
-    if not ForceDirectories(FDirectory) and not DirectoryExists(FDirectory)
-    then
+    if not EnsureSharedDirectory(FDirectory) then
       raise ELWPTError.CreateFmt('could not create hook run directory %s',
         [FDirectory]);
     Entries := TStringList.Create;

@@ -231,6 +231,9 @@ function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
 function AcquireOwnerGuard(const APath, ADescription: string): TObject;
 function OwnerGuardHeld(const APath: string): Boolean;
 function AcquireShortLock(const APath: string): TObject;
+{ Creates APath and its parents, retrying while concurrent processes create
+  the same components; True when the directory exists afterwards. }
+function EnsureSharedDirectory(const APath: string): Boolean;
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTSessionFinishTestHook = procedure(const ASessionRoot: string);
@@ -2288,6 +2291,11 @@ end;
 function AcquireShortLock(const APath: string): TObject;
 begin
   Result := TLWPTPublicationLock.Create(APath, True);
+end;
+
+function EnsureSharedDirectory(const APath: string): Boolean;
+begin
+  Result := EnsureDirectory(APath);
 end;
 
 function BuildSessionsProjectRoot(const AProjectRoot,

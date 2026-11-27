@@ -57,8 +57,8 @@ program	*	source/LWPT.Gzip.Test.pas	1	20
 program	*	source/LWPT.TarWriter.Test.pas	1	11
 program	*	source/LWPT.Zip.Test.pas	3	24
 program	*	source/LWPT.Health.Test.pas	1	11
-program	*	source/LWPT.HookRuns.Test.pas	1	13
-program	windows/*	source/LWPT.HookRuns.Test.pas	1	8
+program	*	source/LWPT.HookRuns.Test.pas	1	14
+program	windows/*	source/LWPT.HookRuns.Test.pas	1	9
 program	*	source/LWPT.SHA1.Test.pas	1	2
 program	*	source/LWPT.TestArtifactSet.Test.pas	1	9
 program	windows/*	source/LWPT.TestArtifactSet.Test.pas	1	7

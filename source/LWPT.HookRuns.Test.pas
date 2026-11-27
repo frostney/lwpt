@@ -28,6 +28,17 @@ const
   PollMilliseconds = 10;
 
 type
+  { Registers one run on a shared, not yet existing directory tree. }
+  TRegisterThread = class(TThread)
+  private
+    FRuns, FGuard, FError: string;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ARuns, AGuard: string);
+    property Error: string read FError;
+  end;
+
   THookRunTests = class(TTestSuite)
   private
     FRoot, FRuns, FGuard: string;
@@ -45,6 +56,7 @@ type
     procedure TestDeadMarkerIsRemoved;
     procedure TestOtherProcessMarkerOverlaps;
     procedure TestUnfinishedRunLeavesNoMarker;
+    procedure TestConcurrentFirstRegistrationsSucceed;
     {$IFDEF UNIX}
     procedure TestLinkedMarkerIsRemovedUnprobed;
     procedure TestLinkedLockIsRefused;
@@ -72,6 +84,22 @@ begin
     Result := 0;
   finally
     Guard.Free;
+  end;
+end;
+
+constructor TRegisterThread.Create(const ARuns, AGuard: string);
+begin
+  FRuns := ARuns;
+  FGuard := AGuard;
+  inherited Create(True);
+end;
+
+procedure TRegisterThread.Execute;
+begin
+  try
+    TLWPTHookRun.Create(FRuns, FGuard, '').Free;
+  except
+    on E: Exception do FError := E.Message;
   end;
 end;
 
@@ -312,6 +340,30 @@ begin
   end;
 end;
 
+{ Runs that register at the same moment on a state tree none of them has
+  created yet all succeed: each tolerates the others creating the same
+  directories. }
+procedure THookRunTests.TestConcurrentFirstRegistrationsSucceed;
+const
+  Count = 8;
+var
+  Threads: array[0..Count - 1] of TRegisterThread;
+  Runs, Guard: string;
+  i: Integer;
+begin
+  Runs := FRoot + '/a/b/c/out.runs';
+  Guard := FRoot + '/a/b/c/out.lock';
+  for i := 0 to Count - 1 do
+    Threads[i] := TRegisterThread.Create(Runs, Guard);
+  for i := 0 to Count - 1 do Threads[i].Start;
+  for i := 0 to Count - 1 do
+  begin
+    Threads[i].WaitFor;
+    Expect<string>(Threads[i].Error).ToBe('');
+    Threads[i].Free;
+  end;
+end;
+
 procedure THookRunTests.TestUnfinishedRunLeavesNoMarker;
 var
   Run: TLWPTHookRun;
@@ -443,6 +495,8 @@ begin
   Test('another process''s live marker overlaps',
     TestOtherProcessMarkerOverlaps);
   Test('an unfinished run leaves no marker', TestUnfinishedRunLeavesNoMarker);
+  Test('concurrent first registrations all succeed',
+    TestConcurrentFirstRegistrationsSucceed);
   {$IFDEF UNIX}
   Test('a linked marker is removed without being probed',
     TestLinkedMarkerIsRemovedUnprobed);
