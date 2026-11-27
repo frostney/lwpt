@@ -56,7 +56,7 @@ type
   private
     FListen, FClient: TSocket;
     FPort: Word;
-    FWorkerCreated: Boolean;
+    FStarted: Boolean;
     {$IFDEF MSWINDOWS}
     FWinSockStarted: Boolean;
     {$ENDIF}
@@ -282,6 +282,7 @@ begin
   FClient := INVALID_SOCKET;
   {$ENDIF}
   FListen := FClient;
+  inherited Create(True);
   {$IFDEF MSWINDOWS}
   if WSAStartup($0202, Data) <> 0 then
     raise Exception.Create('flooder WSAStartup failed');
@@ -314,8 +315,8 @@ begin
   {$ENDIF}
   PreventSigPipe(FListen);
   SetNonblocking(FListen);
-  inherited Create(False);
-  FWorkerCreated := True;
+  Start;
+  FStarted := True;
 end;
 
 procedure TFlooder.Execute;
@@ -362,7 +363,7 @@ end;
 
 destructor TFlooder.Destroy;
 begin
-  if FWorkerCreated then
+  if FStarted then
   begin
     Terminate;
     WaitFor;

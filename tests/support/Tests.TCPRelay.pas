@@ -37,9 +37,10 @@ type
     FBackendHost: string;
     FAccepted, FFailedConnects, FSendStalls: LongInt;
     FLock: TRTLCriticalSection;
+    FLockInitialized: Boolean;
     FSockets: array of TSocket;
     FPumps: TList;
-    FWorkerCreated: Boolean;
+    FStarted: Boolean;
     {$IFDEF MSWINDOWS}
     FWinSockStarted: Boolean;
     {$ENDIF}
@@ -310,11 +311,13 @@ var
   {$ENDIF}
 begin
   FListen := INVALID_RELAY_SOCKET;
+  inherited Create(True);
   FBackend := ABackend;
   FBackendHost := ABackendHost;
   ConnectTimeoutMilliseconds := 5000;
   FreeOnTerminate := False;
   InitCriticalSection(FLock);
+  FLockInitialized := True;
   FPumps := TList.Create;
   {$IFDEF MSWINDOWS}
   if WSAStartup($0202, Data) <> 0 then
@@ -341,8 +344,8 @@ begin
   {$ENDIF}
   if not SetRelayBlocking(FListen, False) then
     raise Exception.Create('relay listener cannot be made nonblocking');
-  inherited Create(False);
-  FWorkerCreated := True;
+  Start;
+  FStarted := True;
 end;
 
 procedure TTCPRelay.Track(const ASocket: TSocket);
@@ -459,7 +462,7 @@ begin
     and a pending backend connection notice Terminated within one poll
     slice, and shut-down sockets end every copy. The listener is closed
     only after the join, so no thread uses a closed handle. }
-  if FWorkerCreated then
+  if FStarted then
   begin
     Terminate;
     ShutdownRelaySocket(FListen);
@@ -483,7 +486,7 @@ begin
   FPumps.Free;
   for Index := 0 to High(FSockets) do CloseRelaySocket(FSockets[Index]);
   if RelaySocketValid(FListen) then CloseRelaySocket(FListen);
-  DoneCriticalSection(FLock);
+  if FLockInitialized then DoneCriticalSection(FLock);
   {$IFDEF MSWINDOWS}
   if FWinSockStarted then WSACleanup;
   {$ENDIF}

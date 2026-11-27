@@ -27,10 +27,10 @@ uses
   {$IFDEF MSWINDOWS}
   WinSock2,
   {$ENDIF}
+  Process,
   base64,
   HTTPClient,
   TestingPascalLibrary,
-  Tests.ProcessSupport,
   Tests.RetrievalRecorder,
   TransportSecurity;
 
@@ -92,7 +92,9 @@ const
   SERVER_JOIN_MILLISECONDS = 15000;
   RECEIVE_CHUNK_SIZE = 4096;
   FAILED_SERVER_CONSTRUCTION_PROBE = '--failed-server-construction-probe';
+  IDENTITY_OPEN_FAILURE_EXIT_CODE = 1;
   FAILED_SERVER_CONSTRUCTION_TIMEOUT_MILLISECONDS = 5000;
+  CHILD_CLEANUP_TIMEOUT_MILLISECONDS = 2000;
 
 type
   TServedConnection = record
@@ -1591,24 +1593,57 @@ begin
     on E: EFOpenError do
     begin
       WriteLn(ErrOutput, E.ClassName, ': ', E.Message);
-      ExitCode := 1;
+      ExitCode := IDENTITY_OPEN_FAILURE_EXIT_CODE;
     end;
   end;
 end;
 
+{$IFDEF MSWINDOWS}
+function TerminateChildHandle(AProcess: THandle;
+  AExitCode: LongWord): LongBool; stdcall;
+  external 'kernel32.dll' name 'TerminateProcess';
+{$ENDIF}
+
+function ChildExitedWithin(AChild: TProcess;
+  const ATimeoutMilliseconds: QWord): Boolean;
+var
+  StartedAt: QWord;
+begin
+  StartedAt := GetTickCount64;
+  while AChild.Running and
+        (GetTickCount64 - StartedAt < ATimeoutMilliseconds) do
+    Sleep(10);
+  Result := not AChild.Running;
+end;
+
 procedure TTransportSecurityClientOptionsE2ETests.
   TestFailedServerConstructionReportsError;
-const
-  ERROR_PREFIX = 'EFOpenError: ';
 var
-  Code: Integer;
-  Output: string;
+  Child: TProcess;
 begin
-  Code := RunChildCommand('', ExpandFileName(ParamStr(0)),
-    [FAILED_SERVER_CONSTRUCTION_PROBE], Output,
-    FAILED_SERVER_CONSTRUCTION_TIMEOUT_MILLISECONDS);
-  Expect<string>(Copy(Output, 1, Length(ERROR_PREFIX))).ToBe(ERROR_PREFIX);
-  Expect<Integer>(Code).ToBe(1);
+  Child := TProcess.Create(nil);
+  try
+    Child.Executable := ExpandFileName(ParamStr(0));
+    Child.Parameters.Add(FAILED_SERVER_CONSTRUCTION_PROBE);
+    Child.Execute;
+    if not ChildExitedWithin(Child,
+      FAILED_SERVER_CONSTRUCTION_TIMEOUT_MILLISECONDS) then
+    begin
+      {$IFDEF UNIX}
+      FpKill(Child.ProcessID, SIGKILL);
+      {$ENDIF}
+      {$IFDEF MSWINDOWS}
+      TerminateChildHandle(Child.ProcessHandle, 1);
+      {$ENDIF}
+      if not ChildExitedWithin(Child, CHILD_CLEANUP_TIMEOUT_MILLISECONDS) then
+        raise Exception.Create('Failed to stop the TLS fixture probe child');
+      raise Exception.CreateFmt('TLS fixture probe exceeded its %d ms deadline',
+        [FAILED_SERVER_CONSTRUCTION_TIMEOUT_MILLISECONDS]);
+    end;
+    Expect<Integer>(Child.ExitCode).ToBe(IDENTITY_OPEN_FAILURE_EXIT_CODE);
+  finally
+    Child.Free;
+  end;
 end;
 
 procedure TTransportSecurityClientOptionsE2ETests.SetupTests;
