@@ -467,7 +467,16 @@ begin
   Result.FStream := Stream;
   Result.FDeclared := ALength;
   Result.FReceived := 0;
+  {$IFDEF MSWINDOWS}
+  try
+    SHA256Init(Result.FContext);
+  except
+    Result.Free;
+    raise;
+  end;
+  {$ELSE}
   SHA256Init(Result.FContext);
+  {$ENDIF}
 end;
 
 function TLWPTRegistryIncoming.Sweep(const AWait: Boolean): Boolean;
@@ -668,6 +677,9 @@ end;
 function TLWPTRegistryUpload.Abandon: Boolean;
 begin
   if FFinished then Exit(True);
+  {$IFDEF MSWINDOWS}
+  SHA256Discard(FContext);
+  {$ENDIF}
   CloseStream;
   FFinished := True;
   Result := DeletePart;
@@ -676,6 +688,9 @@ end;
 
 destructor TLWPTRegistryUpload.Destroy;
 begin
+  {$IFDEF MSWINDOWS}
+  SHA256Discard(FContext);
+  {$ENDIF}
   try
     if not FFinished then Abandon;
   except

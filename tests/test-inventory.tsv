@@ -45,7 +45,8 @@ program	windows/*	source/LWPT.CompilerDriver.FPC.Test.pas	1	23
 program	*	source/LWPT.CompilerDriver.Lakon.Test.pas	1	17
 program	*	source/LWPT.CompilerRegistry.Test.pas	1	11
 program	*	source/LWPT.Core.Test.pas	24	184
-program	windows/*	source/LWPT.Core.Test.pas	24	193
+program	windows/*	source/LWPT.Core.Test.pas	24	194
+program	windows/x86_64	source/LWPT.Core.Test.pas	24	195
 program	*	source/LWPT.DependencyUpdate.Test.pas	4	17
 program	*	source/LWPT.Duplication.Test.pas	1	18
 program	*	source/LWPT.FetchPolicy.Test.pas	1	10

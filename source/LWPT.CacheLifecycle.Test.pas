@@ -1220,7 +1220,7 @@ var
     MalformedRootEntry: string;
   FirstReport, SecondReport: TLWPTCacheRepairReport;
   Store: TLWPTImmutableObjectStore;
-  {$IFDEF DARWIN}
+  {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
   FirstHashCount: SizeInt;
   {$ENDIF}
 begin
@@ -1243,11 +1243,11 @@ begin
     WriteTextFile(MalformedRootEntry, 'root-residue');
     WriteTextFile(MalformedPrefix, 'prefix-residue');
     WriteTextFile(MalformedEntry, 'entry-residue');
-    {$IFDEF DARWIN}
+    {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
     FirstHashCount := NativeSHA256StreamCount;
     {$ENDIF}
     FirstReport := RepairSharedCache(FCacheRoot);
-    {$IFDEF DARWIN}
+    {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
     Expect<SizeInt>(NativeSHA256StreamCount - FirstHashCount).ToBe(2);
     {$ENDIF}
     Expect<Boolean>(FirstReport.IndexRebuilt).ToBe(True);
@@ -1260,7 +1260,7 @@ begin
     Expect<Boolean>(FileExists(MalformedPrefix)).ToBe(False);
     Expect<Boolean>(FileExists(MalformedEntry)).ToBe(False);
     SecondReport := RepairSharedCache(FCacheRoot);
-    {$IFDEF DARWIN}
+    {$IF DEFINED(DARWIN) OR DEFINED(MSWINDOWS)}
     Expect<SizeInt>(NativeSHA256StreamCount - FirstHashCount).ToBe(3);
     {$ENDIF}
     Expect<Integer>(SecondReport.CorruptObjectsRemoved).ToBe(0);
