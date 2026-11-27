@@ -213,6 +213,18 @@ function BuildPublicationLockPath(const ASessionsRoot, AOutput: string): string;
   and relocated session roots, for a short project-wide critical section.
   Free the result to release it. }
 function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
+{ The primitives behind build sessions, for other per-project coordination
+  state. AcquireOwnerGuard creates APath and holds it under a
+  non-inherited operating-system lock (fcntl on Unix, LockFileEx on Windows)
+  until the result is freed or the process exits; it raises when the guard
+  cannot be taken. OwnerGuardHeld probes another process's guard: it opens
+  and closes APath, so a process must never probe a guard it holds itself.
+  AcquireShortLock takes the advisory lock at APath for a short critical
+  section, waiting at most as long as a build publication does, and raises
+  EConcurrencyError when that wait runs out. Free its result to release it. }
+function AcquireOwnerGuard(const APath, ADescription: string): TObject;
+function OwnerGuardHeld(const APath: string): Boolean;
+function AcquireShortLock(const APath: string): TObject;
 {$IFDEF OBJECTSTORE_TESTING}
 type
   TLWPTSessionFinishTestHook = procedure(const ASessionRoot: string);
@@ -323,7 +335,8 @@ type
     FHandle: THandle;
     {$ENDIF}
   public
-    constructor Create(const APath: string);
+    constructor Create(const APath: string;
+      const ADescription: string = 'build session owner guard');
     destructor Destroy; override;
   end;
 
@@ -1866,7 +1879,8 @@ begin
   end;
 end;
 
-constructor TLWPTSessionOwnerGuard.Create(const APath: string);
+constructor TLWPTSessionOwnerGuard.Create(const APath: string;
+  const ADescription: string);
 {$IFDEF UNIX}
 var
   LockSpec: TLWPTFlock;
@@ -1880,9 +1894,8 @@ begin
   FPath := APath;
   FLocked := False;
   if not EnsureDirectory(ExtractFileDir(FPath)) then
-    raise ELWPTError.CreateFmt(
-      'could not create build session owner guard directory %s',
-      [ExtractFileDir(FPath)]);
+    raise ELWPTError.CreateFmt('could not create %s directory %s',
+      [ADescription, ExtractFileDir(FPath)]);
   {$IFDEF UNIX}
   FDescriptor := -1;
   {$ENDIF}
@@ -1892,8 +1905,8 @@ begin
   {$IFDEF UNIX}
   FDescriptor := OpenProtectedDescriptor(FPath, O_RDWR or O_CREAT);
   if FDescriptor < 0 then
-    raise ELWPTError.CreateFmt(
-      'could not open build session owner guard %s', [FPath]);
+    raise ELWPTError.CreateFmt('could not open %s %s',
+      [ADescription, FPath]);
   FillChar(LockSpec, SizeOf(LockSpec), 0);
   LockSpec.l_type := F_WRLCK_LWPT;
   LockSpec.l_whence := SEEK_SET;
@@ -1903,8 +1916,8 @@ begin
   begin
     FpClose(FDescriptor);
     FDescriptor := -1;
-    raise ELWPTError.CreateFmt(
-      'build session owner guard is already held %s', [FPath]);
+    raise ELWPTError.CreateFmt('%s is already held %s',
+      [ADescription, FPath]);
   end;
   FLocked := True;
   {$ENDIF}
@@ -1915,8 +1928,8 @@ begin
       or Windows.FILE_SHARE_DELETE,
     nil, Windows.OPEN_ALWAYS, Windows.FILE_ATTRIBUTE_NORMAL, 0);
   if FHandle = THandle(Windows.INVALID_HANDLE_VALUE) then
-    raise ELWPTError.CreateFmt(
-      'could not open build session owner guard %s', [FPath]);
+    raise ELWPTError.CreateFmt('could not open %s %s',
+      [ADescription, FPath]);
   FillChar(Overlapped, SizeOf(Overlapped), 0);
   if not Windows.LockFileEx(FHandle,
     LOCKFILE_EXCLUSIVE_LOCK_LWPT or LOCKFILE_FAIL_IMMEDIATELY_LWPT,
@@ -1924,8 +1937,8 @@ begin
   begin
     Windows.CloseHandle(FHandle);
     FHandle := THandle(Windows.INVALID_HANDLE_VALUE);
-    raise ELWPTError.CreateFmt(
-      'build session owner guard is already held %s', [FPath]);
+    raise ELWPTError.CreateFmt('%s is already held %s',
+      [ADescription, FPath]);
   end;
   FLocked := True;
   {$ENDIF}
@@ -2215,6 +2228,21 @@ function AcquireBuildCoordinationLock(const AProjectRoot: string): TObject;
 begin
   Result := TLWPTPublicationLock.Create(
     BuildSessionLedgerLockPath(AProjectRoot));
+end;
+
+function AcquireOwnerGuard(const APath, ADescription: string): TObject;
+begin
+  Result := TLWPTSessionOwnerGuard.Create(APath, ADescription);
+end;
+
+function OwnerGuardHeld(const APath: string): Boolean;
+begin
+  Result := SessionOwnerGuardHeld(APath);
+end;
+
+function AcquireShortLock(const APath: string): TObject;
+begin
+  Result := TLWPTPublicationLock.Create(APath);
 end;
 
 function BuildSessionsProjectRoot(const AProjectRoot,

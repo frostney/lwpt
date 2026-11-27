@@ -23,6 +23,7 @@ uses
 
   LWPT.Command.Common,
   LWPT.Core,
+  LWPT.HookRuns,
   LWPT.Manifest,
   TestingPascalLibrary,
   Tests.ProcessSupport,
@@ -71,6 +72,9 @@ type
     procedure TestInputEditedDuringRunIsNotRecorded;
     procedure TestSessionPrivateOutputKeepsNoRecord;
     procedure TestUnreadableOutputSkipsRecord;
+    procedure TestRegisteredRunIsRecorded;
+    procedure TestOverlappedRunIsNotRecorded;
+    procedure TestUnrecordedHooksRegisterNoRun;
     {$IFDEF UNIX}
     procedure TestFifoInputIsStaleWithoutBlocking;
     {$ENDIF}
@@ -327,6 +331,80 @@ end;
 
 { A per-entry postbuild output retargeted to a session's private candidate
   changes path with every session, so it never gets a record. }
+{ What RunHooks and RunUserTask do around the command (#442): register the
+  run, then record after it. A run no other run overlapped is recorded and
+  leaves no in-flight state behind. }
+procedure THookStalenessTests.TestRegisteredRunIsRecorded;
+var
+  Hook: THook;
+  InputDigest, Runs: string;
+  Run: TLWPTHookRun;
+  Search: TSearchRec;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  HookIsStale(Hook, FRoot, InputDigest);
+  Run := BeginHookRun(Hook, FRoot);
+  try
+    Expect<Boolean>(Run <> nil).ToBe(True);
+    Expect<Boolean>(Pos(HOOK_RUN_ANCESTORS_ENV + '=', Run.ChildEnvironment)
+      = 1).ToBe(True);
+    WriteStamped(OutputName, OutputNanoseconds);
+    RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest, Run);
+  finally
+    Run.Free;
+  end;
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+  Runs := IncludeTrailingPathDelimiter(FRoot) + '.lwpt/sessions/hook-runs';
+  Expect<Boolean>(FindFirst(Runs + '/*.runs/*.*', faAnyFile, Search) = 0)
+    .ToBe(False);
+  FindClose(Search);
+end;
+
+{ A second run of the same output registers while the first is still
+  going, writes the output and finishes first. The first run then finds
+  that output, which may be the second run's generation from other inputs,
+  so it records nothing and the output stays stale. }
+procedure THookStalenessTests.TestOverlappedRunIsNotRecorded;
+var
+  Hook: THook;
+  InputDigest: string;
+  First, Second: TLWPTHookRun;
+begin
+  Hook := GatedHook(['lwpt.toml']);
+  WriteStamped('lwpt.toml', OlderSeconds, OlderNanoseconds);
+  HookIsStale(Hook, FRoot, InputDigest);
+  First := BeginHookRun(Hook, FRoot);
+  try
+    Second := BeginHookRun(Hook, FRoot);
+    try
+      WriteStamped(OutputName, OutputNanoseconds);
+      RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest, Second);
+    finally
+      Second.Free;
+    end;
+    RecordHookRun(Hook, FRoot, TMP_DIR, InputDigest, First);
+  finally
+    First.Free;
+  end;
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(True);
+  { Overlap is per run, not sticky: the next lone run records again. }
+  RecordRun(Hook);
+  Expect<Boolean>(HookIsStale(Hook, FRoot)).ToBe(False);
+end;
+
+procedure THookStalenessTests.TestUnrecordedHooksRegisterNoRun;
+var
+  Hook: THook;
+begin
+  Hook := Default(THook);
+  Hook.Name := 'always';
+  Expect<Boolean>(BeginHookRun(Hook, FRoot) = nil).ToBe(True);
+  Hook := GatedHook(['lwpt.toml']);
+  Hook.SessionPrivateOutput := True;
+  Expect<Boolean>(BeginHookRun(Hook, FRoot) = nil).ToBe(True);
+end;
+
 procedure THookStalenessTests.TestSessionPrivateOutputKeepsNoRecord;
 var
   Hook: THook;
@@ -485,6 +563,12 @@ begin
     TestSessionPrivateOutputKeepsNoRecord);
   Test('an output that cannot be read after the run leaves no record',
     TestUnreadableOutputSkipsRecord);
+  Test('a registered run no other run overlapped is recorded',
+    TestRegisteredRunIsRecorded);
+  Test('a run another run of the same output overlapped is not recorded',
+    TestOverlappedRunIsNotRecorded);
+  Test('ungated and session-private hooks register no run',
+    TestUnrecordedHooksRegisterNoRun);
   {$IFDEF UNIX}
   Test('a matched FIFO is stale, unhashed and never blocks the gate',
     TestFifoInputIsStaleWithoutBlocking);

@@ -15,6 +15,7 @@ uses
   LWPT.BuildRequest,
   LWPT.CompilerDriver,
   LWPT.Core,
+  LWPT.HookRuns,
   LWPT.Manifest;
 
 { Exit code of a finished TProcess, tolerant of which call reaped it.
@@ -52,12 +53,22 @@ function  HookIsStale(const AHook: THook;
   const AProjectRoot: string): Boolean; overload;
 function  HookIsStale(const AHook: THook; const AProjectRoot: string;
   out AInputDigest: string): Boolean; overload;
+{ Registers a run of AHook's output that is about to start (#442), or
+  returns nil for a hook that keeps no record: an ungated hook, or a
+  postbuild output retargeted to its session's private candidate. The
+  command's environment must carry the result's ChildEnvironment. Raises
+  when the run cannot be registered. The caller frees the result. }
+function  BeginHookRun(const AHook: THook;
+  const AProjectRoot: string): TLWPTHookRun;
 { Records that AHook just succeeded on inputs with AInputDigest (taken
   before it ran), together with the content of the output it left. The
   record is staged through ATmpRoot, the project's temporary root (the
-  manifest's resolved tmp-dir). }
+  manifest's resolved tmp-dir). ARun, the run BeginHookRun registered, is
+  finished after the output is read, and nothing is recorded when another
+  run of the same output overlapped it. }
 procedure RecordHookRun(const AHook: THook;
-  const AProjectRoot, ATmpRoot, AInputDigest: string);
+  const AProjectRoot, ATmpRoot, AInputDigest: string;
+  ARun: TLWPTHookRun = nil);
 function  RunUserTask(const ATask: THook;
   const AProjectRoot, ATmpRoot: string): Integer;
 procedure RunHooks(const APhase: string; const AHooks: THookArray;
@@ -437,14 +448,33 @@ end;
   lives below the default sessions directory, which repair never sweeps
   (repair reclaims only session directories). A lost record only makes the
   hook run once more. }
-function HookRunRecordPath(const AHook: THook;
+function HookRunStatePrefix(const AHook: THook;
   const AProjectRoot: string): string;
 var
   Key: string;
 begin
   Key := HookTextDigest(HookRecordPath(AHook.Output));
   Result := ResolveProjectPath(AProjectRoot, HOOK_RUN_RECORD_DIR) + '/'
-    + Copy(Key, Length('sha256:') + 1, 32) + '.record';
+    + Copy(Key, Length('sha256:') + 1, 32);
+end;
+
+function HookRunRecordPath(const AHook: THook;
+  const AProjectRoot: string): string;
+begin
+  Result := HookRunStatePrefix(AHook, AProjectRoot) + '.record';
+end;
+
+{ The output's in-flight runs live beside its record, in <key>.runs/,
+  registered under the short lock <key>.lock (see LWPT.HookRuns). }
+function BeginHookRun(const AHook: THook;
+  const AProjectRoot: string): TLWPTHookRun;
+var
+  Prefix: string;
+begin
+  if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
+    or AHook.SessionPrivateOutput then Exit(nil);
+  Prefix := HookRunStatePrefix(AHook, AProjectRoot);
+  Result := TLWPTHookRun.Create(Prefix + '.runs', Prefix + '.lock');
 end;
 
 { The declaration the record was made for. A changed command, argument,
@@ -781,21 +811,31 @@ begin
 end;
 
 procedure RecordHookRun(const AHook: THook;
-  const AProjectRoot, ATmpRoot, AInputDigest: string);
+  const AProjectRoot, ATmpRoot, AInputDigest: string; ARun: TLWPTHookRun);
 var
   Lines: TStringList;
   OutputDigest, RecordPath: string;
+  InputsUnchanged: Boolean;
 begin
   if (AHook.Output = '') or (Length(AHook.Inputs) = 0)
-    or (AInputDigest = '') or AHook.SessionPrivateOutput then Exit;
+    or (AInputDigest = '') or AHook.SessionPrivateOutput then
+  begin
+    if ARun <> nil then ARun.Finish;
+    Exit;
+  end;
   OutputDigest := HookFileDigest(
     ResolveProjectPath(AProjectRoot, AHook.Output));
-  if OutputDigest = '' then Exit;
   { Inputs whose digest after the command differs from the one taken
     before it may or may not have reached the output, so nothing is
     recorded. Two snapshots cannot see a change that was reverted while
     the command ran. }
-  if CurrentHookInputsDigest(AHook, AProjectRoot) <> AInputDigest then Exit;
+  InputsUnchanged := (OutputDigest <> '')
+    and (CurrentHookInputsDigest(AHook, AProjectRoot) = AInputDigest);
+  { The run finishes only after the output is read: another run of this
+    output that wrote it before then has overlapped this one, and the
+    output may be its generation, from other inputs. }
+  if (ARun <> nil) and not ARun.Finish then Exit;
+  if not InputsUnchanged then Exit;
   RecordPath := HookRunRecordPath(AHook, AProjectRoot);
   Lines := TStringList.Create;
   try
@@ -920,6 +960,22 @@ begin
   end;
 end;
 
+{ AEnvironment plus the registered run's ancestry for the command. }
+function RunEnvironment(const AEnvironment: array of string;
+  ARun: TLWPTHookRun): TStringArray;
+var
+  i: Integer;
+begin
+  Result := nil;
+  SetLength(Result, Length(AEnvironment));
+  for i := 0 to High(AEnvironment) do Result[i] := AEnvironment[i];
+  if ARun <> nil then
+  begin
+    SetLength(Result, Length(Result) + 1);
+    Result[High(Result)] := ARun.ChildEnvironment;
+  end;
+end;
+
 procedure RunHooksWithEnvironment(const APhase: string;
   const AHooks: THookArray; const AProjectRoot, ATmpRoot: string;
   const AEnvironment: array of string);
@@ -927,6 +983,7 @@ var
   i, Code: Integer;
   H: THook;
   InputDigest, RunnableError: string;
+  Run: TLWPTHookRun;
 begin
   if Length(AHooks) = 0 then Exit;
   for i := 0 to High(AHooks) do
@@ -941,18 +998,23 @@ begin
 
     WriteLn('  [', APhase, '] ', H.Name);
 
-    Code := RunRunnableWithEnvironment(H, RunnableError, AProjectRoot,
-      AEnvironment);
-    if RunnableError <> '' then
-      raise ELWPTError.CreateFmt(
-        '[%s] %s: %s while running %s',
-        [APhase, H.Name, RunnableError, H.Runnable.Command]);
+    Run := BeginHookRun(H, AProjectRoot);
+    try
+      Code := RunRunnableWithEnvironment(H, RunnableError, AProjectRoot,
+        RunEnvironment(AEnvironment, Run));
+      if RunnableError <> '' then
+        raise ELWPTError.CreateFmt(
+          '[%s] %s: %s while running %s',
+          [APhase, H.Name, RunnableError, H.Runnable.Command]);
 
-    if Code <> 0 then
-      raise ELWPTError.CreateFmt(
-        '[%s] %s: command exited %d while running %s',
-        [APhase, H.Name, Code, H.Runnable.Command]);
-    RecordHookRun(H, AProjectRoot, ATmpRoot, InputDigest);
+      if Code <> 0 then
+        raise ELWPTError.CreateFmt(
+          '[%s] %s: command exited %d while running %s',
+          [APhase, H.Name, Code, H.Runnable.Command]);
+      RecordHookRun(H, AProjectRoot, ATmpRoot, InputDigest, Run);
+    finally
+      Run.Free;
+    end;
   end;
 end;
 
@@ -966,11 +1028,18 @@ function RunUserTask(const ATask: THook;
   const AProjectRoot, ATmpRoot: string): Integer;
 var
   InputDigest, TaskError: string;
+  Run: TLWPTHookRun;
 begin
   if not HookIsStale(ATask, AProjectRoot, InputDigest) then Exit(0);
-  Result := RunRunnableWithEnvironment(ATask, TaskError, AProjectRoot, []);
-  if (Result = 0) and (TaskError = '') then
-    RecordHookRun(ATask, AProjectRoot, ATmpRoot, InputDigest);
+  Run := BeginHookRun(ATask, AProjectRoot);
+  try
+    Result := RunRunnableWithEnvironment(ATask, TaskError, AProjectRoot,
+      RunEnvironment([], Run));
+    if (Result = 0) and (TaskError = '') then
+      RecordHookRun(ATask, AProjectRoot, ATmpRoot, InputDigest, Run);
+  finally
+    Run.Free;
+  end;
   if TaskError <> '' then
   begin
     WriteLn(ErrOutput, PROGRAM_NAME, ' run: ', TaskError, '.');

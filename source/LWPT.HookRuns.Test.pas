@@ -1,0 +1,358 @@
+{ LWPT.HookRuns.Test — the in-flight registry of gated runs (#442): which
+  runs count as overlapping, how a nested run's ancestors are exempt, and
+  how a dead run's marker is removed. A second process holds a marker
+  through this program's own child mode. }
+program LWPT.HookRuns.Test;
+
+{$mode delphi}{$H+}
+
+uses
+  {$IFDEF UNIX}
+  cthreads,
+  BaseUnix,
+  {$ENDIF}
+  Classes,
+  Process,
+  SysUtils,
+
+  LWPT.BuildSession,
+  LWPT.Core,
+  LWPT.HookRuns,
+  TestingPascalLibrary,
+  Tests.ProcessSupport,
+  Tests.Scratch;
+
+const
+  ChildArgument = '--hook-runs-holder';
+  HolderMilliseconds = 60000;
+  PollMilliseconds = 10;
+
+type
+  THookRunTests = class(TTestSuite)
+  private
+    FRoot, FRuns, FGuard: string;
+    function RunFiles: Integer;
+  protected
+    procedure BeforeEach; override;
+    procedure AfterEach; override;
+  public
+    procedure SetupTests; override;
+    procedure TestSoleRunMayRecord;
+    procedure TestOverlappingRunsMayNotRecord;
+    procedure TestLaterRunFlagsEarlierRun;
+    procedure TestAncestorDoesNotOverlap;
+    procedure TestMalformedAncestorsAreIgnored;
+    procedure TestDeadMarkerIsRemoved;
+    procedure TestOtherProcessMarkerOverlaps;
+    procedure TestUnfinishedRunLeavesNoMarker;
+    {$IFDEF UNIX}
+    procedure TestLinkedMarkerIsRemovedUnprobed;
+    {$ENDIF}
+  end;
+
+{ Child mode: hold a marker as another process would, until released. }
+function RunHolder(const AMarker, AReady, ARelease: string): Integer;
+var
+  Guard: TObject;
+  StartedAt: QWord;
+begin
+  Guard := AcquireOwnerGuard(AMarker, 'test marker');
+  try
+    WriteTextFile(AReady, '');
+    StartedAt := GetTickCount64;
+    while not FileExists(ARelease) do
+    begin
+      if GetTickCount64 - StartedAt >= HolderMilliseconds then Exit(1);
+      Sleep(PollMilliseconds);
+    end;
+    Result := 0;
+  finally
+    Guard.Free;
+  end;
+end;
+
+procedure THookRunTests.BeforeEach;
+begin
+  FRoot := CreateScratchRoot('hook-runs');
+  FRuns := FRoot + '/out.runs';
+  FGuard := FRoot + '/out.lock';
+end;
+
+procedure THookRunTests.AfterEach;
+begin
+  RecursiveDelete(FRoot);
+end;
+
+function THookRunTests.RunFiles: Integer;
+var
+  Search: TSearchRec;
+begin
+  Result := 0;
+  if FindFirst(FRuns + '/*', faAnyFile, Search) = 0 then
+  try
+    repeat
+      if (Search.Attr and faDirectory) = 0 then Inc(Result);
+    until FindNext(Search) <> 0;
+  finally
+    FindClose(Search);
+  end;
+end;
+
+procedure THookRunTests.TestSoleRunMayRecord;
+var
+  Run: TLWPTHookRun;
+begin
+  Run := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Expect<Boolean>(FileExists(FRuns + '/' + Run.Id + '.run')).ToBe(True);
+    Expect<Boolean>(Run.Finish).ToBe(True);
+    Expect<Integer>(RunFiles).ToBe(0);
+    { A run finishes once; a second call never permits a record. }
+    Expect<Boolean>(Run.Finish).ToBe(False);
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure THookRunTests.TestOverlappingRunsMayNotRecord;
+var
+  First, Second: TLWPTHookRun;
+begin
+  First := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Second := TLWPTHookRun.Create(FRuns, FGuard, '');
+    try
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+  Expect<Integer>(RunFiles).ToBe(0);
+end;
+
+{ The earlier run is flagged by the later one even when the later run has
+  already finished when the earlier one does. }
+procedure THookRunTests.TestLaterRunFlagsEarlierRun;
+var
+  First, Second: TLWPTHookRun;
+begin
+  First := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Second := TLWPTHookRun.Create(FRuns, FGuard, '');
+    Second.Free;
+    Expect<Boolean>(FileExists(FRuns + '/' + First.Id + '.overlapped'))
+      .ToBe(True);
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+  { A run that starts after both finished overlaps nothing. }
+  First := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Expect<Boolean>(First.Finish).ToBe(True);
+  finally
+    First.Free;
+  end;
+end;
+
+procedure THookRunTests.TestAncestorDoesNotOverlap;
+var
+  Parent, Child, Grandchild: TLWPTHookRun;
+  Ancestry: string;
+begin
+  Parent := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Ancestry := Parent.ChildEnvironment;
+    Expect<string>(Ancestry).ToBe(HOOK_RUN_ANCESTORS_ENV + '=' + Parent.Id);
+    Ancestry := Copy(Ancestry, Pos('=', Ancestry) + 1, MaxInt);
+    Child := TLWPTHookRun.Create(FRuns, FGuard, Ancestry);
+    try
+      Expect<string>(Child.ChildEnvironment).ToBe(HOOK_RUN_ANCESTORS_ENV
+        + '=' + Parent.Id + ',' + Child.Id);
+      Grandchild := TLWPTHookRun.Create(FRuns, FGuard,
+        Parent.Id + ',' + Child.Id);
+      try
+        Expect<Boolean>(Grandchild.Finish).ToBe(True);
+      finally
+        Grandchild.Free;
+      end;
+      Expect<Boolean>(Child.Finish).ToBe(True);
+    finally
+      Child.Free;
+    end;
+    Expect<Boolean>(Parent.Finish).ToBe(True);
+  finally
+    Parent.Free;
+  end;
+end;
+
+procedure THookRunTests.TestMalformedAncestorsAreIgnored;
+var
+  First, Second: TLWPTHookRun;
+begin
+  First := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    { Only exact, well-formed IDs exempt a run: a path, a glob or an ID
+      with extra characters does not. }
+    Second := TLWPTHookRun.Create(FRuns, FGuard,
+      '../' + First.Id + ',*,' + First.Id + 'x, ' + First.Id);
+    try
+      Expect<string>(Second.ChildEnvironment).ToBe(HOOK_RUN_ANCESTORS_ENV
+        + '=' + Second.Id);
+      Expect<Boolean>(Second.Finish).ToBe(False);
+    finally
+      Second.Free;
+    end;
+    Expect<Boolean>(First.Finish).ToBe(False);
+  finally
+    First.Free;
+  end;
+end;
+
+{ A marker whose owner exited without finishing is unlocked: it neither
+  overlaps a new run nor stays behind, and neither does a leftover flag. }
+procedure THookRunTests.TestDeadMarkerIsRemoved;
+var
+  Run: TLWPTHookRun;
+begin
+  ForceDirectories(FRuns);
+  WriteTextFile(FRuns + '/1-2-3.run', '');
+  WriteTextFile(FRuns + '/1-2-3.overlapped', '');
+  WriteTextFile(FRuns + '/4-5-6.overlapped', '');
+  Run := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Expect<Integer>(RunFiles).ToBe(1);
+    Expect<Boolean>(Run.Finish).ToBe(True);
+  finally
+    Run.Free;
+  end;
+  Expect<Integer>(RunFiles).ToBe(0);
+end;
+
+procedure THookRunTests.TestOtherProcessMarkerOverlaps;
+var
+  Holder: TProcess;
+  Run: TLWPTHookRun;
+  Marker, Ready, Release: string;
+  StartedAt: QWord;
+  HolderExit: Integer;
+begin
+  ForceDirectories(FRuns);
+  Marker := FRuns + '/7-8-9.run';
+  Ready := FRoot + '/holder-ready';
+  Release := FRoot + '/holder-release';
+  Holder := TProcess.Create(nil);
+  try
+    Holder.Executable := ExpandFileName(ParamStr(0));
+    Holder.Parameters.Add(ChildArgument);
+    Holder.Parameters.Add(Marker);
+    Holder.Parameters.Add(Ready);
+    Holder.Parameters.Add(Release);
+    Holder.Execute;
+    try
+      StartedAt := GetTickCount64;
+      while not FileExists(Ready) do
+      begin
+        if not Holder.Running then
+          raise Exception.Create('marker holder exited early');
+        if GetTickCount64 - StartedAt >= HolderMilliseconds then
+          raise Exception.Create('marker holder did not start');
+        Sleep(PollMilliseconds);
+      end;
+      Run := TLWPTHookRun.Create(FRuns, FGuard, '');
+      try
+        { The live marker stays and is flagged; the new run may not record. }
+        Expect<Boolean>(FileExists(Marker)).ToBe(True);
+        Expect<Boolean>(FileExists(FRuns + '/7-8-9.overlapped')).ToBe(True);
+        Expect<Boolean>(Run.Finish).ToBe(False);
+      finally
+        Run.Free;
+      end;
+      { The holder as an ancestor overlaps nothing. }
+      Run := TLWPTHookRun.Create(FRuns, FGuard, '7-8-9');
+      try
+        Expect<Boolean>(Run.Finish).ToBe(True);
+      finally
+        Run.Free;
+      end;
+    finally
+      WriteTextFile(Release, '');
+      HolderExit := FinishChild(Holder, HolderMilliseconds, 'marker holder');
+    end;
+    Expect<Integer>(HolderExit).ToBe(0);
+  finally
+    Holder.Free;
+  end;
+  { Once its owner is gone, the next registration removes its marker. }
+  Run := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Expect<Boolean>(FileExists(Marker)).ToBe(False);
+    Expect<Boolean>(Run.Finish).ToBe(True);
+  finally
+    Run.Free;
+  end;
+end;
+
+procedure THookRunTests.TestUnfinishedRunLeavesNoMarker;
+var
+  Run: TLWPTHookRun;
+begin
+  Run := TLWPTHookRun.Create(FRuns, FGuard, '');
+  Run.Free;
+  Expect<Integer>(RunFiles).ToBe(0);
+end;
+
+{$IFDEF UNIX}
+{ A link in the runs directory is removed without opening what it names. }
+procedure THookRunTests.TestLinkedMarkerIsRemovedUnprobed;
+var
+  Run: TLWPTHookRun;
+  Target: string;
+begin
+  ForceDirectories(FRuns);
+  Target := FRoot + '/target';
+  WriteTextFile(Target, 'kept');
+  Expect<Integer>(FpSymlink(PChar(Target), PChar(FRuns + '/1-1-1.run')))
+    .ToBe(0);
+  Run := TLWPTHookRun.Create(FRuns, FGuard, '');
+  try
+    Expect<Boolean>(FileExists(FRuns + '/1-1-1.run')).ToBe(False);
+    Expect<Boolean>(Run.Finish).ToBe(True);
+  finally
+    Run.Free;
+  end;
+  Expect<Boolean>(FileExists(Target)).ToBe(True);
+end;
+{$ENDIF}
+
+procedure THookRunTests.SetupTests;
+begin
+  Test('a run that overlaps no other may record', TestSoleRunMayRecord);
+  Test('two overlapping runs may not record',
+    TestOverlappingRunsMayNotRecord);
+  Test('a later run flags an earlier run that is still going',
+    TestLaterRunFlagsEarlierRun);
+  Test('an ancestor run does not overlap its nested runs',
+    TestAncestorDoesNotOverlap);
+  Test('malformed ancestor IDs are ignored',
+    TestMalformedAncestorsAreIgnored);
+  Test('a dead run''s marker is removed', TestDeadMarkerIsRemoved);
+  Test('another process''s live marker overlaps',
+    TestOtherProcessMarkerOverlaps);
+  Test('an unfinished run leaves no marker', TestUnfinishedRunLeavesNoMarker);
+  {$IFDEF UNIX}
+  Test('a linked marker is removed without being probed',
+    TestLinkedMarkerIsRemovedUnprobed);
+  {$ENDIF}
+end;
+
+begin
+  if (ParamCount = 4) and (ParamStr(1) = ChildArgument) then
+    Halt(RunHolder(ParamStr(2), ParamStr(3), ParamStr(4)));
+  TestRunnerProgram.AddSuite(THookRunTests.Create('hook runs'));
+  TestRunnerProgram.Run;
+  ExitCode := TestResultToExitCode;
+end.
