@@ -32,6 +32,7 @@ type
     FObjects: TLWPTImmutableObjectStore;
     FProducerLeases: TLWPTProducerLeaseCoordinator;
     function ReferencePath(const AFingerprint: string): string;
+    function ReferencePathHasLink(const APath: string): Boolean;
     function InvalidateReferenceIfCurrent(const AFingerprint,
       AExpectedReferenceText: string): Boolean;
     function ReadSmallTextFile(const APath: string;
@@ -159,6 +160,20 @@ begin
     + Copy(Hex, 1, 2) + '/' + Copy(Hex, 3, MaxInt);
 end;
 
+{ True when the namespace root, the refs tree, a reference shard or the
+  reference itself is a symlink or junction. A reference reached through a
+  link is never read, written or invalidated; it is a miss, and repair
+  removes the link. }
+function TLWPTBuildCache.ReferencePathHasLink(const APath: string): Boolean;
+begin
+  Result := IsDirSymlinkOrJunction(FRoot)
+    or IsDirSymlinkOrJunction(IncludeTrailingPathDelimiter(FRoot) + 'refs')
+    or IsDirSymlinkOrJunction(IncludeTrailingPathDelimiter(FRoot)
+      + 'refs/sha256')
+    or IsDirSymlinkOrJunction(ExtractFileDir(APath))
+    or IsDirSymlinkOrJunction(APath);
+end;
+
 function TLWPTBuildCache.ReadSmallTextFile(const APath: string;
   out AText: string): Boolean;
 var
@@ -200,6 +215,7 @@ begin
   {$ENDIF}
   MutationLease := FCacheLifecycle.AcquireMutation;
   try
+    if ReferencePathHasLink(ReferencePath(AFingerprint)) then Exit;
     if ReadSmallTextFile(ReferencePath(AFingerprint), Current)
        and (Trim(Current) = AExpectedReferenceText) then
     begin
@@ -229,6 +245,7 @@ begin
   Result := False;
   AResult := Default(TLWPTCachedBuildResult);
   AReason := 'no-result';
+  if ReferencePathHasLink(ReferencePath(AFingerprint)) then Exit;
   if not ReadSmallTextFile(ReferencePath(AFingerprint), ReferenceText) then
     Exit;
   ReferenceText := Trim(ReferenceText);
@@ -360,6 +377,13 @@ begin
         Lines.LineBreak := #10;
         Lines.Add(ManifestDigest);
         ReferenceBytes := Length(RawByteString(Lines.Text));
+        { The reference is published by path, so its directories are
+          checked before it is measured or they are created, and again
+          before the rename. }
+        if ReferencePathHasLink(ReferencePath(AFingerprint)) then
+          raise ELWPTBuildCacheError.CreateFmt(
+            'build-cache reference path must not contain a link: %s',
+            [ReferencePath(AFingerprint)]);
         ReferenceSize := 0;
         if FindFirst(ReferencePath(AFingerprint), faAnyFile, Search) = 0 then
         try
@@ -371,6 +395,10 @@ begin
         if ReferenceAdditional < 0 then ReferenceAdditional := 0;
         if not FCacheLifecycle.MakeRoomLocked(ReferenceAdditional) then Exit;
         ForceDirectories(ExtractFileDir(ReferencePath(AFingerprint)));
+        if ReferencePathHasLink(ReferencePath(AFingerprint)) then
+          raise ELWPTBuildCacheError.CreateFmt(
+            'build-cache reference path must not contain a link: %s',
+            [ReferencePath(AFingerprint)]);
         AtomicWriteText(ReferencePath(AFingerprint), ManifestTmpRoot, Lines);
         Published := True;
         Result := True;
